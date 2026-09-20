@@ -2,8 +2,9 @@
 
 This is intentionally separate from litelm's API-key adapters. Credentials are
 read from pi on every request, never refreshed or written here. The backend does
-not accept max_output_tokens: output acceptance is locally bounded, NOT a remote
-usage/spending cap. No partial stream text is ever returned for execution.
+not accept max_output_tokens. Completed responses are not rejected for exceeding
+an artificial local token budget. Complete-response validation remains; partial
+stream text is never returned for execution.
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from .provider import Completion, MAX_RESPONSE_BYTES, MAX_STREAM_CHUNKS, ProviderError, _validate_messages
+from .provider import Completion, ProviderError, _validate_messages
 
 CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 _TERMINAL = {"response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled"}
@@ -77,22 +78,19 @@ def _json_response_event(data: bytes, secrets=()) -> dict:
 
 
 async def _events(response, secrets=()):
-    """Bound and validate the payload, regardless of a proxy's MIME label.
+    """Validate the complete payload, regardless of a proxy's MIME label.
 
     Native JSON Responses results go through the same terminal-status, refusal,
     output-shape and usage checks as SSE. HTML/other bodies never become source.
     """
     pending = bytearray()
+    scan_from = 0
     data_lines: list[bytes] = []
     event_name = None
-    received = event_bytes = count = 0
     done_marker = False
     wire_format = None
     media_type = response.headers.get("content-type", "missing")[:120]
     async for chunk in response.aiter_bytes(chunk_size=4096):
-        received += len(chunk)
-        if received > MAX_RESPONSE_BYTES:
-            raise ProviderError("Codex stream exceeded byte limit; no source accepted", kind="limit")
         pending.extend(chunk)
         if wire_format is None:
             start = bytes(pending).lstrip()
@@ -101,17 +99,18 @@ async def _events(response, secrets=()):
             wire_format = "json" if start[:1] in (b"{", b"[") else "sse"
         if wire_format == "json":
             continue
-        while (newline := pending.find(b"\n")) >= 0:
+        while True:
+            newline = pending.find(b"\n", scan_from)
+            if newline < 0:
+                scan_from = len(pending)
+                break
             line = bytes(pending[:newline]).removesuffix(b"\r")
             del pending[:newline + 1]
+            scan_from = 0
             if not line:
                 if data_lines:
                     data = b"\n".join(data_lines)
                     data_lines = []
-                    event_bytes = 0
-                    count += 1
-                    if count > MAX_STREAM_CHUNKS:
-                        raise ProviderError("Codex stream exceeded event limit", kind="limit")
                     if data == b"[DONE]":
                         if done_marker:
                             raise ProviderError("Duplicate Codex SSE done marker", kind="shape")
@@ -132,9 +131,6 @@ async def _events(response, secrets=()):
                 value = value.removeprefix(b" ")
                 if field == b"data":
                     data_lines.append(value)
-                    event_bytes += len(value) + 1
-                    if event_bytes > MAX_RESPONSE_BYTES:
-                        raise ProviderError("Codex SSE event exceeded byte limit", kind="limit")
                 elif field == b"event":
                     event_name = value
                 elif field not in (b"id", b"retry"):
@@ -247,7 +243,7 @@ class CodexProvider:
         self.auth_file = Path(auth_file) if auth_file is not None else Path.home() / ".pi/agent/auth.json"
         self._transport = transport  # deterministic tests; never an endpoint override
 
-    def build_request(self, messages: list[dict], *, max_tokens: int) -> dict:
+    def build_request(self, messages: list[dict], *, max_tokens: int | None = None) -> dict:
         messages = _validate_messages(messages, max_tokens)
         instructions = []
         inputs = []
@@ -268,14 +264,14 @@ class CodexProvider:
                 "input": inputs, "store": False, "stream": True,
                 "reasoning": {"effort": "medium"}, "text": {"verbosity": "low"}}
 
-    def request_details(self, messages: list[dict], *, max_tokens: int) -> dict:
+    def request_details(self, messages: list[dict], *, max_tokens: int | None = None) -> dict:
         """Exact JSON request plus nonsecret policy, for the supervisor journal."""
         return {"adapter": "codex_subscription_sse", "url": CODEX_URL,
                 "body": self.build_request(messages, max_tokens=max_tokens),
-                "requested_max_tokens": max_tokens, "output_limit_enforcement": "local_only",
+                "ignored_max_tokens": max_tokens, "output_limit_enforcement": "none",
                 "auth": "pi_oauth_read_only", "remote_output_token_cap": False}
 
-    async def generate(self, messages: list[dict], *, max_tokens: int) -> Completion:
+    async def generate(self, messages: list[dict], *, max_tokens: int | None = None) -> Completion:
         body = self.build_request(messages, max_tokens=max_tokens)
         credentials = read_codex_credentials(self.auth_file)
         headers = {"Authorization": f"Bearer {credentials.access}", "chatgpt-account-id": credentials.account_id,
@@ -283,7 +279,7 @@ class CodexProvider:
                    "Content-Type": "application/json", "originator": "py-agent", "User-Agent": "py-agent/0.1.0"}
         try:
             async with httpx.AsyncClient(transport=self._transport, follow_redirects=False, trust_env=True,
-                                        timeout=httpx.Timeout(120, connect=20, pool=20)) as client:
+                                        timeout=httpx.Timeout(None, connect=20, pool=20)) as client:
                 async with client.stream("POST", CODEX_URL, json=body, headers=headers) as response:
                     if response.status_code != 200:
                         status = response.status_code
@@ -405,17 +401,11 @@ class CodexProvider:
         text = "".join(part["text"] for part in selected["content"]) if selected else ""
         if not text.strip():
             rejection = rejection or "Codex returned no executable text"
-        reported_output = usage["normalized"].get("output_tokens")
-        if reported_output is None:
-            rejection = rejection or "Codex output usage missing; cannot enforce local token acceptance limit"
-        elif reported_output > max_tokens:
-            finish = "length"
-            rejection = rejection or "Codex output exceeded local token acceptance limit (not a server-side cap)"
         raw = {"response": terminal, "events": for_audit, "event_count": event_count,
                "output_source": output_source, "cell_selection": "first_complete_assistant_message",
                "selected_phase": selected.get("phase") if selected else None,
                "discarded_followup_messages": max(0, len(messages) - 1),
-               "requested_max_tokens": max_tokens, "output_limit_enforcement": "local_only"}
+               "ignored_max_tokens": max_tokens, "output_limit_enforcement": "none"}
         # Rejected content stays only in raw evidence, never in executable text.
         return Completion(text if rejection is None else "", finish, usage, "\n\n".join(summaries) or None, raw, rejection,
                           phase=selected.get("phase") if selected else None)

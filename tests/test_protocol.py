@@ -6,10 +6,12 @@ import json
 import pytest
 
 from py_agent.protocol import (
-    HOST_TYPES, MAX_FRAME_BYTES, WORKER_TYPES, ProtocolError, decode_frame,
+    HOST_TYPES, WORKER_TYPES, ProtocolError, decode_frame,
     encode_frame, read_frame, read_frame_sync, validate_frame, write_frame,
     write_frame_sync,
 )
+
+OLD_FRAME_LIMIT = 65536  # Regression threshold, not a production quota.
 
 FRAMES = [
     {"v": 1, "type": "execute", "cell_id": "a1:c1", "source": "print('λ')"},
@@ -37,7 +39,7 @@ def test_sync_roundtrip(frame):
 
 def test_async_roundtrip_and_fragmentation():
     async def run():
-        reader = asyncio.StreamReader(limit=MAX_FRAME_BYTES)
+        reader = asyncio.StreamReader(limit=32)
         raw = encode_frame(FRAMES[2])
         task = asyncio.create_task(read_frame(reader))
         reader.feed_data(raw[:10])
@@ -96,19 +98,23 @@ def test_directions_are_explicit():
     b'{"v":1,"v":1,"type":"ready","kernel_pid":1}\n',
     b'{"v":1,"type":"say","cell_id":"c1","content":NaN,"final":false}\n',
     b'{"v":1,"type":"say","cell_id":"c1","content":1e999,"final":false}\n',
-    b"x" * MAX_FRAME_BYTES + b"\n",
+    b"x" * OLD_FRAME_LIMIT + b"\n",
 ])
 def test_bad_wire(raw):
     with pytest.raises(ProtocolError):
         decode_frame(raw)
 
 
-def test_byte_boundary_and_nesting():
-    prefix = {**FRAMES[0], "source": "x"}
-    overhead = len(encode_frame(prefix)) - 1
-    assert len(encode_frame({**prefix, "source": "x" * (MAX_FRAME_BYTES - overhead)})) == MAX_FRAME_BYTES
-    with pytest.raises(ProtocolError):
-        encode_frame({**prefix, "source": "x" * (MAX_FRAME_BYTES - overhead + 1)})
+@pytest.mark.parametrize("source", ["# " + "x" * 100000, "# " + "🐍" * 10000])
+def test_source_larger_than_old_wire_limit_roundtrips(source):
+    frame = {**FRAMES[0], "source": source}
+    encoded = encode_frame(frame)
+    assert len(encoded) > OLD_FRAME_LIMIT
+    assert decode_frame(encoded) == frame
+    assert read_frame_sync(io.BytesIO(encoded)) == frame
+
+
+def test_structural_nesting_guard_remains():
     value = []
     for _ in range(65):
         value = [value]
@@ -116,10 +122,10 @@ def test_byte_boundary_and_nesting():
         encode_frame({**FRAMES[3], "content": value})
 
 
-def test_async_eof_truncation_and_limit():
+def test_async_eof_and_truncation_still_rejected():
     async def run():
-        for raw, error in [(b"", EOFError), (b"{", ProtocolError), (b"x" * (MAX_FRAME_BYTES + 1), ProtocolError)]:
-            reader = asyncio.StreamReader(limit=MAX_FRAME_BYTES)
+        for raw, error in [(b"", EOFError), (b"{", ProtocolError), (b"x" * (OLD_FRAME_LIMIT + 1), ProtocolError)]:
+            reader = asyncio.StreamReader(limit=32)
             reader.feed_data(raw)
             reader.feed_eof()
             with pytest.raises(error):
@@ -129,17 +135,28 @@ def test_async_eof_truncation_and_limit():
         read_frame_sync(io.BytesIO())
 
 
-def test_async_frame_bound_does_not_depend_on_reader_limit():
+def test_large_async_frames_ignore_reader_line_limit_and_wait_for_completion():
     async def run():
-        reader = asyncio.StreamReader(limit=MAX_FRAME_BYTES * 20)
-        reader.feed_data(b"x" * (MAX_FRAME_BYTES * 10))
-        with pytest.raises(ProtocolError):
+        reader = asyncio.StreamReader(limit=32)
+        frame = {**FRAMES[0], "source": "# " + "🐍" * 20000}
+        raw = encode_frame(frame)
+        reader.feed_data(raw[:OLD_FRAME_LIMIT + 1])
+        task = asyncio.create_task(read_frame(reader))
+        await asyncio.sleep(0)
+        assert not task.done()  # no fragments are accepted as a complete cell
+        reader.feed_data(raw[OLD_FRAME_LIMIT + 1:] + encode_frame(FRAMES[1]))
+        reader.feed_eof()
+        assert await task == frame
+        assert await read_frame(reader) == FRAMES[1]
+        with pytest.raises(EOFError):
             await read_frame(reader)
     asyncio.run(run())
 
 
-def test_sync_read_is_bounded():
-    stream = io.BytesIO(b"x" * (MAX_FRAME_BYTES * 10))
-    with pytest.raises(ProtocolError):
-        read_frame_sync(stream)
-    assert stream.tell() == MAX_FRAME_BYTES + 1
+def test_sync_large_frame_consumes_only_one_complete_message():
+    frame = {**FRAMES[0], "source": "# " + "x" * (OLD_FRAME_LIMIT * 10)}
+    raw = encode_frame(frame)
+    stream = io.BytesIO(raw + encode_frame(FRAMES[1]))
+    assert read_frame_sync(stream) == frame
+    assert stream.tell() == len(raw)
+    assert read_frame_sync(stream) == FRAMES[1]

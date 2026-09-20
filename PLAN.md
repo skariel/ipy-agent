@@ -14,9 +14,9 @@ Latest user decisions supersede the historical sections below:
   maintenance turns, replay or automatically retained unfinished-task instructions.
   `tail_groups` was removed. Explicit `/reset` remains a manual exception.
 - Current-epoch reported input tokens control eviction. Late/orphan usage cannot
-  influence it. Before any measurement exists, a labelled conservative byte-based
-  fallback applies; it is never presented as reported tokens. Abrupt input growth
-  between measurements can still exceed a provider's real window.
+  influence it. Before measurement, usage is unknown: the byte estimate is audit
+  information only, never an eviction/rejection gate. Abrupt input growth between
+  measurements can still exceed a provider's real window.
 - At each new context, freeze `This context started with X memories` and a bounded
   namespace inventory (public names/types, not values/reprs). Count/inventory are
   reported by the worker after cells but do NOT change the existing prompt.
@@ -29,13 +29,36 @@ Latest user decisions supersede the historical sections below:
   `Out[n]:`/stdout/stderr; result numbers are worker-cell IDs, not user-input IDs.
 - Status displays `ctx(last) 30%/272k` using current-context reported input tokens
   and configured capacity. `--context-window-tokens` or trusted config controls
-  capacity; fallback is the `input_tokens` budget, default 24000. This is not model
-  discovery. Missing measurements show `?`; `out(last)` retains output counters.
-- Existing sandbox, output-file deduplication, deadlines, cancellation, audit
-  journal and read-only historical export remain. Historical snapshot records
-  remain readable without any memory-file runtime support.
+  capacity; fallback is the `input_tokens` budget, now default **272000**, not the
+  obsolete 24000 cap. Default eviction starts at 258400 reported input tokens.
+  This is not model discovery. Missing measurements show `?`; `out(last)` retains output counters.
+- Removed Codex's local output-token acceptance cap: completed code is not rejected
+  because reasoning/output counters exceed the generic output budget. Missing usage
+  stays unknown; failed/incomplete responses and invalid protocol still cannot run.
+  API-key output caps are also omitted by default, with an explicit override only.
+  Native SDK/provider defaults can still apply.
+- Removed application work quotas: request/cell totals, execution deadlines, worker
+  resource ceilings, active-capture ceiling, file/spool size, message/frame size,
+  provider response/chunk ceilings, history broker counts and journal storage cap.
+  Workers inherit actual OS limits. Actual resource exhaustion is still possible.
+  Quota configuration fields and their obsolete tests were removed.
+- Worker output over 8,000 characters still becomes a private hash-deduplicated
+  file notice. Large `say` strings/structured replies use the same mechanism,
+  preserving final-answer staging. Files have no application size cap; real disk/
+  OS failures are explicitly reported. Observations reach the model losslessly:
+  the duplicate serialized-byte clipping layer is gone, including for Unicode.
+- Terminal backlog events and trace text are not silently dropped/clipped. Offline
+  journal readers/export accept complete records beyond the former 8 MiB ceiling.
+- Sandbox confinement, correlation/schema validation, incomplete-response rejection,
+  cancellation/stale-result revocation, no replay and actual-storage-failure handling
+  remain. Connection/startup/cleanup waits, protected-control-file validation and
+  abbreviated namespace inventories remain—not normal-work allowances.
+  Historical snapshot records stay readable without any memory runtime.
 
-Verified: **702 passed, 2 skipped**; `uv lock --check` and `uv build` passed.
+Verified: **701 passed, 2 skipped**; `uv lock --check` and `uv build` passed.
+New regressions cover 121 requests, 120 history calls in a cell, >64 MiB files,
+large Unicode frames, >2 MiB responses, >16,384 stream events, large journal/export
+records, untruncated 8k-character model observations and large staged `say` replies.
 Coverage includes stable prompts, full epoch eviction, pending steering, frozen
 memory counts/inventories, no note injection, fresh kernels, safe bounded metadata,
 usage isolation from stale responses, hidden source, numbered prompts and PTY exit.

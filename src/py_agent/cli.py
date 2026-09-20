@@ -17,7 +17,7 @@ import uuid
 from .limits import Limits
 from .terminal import run as run_terminal, sanitize
 
-BUDGET_TYPES = {field.name: field.type for field in fields(Limits)}
+BUDGET_TYPES = {field.name: int for field in fields(Limits)}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -48,9 +48,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--no-color", action="store_true", help="Disable color (also honors NO_COLOR)")
     for key, type_ in BUDGET_TYPES.items():
         result.add_argument("--" + key.replace("_", "-"), type=type_, default=None,
-                            help=("Wall-clock seconds per complete cell (default: 300; timeout kills kernel)"
-                                  if key == "cell_seconds" else
-                                  "Override provisional " + key.replace("_", " ") + " budget"))
+                            help=("Optional API-key response token limit; omitted by default and ignored by Codex"
+                                  if key == "output_tokens" else
+                                  "Configure " + key.replace("_", " ")))
     return result
 
 
@@ -82,7 +82,7 @@ def _validate_budgets(budgets: dict) -> None:
     if not isinstance(budgets, dict) or set(budgets) - BUDGET_TYPES.keys():
         raise ValueError("Configuration budgets contains unknown fields")
     for key, value in budgets.items():
-        valid_type = type(value) in (int, float) if key == "cell_seconds" else type(value) is int
+        valid_type = type(value) is int
         if not valid_type:
             raise ValueError(f"Budget {key} has the wrong type")
         zero_allowed = key == "generation_retries"
@@ -132,12 +132,9 @@ def load_config(path: Path, *, required: bool = False) -> dict:
 
 def _fake_responses(path: Path) -> list[str]:
     with path.open("rb") as stream:
-        raw = stream.read(2 * 1024 * 1024 + 1)
-    if len(raw) > 2 * 1024 * 1024:
-        raise ValueError("Fake responses exceed 2 MiB")
-    value = json.loads(raw)
-    if not isinstance(value, list) or not value or len(value) > 1000 or any(not isinstance(x, str) for x in value):
-        raise ValueError("Fake responses must be a nonempty JSON array of at most 1000 raw code strings")
+        value = json.load(stream)
+    if not isinstance(value, list) or not value or any(not isinstance(x, str) for x in value):
+        raise ValueError("Fake responses must be a nonempty JSON array of raw code strings")
     return value
 
 
@@ -179,7 +176,7 @@ def _make_provider(args, config, workspace):
             raise ValueError("Codex auth.json must be outside the worker's writable workspace and /tmp")
         read_codex_credentials(auth_file)  # fail before startup, without logging/storing credentials
         print("Codex subscription via read-only pi auth. Reasoning effort: medium. Refresh/login through pi if expired. "
-              "Output token limit is local acceptance only; the backend has no server-side output cap.")
+              "No client-side Codex output-token cap.")
         return CodexProvider(model, auth_file=auth_file)
     if args.pi_auth:
         raise ValueError("--pi-auth requires an openai-codex/MODEL model")

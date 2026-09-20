@@ -492,14 +492,14 @@ def test_escape_state_survives_stream_switch_cell_end_and_late_output():
     assert "stdout [1] (late):" in output.text and "visible" in output.text
 
 
-def test_queue_drops_cannot_expose_escape_payload_or_modify_original_events():
+def test_queued_backlog_cannot_expose_escape_payload_or_modify_original_events():
     output = Output()
     terminal = Terminal(Supervisor(), output=output, no_color=True)
     event = {"kind": "output", "cell_id": "a1:c0001", "stream": "stdout", "content": "\x1b]52;c;"}
     terminal.on_event(event)
     for _ in range(260):
         terminal.on_event({"kind": "notice", "content": "busy"})
-    assert terminal._dropped
+    assert len(terminal._pending) == 261
     stream(terminal, "SECRET\x07safe\n")
     assert event["content"] == "\x1b]52;c;"
     assert "SECRET" not in output.text and "safe" in output.text
@@ -654,12 +654,11 @@ async def test_emacs_ctrl_r_and_history_navigation():
         await asyncio.wait_for(task, 3)
 
 
-async def test_terminal_queue_is_bounded_and_status_unknown():
+async def test_terminal_queue_preserves_all_events_and_status_unknown():
     terminal = Terminal(Supervisor(), output=Output())
     for i in range(300):
         terminal.on_event({"kind": "say", "content": str(i)})
-    assert len(terminal._pending) == 256
-    assert terminal._dropped == 44
+    assert len(terminal._pending) == 300
     terminal._pending.clear()
     terminal.on_event({"kind": "user_queued", "id": "a1:e1"})
     terminal.on_event({"kind": "user_queued", "id": "a1:e1"})
@@ -667,6 +666,16 @@ async def test_terminal_queue_is_bounded_and_status_unknown():
     toolbar = "".join(text for _, text in terminal._toolbar())
     assert "ctx(last) ?%/? out(last) ?" in toolbar
     assert "ctx~" not in toolbar and "123" not in toolbar
+
+
+def test_trace_source_has_no_terminal_character_excerpt():
+    output = Output()
+    terminal = Terminal(Supervisor(), output=output, no_color=True)
+    terminal.trace = True
+    source = "# " + "x" * 16000 + "\nprint('the end')"
+    render(terminal, {"kind": "source", "cell_id": "a1:c1", "content": source})
+    assert source in output.text.replace("\r\n", "\n")
+    assert "terminal excerpt" not in output.text
 
 
 async def test_journal_queue_receipt_and_submit_fallback_are_one_ack():
@@ -737,10 +746,10 @@ async def test_toolbar_ignores_orphan_or_previous_epoch_usage(current, expected)
 
 def test_config_exact_schema_and_types(tmp_path):
     path = tmp_path / "config.toml"
-    path.write_text('model="openai/explicit"\nstream=true\n[budgets]\ninput_tokens=10000\ncell_seconds=2.5\n')
+    path.write_text('model="openai/explicit"\nstream=true\n[budgets]\ninput_tokens=10000\noutput_tokens=4000\n')
     config = cli.load_config(path)
     assert config["model"] == "openai/explicit"
-    assert config["budgets"]["cell_seconds"] == 2.5
+    assert config["budgets"]["output_tokens"] == 4000
     path.write_text('context_window_tokens=272000')
     assert cli.load_config(path)["context_window_tokens"] == 272000
     for text in (
@@ -802,6 +811,14 @@ def test_cli_permission_switches_are_explicit(monkeypatch, capsys):
     assert "--network proxy" in capsys.readouterr().err
     assert cli.main(["--fake-responses", "fake.json", "--model", "openai/model"]) == 1
     assert "cannot be combined" in capsys.readouterr().err
+
+
+def test_fake_responses_have_no_count_or_size_ceiling(tmp_path):
+    import json
+    path = tmp_path / "fake.json"
+    responses = ["# " + "x" * 2100] * 1001
+    path.write_text(json.dumps(responses))
+    assert cli._fake_responses(path) == responses
 
 
 def test_fake_responses_strict_format(tmp_path):
@@ -912,8 +929,8 @@ async def test_cli_integration_fake_provider_wiring_and_cleanup(monkeypatch, tmp
     args = cli.parser().parse_args(["--workspace", str(tmp_path), "--host-root", str(tmp_path / "host"),
                                    "--fake-responses", str(fake_path), "--network", "proxy",
                                    "--no-input-history", "--multiline", "--input-tokens", "9000", *window_args])
-    assert await cli._run(args, {"budgets": {"input_tokens": 12000, "cell_seconds": 10}, **window_config}) == 0
-    assert captured["limits"] == Limits(input_tokens=9000, cell_seconds=10)
+    assert await cli._run(args, {"budgets": {"input_tokens": 12000}, **window_config}) == 0
+    assert captured["limits"] == Limits(input_tokens=9000)
     assert captured["provider"].model == "fake/deterministic"
     assert captured["context_window_tokens"] == expected_window
     assert not list(tmp_path.rglob("memory.md"))

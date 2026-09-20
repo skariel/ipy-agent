@@ -37,9 +37,11 @@ not `--api-base`.
 Credentials are not injected into worker environment or request journals, but
 readable credential files are subject to the privacy warning below.
 
-**Codex's output-token limit is local acceptance only, not a server spending cap.**
-Reported reasoning output counts toward it. Complete responses are validated
-before execution. For Codex, the first complete assistant message is the next
+**Codex has no client-side output-token cap.** `--output-tokens` is not enforced
+by this adapter; the backend does not accept that request parameter. Reported
+usage is accounting, not a reason to reject completed code. Incomplete/failed
+responses still never execute, and protocol validation remains. Complete
+responses are validated before execution. For Codex, the first complete assistant message is the next
 cell, regardless of its commentary/final-answer label; later messages generated
 without execution results are discarded. Hidden reasoning and unfinished streams
 never execute. The worker still requires raw code—prose is not turned into code.
@@ -49,6 +51,8 @@ Only a successful `say(..., final=True)` finishes the task; the provider's
 API-key providers use **kennethwolters/litelm**, not LiteLLM. Set the provider's
 key privately in your environment, then run
 `uv run --locked py --model openai/YOUR_MODEL --network proxy`.
+No output-token cap is supplied by default; `--output-tokens` is an optional
+explicit API-key-provider setting. Native providers/SDKs may have their own limits.
 
 Optional private `~/.py/config.toml` can hold `model`, `api_base`, `stream`,
 `context_window_tokens` and a
@@ -122,10 +126,11 @@ in capture order, not separate stdout/stderr labels.
 
 The journal keeps the notice, **not the oversized text**. These are mutable worker
 files, not immutable evidence. They persist in `/tmp` until removed and may contain
-secrets. Files are capped at 64 MiB (or a lower inherited file limit); disk failures
-or exhaustion explicitly report **incomplete** saved output while capture continues.
-There is no aggregate disk quota. `say()` and other control frames retain their
-existing transport limits.
+secrets. There is **no application file-size cap**; actual OS file limits and disk
+failures explicitly report **incomplete** saved output while capture continues.
+Large `say()` strings or structured replies also become complete file notices,
+while keeping final-answer staging. There is no second byte-based output clipping:
+chunks within the 8k-character threshold reach the next model turn intact.
 
 ## Memory, context and full session view
 
@@ -152,11 +157,12 @@ uv run --locked py --model openai-codex/gpt-5.6-sol --network proxy --context-wi
 ```
 
 This is configuration, not automatic model-window discovery. Without the flag or
-`context_window_tokens` config entry, the `input_tokens` budget (default 24000)
-is used. Reported current-context input tokens drive the 95% threshold. Until a
-provider measurement exists, a conservative UTF-8-byte estimate plus reserve is
-used; this fallback is never displayed as actual token usage. Large additions
-between responses can still exceed a model's real window. `tail_groups` is removed.
+`context_window_tokens` config entry, the `input_tokens` budget (default 272000)
+is used. The default is **272,000 tokens**, with eviction at **258,400 reported
+input tokens** (95%). No 24k cap remains. Only reported current-context input tokens
+drive eviction. Before measurement, usage is unknown: the byte estimate is audit
+information only and cannot reject or clear context. Large additions between
+responses can still exceed a model's real window. `tail_groups` is removed.
 
 Source and printed output still enter the audit journal, so explicitly written or
 printed notes can appear there. This is evidence, not variable persistence or a
@@ -195,21 +201,22 @@ not infer task quality, actual cache behavior or prices.
   `/tmp` is not session-private. Default `TMPDIR` remains in workspace scratch.
   Host storage, launcher sockets and trusted runtime/import roots remain protected,
   including when located under `/tmp`. No unsandboxed fallback exists.
-- Resource/transport safeguards remain: by default 100 requests, **300 seconds per
-  complete cell** (`--cell-seconds` overrides), 1 MiB of IPC frames per cell, 64 KiB protocol
-  frames and 64 MiB logical journal payload. A cell's deadline covers all commands
-  in it, regardless of their individual subprocess timeouts; expiry kills the
-  kernel and requires a fresh session. Context uses reported tokens when available,
-  with a conservative byte-based fallback before measurement. Observations may be
-  coalesced before budgeting; observations that still exceed this separate byte
-  budget have explicit head/tail excerpts. Original received frames remain in the
-  journal; oversized worker text lives in the reported `/tmp` file instead.
-  Truncation is not execution failure.
-  No source-headroom reservation.
-- Worker per-process/file limits are **not aggregate** CPU, memory, process or
-  disk quotas. There is no cgroup or aggregate filesystem quota; SQLite overhead
-  also exceeds the logical journal quota. Descendant cleanup needs target-host
-  verification. Execution interruption loses live Python state; earlier effects remain.
+- **No application work quotas:** no request/cell-count ceilings, execution
+  deadlines, CPU/address-space/file/descriptor limits, user-message or logical
+  frame-size limits, provider response/chunk quotas, journal quota, or history-call
+  cutoff. Provider output limits are omitted unless explicitly configured. Large
+  valid responses are accepted; malformed, failed or incomplete ones are not.
+- **Resource use can grow without a preset ceiling.** RAM, disk, API usage and
+  runtime are constrained by actual OS/provider limits, not application allowances.
+  Use `/interrupt` or Ctrl-C to stop work. An actual disk failure still stops the
+  session safely rather than pretending evidence was saved. Connection/startup/
+  cleanup timeouts and validation of protected control files remain; these are
+  not cell execution deadlines. Namespace listings are intentionally abbreviated.
+- Observations are losslessly coalesced, not clipped a second time. The terminal
+  no longer drops queued events or truncates trace text. Full audit records remain
+  in the journal; oversized worker text is in the reported `/tmp` file.
+- Descendant cleanup needs target-host verification. Execution interruption loses
+  live Python state; earlier effects remain. No rollback, replay or aggregate quota.
 - Each launch starts a fresh kernel. **Resume/restart reconstruction is absent**;
   saved files/history do not restore variables. Live multi-provider reliability
   and full sandbox/network/tree-cleanup validation remain incomplete.

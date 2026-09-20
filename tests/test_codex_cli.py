@@ -21,7 +21,7 @@ def test_explicit_codex_selection_and_default_auth(tmp_path, monkeypatch, capsys
     assert isinstance(provider, CodexProvider)
     assert provider.auth_file == auth
     assert reads == [auth]
-    assert "local acceptance" in capsys.readouterr().out
+    assert "No client-side Codex output-token cap" in capsys.readouterr().out
 
 
 def test_configured_codex_and_explicit_auth_file(tmp_path, monkeypatch):

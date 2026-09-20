@@ -12,8 +12,7 @@ import time
 import sqlite3
 
 from .context import Context
-from .history import JournalQuotaExceeded
-from .limits import Limits, LimitExceeded
+from .limits import Limits
 from .observations import pack_observations
 from .protocol import WORKER_TYPES, ProtocolError, encode_frame, read_frame, write_frame
 
@@ -43,9 +42,7 @@ class Supervisor:
         self._reset = False
         self._requests = self._cells = self._generations = 0
         self._known_cells: set[str] = set()
-        self._output_bytes: dict[str, int] = {}
         self._broker_ids: set[tuple[str, str]] = set()
-        self._broker_counts: dict[str, int] = {}
         self._current_group = None
         self._observation = []
         self._finals = []
@@ -63,7 +60,7 @@ class Supervisor:
         else:
             try:
                 event = self.journal.append(kind, content, **metadata)
-            except (JournalQuotaExceeded, OSError, sqlite3.Error) as exc:
+            except (OSError, sqlite3.Error) as exc:
                 self._fatal_storage(kind, exc)
                 raise
         if notify:
@@ -89,7 +86,7 @@ class Supervisor:
     def _commit_epoch(self, *args, **kwargs):
         try:
             return self.journal.commit_epoch(*args, **kwargs)
-        except (JournalQuotaExceeded, OSError, sqlite3.Error) as exc:
+        except (OSError, sqlite3.Error) as exc:
             self._fatal_storage("epoch_commit", exc)
             raise
 
@@ -127,8 +124,6 @@ class Supervisor:
             raise RuntimeError("No live kernel; start a fresh session. No source will be replayed.")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Input must be nonempty text")
-        if len(text.encode("utf-8")) > self.limits.max_user_bytes:
-            raise LimitExceeded("User input exceeds max_user_bytes; split it explicitly")
         event = self._emit("user", text)
         self.pending.append(event)
         self.revision += 1
@@ -207,8 +202,6 @@ class Supervisor:
                 self._compact_context()
             messages = self.context.messages()
             estimate = self.context.check(messages)
-            if self._requests >= self.limits.max_requests:
-                raise LimitExceeded("Request budget exhausted; no further provider calls")
             self._requests += 1
             self._generations += 1
             generation_id = f"a1:g{self._generations:06d}"
@@ -296,12 +289,10 @@ class Supervisor:
         self._cells += 1
         cell_id = f"a1:c{self._cells:06d}"
         frame = {"v": 1, "type": "execute", "cell_id": cell_id, "source": source}
-        data = encode_frame(frame)  # reject oversize before committed dispatch
+        data = encode_frame(frame)  # structural validation before committed dispatch
         event = self._emit("source", source, cell_id=cell_id, generation_id=generation_id)
         self.cell_id = cell_id
         self._known_cells.add(cell_id)
-        self._output_bytes[cell_id] = 0
-        self._broker_counts[cell_id] = 0
         self._current_group = self.context.add("assistant", source, [event["id"]])
         if phase is not None:
             self._current_group.messages[0]["phase"] = phase
@@ -315,18 +306,12 @@ class Supervisor:
         self._emit("dispatch", {"status": "committed", "kernel_epoch": "k1"}, cell_id=cell_id)
         try:
             self.process.stdin.write(data)
-            async with asyncio.timeout(self.limits.cell_seconds):
-                await self.process.stdin.drain()
-                result = await self._cell_done
+            await self.process.stdin.drain()
+            result = await self._cell_done
         except BaseException as exc:
             self._kernel_dead = True
             await self.sandbox.close()
-            self._emit("cell_uncertain", "Cell interrupted/crashed/timed out. Partial effects may remain; no replay.", cell_id=cell_id)
-            if isinstance(exc, TimeoutError):
-                raise LimitExceeded(
-                    f"Cell deadline exceeded ({self.limits.cell_seconds:g}s); kernel terminated. "
-                    "Start a fresh session; use --cell-seconds SECONDS for longer cells."
-                ) from exc
+            self._emit("cell_uncertain", "Cell interrupted/crashed. Partial effects may remain; no replay.", cell_id=cell_id)
             if isinstance(exc, EOFError):
                 # EOF and diagnostic stderr travel on separate descriptors. Drain
                 # briefly after termination so the actual failure reaches the UI.
@@ -341,7 +326,7 @@ class Supervisor:
             self._cell_done = None
         self._memories_count = result.get("memories_count")
         self._namespace_summary = result.get("namespace_summary")
-        packed = pack_observations(self._observation, self.limits.observation_chars)
+        packed = pack_observations(self._observation)
         self.context.observation({"cell_id": cell_id, **packed, "status": result["status"],
                                   "error": result.get("error"), "full_evidence": cell_id}, group=self._current_group)
         finals = self._finals
@@ -382,10 +367,6 @@ class Supervisor:
                 active = cell_id == self.cell_id and self._cell_done is not None and not self._cell_done.done()
                 if not active and kind != "output":
                     raise ProtocolError("Worker event outside its active cell")
-                size = len(encode_frame(frame))
-                if self._output_bytes[cell_id] + size > self.limits.max_output_bytes:
-                    raise LimitExceeded("Cell output/frame quota exceeded; kernel stopped before further evidence was accepted")
-                self._output_bytes[cell_id] += size
                 if kind == "broker_request":
                     await self._broker(frame)
                 elif kind == "output":
@@ -394,7 +375,7 @@ class Supervisor:
                         self._current_group.refs.append(event["id"])
                         self._observation.append({"id": event["id"], "stream": frame["stream"], "text": frame["text"]})
                     else:
-                        self.context.observation({"asynchronous_output_from": cell_id, "excerpt": frame["text"][:self.limits.observation_chars]}, [event["id"]])
+                        self.context.observation({"asynchronous_output_from": cell_id, "text": frame["text"]}, [event["id"]])
                 elif kind == "say":
                     event = self._emit("say_staged" if frame["final"] else "say", frame["content"],
                                        cell_id=cell_id, final=frame["final"], notify=not frame["final"])
@@ -410,7 +391,7 @@ class Supervisor:
             raise
         except Exception as exc:
             if self._closed or (self._kernel_dead and (self._cell_done is None or self._cell_done.done())):
-                # Intentional termination already has a cause (deadline/interrupt).
+                # Intentional termination already has a cause (interrupt/close).
                 # Its ensuing EOF is not a second, unexplained worker crash.
                 return
             self._kernel_dead = True
@@ -428,15 +409,12 @@ class Supervisor:
         if key in self._broker_ids:
             raise ProtocolError("Duplicate broker request")
         self._broker_ids.add(key)
-        self._broker_counts[frame["cell_id"]] += 1
-        if self._broker_counts[frame["cell_id"]] > 100:
-            raise LimitExceeded("Broker request limit exceeded")
         response = {"v": 1, "type": "broker_response", "cell_id": frame["cell_id"], "request_id": frame["request_id"]}
         try:
             # Validated method allowlist only; no paths, eval, capabilities or user input.
             method = {"recent": self.journal.recent, "search": self.journal.search, "read": self.journal.read}[frame["method"]]
             response["result"] = method(**frame["args"])
-            # History index pages may expand under JSON escaping: bound at transport.
+            # Validate the outgoing response before writing it.
             encode_frame(response)
         except (ValueError, KeyError, ProtocolError) as exc:
             response.pop("result", None)
@@ -445,15 +423,9 @@ class Supervisor:
         await write_frame(self.process.stdin, response)
 
     async def _read_stderr(self):
-        total = 0
         while not self._closed:
             data = await self.process.stderr.read(4096)
             if not data:
-                return
-            total += len(data)
-            if total > self.limits.max_output_bytes:
-                self._kernel_dead = True
-                await self.sandbox.close()
                 return
             text = data.decode("utf-8", "replace")
             self._stderr_tail = (self._stderr_tail + text)[-4096:]

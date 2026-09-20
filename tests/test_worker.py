@@ -263,10 +263,10 @@ async def test_duplicate_dispatch_fails_without_replay(runtime):
     assert (runtime.workspace / "once").read_text() == "1"
 
 
-async def test_render_once_text_only_and_bounded_expression_cache(runtime):
+async def test_render_once_text_only_and_ipython_default_expression_cache(runtime):
     result = await runtime.execute("class Counted:\n    calls = 0\n    def __repr__(self):\n        Counted.calls += 1\n        return 'rendered-value'\n    def _repr_html_(self):\n        raise AssertionError('rich formatting must be off')\nobj = Counted()\nobj")
     assert text(result, "display") == "rendered-value"
-    assert text(await runtime.execute("print(Counted.calls, get_ipython().cache_size)")) == "1 64\n"
+    assert text(await runtime.execute("print(Counted.calls, get_ipython().cache_size == type(get_ipython()).cache_size.default_value)")) == "1 True\n"
     assert end(result)["status"] == "success"
 
 
@@ -428,10 +428,12 @@ async def test_spool_creation_failure_does_not_kill_kernel(runtime):
     assert text(await runtime.execute("output_module.tempfile = original_tempfile\nprint('still alive')")) == 'still alive\n'
 
 
-async def test_spool_cap_reports_partial_file_without_sigxfsz(runtime):
-    await runtime.execute("import py_agent.output as output_module\noutput_module.MAX_SPOOL_BYTES = 32")
+async def test_inherited_file_limit_reports_partial_output_without_losing_kernel(runtime):
+    # Model an inherited file limit only for spooling; real-OS behavior is covered
+    # independently without constraining IPython's own SQLite history file.
+    await runtime.execute("import py_agent.output as output_module\nfrom types import SimpleNamespace\noutput_module.resource = SimpleNamespace(RLIMIT_FSIZE=1, RLIM_INFINITY=-1, getrlimit=lambda _: (32, 32))")
     result = await runtime.execute("print('z' * 9000)")
-    assert 'Full output NOT saved: file byte limit 32 reached' in text(result)
+    assert 'Full output NOT saved: inherited OS file size limit 32 reached' in text(result)
     assert spool_path(result).read_text() == 'z' * 32
     assert 'size=9001 chars, lines=1' in text(result)
     assert end(result)['status'] == 'success'
@@ -544,6 +546,100 @@ async def test_cleanup_tolerates_process_exiting_before_killpg(monkeypatch):
     assert process.returncode == 70
 
 
-async def test_no_ambient_startup_and_hard_resource_ceilings(runtime):
-    result = await runtime.execute("import resource, os\nprint(os.environ.get('PYTHONPATH'))\nprint(resource.getrlimit(resource.RLIMIT_CORE))\nprint(resource.getrlimit(resource.RLIMIT_NOFILE))\nprint(resource.getrlimit(resource.RLIMIT_CPU))")
-    assert text(result) == "None\n(0, 0)\n(128, 128)\n(120, 120)\n"
+@pytest.mark.parametrize("structured", [False, True])
+async def test_large_say_spools_to_final_hash_path_and_keeps_typed_small_replies(runtime, structured):
+    expression = "{'value': '雪' * 10000}" if structured else "'雪' * 10000"
+    result = await runtime.execute(f"say({expression}, final=True)")
+    replies = [event for event in result if event['type'] == 'say']
+    assert len(replies) == 1 and replies[0]['final'] is True
+    notice = replies[0]['content']
+    assert 'Output too long to display here' in notice
+    assert 'provisional' not in notice
+    path = Path(re.search(r'Saved to (.*?\.txt)\.', notice)[1])
+    assert path.parent == runtime.workspace / 'output-artifacts'
+    expected = '{"value":"' + '雪' * 10000 + '"}' if structured else '雪' * 10000
+    assert path.read_text(encoding='utf-8') == expected
+    assert len(path.stem.removeprefix('py-output-')) == 64
+    assert end(result)['status'] == 'success'
+    again = await runtime.execute("say({'answer': 42}, final=True)")
+    assert [event['content'] for event in again if event['type'] == 'say'] == [{'answer': 42}]
+    assert end(again)['status'] == 'success'
+
+
+async def test_large_say_final_still_reports_later_cell_failure(runtime):
+    result = await runtime.execute("say('x' * 20000, final=True)\nraise ValueError('later failure')")
+    reply = next(event for event in result if event['type'] == 'say')
+    assert reply['final'] is True and 'Output too long' in reply['content']
+    assert end(result)['status'] == 'error'  # supervisor must discard the staged final
+
+
+async def test_invalid_say_control_does_not_create_artifacts(runtime):
+    result = await runtime.execute("say('x' * 20000, final=1)")
+    assert end(result)['status'] == 'error'
+    assert not any(event['type'] == 'say' for event in result)
+    assert not list((runtime.workspace / 'output-artifacts').iterdir())
+
+
+async def test_ordinary_file_can_exceed_old_64mib_ceiling(runtime):
+    size = 64 * 1024 * 1024 + 1
+    soft, _ = resource.getrlimit(resource.RLIMIT_FSIZE)
+    if soft != resource.RLIM_INFINITY and soft < size:
+        pytest.skip('Inherited OS file limit prevents >64MiB regression')
+    result = await runtime.execute(f"from pathlib import Path\nwith open('large-file', 'wb') as f:\n    _ = f.truncate({size})\nprint(Path('large-file').stat().st_size)")
+    assert text(result) == f'{size}\n' and end(result)['status'] == 'success'
+
+
+def test_runner_has_no_old_cell_or_active_capture_quota(monkeypatch):
+    from types import SimpleNamespace
+    import py_agent.worker as worker
+
+    class Capture:
+        def __init__(self, *args):
+            self.finished = threading.Event()
+        def detach(self):
+            pass
+    monkeypatch.setattr(worker, 'Capture', Capture)
+    frames = []
+    runner = worker.Runner.__new__(worker.Runner)
+    runner.transport = SimpleNamespace(send=frames.append)
+    runner.capture = None
+    runner.captures = [Capture() for _ in range(17)]
+    runner.dispatched = {f'a1:prior{index}' for index in range(10000)}
+    runner.bridge = worker.Bridge(frames.append, lambda: None)
+    runner.shell = SimpleNamespace(execution_count=10001, user_ns={'memories': []},
+                                   transform_cell=lambda source: source,
+                                   run_cell=lambda *args, **kwargs: SimpleNamespace(error_before_exec=None, error_in_exec=None))
+    frame = {'v': 1, 'type': 'execute', 'cell_id': 'a1:next', 'source': 'pass'}
+    runner.execute(frame)
+    assert len(runner.dispatched) == 10001 and len(runner.captures) == 18
+    assert frames[-1]['status'] == 'success'
+    with pytest.raises(worker.ProtocolError, match='Duplicate cell dispatch'):
+        runner.execute(frame)
+
+
+def test_capture_barrier_waits_without_an_execution_deadline(monkeypatch):
+    from collections import deque
+    from types import SimpleNamespace
+    import py_agent.worker as worker
+
+    class Marker:
+        def wait(self, timeout=None):
+            assert timeout is None
+            return True
+    capture = worker.Capture.__new__(worker.Capture)
+    capture.guard = threading.Lock()
+    capture.finished = threading.Event()
+    capture.pending = deque()
+    capture.failure = None
+    capture.wake_write = 123
+    monkeypatch.setattr(worker, 'threading', SimpleNamespace(Event=Marker))
+    monkeypatch.setattr(worker, 'os', SimpleNamespace(write=lambda fd, data: 1))
+    capture.barrier()
+    assert len(capture.pending) == 1
+
+
+async def test_no_ambient_startup_and_all_os_resource_limits_are_inherited(runtime):
+    names = sorted(name for name in dir(resource) if name.startswith('RLIMIT_'))
+    expected = {name: resource.getrlimit(getattr(resource, name)) for name in names}
+    result = await runtime.execute("import resource, os\nprint(os.environ.get('PYTHONPATH'))\nprint({name: resource.getrlimit(getattr(resource, name)) for name in sorted(dir(resource)) if name.startswith('RLIMIT_')})")
+    assert text(result) == f"None\n{expected}\n"

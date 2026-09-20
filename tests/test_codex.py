@@ -113,7 +113,7 @@ async def test_exact_request_no_tools_history_or_unsupported_output_cap(auth):
         {"role": "user", "content": [{"type": "input_text", "text": "runtime observation"}]},
     ]
     assert not {"tools", "tool_choice", "previous_response_id", "conversation", "max_output_tokens", "max_tokens"} & body.keys()
-    assert details["output_limit_enforcement"] == "local_only" and details["remote_output_token_cap"] is False
+    assert details["output_limit_enforcement"] == "none" and details["remote_output_token_cap"] is False
     assert SECRET not in repr(details) + repr(result) + repr(provider)
     assert ACCOUNT not in repr(details) + repr(result) + repr(provider)
 
@@ -199,10 +199,10 @@ async def test_unsupported_or_malformed_json_rejected(auth, data):
         await provider.generate(MESSAGES, max_tokens=30)
 
 
-async def test_json_output_limit_still_applies(auth):
+async def test_json_complete_response_is_not_rejected_by_local_token_budget(auth):
     provider, _, _ = setup(data=json.dumps(terminal()).encode())
     result = await provider.generate(MESSAGES, max_tokens=1)
-    assert not result.successful and result.finish_reason == "length"
+    assert result.successful and result.finish_reason == "stop"
 
 
 def sparse_terminal_events():
@@ -353,10 +353,10 @@ async def test_unknown_message_phase_is_still_rejected(auth):
     assert not result.successful and "phase" in result.rejection_reason
 
 
-async def test_sparse_terminal_still_obeys_output_token_limit(auth):
+async def test_sparse_complete_response_is_not_rejected_by_local_token_budget(auth):
     provider, _, _ = setup(sparse_terminal_events())
     result = await provider.generate(MESSAGES, max_tokens=1)
-    assert not result.successful and result.finish_reason == "length"
+    assert result.successful and result.finish_reason == "stop"
 
 
 async def test_usage_preserves_raw_counters_without_cache_arithmetic(auth):
@@ -485,21 +485,25 @@ async def test_broken_or_unfinished_sse_raises_without_source(auth, data):
     assert stream.closed
 
 
-async def test_local_output_limit_not_sent_to_backend(auth):
-    provider, requests, _ = setup()
+@pytest.mark.parametrize("tokens,reasoning", [(20, 7), (12000, 11990)])
+async def test_complete_response_and_reasoning_are_not_subject_to_local_output_cap(auth, tokens, reasoning):
+    provider, requests, _ = setup([done(terminal(usage={"input_tokens": 100, "output_tokens": tokens,
+                                                      "output_tokens_details": {"reasoning_tokens": reasoning}}))])
     result = await provider.generate(MESSAGES, max_tokens=19)
-    assert result.finish_reason == "length" and not result.successful and not result.text
-    assert result.usage["normalized"]["output_tokens"] == 20
-    assert result.raw["output_limit_enforcement"] == "local_only"
+    assert result.successful and result.finish_reason == "stop" and result.text == "say('ok', final=True)"
+    assert result.usage["normalized"]["output_tokens"] == tokens
+    assert result.usage["normalized"]["reasoning_tokens"] == reasoning
+    assert result.raw["output_limit_enforcement"] == "none"
+    assert result.raw["ignored_max_tokens"] == 19
     assert "max_output_tokens" not in json.loads(requests[0].content)
 
 
-async def test_missing_usage_cannot_satisfy_local_acceptance_limit(auth):
+async def test_missing_usage_is_unknown_not_a_reason_to_reject_complete_code(auth):
     raw = terminal()
     del raw["usage"]
     provider, _, _ = setup([done(raw)])
     result = await provider.generate(MESSAGES, max_tokens=30)
-    assert not result.successful and "usage missing" in result.rejection_reason
+    assert result.successful and result.finish_reason == "stop"
     assert result.usage["source"] == "unknown"
 
 
@@ -546,18 +550,49 @@ async def test_cancellation_closes_stream_no_completion_returned(auth):
     assert stream.closed
 
 
-async def test_stream_byte_and_event_limits(auth, monkeypatch):
-    monkeypatch.setattr(codex, "MAX_RESPONSE_BYTES", 100)
-    provider, _, stream = setup(data=b":" + b"x" * 101)
-    with pytest.raises(ProviderError, match="byte limit"):
-        await provider.generate(MESSAGES, max_tokens=30)
+@pytest.mark.parametrize("wire_format", ["sse", "json"])
+async def test_complete_responses_over_two_mib_are_not_rejected(auth, wire_format):
+    source = "# " + "x" * (2 * 1024 * 1024) + "\nsay('done', final=True)"
+    final = terminal(output=[message(source)])
+    data = sse([done(final)]) if wire_format == "sse" else json.dumps(final).encode()
+    provider, requests, stream = setup(data=data)
+    result = await provider.generate(MESSAGES)
+    assert result.successful and result.text == source
     assert stream.closed
-    monkeypatch.setattr(codex, "MAX_RESPONSE_BYTES", 10000)
-    monkeypatch.setattr(codex, "MAX_STREAM_CHUNKS", 1)
-    provider, _, stream = setup([{"type": "response.output_text.delta", "delta": "x"}, done()])
-    with pytest.raises(ProviderError, match="event limit"):
-        await provider.generate(MESSAGES, max_tokens=30)
-    assert stream.closed
+    assert result.raw["ignored_max_tokens"] is None
+    assert "max_output_tokens" not in json.loads(requests[0].content)
+
+
+async def test_complete_stream_accepts_more_than_16384_events(auth):
+    events = [{"type": "response.output_text.delta", "delta": "x"}] * 16385 + [done()]
+    provider, _, stream = setup(events)
+    result = await provider.generate(MESSAGES, max_tokens=None)
+    assert result.successful and result.text == "say('ok', final=True)"
+    assert result.raw["event_count"] == 16386 and stream.closed
+
+
+async def test_large_unfinished_response_is_never_returned_early(auth):
+    reached_terminal, finish = asyncio.Event(), asyncio.Event()
+    source = "# " + "x" * (2 * 1024 * 1024)
+    class DeferredTerminal(Bytes):
+        async def __aiter__(self):
+            yield sse([{"type": "response.output_text.delta", "delta": source}])
+            reached_terminal.set()
+            await finish.wait()
+            yield sse([done(terminal(output=[message(source)]))])
+    provider, _, stream = setup(stream=DeferredTerminal([]))
+    task = asyncio.create_task(provider.generate(MESSAGES))
+    await reached_terminal.wait()
+    assert not task.done()
+    finish.set()
+    result = await task
+    assert result.successful and result.text == source and stream.closed
+
+
+async def test_read_and_write_timeouts_do_not_limit_generation(auth):
+    provider, requests, _ = setup()
+    assert (await provider.generate(MESSAGES)).successful
+    assert requests[0].extensions["timeout"] == {"connect": 20, "read": None, "write": None, "pool": 20}
 
 
 @pytest.mark.parametrize("secret", [SECRET, ACCOUNT])

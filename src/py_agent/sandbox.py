@@ -6,8 +6,8 @@ fails explicitly; ``network='proxy'`` is an opt-in to a different policy.
 
 Only inherited stdin/stdout/stderr cross the launcher boundary.  The worker
 must reserve its transport descriptors before redirecting cell standard IO.
-This module does not execute generated source and does not set worker resource
-limits: those must be applied by the worker bootstrap before accepting cells.
+This module does not execute generated source. Workers inherit OS resource
+limits; the application does not impose execution or session resource quotas.
 """
 from __future__ import annotations
 
@@ -218,7 +218,7 @@ class Sandbox:
             'broad_root_warning': self.workspace in (Path('/'), Path.home().resolve()),
             'mandatory_srt_write_protections': True,
             'interrupt': 'kills launcher group; descendant cleanup relies on srt PID namespaces and remains integration-unverified; no rollback or replay',
-            'resource_limits': 'worker bootstrap must apply per-process limits; no aggregate cgroup quota',
+            'resource_limits': 'inherited OS limits only; no application execution/session quotas',
         }
 
     def _prepare(self) -> None:

@@ -178,7 +178,7 @@ def test_read_only_journal_preserves_content_permissions_and_does_not_execute(tm
     assert not (tmp_path / "missing.sqlite").exists()
 
 
-def test_reader_rejects_invalid_and_oversized_records(tmp_path, monkeypatch):
+def test_reader_rejects_invalid_but_accepts_large_records(tmp_path):
     path = tmp_path / "invalid.sqlite"
     db = sqlite3.connect(path)
     db.execute("CREATE TABLE events(seq INTEGER, payload TEXT)")
@@ -186,10 +186,13 @@ def test_reader_rejects_invalid_and_oversized_records(tmp_path, monkeypatch):
     db.commit()
     with pytest.raises(ValueError, match="object"):
         list(journal_events(path))
-    db.execute("UPDATE events SET payload=?", ('{"content":"too long"}',))
+    content = "x" * (8 * 1024 * 1024 + 1)
+    db.execute("UPDATE events SET payload=?", (json.dumps({"content": content}),))
     db.commit()
-    monkeypatch.setattr("py_agent.evaluation.MAX_RECORD_BYTES", 2)
-    with pytest.raises(ValueError, match="8 MiB"):
+    assert list(journal_events(path)) == [{"content": content}]
+    db.execute("UPDATE events SET payload=NULL")
+    db.commit()
+    with pytest.raises(ValueError, match="no payload"):
         list(journal_events(path))
     db.close()
 

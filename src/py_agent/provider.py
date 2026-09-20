@@ -13,9 +13,6 @@ import inspect
 import json
 from typing import Any, Protocol
 
-MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-MAX_STREAM_CHUNKS = 16384
-
 
 @dataclass(frozen=True)
 class Completion:
@@ -36,7 +33,7 @@ class Completion:
 class Provider(Protocol):
     model: str
 
-    async def generate(self, messages: list[dict], *, max_tokens: int) -> Completion: ...
+    async def generate(self, messages: list[dict], *, max_tokens: int | None = None) -> Completion: ...
 
 
 class ProviderError(RuntimeError):
@@ -58,8 +55,6 @@ def _json_object(value: Any) -> dict:
         encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise ProviderError("Non-JSON provider response", kind="shape") from exc
-    if len(encoded.encode("utf-8")) > MAX_RESPONSE_BYTES:
-        raise ProviderError("Provider response exceeded byte limit", kind="limit")
     return json.loads(encoded)
 
 
@@ -87,9 +82,9 @@ def normalize_usage(raw: dict | None) -> dict:
     return {"source": "reported_by_litelm", "raw": deepcopy(raw), "normalized": counters}
 
 
-def _validate_messages(messages: list[dict], max_tokens: int) -> list[dict]:
-    if type(max_tokens) is not int or max_tokens <= 0:
-        raise ValueError("max_tokens must be a positive integer")
+def _validate_messages(messages: list[dict], max_tokens: int | None) -> list[dict]:
+    if max_tokens is not None and (type(max_tokens) is not int or max_tokens <= 0):
+        raise ValueError("max_tokens must be a positive integer or None")
     if not isinstance(messages, list) or not messages:
         raise ValueError("messages must be a nonempty explicit context")
     for message in messages:
@@ -166,15 +161,17 @@ class LitelmProvider:
             raise ValueError("An explicit provider/model is required")
         self.model, self.api_base, self.stream = model, api_base, stream
 
-    async def generate(self, messages: list[dict], *, max_tokens: int) -> Completion:
+    async def generate(self, messages: list[dict], *, max_tokens: int | None = None) -> Completion:
         context = [{"role": m["role"], "content": m["content"]}
                    for m in _validate_messages(messages, max_tokens)]
         try:
             import litelm
         except ImportError as exc:
             raise ProviderError("Install the locked litelm dependencies", kind="configuration") from exc
-        kwargs = {"model": self.model, "messages": context, "max_tokens": max_tokens,
+        kwargs = {"model": self.model, "messages": context,
                   "stream": self.stream, "num_retries": 0}
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         if self.api_base is not None:
             kwargs["api_base"] = self.api_base
         if self.stream and self.model.split("/", 1)[0] not in {"anthropic", "bedrock", "cloudflare", "mistral"}:
@@ -202,14 +199,10 @@ class LitelmProvider:
         usage_samples = []
         usage = None
         rejection = None
-        byte_count = 0
         finished = False
         try:
             async for chunk in stream:
                 raw = _json_object(chunk)
-                byte_count += len(json.dumps(raw, ensure_ascii=False).encode("utf-8"))
-                if byte_count > MAX_RESPONSE_BYTES or len(chunks) >= MAX_STREAM_CHUNKS:
-                    raise ProviderError("Provider stream exceeded buffer limit", kind="limit")
                 chunks.append(raw)
                 if raw.get("error"):
                     rejection = rejection or "Provider returned a streaming error"
@@ -283,7 +276,7 @@ class FakeProvider:
         self.started = asyncio.Event()
         self.cancelled = 0
 
-    async def generate(self, messages: list[dict], *, max_tokens: int) -> Completion:
+    async def generate(self, messages: list[dict], *, max_tokens: int | None = None) -> Completion:
         context = _validate_messages(messages, max_tokens)
         self.requests.append({"messages": context, "max_tokens": max_tokens, "model": self.model})
         self.started.set()

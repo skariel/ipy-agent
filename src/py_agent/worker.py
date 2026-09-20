@@ -1,8 +1,8 @@
 """Persistent IPython subprocess. Production launch is exclusively via Sandbox.
 
 This entry point intentionally has no sandbox bypass switch. The supervisor
-must set deadlines/output quotas and kill the sandbox on transport violations.
-Worker rlimits are per-process hard ceilings, NOT an aggregate resource manager.
+owns interruption and validates transport. OS resource limits are inherited,
+never replaced with application-imposed execution or session quotas.
 """
 from __future__ import annotations
 
@@ -36,20 +36,6 @@ from py_agent.protocol import (
 )
 
 
-# Per-process ceilings: 1 GiB virtual address space, 120 s cumulative CPU,
-# 64 MiB per regular file and 128 descriptors. Preserve inherited RLIMIT_NPROC:
-# on Linux it counts ALL same-UID threads, including unrelated desktop apps.
-# Lowering it to an agent-sized number prevents our own capture threads from
-# starting. Per-agent process limits require a separate cgroup/pids controller.
-RESOURCE_LIMITS = {
-    resource.RLIMIT_AS: 1024 * 1024 * 1024,
-    resource.RLIMIT_CPU: 120,
-    resource.RLIMIT_FSIZE: 64 * 1024 * 1024,
-    resource.RLIMIT_NOFILE: 128,
-    resource.RLIMIT_CORE: 0,
-}
-MAX_SOURCE_CELLS = 10000
-MAX_ACTIVE_CAPTURES = 16
 MAX_NAMESPACE_SCAN = 512
 _NAMESPACE_HELPERS = frozenset({"say", "wait", "history", "memories", "In", "Out",
                                 "get_ipython", "exit", "quit", "open"})
@@ -96,14 +82,6 @@ def kernel_metadata(namespace):
         return {"memories_count": count, "namespace_summary": summary}
     except (RuntimeError, TypeError):
         return unknown  # e.g. unsupported concurrent namespace mutation
-
-
-def apply_limits() -> None:
-    for which, ceiling in RESOURCE_LIMITS.items():
-        _, hard = resource.getrlimit(which)
-        if hard != resource.RLIM_INFINITY:
-            ceiling = min(ceiling, hard)
-        resource.setrlimit(which, (ceiling, ceiling))
 
 
 class Transport:
@@ -229,8 +207,9 @@ cells cannot be reliably attributed and are outside the supported task model.
                 os.write(self.wake_write, b".")
             else:
                 marker.set()
-        if not marker.wait(5):
-            raise RuntimeError("Output transport stalled; execution completion is uncertain")
+        # A long-running flush is not a failed cell. The supervisor can still
+        # interrupt by terminating this worker and its sandbox process tree.
+        marker.wait()
         if self.failure is not None:
             raise RuntimeError("Output transport failed") from self.failure
 
@@ -255,7 +234,6 @@ def _shell(bridge, emit_display):
     profile = ProfileDir.create_profile_dir(str(profile_root / "profile_py_agent"))
     config = Config()
     config.InteractiveShell.colors = "nocolor"
-    config.InteractiveShell.cache_size = 64
     config.InteractiveShell.separate_in = ""
     config.InteractiveShell.separate_out = ""
     config.InteractiveShell.separate_out2 = ""
@@ -327,12 +305,8 @@ class Runner:
         cell_id, source = frame["cell_id"], frame["source"]
         if cell_id in self.dispatched:
             raise ProtocolError("Duplicate cell dispatch rejected; never replay source")
-        if len(self.dispatched) >= MAX_SOURCE_CELLS:
-            raise ProtocolError("Live dispatch ledger limit reached")
         self.dispatched.add(cell_id)
         self.captures = [capture for capture in self.captures if not capture.finished.is_set()]
-        if len(self.captures) >= MAX_ACTIVE_CAPTURES:
-            raise ProtocolError("Too many background output streams; stop background descendants")
         self.bridge.begin(cell_id)
         capture = self.capture = Capture(cell_id, self.transport.send)
         self.captures.append(capture)
@@ -377,7 +351,6 @@ def main() -> int:
     diagnostic_fd = os.dup(2)
     try:
         transport = Transport()
-        apply_limits()
         runner = Runner(transport)
         transport.send({"v": 1, "type": "ready", "kernel_pid": os.getpid()})
         while True:

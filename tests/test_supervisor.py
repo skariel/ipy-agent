@@ -19,7 +19,7 @@ import sys
 import pytest
 
 from py_agent.history import Journal
-from py_agent.limits import Limits, LimitExceeded
+from py_agent.limits import Limits
 from py_agent.provider import Completion, FakeProvider, ProviderError
 from py_agent.protocol import encode_frame, decode_frame
 from py_agent.supervisor import Supervisor
@@ -243,7 +243,9 @@ async def test_failed_completions_never_dispatch_partial_source(tmp_path, comple
 
 async def test_large_valid_cell_executes_then_context_compacts_without_extra_model_turn(tmp_path):
     large = "# " + "x" * 22000 + "\neffect = 999"
-    async with running(tmp_path, [large, "say(effect, final=True)"]) as (sup, seen, provider, launcher):
+    async with running(tmp_path, [Completion(large, usage={"normalized": {"input_tokens": 22800}}),
+                                  "say(effect, final=True)"],
+                       limits=Limits(input_tokens=24000)) as (sup, seen, provider, launcher):
         uid = sup.submit("preserve this active task: report the computed effect")
         await seen.state(sup, "DONE")
         assert [e["content"] for e in seen.kind("say")] == [999]
@@ -301,7 +303,7 @@ class CancellationResistantProvider(FakeProvider):
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
-                return Completion("say('stale should not run', final=True)", usage={"reported": 7, "normalized": {"input_tokens": 24000}})
+                return Completion("say('stale should not run', final=True)", usage={"reported": 7, "normalized": {"input_tokens": 272000}})
         return await super().generate(messages, max_tokens=max_tokens)
 
 
@@ -315,7 +317,7 @@ async def test_cancellation_resistant_stale_completion_is_discarded(tmp_path):
         assert [e["content"] for e in seen.kind("say")] == ["fresh"]
         assert len(seen.kind("source")) == 1
         discarded = seen.kind("generation_response")[0]
-        assert discarded["stale"] and discarded["content"]["usage"]["normalized"]["input_tokens"] == 24000
+        assert discarded["stale"] and discarded["content"]["usage"]["normalized"]["input_tokens"] == 272000
         assert sup.context.epoch == 1
         assert len(all_events(sup, "epoch_commit")) == 1
 
@@ -376,7 +378,7 @@ async def test_codex_serialized_request_is_journaled_without_auth_reads(tmp_path
         await seen.state(sup, "DONE")
         request = seen.kind("generation_request")[0]["content"]
         assert request["provider_request"]["body"] == adapter.build_request(provider.requests[0]["messages"], max_tokens=sup.limits.output_tokens)
-        assert request["provider_request"]["output_limit_enforcement"] == "local_only"
+        assert request["provider_request"]["output_limit_enforcement"] == "none"
         assert "Authorization" not in json.dumps(request)
 
 
@@ -435,7 +437,7 @@ async def test_live_memories_variables_and_functions_survive_reset_without_injec
 async def test_automatic_compaction_preserves_live_memories_without_inserting_them(tmp_path):
     first = "# " + "x" * 22000 + "\nmemories.append('kernel-only note')\nvalue = 17"
     final = "say({'note': memories[0], 'value': value}, final=True)"
-    async with running(tmp_path, [first, final]) as (sup, seen, provider, launcher):
+    async with running(tmp_path, [Completion(first, usage={"normalized": {"input_tokens": 258400}}), final]) as (sup, seen, provider, launcher):
         uid = sup.submit("perform the fixed task")
         await seen.state(sup, "DONE")
         assert seen.kind("say")[-1]["content"] == {"note": "kernel-only note", "value": 17}
@@ -538,7 +540,7 @@ async def test_reported_low_tokens_keep_large_byte_context_append_only(tmp_path)
     source = "# " + "x" * 26000 + "\nvalue = 17"
     responses = [Completion(source, usage={"normalized": {"input_tokens": 1000}}),
                  "say(value, final=True)"]
-    async with running(tmp_path, responses) as (sup, seen, provider, _):
+    async with running(tmp_path, responses, limits=Limits(input_tokens=24000)) as (sup, seen, provider, _):
         sup.submit("keep the entire conversation")
         await seen.state(sup, "DONE")
         assert sup.context.epoch == 1 and len(all_events(sup, "epoch_commit")) == 1
@@ -552,8 +554,8 @@ async def test_reported_low_tokens_keep_large_byte_context_append_only(tmp_path)
 
 
 async def test_near_capacity_reported_usage_clears_entire_dispatched_context(tmp_path):
-    responses = [Completion("value = 17", usage={"normalized": {"input_tokens": 22799}}),
-                 Completion("value += 1", usage={"normalized": {"input_tokens": 22800}}),
+    responses = [Completion("value = 17", usage={"normalized": {"input_tokens": 258399}}),
+                 Completion("value += 1", usage={"normalized": {"input_tokens": 258400}}),
                  Completion("say(value, final=True)", usage={"normalized": {"input_tokens": 1100}})]
     async with running(tmp_path, responses) as (sup, seen, provider, launcher):
         uid = sup.submit("calculate this unfinished task")
@@ -583,9 +585,9 @@ async def test_late_orphan_usage_cannot_change_new_epoch_capacity(tmp_path):
         assert sup.context.epoch == 2 and sup.context.reported_input_tokens == 2000
         orphan = asyncio.get_running_loop().create_future()
         orphan.set_result(Completion("raise AssertionError('must not run')",
-                                     usage={"normalized": {"input_tokens": 24000}}))
+                                     usage={"normalized": {"input_tokens": 272000}}))
         sup._late_generation(orphan, "a1:g-old-orphan")
-        assert sup.usage[-1]["normalized"]["input_tokens"] == 24000  # retained for audit only
+        assert sup.usage[-1]["normalized"]["input_tokens"] == 272000  # retained for audit only
         assert sup.status()["context_input_tokens"] == 2000
         assert not sup.context.needs_reset()
         sup.submit("continue")
@@ -657,24 +659,21 @@ async def test_steering_during_execution_is_carried_verbatim_into_next_context_r
         assert not seen.kind("checkpoint")
 
 
-async def test_history_broker_limits_pages_and_keeps_retrieval_provenance(tmp_path):
-    async with running(tmp_path, ["say(history.read(history.search('needle', kind='user')[0]['id'], limit=999999), final=True)"],
-                       limits=Limits(input_tokens=50000)) as (sup, seen, _, _):
+async def test_history_broker_honors_requested_page_and_keeps_retrieval_provenance(tmp_path):
+    source = ("page = history.read(history.search('needle', kind='user')[0]['id'], limit=999999)\n"
+              "say({'chars': len(page['content']), 'truncated': page['truncated']}, final=True)")
+    async with running(tmp_path, [source], limits=Limits(input_tokens=50000)) as (sup, seen, _, _):
         sup.submit("needle " + "a" * 9000)
         await seen.state(sup, "DONE")
         page = seen.kind("say")[-1]["content"]
-        assert len(page["content"]) == 8000 and page["truncated"]
+        assert page["chars"] > 9000 and not page["truncated"]
         assert all_events(sup, "retrieval")
         assert not any(e["kind"] == "retrieval" for e in sup.journal.search("needle"))
 
 
-@pytest.mark.parametrize("source,limits", [
-    ("while True: pass", Limits(cell_seconds=0.05)),
-    ("say('x' * 3000)", Limits(max_output_bytes=2048)),
-    ("import os\nos._exit(7)", Limits()),
-])
-async def test_timeout_output_flood_crash_stop_without_replay(tmp_path, source, limits):
-    async with running(tmp_path, [source, "say('must not run', final=True)"], limits=limits) as (sup, seen, provider, launcher):
+async def test_actual_worker_crash_stops_without_replay(tmp_path):
+    source = "import os\nos._exit(7)"
+    async with running(tmp_path, [source, "say('must not run', final=True)"]) as (sup, seen, provider, launcher):
         sup.submit("begin")
         await seen.state(sup, "FAILED")
         assert len(provider.requests) == 1
@@ -682,11 +681,6 @@ async def test_timeout_output_flood_crash_stop_without_replay(tmp_path, source, 
         await seen.until(lambda: bool(seen.kind("cell_uncertain")))
         await launcher.process.wait()
         assert launcher.process.returncode is not None
-        if limits.cell_seconds == 0.05:
-            errors = [event["content"] for event in seen.kind("error")]
-            assert len(errors) == 1
-            assert "Cell deadline exceeded (0.05s)" in errors[0]
-            assert "--cell-seconds" in errors[0]
         with pytest.raises(RuntimeError, match="No live kernel"):
             sup.submit("new work")
 
@@ -714,7 +708,7 @@ async def test_oversized_output_reaches_model_as_file_notice_and_kernel_continue
             return await super().generate(messages, max_tokens=max_tokens)
 
     provider = ReadArtifact(["runs = globals().get('runs', 0) + 1\nprint('line\\n' * 400000, end='')"])
-    async with running(tmp_path, provider=provider, limits=Limits(max_output_bytes=8192)) as (sup, seen, _, _):
+    async with running(tmp_path, provider=provider) as (sup, seen, _, _):
         sup.submit("produce a large listing and read a small chunk")
         await seen.state(sup, "DONE")
         assert len(provider.requests) == 2
@@ -741,6 +735,9 @@ async def test_output_character_boundary_survives_transport_and_next_cell(tmp_pa
         if count <= 8000:
             assert outputs == character * count
             assert not artifacts
+            observation = json.loads(provider.requests[1]["messages"][-1]["content"].split("\n", 1)[1])
+            assert "".join(event.get("text", "") for event in observation["events"]) == character * count
+            assert not observation["truncated"] and observation["omitted_events"] == 0
         else:
             assert "size=8001 chars, lines=1" in outputs
             assert "Output too long to display here" in provider.requests[1]["messages"][-1]["content"]
@@ -777,21 +774,23 @@ async def test_execution_interrupt_marks_kernel_lost_and_preserves_no_replay(tmp
         assert launcher.process.returncode is not None
 
 
-async def test_oversize_input_rejected_before_journal_acceptance(tmp_path):
-    async with running(tmp_path, limits=Limits(max_user_bytes=8)) as (sup, seen, provider, _):
-        with pytest.raises(LimitExceeded):
-            sup.submit("x" * 9)
-        assert not seen.kind("user")
-        assert not provider.requests
+async def test_large_user_input_is_not_rejected_or_trimmed(tmp_path):
+    text = "🐍" * 100000
+    async with running(tmp_path, ["say('accepted', final=True)"]) as (sup, seen, provider, _):
+        sup.submit(text)
+        await seen.state(sup, "DONE")
+        assert seen.kind("user")[0]["content"] == text
+        assert any(message["content"] == text for message in provider.requests[0]["messages"])
+        assert not seen.kind("error")
 
 
-async def test_request_budget_is_host_enforced(tmp_path):
-    async with running(tmp_path, ["print('one')", "say('not allowed', final=True)"],
-                       limits=Limits(max_requests=1)) as (sup, seen, provider, _):
-        sup.submit("begin")
-        await seen.state(sup, "FAILED")
-        assert len(provider.requests) == 1
-        assert len(seen.kind("source")) == 1
+async def test_more_than_100_history_calls_do_not_kill_kernel(tmp_path):
+    source = "for _ in range(120):\n    history.search('never-match-fixed-fixture')\nsay('done', final=True)"
+    async with running(tmp_path, [source]) as (sup, seen, _, _):
+        sup.submit("exercise repeated history paging")
+        await seen.state(sup, "DONE")
+        assert len(seen.kind("retrieval")) == 120
+        assert not seen.kind("error") and not seen.kind("cell_uncertain")
 
 
 class ScriptedProcess:
@@ -824,6 +823,60 @@ class ScriptedProcess:
 
     async def interrupt(self):
         await self.close()
+
+
+async def test_more_than_100_provider_requests_are_allowed(tmp_path):
+    calls = 0
+    def respond(cmd):
+        nonlocal calls
+        calls += 1
+        if calls == 121:
+            yield {"v": 1, "type": "say", "cell_id": cmd["cell_id"], "content": "finished", "final": True}
+        yield {"v": 1, "type": "cell_end", "cell_id": cmd["cell_id"], "status": "success", "execution_count": calls}
+    peer = ScriptedProcess(respond)
+    provider = FakeProvider(["pass"] * 121)
+    seen = Observed()
+    with Journal(tmp_path / "many-requests.sqlite", "many-requests") as journal:
+        sup = Supervisor(provider, peer, journal, on_event=seen)
+        try:
+            await sup.start()
+            sup.submit("run 121 fixed synthetic turns")
+            await seen.state(sup, "DONE")
+            assert len(provider.requests) == sup.status()["requests"] == calls == 121
+            assert len(seen.kind("source")) == 121
+            assert not seen.kind("error") and not peer.closed
+        finally:
+            await sup.close()
+
+
+async def test_worker_and_launcher_traffic_have_no_cumulative_byte_cutoff(tmp_path):
+    block = "x" * 4096
+    def respond(cmd):
+        for _ in range(300):
+            yield {"v": 1, "type": "output", "cell_id": cmd["cell_id"], "stream": "stdout", "text": block}
+        yield {"v": 1, "type": "say", "cell_id": cmd["cell_id"], "content": "done", "final": True}
+        yield {"v": 1, "type": "cell_end", "cell_id": cmd["cell_id"], "status": "success", "execution_count": 1}
+    peer = ScriptedProcess(respond)
+    peer.stderr.feed_data(b"s" * (4096 * 300))
+    seen = Observed()
+    with Journal(tmp_path / "traffic.sqlite", "traffic") as journal:
+        sup = Supervisor(FakeProvider(["pass"]), peer, journal, on_event=seen)
+        try:
+            await sup.start()
+            sup.submit("receive more than the old 1 MiB limits")
+            await seen.state(sup, "DONE")
+            await seen.until(lambda: sum(len(e["content"]) for e in seen.kind("launcher_stderr")) == 4096 * 300)
+            assert sum(len(e["content"]) for e in seen.kind("output")) == 4096 * 300
+            assert len(sup._stderr_tail) == 4096  # diagnostic tail only, not an acceptance cap
+            assert not seen.kind("error") and not peer.closed
+            # Late old-cell text is also preserved, not independently excerpted.
+            late = "late-" * 2400
+            peer.stdout.feed_data(encode_frame({"v": 1, "type": "output", "cell_id": "a1:c000001",
+                                               "stream": "stdout", "text": late}))
+            await seen.until(lambda: any(e.get("asynchronous") for e in seen.kind("output")))
+            assert late in sup.context.messages()[-1]["content"]
+        finally:
+            await sup.close()
 
 
 @pytest.mark.parametrize("responder", [
@@ -880,20 +933,25 @@ async def test_failed_steered_generation_pauses_without_consuming_extra_retry(tm
         assert not seen.kind("source")
 
 
-async def test_journal_quota_stops_visibly_without_crashing_supervisor_task(tmp_path):
-    source = ("from pathlib import Path\nimport time\nsay('ready for quota')\n"
+async def test_actual_journal_failure_during_output_stops_without_crashing_actor(tmp_path, monkeypatch):
+    source = ("from pathlib import Path\nimport time\nsay('ready')\n"
               "while not Path('release').exists():\n    time.sleep(0.005)\n"
-              "print('output exceeds remaining journal quota')\nwait()")
+              "print('output when storage is unavailable')\nwait()")
     async with running(tmp_path, [source]) as (sup, seen, _, launcher):
         sup.submit("begin")
         await seen.until(lambda: bool(seen.kind("say")))
-        sup.journal.max_bytes = sup.journal.db.execute("SELECT SUM(size) FROM events").fetchone()[0]
+        append = sup.journal.append
+        def unavailable(kind, *args, **kwargs):
+            if kind == "output":
+                raise sqlite3.OperationalError("database or disk is full")
+            return append(kind, *args, **kwargs)
+        monkeypatch.setattr(sup.journal, "append", unavailable)
         (tmp_path / "release").touch()
-        await asyncio.wait({sup._driver}, timeout=1)
+        await seen.state(sup, "FAILED")
+        await asyncio.wait_for(launcher.process.wait(), 3)
         error = sup._driver.exception() if sup._driver.done() and not sup._driver.cancelled() else None
-        assert error is None, f"Quota failure escaped the supervisor actor: {error!r}"
-        assert sup.state == "FAILED"
-        assert launcher.process.returncode is not None
+        assert error is None, f"Storage failure escaped the supervisor actor: {error!r}"
+        assert sup._storage_failed and launcher.process.returncode is not None
 
 
 async def test_successful_final_after_reset_is_a_normal_task_completion(tmp_path):
@@ -923,13 +981,14 @@ async def test_interrupt_rejects_cancellation_resistant_completion(tmp_path):
                 await interrupt
 
 
-async def test_unicode_output_compacts_context_without_memory_save_turn(tmp_path):
+async def test_unicode_output_does_not_trigger_byte_based_context_eviction(tmp_path):
     async with running(tmp_path, ['print("😀" * 5000)', "say('done', final=True)"],
                        limits=Limits(input_tokens=8000)) as (sup, seen, provider, _):
         sup.submit("begin")
         await seen.state(sup, "DONE")
-        assert len(provider.requests) == 2 and sup.context.epoch == 2
+        assert len(provider.requests) == 2 and sup.context.epoch == 1
         sup.context.check(provider.requests[-1]["messages"])
+        assert "😀" * 5000 in provider.requests[-1]["messages"][-1]["content"]
         assert "😀" * 5000 in "".join(e["content"] for e in all_events(sup, "output"))
         assert not seen.kind("checkpoint")
         assert not hasattr(sup.context, "snapshot")
@@ -999,7 +1058,7 @@ async def test_worker_fatal_diagnostic_is_in_user_visible_failure(tmp_path):
 
 async def test_close_rejects_cancellation_resistant_completion(tmp_path):
     provider = CancellationResistantProvider([])
-    async with running(tmp_path, provider=provider, limits=Limits(cell_seconds=0.1)) as (sup, seen, _, _):
+    async with running(tmp_path, provider=provider) as (sup, seen, _, _):
         sup.submit("begin")
         await provider.started.wait()
         await sup.close()

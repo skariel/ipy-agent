@@ -1,7 +1,7 @@
-"""Bounded, versioned JSON-line transport shared by host and sandbox worker.
+"""Versioned JSON-line transport shared by host and sandbox worker.
 
 Validation is structural, not authentication. Worker frames are untrusted even
-when they pass it; host callers must also enforce correlation, scope and quotas.
+when they pass it; host callers must also enforce correlation and scope.
 """
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ import weakref
 from typing import Any, BinaryIO
 
 VERSION = 1
-MAX_FRAME_BYTES = 65536  # includes terminating LF
 MAX_NAMESPACE_ROWS = 32
 MAX_NAMESPACE_NAME_CHARS = 64
 MAX_NAMESPACE_TYPE_CHARS = 40
@@ -157,9 +156,7 @@ def encode_frame(frame: dict) -> bytes:
     try:
         data = json.dumps(frame, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii") + b"\n"
     except (TypeError, ValueError, RecursionError) as exc:
-        raise ProtocolError("Frame is not bounded JSON data") from exc
-    if len(data) > MAX_FRAME_BYTES:
-        raise ProtocolError("Frame exceeds 65536-byte limit")
+        raise ProtocolError("Frame is not JSON data") from exc
     return data
 
 
@@ -175,8 +172,8 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict:
 def decode_frame(data: bytes, *, allowed_types=None) -> dict:
     if not data:
         raise EOFError("Worker transport closed")
-    if len(data) > MAX_FRAME_BYTES or not data.endswith(b"\n"):
-        raise ProtocolError("Oversized or unterminated frame")
+    if not data.endswith(b"\n"):
+        raise ProtocolError("Unterminated frame")
     try:
         frame = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object,
                            parse_constant=lambda _: (_ for _ in ()).throw(ProtocolError("Nonfinite JSON number")))
@@ -185,22 +182,22 @@ def decode_frame(data: bytes, *, allowed_types=None) -> dict:
     return validate_frame(frame, allowed_types=allowed_types)
 
 
-# Bounded read-ahead keeps framing independent of the caller's StreamReader
-# limit. One consumer per reader is required, as with asyncio's own read API.
+# Chunked read-ahead keeps logical frame size independent of StreamReader's
+# line limit. One consumer per reader is required, as with asyncio's read API.
 _BUFFERS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 async def read_frame(reader: asyncio.StreamReader, *, allowed_types=None) -> dict:
     buffer = _BUFFERS.setdefault(reader, bytearray())
+    search_from = 0
     while True:
-        newline = buffer.find(b"\n")
+        newline = buffer.find(b"\n", search_from)
         if newline >= 0:
             data = bytes(buffer[:newline + 1])
             del buffer[:newline + 1]
             return decode_frame(data, allowed_types=allowed_types)
-        if len(buffer) >= MAX_FRAME_BYTES:
-            raise ProtocolError("Frame exceeds 65536-byte limit")
-        chunk = await reader.read(min(4096, MAX_FRAME_BYTES - len(buffer)))
+        search_from = len(buffer)  # Do not rescan a growing frame quadratically.
+        chunk = await reader.read(65536)
         if not chunk:
             if not buffer:
                 raise EOFError("Worker transport closed")
@@ -214,7 +211,7 @@ async def write_frame(writer: asyncio.StreamWriter, frame: dict) -> None:
 
 
 def read_frame_sync(reader: BinaryIO, *, allowed_types=None) -> dict:
-    return decode_frame(reader.readline(MAX_FRAME_BYTES + 1), allowed_types=allowed_types)
+    return decode_frame(reader.readline(), allowed_types=allowed_types)
 
 
 def write_frame_sync(writer: BinaryIO, frame: dict) -> None:

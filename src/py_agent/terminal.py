@@ -167,8 +167,7 @@ class Terminal:
         self.multiline = multiline
         self._pending: deque[dict] = deque()
         self._wake = asyncio.Event()
-        self._dropped = 0
-        self._acknowledged: deque[str] = deque(maxlen=256)
+        self._acknowledged: set[str] = set()
         self._renderer: asyncio.Task | None = None
         self._interrupting: asyncio.Task | None = None
         self._closing = False
@@ -296,8 +295,8 @@ class Terminal:
         if kind == "state":
             return  # Coalesce frequent status changes in the toolbar.
         if kind == "output":
-            # Parse every fragment BEFORE the bounded display queue can drop it.
-            # Otherwise a dropped OSC introducer could expose its later payload.
+            # Parse every fragment before queuing; escape sequences can span
+            # fragments, stream changes and delayed rendering.
             origin = (event.get("cell_id"), event.get("stream", "stdout"))
             cleaner = self._stream_sanitizers.setdefault(origin, _StreamSanitizer())
             content = event.get("content", "")
@@ -310,7 +309,7 @@ class Terminal:
             event = {**event, "user_id": identifier}
             if identifier in self._acknowledged:
                 return
-            self._acknowledged.append(identifier)
+            self._acknowledged.add(identifier)
         failed_cell = (kind == "cell_end" and isinstance(event.get("content"), dict)
                        and event["content"].get("status") not in {"success", "wait"})
         if not self.trace and not failed_cell and kind not in {
@@ -318,17 +317,12 @@ class Terminal:
             "user_queued", "queued", "cancelled", "interrupted", "failed",
         }:
             return
-        if len(self._pending) >= 256:
-            self._pending.popleft()
-            self._dropped += 1
         self._pending.append(dict(event))
         self._wake.set()
 
     def _emit(self, content, *, python: bool = False) -> None:
         self._finish_stream()
         safe = sanitize(content)
-        if len(safe) > 12000:
-            safe = safe[:12000] + "\n[terminal excerpt; original available in /history]"
         formatted = PygmentsTokens(lex(safe, PythonLexer())) if python and not self.no_color else safe
         print_formatted_text(formatted, output=self.session.output,
                              color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None)
@@ -415,9 +409,6 @@ class Terminal:
         while True:
             await self._wake.wait()
             self._wake.clear()
-            if self._dropped:
-                self._emit(f"[terminal skipped {self._dropped} display events; originals remain in /history]")
-                self._dropped = 0
             while self._pending:
                 self._render_event(self._pending.popleft())
             # print_formatted_text schedules coordinated redraws in the current

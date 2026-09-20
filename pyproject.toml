@@ -13,7 +13,12 @@ dependencies = ["ipython==9.10.0", "prompt-toolkit==3.0.52", "litelm[anthropic]=
 py = "py_agent.cli:main"
 
 [dependency-groups]
-dev = ["pytest==8.4.2", "pytest-asyncio==1.2.0"]
+dev = [
+    "mypy",
+    "pytest==8.4.2",
+    "pytest-asyncio==1.2.0",
+    "ruff",
+]
 
 [tool.uv]
 # Read-only mounts cannot protect dependency files through writable hardlink aliases.

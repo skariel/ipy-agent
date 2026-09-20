@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from py_agent.context import CONTRACT, Context
-from py_agent.limits import LimitExceeded, Limits
+from py_agent.limits import Limits
 
 
 def test_system_only_prefix_describes_live_memories_without_injection():
@@ -56,20 +56,20 @@ def test_reset_discards_all_dispatched_groups_and_keeps_only_pending_input():
     assert ctx.messages()[1:] == [{"role": "user", "content": "must survive"}]
 
 
-def test_reset_never_trims_pending_input_or_commits_on_failure():
-    ctx = Context(Limits())
+def test_reset_never_trims_or_byte_rejects_pending_input():
+    ctx = Context(Limits(input_tokens=24000))
     pending = ctx.add("user", "p" * 30000, ["a1:pending"])
     ctx.record_usage({"normalized": {"input_tokens": 23000}})
     original = ctx.messages()
-    with pytest.raises(LimitExceeded, match="nothing was silently trimmed"):
-        ctx.retention({"a1:pending"}, memories_count=99)
+    retained, evicted = ctx.retention({"a1:pending"}, memories_count=99)
+    assert retained == [pending] and evicted == []
     assert ctx.messages() == original
     assert ctx.groups == [pending] and ctx.epoch == 1
     assert ctx.starting_memories_count == 0
 
 
 def test_large_byte_size_does_not_evict_low_reported_token_context():
-    ctx = Context(Limits())
+    ctx = Context(Limits(input_tokens=24000))
     ctx.add("user", "🐍" * 10000)
     ctx.record_usage({"normalized": {"input_tokens": 6000}})
     assert ctx.estimate(ctx.messages()) > ctx.window_tokens
@@ -79,14 +79,17 @@ def test_large_byte_size_does_not_evict_low_reported_token_context():
 
 @pytest.mark.parametrize("tokens,reset", [(0, False), (22799, False), (22800, True), (24000, True)])
 def test_eviction_threshold_uses_95_percent_reported_input(tokens, reset):
-    ctx = Context(Limits())
+    ctx = Context(Limits(input_tokens=24000))
     ctx.record_usage({"normalized": {"input_tokens": tokens, "cache_read_tokens": tokens}})
     assert ctx.needs_reset() is reset  # no cache arithmetic
 
 
-def test_configured_window_controls_threshold_and_fresh_input_check():
-    ctx = Context(Limits(), context_window_tokens=272000)
-    assert ctx.window_tokens == 272000
+@pytest.mark.parametrize("kwargs", [{}, {"context_window_tokens": 272000}])
+def test_default_and_explicit_window_allow_272k_without_old_24k_cap(kwargs):
+    ctx = Context(Limits(), **kwargs)
+    assert ctx.window_tokens == Limits().input_tokens == 272000
+    ctx.record_usage({"normalized": {"input_tokens": 24000}})
+    assert not ctx.needs_reset()
     ctx.record_usage({"normalized": {"input_tokens": 258399}})
     assert not ctx.needs_reset()
     ctx.record_usage({"normalized": {"input_tokens": 258400}})
@@ -102,12 +105,11 @@ def test_invalid_context_capacity_is_rejected(window):
         Context(Limits(), context_window_tokens=window)
 
 
-def test_unknown_usage_fallback_is_conservative_without_inventing_reported_tokens():
-    ctx = Context(Limits())
-    ctx.add("assistant", "# " + "x" * 23000)
-    assert ctx.reported_input_tokens is None and ctx.needs_reset()
-    with pytest.raises(LimitExceeded):
-        ctx.check(ctx.messages())
+def test_unknown_usage_never_invents_byte_based_token_measurements_or_eviction():
+    ctx = Context(Limits(input_tokens=24000))
+    ctx.add("assistant", "# " + "x" * 500000)
+    assert ctx.reported_input_tokens is None and not ctx.needs_reset()
+    assert ctx.check(ctx.messages()) > ctx.window_tokens
     ctx.record_usage({"normalized": {"input_tokens": 10}})
     assert not ctx.needs_reset()
     ctx.record_usage({"normalized": {}})
@@ -116,21 +118,20 @@ def test_unknown_usage_fallback_is_conservative_without_inventing_reported_token
     assert ctx.reported_input_tokens is None
 
 
-def test_required_first_request_rejects_oversize_without_trimming():
-    ctx = Context(Limits())
+def test_required_first_request_has_no_byte_based_rejection_or_trimming():
+    ctx = Context(Limits(input_tokens=24000))
     ctx.add("user", "λ" * 20000, ["a1:e1"])
     original = ctx.messages()
-    with pytest.raises(LimitExceeded, match="nothing was silently trimmed"):
-        ctx.check(original)
+    assert ctx.check(original) > 40000
+    assert not ctx.needs_reset()
     assert ctx.messages() == original
 
 
 @pytest.mark.parametrize("kwargs", [
-    {"cell_seconds": float("nan")}, {"cell_seconds": float("inf")},
-    {"input_tokens": -1}, {"output_tokens": 0},
-    {"max_requests": True}, {"max_requests": 1.5}, {"input_tokens": 3000},
+    {"input_tokens": -1}, {"input_tokens": True}, {"input_tokens": 1.5},
+    {"output_tokens": 0}, {"output_tokens": True}, {"generation_retries": -1},
 ])
-def test_limits_reject_invalid_or_unreserved_values(kwargs):
+def test_context_and_explicit_provider_configuration_reject_invalid_values(kwargs):
     with pytest.raises(ValueError):
         Limits(**kwargs)
 
@@ -139,9 +140,13 @@ def test_zero_retries_are_valid():
     assert Limits(generation_retries=0).generation_retries == 0
 
 
-def test_default_cell_deadline_allows_longer_test_and_build_cells():
-    assert Limits().cell_seconds == 300
-    assert Limits(cell_seconds=0.05).cell_seconds == 0.05
+def test_execution_and_observation_quotas_are_not_configuration_fields():
+    limits = Limits()
+    assert limits.output_tokens is None
+    for key in ("cell_seconds", "max_requests", "max_output_bytes", "max_user_bytes", "observation_chars"):
+        assert not hasattr(limits, key)
+        with pytest.raises(TypeError):
+            Limits(**{key: 100})
 
 
 def test_checkpoint_and_tail_limits_are_not_configuration_fields():

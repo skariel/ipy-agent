@@ -4,7 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, field
 import json
-from .limits import Limits, LimitExceeded
+from .limits import Limits
 from .protocol import validate_namespace_summary
 
 CONTRACT = '''You are the py coding agent. You speak only Python. Always answer with pure Python code and nothing else.
@@ -96,7 +96,7 @@ class Context:
         if type(value) is int and value >= 0:
             self.reported_input_tokens = value
         # Missing usage does not erase this epoch's last real measurement. A
-        # fresh epoch has no measurement and uses the conservative fallback.
+        # fresh epoch remains unmeasured; byte counts never substitute for tokens.
 
     def messages(self, groups=None):
         return [{"role": "system", "content": self.contract}] + [
@@ -122,29 +122,21 @@ class Context:
         # Not a tokenizer, advertised model window, reported usage, or billing figure.
         return sum(len(m["content"].encode("utf-8")) + 64 for m in messages)
 
-    def check(self, messages, *, fresh=False):
-        estimated = self.estimate(messages)
-        # Reported tokens take precedence over the deliberately pessimistic byte
-        # proxy. Do not reject or evict low-token contexts merely for many bytes.
-        if (fresh or self.reported_input_tokens is None) and estimated + self.limits.output_tokens + 1024 > self.window_tokens:
-            raise LimitExceeded("Required context does not fit. Reduce input or raise the configured context capacity; nothing was silently trimmed.")
-        return estimated
+    def check(self, messages):
+        # Audit estimate only. Byte counts are not token measurements and must
+        # never reject input or silently reset a still-unmeasured context.
+        return self.estimate(messages)
 
     def needs_reset(self):
         amount = self.reported_input_tokens
-        if amount is None:
-            # No provider count exists: use a labelled conservative fallback, not
-            # an invented token count. Reserve room for the next response.
-            amount = self.estimate(self.messages()) + self.limits.output_tokens + 1024
-        return amount * 100 >= self.window_tokens * 95
+        return amount is not None and amount * 100 >= self.window_tokens * 95
 
     def retention(self, pending: set[str], *, memories_count=0, namespace_summary=None):
         # Clear ALL dispatched history, not a rolling tail. Only user messages
         # still awaiting committed dispatch survive a reset.
         retained = [g for g in self.groups if pending.intersection(g.refs)]
-        messages = [{"role": "system", "content": self.system_prompt(memories_count, namespace_summary)}] + [
-            m.copy() for g in retained for m in g.messages]
-        self.check(messages, fresh=True)
+        # Validate prospective metadata without changing the frozen live prompt.
+        self.system_prompt(memories_count, namespace_summary)
         return retained, [g for g in self.groups if g not in retained]
 
     def commit(self, retained: list[Group], *, memories_count=0, namespace_summary=None):

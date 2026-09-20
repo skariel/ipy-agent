@@ -17,7 +17,6 @@ from typing import Any
 
 COUNTERS = ("input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
             "cache_creation_tokens", "reasoning_tokens")
-MAX_RECORD_BYTES = 8 * 1024 * 1024
 
 
 def journal_events(path: str | Path) -> Iterable[dict]:
@@ -25,7 +24,7 @@ def journal_events(path: str | Path) -> Iterable[dict]:
 
     Does not instantiate Journal (which creates schema and changes permissions),
     load extensions, re-render live objects, or execute stored Python source.
-    Missing databases fail instead of being created. One bounded record is read
+    Missing databases fail instead of being created. One complete record is read
     at a time; the database's existing run/agent identity is retained.
     """
     path = Path(path).resolve(strict=True)
@@ -36,13 +35,10 @@ def journal_events(path: str | Path) -> Iterable[dict]:
         connection.execute("PRAGMA query_only=ON")
         connection.execute("PRAGMA trusted_schema=OFF")
         connection.execute("BEGIN")
-        rows = connection.execute(
-            "SELECT length(CAST(payload AS BLOB)), "
-            "CASE WHEN length(CAST(payload AS BLOB)) <= ? THEN payload END FROM events ORDER BY seq",
-            (MAX_RECORD_BYTES,))
-        for size, payload in rows:
-            if size is None or size > MAX_RECORD_BYTES:
-                raise ValueError("Journal record exceeds evaluation's 8 MiB bound or has no payload")
+        rows = connection.execute("SELECT payload FROM events ORDER BY seq")
+        for (payload,) in rows:
+            if payload is None:
+                raise ValueError("Journal record has no payload")
             event = json.loads(payload, parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Nonfinite JSON value")))
             if not isinstance(event, dict):
                 raise ValueError("Journal event must be a JSON object")

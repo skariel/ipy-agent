@@ -4,7 +4,7 @@ import stat
 
 import pytest
 
-from py_agent.history import Journal, JournalError, JournalQuotaExceeded
+from py_agent.history import Journal, JournalError
 
 
 def test_exact_events_paging_cell_group_and_reopen(tmp_path):
@@ -34,7 +34,7 @@ def test_exact_events_paging_cell_group_and_reopen(tmp_path):
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
 
 
-def test_history_limits_search_and_scoping(tmp_path):
+def test_history_paging_search_and_scoping(tmp_path):
     path = tmp_path / "history.db"
     with Journal(path, "r") as parent, Journal(path, "r", "a2") as child:
         parent.append("source", "failed assertion 雪", "a1:c1")
@@ -46,7 +46,9 @@ def test_history_limits_search_and_scoping(tmp_path):
         assert len(parent.search("failed", kind="retrieval")) == 1
         assert parent.search("FAILED ASSERTION")[0]["excerpt"] == "failed assertion 雪"
         assert len(parent.recent(10**9)) == 3
-        assert len(parent.read(parent.recent(1)[0]["id"], limit=10**9)["content"]) == 8000
+        page = parent.read(parent.recent(1)[0]["id"], limit=10**9)
+        assert len(page["content"]) > 10000 and not page["truncated"]
+        assert len(parent.read(parent.recent(1)[0]["id"])["content"]) == 8000  # default page only
         assert len(parent.recent(1)[0]["excerpt"]) == 240
         assert parent.search("", limit=0) == []
         with pytest.raises(KeyError):
@@ -58,15 +60,18 @@ def test_history_limits_search_and_scoping(tmp_path):
                 parent.recent(value)
             with pytest.raises(ValueError):
                 parent.read("a1:c1", offset=value)
+        assert len(parent.search("x" * 1001)) == 1
         with pytest.raises(ValueError):
-            parent.search("x" * 1001)
+            parent.search(None)
 
 
-def test_quota_rolls_back_atomically_and_ids_do_not_reuse(tmp_path):
-    with Journal(tmp_path / "history.db", "r", max_bytes=1000) as journal:
+def test_failed_sql_insert_rolls_back_atomically_and_ids_do_not_reuse(tmp_path):
+    with Journal(tmp_path / "history.db", "r") as journal:
         first = journal.append("user", "hello")
-        with pytest.raises(JournalQuotaExceeded):
-            journal.append("stdout", "z" * 1000)
+        journal.db.execute("CREATE TRIGGER simulated_failure BEFORE INSERT ON events "
+                           "WHEN NEW.kind='simulated_failure' BEGIN SELECT RAISE(ABORT, 'storage failure'); END")
+        with pytest.raises(sqlite3.IntegrityError, match="storage failure"):
+            journal.append("simulated_failure", "z" * 1000)
         assert len(journal.recent()) == 1
         second = journal.append("user", "next")
         assert second["seq"] == first["seq"] + 1
@@ -76,6 +81,32 @@ def test_quota_rolls_back_atomically_and_ids_do_not_reuse(tmp_path):
             journal.db.execute("UPDATE events SET kind='forged'")
         with pytest.raises(ValueError):
             journal.append("source", "x", id="fake")
+
+
+def test_existing_journal_size_no_longer_imposes_a_session_quota(tmp_path):
+    with Journal(tmp_path / "history.db", "r") as journal:
+        # Seed the old accounting column without physically writing 64 MiB.
+        original = {"id": "a1:e00000001", "seq": 1, "run_id": "r", "agent_id": "a1",
+                    "timestamp": 0, "kind": "user", "cell_id": None, "content": "legacy evidence"}
+        journal.db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           (1, "r", "a1", original["id"], "user", None, json.dumps(original),
+                            "legacy evidence", 64 * 1024 * 1024 + 1))
+        event = journal.append("user", "still recording beyond the former quota")
+        assert event["seq"] == 2
+        assert not hasattr(journal, "max_bytes")
+        assert json.loads(journal.read(event["id"])["content"])["content"] == event["content"]
+        message = "storage diagnostic " * 1000
+        assert journal.append_emergency(message)["content"] == message
+
+
+def test_requested_result_counts_are_not_silently_clamped(tmp_path):
+    with Journal(tmp_path / "history.db", "r") as journal:
+        for index in range(125):
+            journal.append("user", f"needle {index}")
+        assert len(journal.recent(125)) == 125
+        assert len(journal.search("needle", limit=125)) == 125
+        assert len(journal.recent()) == 10
+        assert len(journal.search("needle")) == 20
 
 
 def test_epoch_is_one_durable_record(tmp_path):

@@ -8,7 +8,8 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
-from py_agent.protocol import ProtocolError, encode_frame
+from py_agent.protocol import ProtocolError, validate_frame
+from py_agent.output import spool_say
 
 
 class CellYield(BaseException):
@@ -60,7 +61,8 @@ class Bridge:
         frame = {"v": 1, "type": "say", "cell_id": self._active(), "content": content, "final": final}
         # Validate before marking control intent, so a caught invalid say does
         # not accidentally request completion. The host stages final content.
-        encode_frame(frame)
+        validate_frame(frame)
+        frame["content"] = spool_say(frame["cell_id"], content)
         self._send(frame)
         self.final_requested |= final
 

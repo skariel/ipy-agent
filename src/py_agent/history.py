@@ -1,7 +1,7 @@
-"""Durable, run/agent-scoped evidence with bounded retrieval.
+"""Durable, run/agent-scoped evidence with caller-controlled paging.
 
-The quota counts serialized event bytes, not SQLite's page/index overhead. The
-supervisor must place this database in a sandbox-protected private directory.
+The supervisor must place this database in a sandbox-protected private directory.
+There is no application storage quota; actual storage failures still propagate.
 """
 from __future__ import annotations
 
@@ -18,34 +18,24 @@ class JournalError(RuntimeError):
     pass
 
 
-class JournalQuotaExceeded(JournalError):
-    pass
-
-
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
 
-def _bound(value: int, maximum: int, name: str) -> int:
+def _count(value: int, name: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
-    return min(value, maximum)
+    return value
 
 
 class Journal:
-    MAX_PAGE = 8000
-    MAX_RESULTS = 100
-
-    def __init__(self, path: str | Path, run_id: str, agent_id: str = "a1",
-                 max_bytes: int = 64 * 1024 * 1024):
+    def __init__(self, path: str | Path, run_id: str, agent_id: str = "a1"):
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id):
             raise ValueError("invalid run ID")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", agent_id):
             raise ValueError("invalid agent ID")
-        if type(max_bytes) is not int or max_bytes <= 0:
-            raise ValueError("max_bytes must be positive")
         self.path = Path(path).absolute()
-        self.run_id, self.agent_id, self.max_bytes = run_id, agent_id, max_bytes
+        self.run_id, self.agent_id = run_id, agent_id
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         for part in [self.path, *self.path.parents]:
             if part.is_symlink():
@@ -79,20 +69,13 @@ class Journal:
             raise JournalError("journal belongs to a different run")
 
     def append_emergency(self, message: str) -> dict:
-        """One bounded termination record from a separate 4 KiB reserve.
+        """Best-effort termination evidence after a storage failure.
 
-        Normal quota accounts for event payloads, not physical SQLite overhead.
-        This does not make ENOSPC survivable: the caller must notify the UI if the
-        underlying disk cannot accept even the emergency record.
+        There is no reserved capacity or quota bypass. The caller must notify the
+        UI if the underlying disk cannot accept this record either. Retain the
+        historical event kind so existing audit readers recognize termination.
         """
-        if self.db.execute("SELECT 1 FROM events WHERE kind='fatal_limit' LIMIT 1").fetchone():
-            raise JournalQuotaExceeded("Emergency journal reserve already used")
-        original = self.max_bytes
-        try:
-            self.max_bytes += 4096
-            return self.append("fatal_limit", message[:512])
-        finally:
-            self.max_bytes = original
+        return self.append("fatal_limit", message)
 
     def close(self) -> None:
         self.db.close()
@@ -123,9 +106,6 @@ class Journal:
                      "content": content, **metadata}
             payload = _json(event)
             size = len(payload.encode("utf-8")) + len(search_text.encode("utf-8"))
-            used = self.db.execute("SELECT COALESCE(SUM(size), 0) FROM events").fetchone()[0]
-            if used + size > self.max_bytes:
-                raise JournalQuotaExceeded("journal quota exhausted; stop before accepting more evidence")
             self.db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             (seq, self.run_id, self.agent_id, event["id"], kind,
                              cell_id, payload, search_text, size))
@@ -148,7 +128,7 @@ class Journal:
                            "pending": pending, "epoch_id": epoch_id}, **metadata)
 
     def recent(self, n: int = 10) -> list[dict[str, Any]]:
-        n = _bound(n, self.MAX_RESULTS, "n")
+        n = _count(n, "n")
         rows = self.db.execute(
             "SELECT event_id,kind,cell_id,search_text FROM events "
             "WHERE run_id=? AND agent_id=? ORDER BY seq DESC LIMIT ?",
@@ -159,9 +139,9 @@ class Journal:
 
     def search(self, query: str, *, kind: str | None = None,
                limit: int = 20) -> list[dict[str, Any]]:
-        if not isinstance(query, str) or len(query) > 1000:
-            raise ValueError("query must be text of at most 1000 characters")
-        limit = _bound(limit, 50, "limit")
+        if not isinstance(query, str):
+            raise ValueError("query must be text")
+        limit = _count(limit, "limit")
         if kind is not None and (not isinstance(kind, str) or len(kind) > 100):
             raise ValueError("invalid kind")
         # Python casefold provides consistent Unicode matching across SQLite builds.
@@ -191,7 +171,7 @@ class Journal:
             raise ValueError("invalid history ID")
         if type(offset) is not int or offset < 0:
             raise ValueError("offset must be a non-negative integer")
-        limit = _bound(limit, self.MAX_PAGE, "limit")
+        limit = _count(limit, "limit")
         rows = self.db.execute(
             "SELECT payload FROM events WHERE run_id=? AND agent_id=? "
             "AND (event_id=? OR cell_id=?) ORDER BY seq",

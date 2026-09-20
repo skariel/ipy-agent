@@ -6,6 +6,7 @@ Only bounded notices cross IPC. No host component opens a supplied pathname.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import resource
 import stat
@@ -13,7 +14,6 @@ import tempfile
 import threading
 
 OUTPUT_CHAR_LIMIT = 8000
-MAX_SPOOL_BYTES = 64 * 1024 * 1024
 
 
 class CellOutput:
@@ -26,13 +26,9 @@ class CellOutput:
     pipe EOF. Both cell completion and pipe EOF are needed to close the artifact.
     """
 
-    def __init__(self, cell_id, send, *, limit=OUTPUT_CHAR_LIMIT, max_bytes=MAX_SPOOL_BYTES):
+    def __init__(self, cell_id, send, *, limit=OUTPUT_CHAR_LIMIT):
         self.cell_id, self.send = cell_id, send
         self.limit = limit
-        soft, _ = resource.getrlimit(resource.RLIMIT_FSIZE)
-        self.max_bytes = min(max_bytes, MAX_SPOOL_BYTES)
-        if soft != resource.RLIM_INFINITY:
-            self.max_bytes = min(self.max_bytes, soft)
         self._lock = threading.RLock()
         self._runs = []  # [stream, text, delivered character offset]
         self.chars = self.newlines = self.saved_bytes = 0
@@ -180,10 +176,13 @@ class CellOutput:
     def _write(self, text):
         if self._storage_error is not None:
             return
+        # Honor actual inherited OS file limits without imposing one ourselves.
+        # Recheck because ordinary cell code may change its own soft limit.
+        soft, _ = resource.getrlimit(resource.RLIMIT_FSIZE)
         # Avoid encoding a whole, potentially enormous rendered display at once.
         for start in range(0, len(text), 4096):
             data = text[start:start + 4096].encode("utf-8", "replace")
-            remaining = self.max_bytes - self.saved_bytes
+            remaining = len(data) if soft == resource.RLIM_INFINITY else max(0, soft - self.saved_bytes)
             clipped = len(data) > remaining
             if clipped:
                 # Never leave a partial UTF-8 sequence at the end of the file.
@@ -200,7 +199,7 @@ class CellOutput:
                 self._fail_storage(f"write failed ({type(exc).__name__}, errno={exc.errno})")
                 return
             if clipped:
-                self._fail_storage(f"file byte limit {self.max_bytes} reached")
+                self._fail_storage(f"inherited OS file size limit {soft} reached")
                 return
 
     def _spill(self):
@@ -235,7 +234,7 @@ class CellOutput:
                 self._runs.append([stream, text, 0])
 
     def _emit(self, stream, text):
-        # 4096 characters fit a frame even with worst-case JSON Unicode escaping.
+        # Send in modest chunks without imposing a logical output-size cap.
         for start in range(0, len(text), 4096):
             self.send({"v": 1, "type": "output", "cell_id": self.cell_id,
                        "stream": stream, "text": text[start:start + 4096]})
@@ -299,3 +298,26 @@ class CellOutput:
                     self._report()
                 else:
                     self.flush()
+
+
+def spool_say(cell_id, content):
+    """Keep small typed replies; turn an oversized reply into a final file notice.
+
+    Structured content is encoded incrementally as JSON. This is separate from
+    the cell's stdout/stderr/display capture, so a staged final reply never points
+    to a provisional filename that will disappear before it is published.
+    """
+    if isinstance(content, str):
+        if len(content) <= OUTPUT_CHAR_LIMIT:
+            return content
+        chunks = (content,)
+    else:
+        chunks = json.JSONEncoder(ensure_ascii=False, allow_nan=False,
+                                  separators=(",", ":")).iterencode(content)
+    notices = []
+    output = CellOutput(cell_id, lambda frame: notices.append(frame["text"]))
+    for chunk in chunks:
+        output.append("display", chunk)
+    output.streams_closed()
+    output.finish_cell()
+    return "".join(notices) if output.chars > OUTPUT_CHAR_LIMIT else content

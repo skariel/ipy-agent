@@ -186,16 +186,16 @@ def test_early_pipe_eof_keeps_file_open_until_display_and_cell_end(sink):
     assert len(events) == 1
 
 
-def test_file_cap_preserves_utf8_and_reports_incomplete_without_stopping(sink):
+def test_inherited_file_limit_preserves_utf8_and_reports_incomplete_without_stopping(sink, monkeypatch):
     output, events = sink
-    output.max_bytes = 7
+    inherited_file_limit(monkeypatch, 7)
     output.append("stdout", "雪" * 9000)
     output.append("stderr", "\nmore\n")
     complete(output)
     assert Path(output.path).read_text(encoding="utf-8") == "雪雪"
     assert Path(output.path).stat().st_size == 6
     assert output.chars == 9006 and output.lines == 2
-    assert "Full output NOT saved: file byte limit 7 reached" in text(events)
+    assert "Full output NOT saved: inherited OS file size limit 7 reached" in text(events)
     assert "Partial output (6 UTF-8 bytes)" in text(events)
     assert output._fd is None
 
@@ -277,13 +277,72 @@ def test_short_os_writes_are_retried_without_dropping_bytes(sink, monkeypatch):
     assert hashlib.sha256('🐍雪\n'.encode('utf-8')).hexdigest() in Path(output.path).name
 
 
-def test_inherited_file_limit_can_only_reduce_cap(monkeypatch):
+def inherited_file_limit(monkeypatch, size):
     monkeypatch.setattr(module, "resource", SimpleNamespace(
         RLIMIT_FSIZE=module.resource.RLIMIT_FSIZE,
-        RLIM_INFINITY=-1, getrlimit=lambda key: (123, 123),
+        RLIM_INFINITY=-1, getrlimit=lambda key: (size, size),
     ))
-    output = CellOutput("a1:c000001", lambda frame: None)
-    assert output.max_bytes == 123
+
+
+def test_changed_inherited_file_limit_is_seen_at_write_time(sink, monkeypatch):
+    output, events = sink
+    inherited_file_limit(monkeypatch, 123)
+    output.append("stdout", "x" * 9000)
+    complete(output)
+    assert Path(output.path).stat().st_size == 123
+    assert "inherited OS file size limit 123 reached" in text(events)
+
+
+def test_spool_over_old_64mib_cap_has_complete_hash_file_with_bounded_memory(sink):
+    output, events = sink
+    size = 65 * 1024 * 1024
+    soft, _ = module.resource.getrlimit(module.resource.RLIMIT_FSIZE)
+    if soft != module.resource.RLIM_INFINITY and soft < size:
+        pytest.skip("Inherited OS file limit prevents >64MiB regression")
+    block = "x" * 65536
+    expected_hash = hashlib.sha256()
+    for _ in range(size // len(block)):
+        output.append("stdout", block)
+        expected_hash.update(block.encode())
+        assert sum(len(run[1]) for run in output._runs) <= 8000
+    complete(output)
+    path = Path(output.path)
+    assert path.stat().st_size == output.chars == size
+    assert path.name == f"py-output-{expected_hash.hexdigest()}.txt"
+    assert len(events) == 1 and "Full output NOT saved" not in text(events)
+
+
+def test_real_inherited_fsize_reports_incomplete_without_signal_exit(tmp_path):
+    import subprocess
+    import sys
+
+    # Fixed trusted subprocess: constrain only this tiny spool exercise, never
+    # the parent test runner or IPython's unrelated history database.
+    source = '''
+import json, resource, sys, tempfile
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+import py_agent.output as module
+real_mkstemp = tempfile.mkstemp
+def create(**kwargs):
+    assert kwargs["dir"] == "/tmp"
+    return real_mkstemp(**(kwargs | {"dir": sys.argv[2]}))
+module.tempfile = SimpleNamespace(mkstemp=create)
+resource.setrlimit(resource.RLIMIT_FSIZE, (32, 32))
+frames = []
+output = module.CellOutput("a1:c1", frames.append)
+output.append("stdout", "x" * 9000)
+output.streams_closed()
+output.finish_cell()
+print(json.dumps({"path": output.path, "text": "".join(f["text"] for f in frames)}))
+'''
+    result = subprocess.run([sys.executable, '-I', '-c', source,
+                             str(Path(module.__file__).resolve().parent.parent), str(tmp_path)],
+                            text=True, capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    value = __import__('json').loads(result.stdout)
+    assert Path(value['path']).read_bytes() == b'x' * 32
+    assert 'Full output NOT saved: inherited OS file size limit 32 reached' in value['text']
 
 
 def hash_path(original, value):
@@ -589,9 +648,9 @@ def test_close_failure_does_not_publish_hash_name(sink, monkeypatch):
     assert len(list(original.parent.iterdir())) == 1
 
 
-def test_incomplete_output_keeps_provisional_name_without_full_content_hash(sink):
+def test_incomplete_output_keeps_provisional_name_without_full_content_hash(sink, monkeypatch):
     output, events = sink
-    output.max_bytes = 3
+    inherited_file_limit(monkeypatch, 3)
     output.append('stdout', 'x' * 9000)
     provisional = Path(output.path)
     complete(output)

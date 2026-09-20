@@ -177,22 +177,48 @@ def test_nonstream_cancellation_propagates(monkeypatch):
         asyncio.run(LitelmProvider("openai/m").generate(MESSAGES, max_tokens=20))
 
 
-def test_limits(monkeypatch):
-    import py_agent.provider as module
-    monkeypatch.setattr(module, "MAX_RESPONSE_BYTES", 20)
-    install(monkeypatch, response())
-    with pytest.raises(ProviderError, match="byte limit"):
-        asyncio.run(LitelmProvider("openai/m").generate(MESSAGES, max_tokens=20))
+@pytest.mark.parametrize("streaming", [False, True])
+def test_complete_responses_larger_than_old_two_mib_quota(monkeypatch, streaming):
+    source = "# " + "x" * (2 * 1024 * 1024) + "\nsay('done', final=True)"
+    value = Stream([chunk(source), chunk(reason="stop")]) if streaming else response(source)
+    calls = install(monkeypatch, value)
+    result = asyncio.run(LitelmProvider("openai/m", stream=streaming).generate(MESSAGES))
+    assert result.successful and result.text == source
+    assert "max_tokens" not in calls[0]
+    if streaming:
+        assert value.closed
 
 
-def test_stream_chunk_limit(monkeypatch):
-    import py_agent.provider as module
-    monkeypatch.setattr(module, "MAX_STREAM_CHUNKS", 1)
-    stream = Stream([chunk("x=1"), chunk(reason="stop")])
+def test_streams_can_have_more_than_16384_chunks(monkeypatch):
+    stream = Stream([chunk(" ")] * 16385 + [chunk("x=1"), chunk(reason="stop")])
     install(monkeypatch, stream)
-    with pytest.raises(ProviderError, match="buffer limit"):
-        asyncio.run(LitelmProvider("openai/m", stream=True).generate(MESSAGES, max_tokens=20))
-    assert stream.closed
+    result = asyncio.run(LitelmProvider("openai/m", stream=True).generate(MESSAGES, max_tokens=None))
+    assert result.successful and result.text == " " * 16385 + "x=1"
+    assert len(result.raw["chunks"]) == 16387 and stream.closed
+
+
+@pytest.mark.parametrize("arguments", [{}, {"max_tokens": None}])
+def test_api_key_provider_has_no_imposed_output_cap(monkeypatch, arguments):
+    calls = install(monkeypatch, response())
+    assert asyncio.run(LitelmProvider("openai/m").generate(MESSAGES, **arguments)).successful
+    assert "max_tokens" not in calls[0]
+
+
+async def test_large_partial_stream_still_waits_for_finish(monkeypatch):
+    ready, finish = asyncio.Event(), asyncio.Event()
+    source = "# " + "x" * (2 * 1024 * 1024)
+    async def stream():
+        yield chunk(source)
+        ready.set()
+        await finish.wait()
+        yield chunk(reason="stop")
+    install(monkeypatch, stream())
+    task = asyncio.create_task(LitelmProvider("openai/m", stream=True).generate(MESSAGES))
+    await ready.wait()
+    assert not task.done()
+    finish.set()
+    result = await task
+    assert result.successful and result.text == source
 
 
 def test_overflow_category_without_credential_logging(monkeypatch):
