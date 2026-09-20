@@ -1,18 +1,18 @@
 """Terminal tests inject input/output; no provider or arbitrary code is run."""
+
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-from pathlib import Path
 import sys
 import types
 
-import pytest
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
+import pytest
 
 from py_agent import cli
 from py_agent.terminal import HELP, Terminal, private_history, sanitize
@@ -59,11 +59,19 @@ class Supervisor:
         self.closed = False
         self.state = "IDLE"
         self.interrupt_gate = None
+        self.permission_decisions = []
+        self.revoked = []
 
     def status(self):
-        return {"model": "fake/test", "state": self.state, "cell_id": "a1:c0001",
-                "context_epoch": "e1", "queued": len(self.submitted),
-                "estimated_input_tokens": 123, "usage": {}}
+        return {
+            "model": "fake/test",
+            "state": self.state,
+            "cell_id": "a1:c0001",
+            "context_epoch": "e1",
+            "queued": len(self.submitted),
+            "estimated_input_tokens": 123,
+            "usage": {},
+        }
 
     def submit(self, text):
         self.submitted.append(text)
@@ -78,6 +86,16 @@ class Supervisor:
     def request_reset(self):
         self.resets += 1
 
+    def resolve_permission(self, request_id, *, allow, scope="once"):
+        self.permission_decisions.append((request_id, allow, scope))
+
+    def permissions_status(self):
+        return {"pending": [{"request_id": "perm-1"}], "grants": [{"id": "p-saved"}]}
+
+    def revoke_permission(self, grant_id):
+        self.revoked.append(grant_id)
+        return grant_id == "p-saved"
+
     async def close(self):
         self.closed = True
 
@@ -86,25 +104,29 @@ async def until(predicate):
     async def poll():
         while not predicate():
             await asyncio.sleep(0)
+
     await asyncio.wait_for(poll(), 3)
 
 
-@pytest.mark.parametrize("payload,expected", [
-    ("hello\x1b]52;c;ZXZpbA==\x07world", "helloworld"),
-    ("a\x1b]0;title\x1b\\b", "ab"),
-    ("a\x1bPgarbage\x1b\\b", "ab"),
-    ("a\x1b[2J\x1b[31mred\x1b[0m", "ared"),
-    ("a\x9b2Jb\x9d52;evil\x9c", "ab"),
-    ("a\x1b]52;unterminated", "a"),
-    ("a\x08\x00\x7fb\u202ereversed\u2066", "abreversed"),
-    ("x\r\ny\rz\t😀中文", "x\ny\nz\t😀中文"),
-])
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        ("hello\x1b]52;c;ZXZpbA==\x07world", "helloworld"),
+        ("a\x1b]0;title\x1b\\b", "ab"),
+        ("a\x1bPgarbage\x1b\\b", "ab"),
+        ("a\x1b[2J\x1b[31mred\x1b[0m", "ared"),
+        ("a\x9b2Jb\x9d52;evil\x9c", "ab"),
+        ("a\x1b]52;unterminated", "a"),
+        ("a\x08\x00\x7fb\u202ereversed\u2066", "abreversed"),
+        ("x\r\ny\rz\t😀中文", "x\ny\nz\t😀中文"),
+    ],
+)
 def test_sanitize_escapes_controls_and_unicode(payload, expected):
     assert sanitize(payload) == expected
 
 
 def test_sanitize_does_not_interpret_html():
-    assert sanitize('<b>not markup</b>') == '<b>not markup</b>'
+    assert sanitize("<b>not markup</b>") == "<b>not markup</b>"
     assert sanitize({"value": "你好"}) == '{"value": "你好"}'
 
 
@@ -168,8 +190,10 @@ async def test_paste_remains_draft_output_preserves_cursor_and_quit():
             await asyncio.sleep(0)
         supervisor.on_event({"kind": "output", "cell_id": "a1:c0001", "stream": "display", "content": "42"})
         await until(lambda: "progress" in output.text and "Out[1]:" in output.text)
-        assert "In [1]:" in output.text and "6 * 7" not in output.text
-        assert "f file.py" in output.text and output.text.count("stdout [1]:") == 1
+        assert "In [1]:" in output.text
+        assert "6 * 7" not in output.text
+        assert "f file.py" in output.text
+        assert output.text.count("stdout [1]:") == 1
         assert terminal.session.default_buffer.text == "hello\nworld"
         assert terminal.session.default_buffer.cursor_position == cursor
         assert "evil" not in output.text
@@ -202,15 +226,18 @@ async def test_numbered_prompt_advances_only_after_successful_user_submissions()
         assert supervisor.submitted == ["first request", "second request"]
         pipe.send_text("/quit\r")
         await asyncio.wait_for(task, 3)
-    assert terminal._input_number == 3 and supervisor.closed
+    assert terminal._input_number == 3
+    assert supervisor.closed
     assert "You:" not in output.text
 
 
 async def test_failed_submission_does_not_advance_prompt_number(monkeypatch):
     supervisor = Supervisor()
     terminal = Terminal(supervisor, output=Output())
+
     def rejected(text):
         raise RuntimeError("No live kernel")
+
     monkeypatch.setattr(supervisor, "submit", rejected)
     with pytest.raises(RuntimeError, match="No live kernel"):
         await terminal.handle_line("request")
@@ -320,7 +347,8 @@ async def test_quit_enter_exits_multiline_without_escape_enter():
         await until(lambda: terminal.session.app.is_running)
         pipe.send_text("  /quit  \r")
         await asyncio.wait_for(task, 3)
-        assert supervisor.closed and not supervisor.submitted
+        assert supervisor.closed
+        assert not supervisor.submitted
 
 
 async def test_closed_input_cancels_active_work_instead_of_spinning():
@@ -339,10 +367,33 @@ async def test_closed_input_cancels_active_work_instead_of_spinning():
 async def test_commands_do_not_submit_code_and_history_is_paged():
     supervisor, output = Supervisor(), Output()
     terminal = Terminal(supervisor, output=output)
-    for command in ("/help", "/history", "/history a1:c1 12", "/usage", "/trace", "/reset", "/unknown"):
+    for command in (
+        "/help",
+        "/history",
+        "/history a1:c1 12",
+        "/usage",
+        "/trace",
+        "/permissions",
+        "/approve perm-1 once",
+        "/approve perm-2 session",
+        "/approve perm-3 project",
+        "/approve perm-4 all",
+        "/deny perm-5",
+        "/revoke p-saved",
+        "/reset",
+        "/unknown",
+    ):
         assert await terminal.handle_line(command)
     assert supervisor.submitted == []
     assert supervisor.resets == 1
+    assert supervisor.permission_decisions == [
+        ("perm-1", True, "once"),
+        ("perm-2", True, "session"),
+        ("perm-3", True, "project"),
+        ("perm-4", True, "global"),
+        ("perm-5", False, "once"),
+    ]
+    assert supervisor.revoked == ["p-saved"]
     assert supervisor.journal.reads == [("a1:c1", {"offset": 12, "limit": 8000})]
     assert terminal.trace
     assert "Esc-Enter" in HELP
@@ -370,9 +421,11 @@ async def test_python_hidden_by_default_and_results_keep_ipython_labels():
         terminal._render_event(terminal._pending.popleft())
     for text in ("stdout [7]:", "hi", "stderr [7]:", "warning", "Out[7]:", "42"):
         assert text in output.text
-    assert "print('hi')" not in output.text and "Python [7]:" not in output.text
+    assert "print('hi')" not in output.text
+    assert "Python [7]:" not in output.text
     assert "In [7]:" not in output.text
-    assert "evil" not in output.text and "\x1b" not in output.text
+    assert "evil" not in output.text
+    assert "\x1b" not in output.text
 
 
 async def test_trace_adds_python_and_audit_records_but_is_not_needed_for_results():
@@ -410,8 +463,7 @@ def render(terminal, event):
 
 
 def stream(terminal, content, *, cell="a1:c0001", kind="stdout", late=False):
-    render(terminal, {"kind": "output", "cell_id": cell, "stream": kind,
-                      "asynchronous": late, "content": content})
+    render(terminal, {"kind": "output", "cell_id": cell, "stream": kind, "asynchronous": late, "content": content})
 
 
 def test_stream_fragments_preserve_lines_without_repeated_headers():
@@ -424,12 +476,15 @@ def test_stream_fragments_preserve_lines_without_repeated_headers():
     assert terminal._stream_partial == ""
 
 
-@pytest.mark.parametrize("boundary", [
-    {"kind": "cell_end", "cell_id": "a1:c0001", "content": {"status": "success"}},
-    {"kind": "say", "content": "answer"},
-    {"kind": "source", "cell_id": "a1:c0002", "content": "print(2)"},
-    {"kind": "notice", "content": "notice"},
-])
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        {"kind": "cell_end", "cell_id": "a1:c0001", "content": {"status": "success"}},
+        {"kind": "say", "content": "answer"},
+        {"kind": "source", "cell_id": "a1:c0002", "content": "print(2)"},
+        {"kind": "notice", "content": "notice"},
+    ],
+)
 def test_partial_line_flushes_at_visible_control_or_cell_boundary(boundary):
     output = Output()
     terminal = Terminal(Supervisor(), output=output, no_color=True)
@@ -449,7 +504,8 @@ def test_stream_switches_keep_order_and_late_cell_origin():
     stream(terminal, "right\n")
     stream(terminal, "old\n", cell="a1:c0002", late=True)
     assert output.text.replace("\r\n", "\n") == (
-        "stdout [1]:\nleft\nstderr [1]:\nwarning\nstdout [1]:\nright\nstdout [2] (late):\nold\n")
+        "stdout [1]:\nleft\nstderr [1]:\nwarning\nstdout [1]:\nright\nstdout [2] (late):\nold\n"
+    )
 
 
 def test_long_partial_line_is_bounded_without_newlines_or_excerpt_insertion():
@@ -457,20 +513,23 @@ def test_long_partial_line_is_bounded_without_newlines_or_excerpt_insertion():
     terminal = Terminal(Supervisor(), output=output, no_color=True)
     payload = "雪" * 4000 + "x" * 15000
     for start in range(0, len(payload), 311):
-        stream(terminal, payload[start:start + 311])
+        stream(terminal, payload[start : start + 311])
         assert len(terminal._stream_partial.encode("utf-8")) <= 8192
     render(terminal, {"kind": "cell_end", "content": {"status": "success"}})
     assert output.text.replace("\r\n", "\n") == "stdout [1]:\n" + payload + "\n"
 
 
-@pytest.mark.parametrize("fragments", [
-    ["\x1b", "]52;c;", "SECRET", "\x1b", "\\", "safe\n"],
-    ["\x9d52;c;", "SECRET", "\x9c", "safe\n"],
-    ["\x1bP", "SECRET\n" * 3000, "\x1b", "\\", "safe\n"],
-    ["\x1bP", "SECRET\x07", "STILL_SECRET", "\x1b\\safe\n"],
-    ["\x1b[", "2", "J", "safe\n"],
-    ["\x1b[3", "1m", "safe", "\x1b[", "0m", "\n"],
-])
+@pytest.mark.parametrize(
+    "fragments",
+    [
+        ["\x1b", "]52;c;", "SECRET", "\x1b", "\\", "safe\n"],
+        ["\x9d52;c;", "SECRET", "\x9c", "safe\n"],
+        ["\x1bP", "SECRET\n" * 3000, "\x1b", "\\", "safe\n"],
+        ["\x1bP", "SECRET\x07", "STILL_SECRET", "\x1b\\safe\n"],
+        ["\x1b[", "2", "J", "safe\n"],
+        ["\x1b[3", "1m", "safe", "\x1b[", "0m", "\n"],
+    ],
+)
 def test_stream_sanitization_survives_fragment_boundaries(fragments):
     output = Output()
     terminal = Terminal(Supervisor(), output=output, no_color=True)
@@ -489,7 +548,8 @@ def test_escape_state_survives_stream_switch_cell_end_and_late_output():
     render(terminal, {"kind": "cell_end", "cell_id": "a1:c0001", "content": {"status": "success"}})
     stream(terminal, "SECRET\x07visible\n", late=True)
     assert "SECRET" not in output.text
-    assert "stdout [1] (late):" in output.text and "visible" in output.text
+    assert "stdout [1] (late):" in output.text
+    assert "visible" in output.text
 
 
 def test_queued_backlog_cannot_expose_escape_payload_or_modify_original_events():
@@ -502,7 +562,8 @@ def test_queued_backlog_cannot_expose_escape_payload_or_modify_original_events()
     assert len(terminal._pending) == 261
     stream(terminal, "SECRET\x07safe\n")
     assert event["content"] == "\x1b]52;c;"
-    assert "SECRET" not in output.text and "safe" in output.text
+    assert "SECRET" not in output.text
+    assert "safe" in output.text
 
 
 def test_stream_crlf_normalization_survives_pipe_boundaries():
@@ -524,22 +585,34 @@ async def test_shutdown_flushes_a_partial_stream_without_cell_end():
         pipe.send_text("/quit\n")
         await asyncio.wait_for(task, 3)
     assert "shutdown-tail" in output.text
-    assert supervisor.closed and terminal._stream_partial == ""
+    assert supervisor.closed
+    assert terminal._stream_partial == ""
 
 
 def test_output_origin_fallback_late_output_and_failure_are_visible():
     output = Output()
     terminal = Terminal(Supervisor(), output=output, no_color=True)
-    terminal.on_event({"kind": "output", "cell_id": "a1:c0002", "stream": "stdout", "asynchronous": True,
-                       "content": "late\x1b[2J\u202e output"})
+    terminal.on_event({
+        "kind": "output",
+        "cell_id": "a1:c0002",
+        "stream": "stdout",
+        "asynchronous": True,
+        "content": "late\x1b[2J\u202e output",
+    })
     terminal.on_event({"kind": "output", "stream": "display", "content": "你好😀"})
-    terminal.on_event({"kind": "cell_end", "cell_id": "a1:c0003", "content": {"status": "error", "error": "ValueError: failed"}})
+    terminal.on_event({
+        "kind": "cell_end",
+        "cell_id": "a1:c0003",
+        "content": {"status": "error", "error": "ValueError: failed"},
+    })
     while terminal._pending:
         terminal._render_event(terminal._pending.popleft())
     assert "stdout [2] (late):" in output.text
-    assert "Out[?]:" in output.text and "你好😀" in output.text
+    assert "Out[?]:" in output.text
+    assert "你好😀" in output.text
     assert "Cell [3] error: ValueError: failed" in output.text
-    assert "\x1b" not in output.text and "\u202e" not in output.text
+    assert "\x1b" not in output.text
+    assert "\u202e" not in output.text
 
 
 @pytest.mark.parametrize("kind", ["source", "cell", "cell_source"])
@@ -552,18 +625,21 @@ async def test_source_requires_trace_and_hidden_events_are_not_replayed(kind):
     await terminal.handle_line("/trace")
     terminal._pending.clear()
     render(terminal, event)
-    assert "Python [7]:" in output.text and "private_generated_code()" in output.text
+    assert "Python [7]:" in output.text
+    assert "private_generated_code()" in output.text
     assert "In [7]:" not in output.text
     terminal.on_event(event)  # Queued while tracing; toggling off also prevents rendering it.
     terminal.trace = False
     before = output.text
     terminal._render_event(terminal._pending.popleft())
     assert output.text == before
-    assert "input numbers" in HELP and "worker cell numbers" in HELP
+    assert "input numbers" in HELP
+    assert "worker cell numbers" in HELP
 
 
 def test_source_highlighting_is_enabled_when_trace_is_on(monkeypatch):
     from prompt_toolkit.formatted_text import PygmentsTokens
+
     calls = []
     monkeypatch.setattr("py_agent.terminal.print_formatted_text", lambda text, **kwargs: calls.append(text))
     terminal = Terminal(Supervisor(), output=Output())
@@ -581,8 +657,10 @@ def test_thinking_spinner_animates_only_during_generation(monkeypatch):
     supervisor = Supervisor()
     terminal = Terminal(supervisor, output=Output(), no_color=True)
     assert terminal.session.refresh_interval == 0.15
+
     def toolbar():
         return "".join(text for _, text in terminal._toolbar())
+
     idle = toolbar()
     clock[0] = 0.16
     assert toolbar() == idle
@@ -590,12 +668,15 @@ def test_thinking_spinner_animates_only_during_generation(monkeypatch):
     first = toolbar()
     clock[0] = 0.31
     second = toolbar()
-    assert first != second and "Thinking (GENERATING)" in first
-    assert first.startswith("/ Thinking") and second.startswith("- Thinking")
+    assert first != second
+    assert "Thinking (GENERATING)" in first
+    assert first.startswith("/ Thinking")
+    assert second.startswith("- Thinking")
     supervisor.state = "EXECUTING"
     executing = toolbar()
     clock[0] = 0.46
-    assert toolbar() == executing and executing.startswith("Executing (EXECUTING)")
+    assert toolbar() == executing
+    assert executing.startswith("Executing (EXECUTING)")
     supervisor.state = "DONE"
     assert "Thinking" not in toolbar()
     assert terminal._renderer is None  # animation has not spawned a background task
@@ -607,7 +688,8 @@ async def test_reset_notice_keeps_live_python_variables():
     notice = terminal._pending[-1]["content"]
     assert "Python variables stay alive" in notice
     assert "no kernel restart" in notice
-    assert "checkpoint" not in HELP and "checkpoint" not in notice
+    assert "checkpoint" not in HELP
+    assert "checkpoint" not in notice
 
 
 async def test_vi_history_search_and_resize(tmp_path):
@@ -645,11 +727,15 @@ async def test_emacs_ctrl_r_and_history_navigation():
         try:
             await until(lambda: terminal.session.default_buffer.text == "first original")
         except TimeoutError:
-            pytest.fail(repr({"text": terminal.session.default_buffer.text,
-                              "history": terminal.session.history.get_strings(),
-                              "working": list(terminal.session.default_buffer._working_lines),
-                              "submitted": supervisor.submitted,
-                              "search": terminal.session.search_buffer.text}))
+            pytest.fail(
+                repr({
+                    "text": terminal.session.default_buffer.text,
+                    "history": terminal.session.history.get_strings(),
+                    "working": list(terminal.session.default_buffer._working_lines),
+                    "submitted": supervisor.submitted,
+                    "search": terminal.session.search_buffer.text,
+                })
+            )
         pipe.send_text("\x03/quit\r")
         await asyncio.wait_for(task, 3)
 
@@ -665,7 +751,8 @@ async def test_terminal_queue_preserves_all_events_and_status_unknown():
     assert len(terminal._pending) == 1
     toolbar = "".join(text for _, text in terminal._toolbar())
     assert "ctx(last) ?%/? out(last) ?" in toolbar
-    assert "ctx~" not in toolbar and "123" not in toolbar
+    assert "ctx~" not in toolbar
+    assert "123" not in toolbar
 
 
 def test_trace_source_has_no_terminal_character_excerpt():
@@ -686,18 +773,34 @@ async def test_journal_queue_receipt_and_submit_fallback_are_one_ack():
     assert terminal._pending[0]["user_id"] == "a1:e5"
 
 
-@pytest.mark.parametrize("usage,expected", [
-    ([{"normalized": {"input_tokens": 500, "output_tokens": 23}}], "50%/1k out(last) 23"),
-    ([{"normalized": {"input_tokens": 999}}, {"normalized": {"input_tokens": 600, "output_tokens": 30}}], "60%/1k out(last) 30"),
-    ([{"normalized": {"input_tokens": 999}}, {}], "?%/1k out(last) ?"),
-    ({"normalized": {"input_tokens": 0, "output_tokens": 0}}, "0%/1k out(last) 0"),
-    ({"normalized": {"output_tokens": 23}}, "?%/1k out(last) 23"),
-    ({"normalized": {"input_tokens": 500}}, "50%/1k out(last) ?"),
-    ({"input_tokens": 500, "output_tokens": 23}, "50%/1k out(last) 23"),
-    ({"normalized": {"input_tokens": None, "output_tokens": None}}, "?%/1k out(last) ?"),
-    ({"normalized": {"input_tokens": True, "output_tokens": -1}}, "?%/1k out(last) ?"),
-    ({"normalized": {"input_tokens": 500, "output_tokens": 23, "cache_read_tokens": 400, "reasoning_tokens": 10}}, "50%/1k out(last) 23"),
-])
+@pytest.mark.parametrize(
+    "usage,expected",
+    [
+        ([{"normalized": {"input_tokens": 500, "output_tokens": 23}}], "50%/1k out(last) 23"),
+        (
+            [{"normalized": {"input_tokens": 999}}, {"normalized": {"input_tokens": 600, "output_tokens": 30}}],
+            "60%/1k out(last) 30",
+        ),
+        ([{"normalized": {"input_tokens": 999}}, {}], "?%/1k out(last) ?"),
+        ({"normalized": {"input_tokens": 0, "output_tokens": 0}}, "0%/1k out(last) 0"),
+        ({"normalized": {"output_tokens": 23}}, "?%/1k out(last) 23"),
+        ({"normalized": {"input_tokens": 500}}, "50%/1k out(last) ?"),
+        ({"input_tokens": 500, "output_tokens": 23}, "50%/1k out(last) 23"),
+        ({"normalized": {"input_tokens": None, "output_tokens": None}}, "?%/1k out(last) ?"),
+        ({"normalized": {"input_tokens": True, "output_tokens": -1}}, "?%/1k out(last) ?"),
+        (
+            {
+                "normalized": {
+                    "input_tokens": 500,
+                    "output_tokens": 23,
+                    "cache_read_tokens": 400,
+                    "reasoning_tokens": 10,
+                }
+            },
+            "50%/1k out(last) 23",
+        ),
+    ],
+)
 async def test_toolbar_reads_last_reported_tokens_without_estimation_or_cache_arithmetic(usage, expected):
     supervisor = Supervisor()
     original = supervisor.status()
@@ -705,28 +808,33 @@ async def test_toolbar_reads_last_reported_tokens_without_estimation_or_cache_ar
     terminal = Terminal(supervisor, output=Output())
     toolbar = "".join(text for _, text in terminal._toolbar())
     assert f"ctx(last) {expected}" in toolbar
-    assert "ctx~" not in toolbar and "123" not in toolbar
+    assert "ctx~" not in toolbar
+    assert "123" not in toolbar
 
 
-@pytest.mark.parametrize("window,input_tokens,expected", [
-    (272000, 81600, "30%/272k"),
-    (272500, 81750, "30%/272.5k"),
-    (272001, 0, "0%/272.001k"),
-    (500, 250, "50%/500"),
-    (1000, 1501, "150%/1k"),
-    (1000, 1555, "156%/1k"),
-    (272000, None, "?%/272k"),
-    (None, 81600, "?%/?"),
-    (0, 81600, "?%/?"),
-    (-1, 81600, "?%/?"),
-    (True, 81600, "?%/?"),
-    (272000.0, 81600, "?%/?"),
-])
+@pytest.mark.parametrize(
+    "window,input_tokens,expected",
+    [
+        (272000, 81600, "30%/272k"),
+        (272500, 81750, "30%/272.5k"),
+        (272001, 0, "0%/272.001k"),
+        (500, 250, "50%/500"),
+        (1000, 1501, "150%/1k"),
+        (1000, 1555, "156%/1k"),
+        (272000, None, "?%/272k"),
+        (None, 81600, "?%/?"),
+        (0, 81600, "?%/?"),
+        (-1, 81600, "?%/?"),
+        (True, 81600, "?%/?"),
+        (272000.0, 81600, "?%/?"),
+    ],
+)
 async def test_toolbar_context_percentage_uses_only_valid_configured_window(window, input_tokens, expected):
     supervisor = Supervisor()
     original = supervisor.status()
     supervisor.status = lambda: {
-        **original, "context_window_tokens": window,
+        **original,
+        "context_window_tokens": window,
         "usage": [{"normalized": {"input_tokens": input_tokens, "output_tokens": 17}}],
     }
     toolbar = "".join(text for _, text in Terminal(supervisor, output=Output())._toolbar())
@@ -737,9 +845,12 @@ async def test_toolbar_context_percentage_uses_only_valid_configured_window(wind
 async def test_toolbar_ignores_orphan_or_previous_epoch_usage(current, expected):
     supervisor = Supervisor()
     original = supervisor.status()
-    supervisor.status = lambda: {**original, "context_window_tokens": 272000,
-                                "context_input_tokens": current,
-                                "usage": [{"normalized": {"input_tokens": 271000, "output_tokens": 23}}]}
+    supervisor.status = lambda: {
+        **original,
+        "context_window_tokens": 272000,
+        "context_input_tokens": current,
+        "usage": [{"normalized": {"input_tokens": 271000, "output_tokens": 23}}],
+    }
     terminal = Terminal(supervisor, output=Output())
     assert f"ctx(last) {expected}" in "".join(text for _, text in terminal._toolbar())
 
@@ -750,14 +861,22 @@ def test_config_exact_schema_and_types(tmp_path):
     config = cli.load_config(path)
     assert config["model"] == "openai/explicit"
     assert config["budgets"]["output_tokens"] == 4000
-    path.write_text('context_window_tokens=272000')
+    path.write_text("context_window_tokens=272000")
     assert cli.load_config(path)["context_window_tokens"] == 272000
     for text in (
-        'network="proxy"', 'api_key="secret"', 'model=123', 'stream="yes"',
-        '[budgets]\nunknown=12', '[budgets]\nmax_requests=true', 'budgets=12',
-        '[budgets]\ncell_seconds=nan', '[budgets]\nmax_requests=0',
-        '[budgets]\ntail_groups=-1', 'context_window_tokens=0',
-        'context_window_tokens=true', 'context_window_tokens="272000"',
+        'network="proxy"',
+        'api_key="secret"',
+        "model=123",
+        'stream="yes"',
+        "[budgets]\nunknown=12",
+        "[budgets]\nmax_requests=true",
+        "budgets=12",
+        "[budgets]\ncell_seconds=nan",
+        "[budgets]\nmax_requests=0",
+        "[budgets]\ntail_groups=-1",
+        "context_window_tokens=0",
+        "context_window_tokens=true",
+        'context_window_tokens="272000"',
     ):
         path.write_text(text)
         with pytest.raises(ValueError):
@@ -796,7 +915,8 @@ def test_cli_help_and_no_unsandboxed_switch(capsys):
         cli.main(["--help"])
     assert exc.value.code == 0
     help_text = capsys.readouterr().out
-    assert "--network" in help_text and "--multiline" in help_text
+    assert "--network" in help_text
+    assert "--multiline" in help_text
     assert "checkpoint" not in help_text
     with pytest.raises(SystemExit):
         cli.parser().parse_args(["--checkpoint-tokens", "2048"])
@@ -814,7 +934,6 @@ def test_cli_permission_switches_are_explicit(monkeypatch, capsys):
 
 
 def test_fake_responses_have_no_count_or_size_ceiling(tmp_path):
-    import json
     path = tmp_path / "fake.json"
     responses = ["# " + "x" * 2100] * 1001
     path.write_text(json.dumps(responses))
@@ -825,7 +944,7 @@ def test_fake_responses_strict_format(tmp_path):
     path = tmp_path / "fake.json"
     path.write_text('["say(42, final=True)"]')
     assert cli._fake_responses(path) == ["say(42, final=True)"]
-    for text in ('[]', '{}', '[12]', '[null]'):
+    for text in ("[]", "{}", "[12]", "[null]"):
         path.write_text(text)
         with pytest.raises(ValueError):
             cli._fake_responses(path)
@@ -835,7 +954,7 @@ def test_normal_startup_is_brief_but_keeps_privacy_warning(tmp_path, capsys):
     sandbox = types.SimpleNamespace(workspace=tmp_path, policy={"network": "proxy", "allowed_domains": []})
     cli._print_policy(sandbox)
     text = capsys.readouterr().out
-    assert "worker network: denied" in text
+    assert "worker network: proxy (0 pre-approved; prompts for others)" in text
     assert "workspace and shared /tmp" in text
     assert "readable private data can reach the model/provider" in text
     assert "Sandbox policy:" not in text
@@ -844,6 +963,7 @@ def test_normal_startup_is_brief_but_keeps_privacy_warning(tmp_path, capsys):
 
 def test_cli_check_sandbox_no_model_or_tty(monkeypatch, tmp_path, capsys):
     import py_agent.sandbox as sandbox_module
+
     created = []
 
     class Sandbox:
@@ -864,56 +984,98 @@ def test_cli_check_sandbox_no_model_or_tty(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(sandbox_module, "Sandbox", Sandbox)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     host = tmp_path / "host"
-    assert cli.main(["--check-sandbox", "--host-root", str(host), "--workspace", str(tmp_path),
-                     "--network", "proxy", "--allow-domain", "example.com"]) == 0
+    assert (
+        cli.main([
+            "--check-sandbox",
+            "--host-root",
+            str(host),
+            "--workspace",
+            str(tmp_path),
+            "--network",
+            "proxy",
+            "--allow-domain",
+            "example.com",
+        ])
+        == 0
+    )
     instance = created[0]
-    assert instance.checked and instance.closed
+    assert instance.checked
+    assert instance.closed
     assert instance.host_dir == host  # Entire control root protected, not only this run.
     assert instance.kwargs == {"network": "proxy", "allowed_domains": ("example.com",)}
     assert instance.scratch.is_relative_to(tmp_path / ".py" / "sessions")
     output = capsys.readouterr().out
-    assert "broad write root" in output and "Nested environments" in output
+    assert "broad write root" in output
+    assert "Nested environments" in output
     assert "External networking is not thereby verified" in output
 
 
-@pytest.mark.parametrize("config_path", ["/tmp/py-test-untrusted-config.toml", "/var/../tmp/py-test-untrusted-config.toml"])
+@pytest.mark.parametrize(
+    "config_path", ["/tmp/py-test-untrusted-config.toml", "/var/../tmp/py-test-untrusted-config.toml"]
+)
 async def test_explicit_config_in_shared_tmp_outside_workspace_is_rejected(tmp_path, config_path):
     args = cli.parser().parse_args([
-        "--workspace", str(tmp_path), "--host-root", str(tmp_path / "host"),
-        "--config", config_path, "--network", "proxy",
+        "--workspace",
+        str(tmp_path),
+        "--host-root",
+        str(tmp_path / "host"),
+        "--config",
+        config_path,
+        "--network",
+        "proxy",
     ])
     with pytest.raises(ValueError, match="workspace or /tmp is unsafe"):
         await cli._run(args, {})
 
 
-@pytest.mark.parametrize("window_args,window_config,expected_window", [
-    ([], {}, 9000),
-    ([], {"context_window_tokens": 272000}, 272000),
-    (["--context-window-tokens", "128000"], {"context_window_tokens": 272000}, 128000),
-])
-async def test_cli_integration_fake_provider_wiring_and_cleanup(monkeypatch, tmp_path, window_args, window_config, expected_window):
+@pytest.mark.parametrize(
+    "window_args,window_config,expected_window",
+    [
+        ([], {}, 9000),
+        ([], {"context_window_tokens": 272000}, 272000),
+        (["--context-window-tokens", "128000"], {"context_window_tokens": 272000}, 128000),
+    ],
+)
+async def test_cli_integration_fake_provider_wiring_and_cleanup(
+    monkeypatch, tmp_path, window_args, window_config, expected_window
+):
     import py_agent.sandbox as sandbox_module
+
     captured = {}
 
     from py_agent.limits import Limits
 
     class Sandbox:
         policy = {"network": "proxy"}
+
         def __init__(self, *args, **kwargs):
             captured["sandbox"] = self
             self.workspace = args[0]
             self.closed = False
+
+        def permanent_protected_paths(self):
+            return ()
+
         async def close(self):
             self.closed = True
 
     class Supervisor:
-        def __init__(self, provider, sandbox, journal, *, limits, on_event, context_window_tokens):
-            captured.update(provider=provider, sandbox=sandbox, journal=journal,
-                            context_window_tokens=context_window_tokens, limits=limits, supervisor=self)
+        def __init__(self, provider, sandbox, journal, *, limits, on_event, context_window_tokens, permissions):
+            captured.update(
+                provider=provider,
+                sandbox=sandbox,
+                journal=journal,
+                context_window_tokens=context_window_tokens,
+                limits=limits,
+                permissions=permissions,
+                supervisor=self,
+            )
             self.closed = False
             self.started = False
+
         async def start(self):
             self.started = True
+
         async def close(self):
             self.closed = True
 
@@ -926,15 +1088,28 @@ async def test_cli_integration_fake_provider_wiring_and_cleanup(monkeypatch, tmp
     monkeypatch.setattr(cli, "run_terminal", terminal)
     fake_path = tmp_path / "fake.json"
     fake_path.write_text('["say(1, final=True)"]')
-    args = cli.parser().parse_args(["--workspace", str(tmp_path), "--host-root", str(tmp_path / "host"),
-                                   "--fake-responses", str(fake_path), "--network", "proxy",
-                                   "--no-input-history", "--multiline", "--input-tokens", "9000", *window_args])
+    args = cli.parser().parse_args([
+        "--workspace",
+        str(tmp_path),
+        "--host-root",
+        str(tmp_path / "host"),
+        "--fake-responses",
+        str(fake_path),
+        "--network",
+        "proxy",
+        "--no-input-history",
+        "--multiline",
+        "--input-tokens",
+        "9000",
+        *window_args,
+    ])
     assert await cli._run(args, {"budgets": {"input_tokens": 12000}, **window_config}) == 0
     assert captured["limits"] == Limits(input_tokens=9000)
     assert captured["provider"].model == "fake/deterministic"
     assert captured["context_window_tokens"] == expected_window
     assert not list(tmp_path.rglob("memory.md"))
-    assert captured["supervisor"].closed and captured["sandbox"].closed
+    assert captured["supervisor"].closed
+    assert captured["sandbox"].closed
     assert captured["terminal_kwargs"]["history_path"] is None
     assert captured["terminal_kwargs"]["multiline"] is True
     with pytest.raises(Exception):

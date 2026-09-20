@@ -4,18 +4,22 @@ This entry point intentionally has no sandbox bypass switch. The supervisor
 owns interruption and validates transport. OS resource limits are inherited,
 never replaced with application-imposed execution or session quotas.
 """
+
 from __future__ import annotations
+
+from pathlib import Path
 
 # -I excludes the script's directory and ambient Python paths. This one pinned
 # runtime parent is protected by Sandbox; never add the workspace or load config.
 import sys
-from pathlib import Path
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import ast
 import builtins
 import codecs
+from collections import deque
 import ctypes
 import io
 import itertools
@@ -25,20 +29,34 @@ import resource
 import selectors
 import threading
 import traceback
-from collections import deque
 
 from py_agent.bridge import Bridge, CellYield, no_input
 from py_agent.output import CellOutput
 from py_agent.protocol import (
-    HOST_TYPES, MAX_NAMESPACE_BYTES, MAX_NAMESPACE_NAME_CHARS,
-    MAX_NAMESPACE_ROWS, MAX_NAMESPACE_TYPE_CHARS, ProtocolError,
-    read_frame_sync, write_frame_sync,
+    HOST_TYPES,
+    MAX_NAMESPACE_BYTES,
+    MAX_NAMESPACE_NAME_CHARS,
+    MAX_NAMESPACE_ROWS,
+    MAX_NAMESPACE_TYPE_CHARS,
+    ProtocolError,
+    read_frame_sync,
+    write_frame_sync,
 )
 
-
 MAX_NAMESPACE_SCAN = 512
-_NAMESPACE_HELPERS = frozenset({"say", "wait", "history", "memories", "In", "Out",
-                                "get_ipython", "exit", "quit", "open"})
+_NAMESPACE_HELPERS = frozenset({
+    "say",
+    "wait",
+    "history",
+    "ask_rw_approval",
+    "memories",
+    "In",
+    "Out",
+    "get_ipython",
+    "exit",
+    "quit",
+    "open",
+})
 _TYPE_NAME = type.__dict__["__name__"]
 
 
@@ -90,12 +108,16 @@ class Transport:
         self.reader = os.fdopen(os.dup(0), "rb")
         self.writer = os.fdopen(os.dup(1), "wb")
         self.lock = threading.Lock()
-        with open(os.devnull, "r+b", buffering=0) as null:
+        with Path(os.devnull).open("r+b", buffering=0) as null:
             for fd in (0, 1, 2):
                 os.dup2(null.fileno(), fd)
         sys.stdin = io.TextIOWrapper(io.FileIO(0, "r", closefd=False), encoding="utf-8")
-        sys.stdout = io.TextIOWrapper(io.FileIO(1, "w", closefd=False), encoding="utf-8", errors="backslashreplace", write_through=True)
-        sys.stderr = io.TextIOWrapper(io.FileIO(2, "w", closefd=False), encoding="utf-8", errors="backslashreplace", write_through=True)
+        sys.stdout = io.TextIOWrapper(
+            io.FileIO(1, "w", closefd=False), encoding="utf-8", errors="backslashreplace", write_through=True
+        )
+        sys.stderr = io.TextIOWrapper(
+            io.FileIO(2, "w", closefd=False), encoding="utf-8", errors="backslashreplace", write_through=True
+        )
         sys.__stdin__, sys.__stdout__, sys.__stderr__ = sys.stdin, sys.stdout, sys.stderr
         # Native extensions may use libc stdio rather than os.write. Make the
         # standard C streams unbuffered so bytes cannot spill into a later
@@ -118,11 +140,12 @@ class Transport:
 class Capture:
     """Cell-owned descriptor pipes; inherited subprocess output keeps its ID.
 
-A barrier drains available bytes before control/display events. A background
-subprocess retaining a pipe can outlive cell_end; its later events retain the
-original cell_id. Unmanaged Python threads doing raw os.write on fd 1/2 across
-cells cannot be reliably attributed and are outside the supported task model.
-"""
+    A barrier drains available bytes before control/display events. A background
+    subprocess retaining a pipe can outlive cell_end; its later events retain the
+    original cell_id. Unmanaged Python threads doing raw os.write on fd 1/2 across
+    cells cannot be reliably attributed and are outside the supported task model.
+    """
+
     def __init__(self, cell_id, send):
         self.cell_id, self.send = cell_id, send
         self.output = CellOutput(cell_id, send)
@@ -216,7 +239,7 @@ cells cannot be reliably attributed and are outside the supported task model.
     def detach(self):
         sys.stdout.flush()
         sys.stderr.flush()
-        with open(os.devnull, "wb", buffering=0) as null:
+        with Path(os.devnull).open("wb", buffering=0) as null:
             os.dup2(null.fileno(), 1)
             os.dup2(null.fileno(), 2)
         self.barrier()
@@ -224,8 +247,8 @@ cells cannot be reliably attributed and are outside the supported task model.
 
 
 def _shell(bridge, emit_display):
-    from IPython.core.interactiveshell import InteractiveShell
     from IPython.core.inputtransformer2 import HelpEnd, _help_end_re
+    from IPython.core.interactiveshell import InteractiveShell
     from IPython.core.profiledir import ProfileDir
     from traitlets.config import Config
 
@@ -239,18 +262,31 @@ def _shell(bridge, emit_display):
     config.InteractiveShell.separate_out2 = ""
     config.HistoryManager.hist_file = str(profile_root / "history.sqlite")
     config.HistoryManager.db_cache_size = 0
-    shell = InteractiveShell.instance(config=config, ipython_dir=str(profile_root), profile_dir=profile,
-                             user_ns={"say": bridge.say, "wait": bridge.wait, "history": bridge.history, "memories": []})
+    shell = InteractiveShell.instance(
+        config=config,
+        ipython_dir=str(profile_root),
+        profile_dir=profile,
+        user_ns={
+            "say": bridge.say,
+            "wait": bridge.wait,
+            "history": bridge.history,
+            "ask_rw_approval": bridge.ask_rw_approval,
+            "memories": [],
+        },
+    )
     # IPython's suffix-help transformer searches the END of a line and can
     # silently discard preceding prose: "Hi! How can I help?" becomes help?.
     # Require the entire help expression to match. Preserve explicit len?,
     # obj.attr??, x[0]? and %magic? rather than disabling IPython syntax.
     # This deliberately uses the grammar from our pinned IPython dependency.
+
     class StrictHelpEnd(HelpEnd):
         def transform(self, lines):
-            piece = "".join(lines[self.start_line:self.q_line + 1])
-            if _help_end_re.fullmatch(piece[self.start_col:].strip()) is None:
-                raise SyntaxError("Ambiguous IPython help syntax: emit one raw code cell; use say(...) for user-facing text")
+            piece = "".join(lines[self.start_line : self.q_line + 1])
+            if _help_end_re.fullmatch(piece[self.start_col :].strip()) is None:
+                raise SyntaxError(
+                    "Ambiguous IPython help syntax: emit one raw code cell; use say(...) for user-facing text"
+                )
             return super().transform(lines)
 
     transformers = shell.input_transformer_manager.token_transformers
@@ -266,15 +302,20 @@ def _shell(bridge, emit_display):
         raise RuntimeError("Interactive debugging is unavailable; inspect state in another cell")
 
     shell.debugger = disabled_debugger
-    shell.show_in_pager = lambda data, *args, **kwargs: emit_display(data.get("text/plain", "") if isinstance(data, dict) else str(data))
+    shell.show_in_pager = lambda data, *args, **kwargs: emit_display(
+        data.get("text/plain", "") if isinstance(data, dict) else str(data)
+    )
     shell.register_magic_function(disabled_debugger, "line", "debug")
     shell.register_magic_function(disabled_debugger, "line", "pdb")
-    shell.ask_exit = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Use say(..., final=True) or wait(); the supervisor owns process lifetime"))
+    shell.ask_exit = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("Use say(..., final=True) or wait(); the supervisor owns process lifetime")
+    )
     builtins.input = no_input
     builtins.breakpoint = disabled_debugger
     # pdb and IPython's debugger eventually ask for input; deny it explicitly
     # rather than repeatedly consuming EOF or waiting on terminal state.
     import pdb
+
     pdb.set_trace = disabled_debugger
     return shell
 
@@ -338,8 +379,14 @@ class Runner:
             capture.detach()
             self.capture = None
             self.bridge.end()
-        end = {"v": 1, "type": "cell_end", "cell_id": cell_id, "status": status,
-               "execution_count": count, **kernel_metadata(self.shell.user_ns)}
+        end = {
+            "v": 1,
+            "type": "cell_end",
+            "cell_id": cell_id,
+            "status": status,
+            "execution_count": count,
+            **kernel_metadata(self.shell.user_ns),
+        }
         if error is not None:
             end["error"] = error
         self.transport.send(end)
@@ -367,9 +414,11 @@ def main() -> int:
         try:
             message = f"py worker fatal: {type(exc).__name__}: {str(exc)[:2000]}"
             if isinstance(exc, RuntimeError) and "start new thread" in str(exc):
-                message += ("; unable to start an output/runtime thread. Check inherited "
-                            "RLIMIT_NPROC, cgroup pids.max and memory limits; "
-                            f"RLIMIT_NPROC={resource.getrlimit(resource.RLIMIT_NPROC)}")
+                message += (
+                    "; unable to start an output/runtime thread. Check inherited "
+                    "RLIMIT_NPROC, cgroup pids.max and memory limits; "
+                    f"RLIMIT_NPROC={resource.getrlimit(resource.RLIMIT_NPROC)}"
+                )
             os.write(diagnostic_fd, (message + "\n").encode("utf-8", "backslashreplace")[:4096])
         except BaseException:
             pass  # The process still exits even if the diagnostic pipe is gone.

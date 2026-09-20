@@ -3,13 +3,14 @@
 The trusted supervisor validates/correlates every frame independently. A worker
 can redefine these functions or forge its own frames; that grants no host power.
 """
+
 from __future__ import annotations
 
+from collections.abc import Callable
 import threading
-from typing import Callable
 
-from py_agent.protocol import ProtocolError, validate_frame
 from py_agent.output import spool_say
+from py_agent.protocol import ProtocolError, validate_frame
 
 
 class CellYield(BaseException):
@@ -34,6 +35,32 @@ class History:
         return self._bridge.request("read", {"event_or_cell_id": event_or_cell_id, "offset": offset, "limit": limit})
 
 
+class RWCapability:
+    """Worker facade for host-brokered writes; it does not change sandbox mounts."""
+
+    def __init__(self, bridge: Bridge, capability_id: str):
+        self._bridge = bridge
+        self._capability_id = capability_id
+
+    def write_text(self, path, content) -> None:
+        self._bridge.request(
+            "rw_write_text",
+            {"capability_id": self._capability_id, "path": path, "content": content},
+        )
+
+    def mkdir(self, path) -> None:
+        self._bridge.request("rw_mkdir", {"capability_id": self._capability_id, "path": path})
+
+    def rename(self, source, destination) -> None:
+        self._bridge.request(
+            "rw_rename",
+            {"capability_id": self._capability_id, "source": source, "destination": destination},
+        )
+
+    def remove(self, path) -> None:
+        self._bridge.request("rw_remove", {"capability_id": self._capability_id, "path": path})
+
+
 class Bridge:
     def __init__(self, send: Callable[[dict], None], receive: Callable[[], dict]):
         self._send = send
@@ -54,7 +81,7 @@ class Bridge:
 
     def _active(self) -> str:
         if threading.get_ident() != self._thread or self.cell_id is None:
-            raise RuntimeError("say/wait/history are only supported in the active cell's main thread")
+            raise RuntimeError("say/wait/history/ask_rw_approval are only supported in the active cell's main thread")
         return self.cell_id
 
     def say(self, content, *, final=False) -> None:
@@ -69,17 +96,43 @@ class Bridge:
     def wait(self) -> None:
         self._active()
         self.wait_requested = True
-        raise CellYield()
+        raise CellYield
+
+    def ask_rw_approval(
+        self,
+        path,
+        *,
+        recursive=True,
+        operations=("create", "modify"),
+        reason="",
+    ) -> RWCapability:
+        capability_id = self.request(
+            "rw_request",
+            {
+                "path": path,
+                "recursive": recursive,
+                "operations": list(operations),
+                "reason": reason,
+            },
+        )
+        if not isinstance(capability_id, str):
+            raise BrokerError("Write permission denied")
+        return RWCapability(self, capability_id)
 
     def request(self, method: str, args: dict):
         cell_id = self._active()
         self._counter += 1
         request_id = f"r{self._counter}"
-        self._send({"v": 1, "type": "broker_request", "cell_id": cell_id,
-                    "request_id": request_id, "method": method, "args": args})
+        self._send({
+            "v": 1,
+            "type": "broker_request",
+            "cell_id": cell_id,
+            "request_id": request_id,
+            "method": method,
+            "args": args,
+        })
         frame = self._receive()
-        if (frame["type"] != "broker_response" or frame["cell_id"] != cell_id
-                or frame["request_id"] != request_id):
+        if frame["type"] != "broker_response" or frame["cell_id"] != cell_id or frame["request_id"] != request_id:
             raise ProtocolError("Uncorrelated broker response")
         if "error" in frame:
             raise BrokerError(frame["error"])

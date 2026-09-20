@@ -3,21 +3,26 @@
 Validation is structural, not authentication. Worker frames are untrusted even
 when they pass it; host callers must also enforce correlation and scope.
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
 import math
 import re
-import weakref
 from typing import Any, BinaryIO
+import weakref
 
 VERSION = 1
 MAX_NAMESPACE_ROWS = 32
 MAX_NAMESPACE_NAME_CHARS = 64
 MAX_NAMESPACE_TYPE_CHARS = 40
 MAX_NAMESPACE_BYTES = 2000
+MAX_PERMISSION_PATH_CHARS = 4096
+MAX_PERMISSION_REASON_CHARS = 1000
+MAX_PERMISSION_TEXT_BYTES = 1_048_576
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_.-]{0,127}\Z")
+_PERMISSION_OPERATIONS = frozenset({"create", "modify", "delete", "rename"})
 HOST_TYPES = frozenset({"execute", "broker_response"})
 WORKER_TYPES = frozenset({"ready", "output", "say", "broker_request", "cell_end"})
 
@@ -60,6 +65,10 @@ def validate_namespace_summary(value: Any) -> None:
         raise ProtocolError("Namespace summary exceeds byte limit")
 
 
+def _bounded_text(value: Any, maximum: int, *, empty: bool = False) -> bool:
+    return isinstance(value, str) and (empty or bool(value)) and len(value) <= maximum and "\x00" not in value
+
+
 def _arguments(method: str, args: Any) -> None:
     if not isinstance(args, dict):
         raise ProtocolError("Broker args must be an object")
@@ -73,6 +82,41 @@ def _arguments(method: str, args: Any) -> None:
         _keys(args, {"event_or_cell_id"}, {"offset", "limit"})
         if not _id(args["event_or_cell_id"]):
             raise ProtocolError("Invalid history ID")
+    elif method == "rw_request":
+        _keys(args, {"path", "recursive", "operations", "reason"})
+        operations = args["operations"]
+        if (
+            not _bounded_text(args["path"], MAX_PERMISSION_PATH_CHARS)
+            or type(args["recursive"]) is not bool
+            or not isinstance(operations, list)
+            or not operations
+            or len(operations) > len(_PERMISSION_OPERATIONS)
+            or any(
+                not isinstance(operation, str) or operation not in _PERMISSION_OPERATIONS for operation in operations
+            )
+            or len(set(operations)) != len(operations)
+            or not _bounded_text(args["reason"], MAX_PERMISSION_REASON_CHARS, empty=True)
+        ):
+            raise ProtocolError("Invalid write permission request")
+    elif method == "rw_write_text":
+        _keys(args, {"capability_id", "path", "content"})
+        if (
+            not _id(args["capability_id"])
+            or not _bounded_text(args["path"], MAX_PERMISSION_PATH_CHARS)
+            or not isinstance(args["content"], str)
+            or len(args["content"].encode("utf-8")) > MAX_PERMISSION_TEXT_BYTES
+        ):
+            raise ProtocolError("Invalid brokered text write")
+    elif method in {"rw_mkdir", "rw_remove"}:
+        _keys(args, {"capability_id", "path"})
+        if not _id(args["capability_id"]) or not _bounded_text(args["path"], MAX_PERMISSION_PATH_CHARS):
+            raise ProtocolError("Invalid brokered filesystem operation")
+    elif method == "rw_rename":
+        _keys(args, {"capability_id", "source", "destination"})
+        if not _id(args["capability_id"]) or not all(
+            _bounded_text(args[key], MAX_PERMISSION_PATH_CHARS) for key in ("source", "destination")
+        ):
+            raise ProtocolError("Invalid brokered rename")
     else:
         raise ProtocolError("Unsupported broker method")
     for key in ("n", "limit", "offset"):
@@ -175,8 +219,11 @@ def decode_frame(data: bytes, *, allowed_types=None) -> dict:
     if not data.endswith(b"\n"):
         raise ProtocolError("Unterminated frame")
     try:
-        frame = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object,
-                           parse_constant=lambda _: (_ for _ in ()).throw(ProtocolError("Nonfinite JSON number")))
+        frame = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_unique_object,
+            parse_constant=lambda _: (_ for _ in ()).throw(ProtocolError("Nonfinite JSON number")),
+        )
     except (UnicodeError, ValueError, RecursionError) as exc:
         raise ProtocolError("Malformed JSON frame") from exc
     return validate_frame(frame, allowed_types=allowed_types)
@@ -193,8 +240,8 @@ async def read_frame(reader: asyncio.StreamReader, *, allowed_types=None) -> dic
     while True:
         newline = buffer.find(b"\n", search_from)
         if newline >= 0:
-            data = bytes(buffer[:newline + 1])
-            del buffer[:newline + 1]
+            data = bytes(buffer[: newline + 1])
+            del buffer[: newline + 1]
             return decode_frame(data, allowed_types=allowed_types)
         search_from = len(buffer)  # Do not rescan a growing frame quadratically.
         chunk = await reader.read(65536)

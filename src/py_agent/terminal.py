@@ -3,6 +3,7 @@
 Rendering is deliberately plain text, with optional Python highlighting. Never
 interpret worker text as ANSI/HTML. Originals remain in the host journal.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -19,8 +20,8 @@ import unicodedata
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.formatted_text import FormattedText, PygmentsTokens
 from prompt_toolkit.filters import Condition
+from prompt_toolkit.formatted_text import FormattedText, PygmentsTokens
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
@@ -29,7 +30,19 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from pygments import lex
 from pygments.lexers import PythonLexer
 
-COMMANDS = ("/help", "/history", "/usage", "/trace", "/interrupt", "/reset", "/quit")
+COMMANDS = (
+    "/help",
+    "/history",
+    "/usage",
+    "/trace",
+    "/approve",
+    "/deny",
+    "/permissions",
+    "/revoke",
+    "/interrupt",
+    "/reset",
+    "/quit",
+)
 HELP = """In [n]: accepts agent requests, not direct Python execution. Its number counts
 submitted messages. Out[n]: and stdout/stderr labels use worker cell numbers,
 which are independent of input numbers. Generated Python is hidden unless /trace
@@ -46,6 +59,10 @@ empty prompt exits, cancelling active work. Earlier effects are not rolled back.
 /history [ID [OFFSET]] recent evidence, or read a page by event/cell ID
 /usage                reported provider counters and estimated context
 /trace                toggle generated Python and extra audit events
+/approve ID SCOPE     approve a pending permission: once, session, project, all
+/deny ID              deny a pending permission request
+/permissions          list pending requests and saved project/all-project grants
+/revoke ID             revoke a saved project/all-project permission
 /interrupt            interrupt active work; never replay automatically
 /reset                shorten context at the next request; Python variables stay
                       alive, without a kernel restart
@@ -55,7 +72,7 @@ composer history. Journal content can still contain secrets."""
 
 # OSC (including clipboard/title), DCS/SOS/PM/APC and CSI. Match unterminated
 # strings to end-of-input too, rather than exposing their payload as commands.
-_STRING_ESCAPE = re.compile(r"(?:\x1b[\]PX^_]|[\x90\x98\x9d\x9e\x9f]).*?(?:\x07|\x1b\\|\x9c|$)", re.S)
+_STRING_ESCAPE = re.compile(r"(?:\x1b[\]PX^_]|[\x90\x98\x9d\x9e\x9f]).*?(?:\x07|\x1b\\|\x9c|$)", re.DOTALL)
 _CSI = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]")
 _ESCAPE = re.compile(r"\x1b[ -/]*[@-~]")
 
@@ -157,9 +174,17 @@ class _QuitRequested(Exception):
 class Terminal:
     """UI adapter with injectable prompt input/output for deterministic tests."""
 
-    def __init__(self, supervisor, *, history_path: Path | None = None,
-                 vi: bool = False, multiline: bool = False, no_color: bool = False,
-                 input=None, output=None):
+    def __init__(
+        self,
+        supervisor,
+        *,
+        history_path: Path | None = None,
+        vi: bool = False,
+        multiline: bool = False,
+        no_color: bool = False,
+        input=None,
+        output=None,
+    ):
         self.supervisor = supervisor
         self.trace = False
         self._input_number = 1
@@ -193,19 +218,28 @@ class Terminal:
             bottom_toolbar=self._toolbar,
             refresh_interval=0.15,  # redraw thinking animation; no separate task
             color_depth=ColorDepth.DEPTH_1_BIT if no_color else None,
-            input=input, output=output,
+            input=input,
+            output=output,
         )
         # Editing between Ctrl-C presses cancels the exit gesture. Ignore empty
         # resets caused by aborting a prompt, so double Ctrl-C survives resets.
+
         def edited(buffer):
             if buffer.text:
                 self._last_ctrl_c = None
+
         self.session.default_buffer.on_text_changed += edited
         self.session.search_buffer.on_text_changed += edited
 
     def _active(self) -> bool:
         return str(self.supervisor.status().get("state", "IDLE")).upper() not in {
-            "IDLE", "DONE", "FAILED", "CANCELLED", "INTERRUPTED", "CLOSED", "NEW",
+            "IDLE",
+            "DONE",
+            "FAILED",
+            "CANCELLED",
+            "INTERRUPTED",
+            "CLOSED",
+            "NEW",
         }
 
     def _bindings(self) -> KeyBindings:
@@ -221,7 +255,9 @@ class Terminal:
         def submit_multiline(event):
             event.current_buffer.validate_and_handle()
 
-        @bindings.add("enter", filter=Condition(lambda: self.multiline and self.session.default_buffer.text.strip() == "/quit"))
+        @bindings.add(
+            "enter", filter=Condition(lambda: self.multiline and self.session.default_buffer.text.strip() == "/quit")
+        )
         def quit_multiline(event):
             event.app.exit(exception=_QuitRequested())
 
@@ -256,6 +292,7 @@ class Terminal:
         if isinstance(usage, list):
             usage = usage[-1] if usage else {}
         normalized = usage.get("normalized", usage) if isinstance(usage, dict) else {}
+
         def reported(name):
             value = normalized.get(name) if isinstance(normalized, dict) else None
             return value if type(value) is int and value >= 0 else "?"
@@ -265,11 +302,11 @@ class Terminal:
         if type(window) is int and window > 0:
             # Exact decimal thousands: never silently round a configured window.
             whole, remainder = divmod(window, 1000)
-            window_label = (f"{whole}.{remainder:03d}".rstrip("0").rstrip(".") + "k"
-                            if window >= 1000 else str(window))
+            window_label = f"{whole}.{remainder:03d}".rstrip("0").rstrip(".") + "k" if window >= 1000 else str(window)
             input_tokens = state.get("context_input_tokens", reported("input_tokens"))
-            percentage = ((input_tokens * 100 + window // 2) // window
-                          if type(input_tokens) is int and input_tokens >= 0 else "?")
+            percentage = (
+                (input_tokens * 100 + window // 2) // window if type(input_tokens) is int and input_tokens >= 0 else "?"
+            )
             context_usage = f"{percentage}%/{window_label}"
         phase = str(state.get("state", "?")).upper()
         if phase == "GENERATING":
@@ -283,8 +320,7 @@ class Terminal:
             f"{activity} | {state.get('model', '?')} | "
             f"{state.get('cell_id') or '-'} {state.get('context_epoch', '-')} | "
             f"queued {state.get('queued', 0)} | ctx(last) {context_usage} "
-            f"out(last) {reported('output_tokens')}"
-            + (" | TRACE" if self.trace else "")
+            f"out(last) {reported('output_tokens')}" + (" | TRACE" if self.trace else "")
         )
         return FormattedText([("", sanitize(text).replace("\n", " ").replace("\t", " "))])
 
@@ -310,12 +346,33 @@ class Terminal:
             if identifier in self._acknowledged:
                 return
             self._acknowledged.add(identifier)
-        failed_cell = (kind == "cell_end" and isinstance(event.get("content"), dict)
-                       and event["content"].get("status") not in {"success", "wait"})
-        if not self.trace and not failed_cell and kind not in {
-            "output", "cell_end", "say", "error", "limit", "notice", "retry",
-            "user_queued", "queued", "cancelled", "interrupted", "failed",
-        }:
+        failed_cell = (
+            kind == "cell_end"
+            and isinstance(event.get("content"), dict)
+            and event["content"].get("status") not in {"success", "wait"}
+        )
+        if (
+            not self.trace
+            and not failed_cell
+            and kind
+            not in {
+                "output",
+                "cell_end",
+                "say",
+                "error",
+                "limit",
+                "notice",
+                "retry",
+                "user_queued",
+                "queued",
+                "cancelled",
+                "interrupted",
+                "failed",
+                "permission_request",
+                "permission_decision",
+                "permission_operation",
+            }
+        ):
             return
         self._pending.append(dict(event))
         self._wake.set()
@@ -324,14 +381,16 @@ class Terminal:
         self._finish_stream()
         safe = sanitize(content)
         formatted = PygmentsTokens(lex(safe, PythonLexer())) if python and not self.no_color else safe
-        print_formatted_text(formatted, output=self.session.output,
-                             color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None)
+        print_formatted_text(
+            formatted, output=self.session.output, color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None
+        )
 
     def _write_stream(self, text: str) -> None:
         """Already sanitized text: preserve its newlines, including their absence."""
         if text:
-            print_formatted_text(text, end="", output=self.session.output,
-                                 color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None)
+            print_formatted_text(
+                text, end="", output=self.session.output, color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None
+            )
             self._stream_open_line = not text.endswith("\n")
 
     def _finish_stream(self) -> None:
@@ -371,8 +430,8 @@ class Terminal:
             self._stream_partial += piece
             newline = self._stream_partial.rfind("\n")
             if newline >= 0:
-                self._write_stream(self._stream_partial[:newline + 1])
-                self._stream_partial = self._stream_partial[newline + 1:]
+                self._write_stream(self._stream_partial[: newline + 1])
+                self._stream_partial = self._stream_partial[newline + 1 :]
             if len(self._stream_partial) == 2048:
                 self._write_stream(self._stream_partial)
                 self._stream_partial = ""
@@ -390,6 +449,17 @@ class Terminal:
             self._emit(f"Queued {event.get('user_id', identifier)}")
         elif kind == "say":
             self._emit(content)
+        elif kind == "permission_request" and isinstance(content, dict):
+            request_id = sanitize(content.get("request_id", "?"))
+            permission_kind = sanitize(content.get("permission_kind", "permission"))
+            resource = sanitize(content.get("resource", {}))
+            reason = sanitize(content.get("reason", ""))
+            message = (
+                f"Permission requested [{request_id}] ({permission_kind}): {resource}"
+                + (f"\nReason: {reason}" if reason else "")
+                + f"\nUse /approve {request_id} once|session|project|all or /deny {request_id}"
+            )
+            self._emit(message)
         elif kind in {"source", "cell", "cell_source"}:
             if self.trace:
                 self._emit(f"Python [{self._cell_number(event)}]:")
@@ -399,7 +469,9 @@ class Terminal:
         elif kind == "cell_end":
             self._finish_stream()
             if isinstance(content, dict) and content.get("status") not in {"success", "wait"}:
-                self._emit(f"Cell [{self._cell_number(event)}] {sanitize(content.get('status', 'error'))}: {sanitize(content.get('error', ''))}")
+                self._emit(
+                    f"Cell [{self._cell_number(event)}] {sanitize(content.get('status', 'error'))}: {sanitize(content.get('error', ''))}"
+                )
             elif self.trace:
                 self._emit(f"[cell_end {identifier}] {sanitize(content)}")
         else:
@@ -424,7 +496,10 @@ class Terminal:
             self._interrupting = asyncio.create_task(self._interrupt())
 
     async def _interrupt(self) -> None:
-        self.on_event({"kind": "notice", "content": "Interrupt requested; earlier or uncertain side effects remain. No replay."})
+        self.on_event({
+            "kind": "notice",
+            "content": "Interrupt requested; earlier or uncertain side effects remain. No replay.",
+        })
         try:
             await self.supervisor.interrupt()
         except Exception as exc:
@@ -463,18 +538,44 @@ class Terminal:
             self.on_event({"kind": "notice", "content": result})
         elif command == "/usage" and not args:
             status = self.supervisor.status()
-            self.on_event({"kind": "notice", "content": {
-                "estimated_input_tokens": status.get("estimated_input_tokens", "unknown"),
-                "provider_usage": status.get("usage") or "unknown (not reported)",
-            }})
+            self.on_event({
+                "kind": "notice",
+                "content": {
+                    "estimated_input_tokens": status.get("estimated_input_tokens", "unknown"),
+                    "provider_usage": status.get("usage") or "unknown (not reported)",
+                },
+            })
         elif command == "/trace" and not args:
             self.trace = not self.trace
-            self.on_event({"kind": "notice", "content": f"Python/audit trace {'on' if self.trace else 'off'}; results stay visible. Use /history for originals."})
+            self.on_event({
+                "kind": "notice",
+                "content": f"Python/audit trace {'on' if self.trace else 'off'}; results stay visible. Use /history for originals.",
+            })
+        elif command == "/approve":
+            if len(args) != 2 or args[1] not in {"once", "session", "project", "all"}:
+                raise ValueError("Usage: /approve ID once|session|project|all")
+            scope = "global" if args[1] == "all" else args[1]
+            self.supervisor.resolve_permission(args[0], allow=True, scope=scope)
+        elif command == "/deny":
+            if len(args) != 1:
+                raise ValueError("Usage: /deny ID")
+            self.supervisor.resolve_permission(args[0], allow=False)
+        elif command == "/permissions" and not args:
+            self.on_event({"kind": "notice", "content": self.supervisor.permissions_status()})
+        elif command == "/revoke":
+            if len(args) != 1:
+                raise ValueError("Usage: /revoke ID")
+            if not self.supervisor.revoke_permission(args[0]):
+                raise ValueError("Unknown saved permission ID")
+            self.on_event({"kind": "notice", "content": f"Revoked permission {args[0]}"})
         elif command == "/interrupt" and not args:
             self._schedule_interrupt()
         elif command == "/reset" and not args:
             self.supervisor.request_reset()
-            self.on_event({"kind": "notice", "content": "Context reset requested for the next request. Python variables stay alive; no kernel restart."})
+            self.on_event({
+                "kind": "notice",
+                "content": "Context reset requested for the next request. Python variables stay alive; no kernel restart.",
+            })
         else:
             raise ValueError(f"{command} takes no arguments; use /help")
         return True
@@ -491,7 +592,9 @@ class Terminal:
                             break
                     except _QuitRequested:
                         if self._active():
-                            self._emit("Exiting: cancelling active work and terminating descendants. Partial effects remain.")
+                            self._emit(
+                                "Exiting: cancelling active work and terminating descendants. Partial effects remain."
+                            )
                         break
                     except KeyboardInterrupt:
                         if self._active():
@@ -499,7 +602,9 @@ class Terminal:
                     except EOFError:
                         # A closed input stream must not spin or orphan work.
                         if self._active():
-                            self._emit("Terminal input closed; cancelling active work and terminating descendants. Partial effects remain.")
+                            self._emit(
+                                "Terminal input closed; cancelling active work and terminating descendants. Partial effects remain."
+                            )
                         break
                     except Exception as exc:
                         self.on_event({"kind": "error", "content": str(exc)})
@@ -529,7 +634,7 @@ class Terminal:
                 self.supervisor.on_event = self._previous_callback
 
 
-async def run(supervisor, *, history_path: Path | None = None, vi: bool = False,
-              multiline: bool = False, no_color: bool = False) -> None:
-    await Terminal(supervisor, history_path=history_path, vi=vi,
-                   multiline=multiline, no_color=no_color).run()
+async def run(
+    supervisor, *, history_path: Path | None = None, vi: bool = False, multiline: bool = False, no_color: bool = False
+) -> None:
+    await Terminal(supervisor, history_path=history_path, vi=vi, multiline=multiline, no_color=no_color).run()

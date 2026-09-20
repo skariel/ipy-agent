@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import sqlite3
 import stat
@@ -24,8 +26,7 @@ def test_exact_events_paging_cell_group_and_reopen(tmp_path):
         assert [event["kind"] for event in events] == ["source", "stdout", "cell_end"]
         assert events[0]["content"] == "x = '雪'\n"
         assert events[1]["content"] == "snow\r\n"
-        assert journal.read(first["id"])["content"] == json.dumps(
-            first, ensure_ascii=False, separators=(",", ":"))
+        assert journal.read(first["id"])["content"] == json.dumps(first, ensure_ascii=False, separators=(",", ":"))
     with Journal(path, "run-1") as reopened:
         third = reopened.append("user", "continue")
         assert third["seq"] > second["seq"]
@@ -47,7 +48,8 @@ def test_history_paging_search_and_scoping(tmp_path):
         assert parent.search("FAILED ASSERTION")[0]["excerpt"] == "failed assertion 雪"
         assert len(parent.recent(10**9)) == 3
         page = parent.read(parent.recent(1)[0]["id"], limit=10**9)
-        assert len(page["content"]) > 10000 and not page["truncated"]
+        assert len(page["content"]) > 10000
+        assert not page["truncated"]
         assert len(parent.read(parent.recent(1)[0]["id"])["content"]) == 8000  # default page only
         assert len(parent.recent(1)[0]["excerpt"]) == 240
         assert parent.search("", limit=0) == []
@@ -68,8 +70,10 @@ def test_history_paging_search_and_scoping(tmp_path):
 def test_failed_sql_insert_rolls_back_atomically_and_ids_do_not_reuse(tmp_path):
     with Journal(tmp_path / "history.db", "r") as journal:
         first = journal.append("user", "hello")
-        journal.db.execute("CREATE TRIGGER simulated_failure BEFORE INSERT ON events "
-                           "WHEN NEW.kind='simulated_failure' BEGIN SELECT RAISE(ABORT, 'storage failure'); END")
+        journal.db.execute(
+            "CREATE TRIGGER simulated_failure BEFORE INSERT ON events "
+            "WHEN NEW.kind='simulated_failure' BEGIN SELECT RAISE(ABORT, 'storage failure'); END"
+        )
         with pytest.raises(sqlite3.IntegrityError, match="storage failure"):
             journal.append("simulated_failure", "z" * 1000)
         assert len(journal.recent()) == 1
@@ -86,11 +90,20 @@ def test_failed_sql_insert_rolls_back_atomically_and_ids_do_not_reuse(tmp_path):
 def test_existing_journal_size_no_longer_imposes_a_session_quota(tmp_path):
     with Journal(tmp_path / "history.db", "r") as journal:
         # Seed the old accounting column without physically writing 64 MiB.
-        original = {"id": "a1:e00000001", "seq": 1, "run_id": "r", "agent_id": "a1",
-                    "timestamp": 0, "kind": "user", "cell_id": None, "content": "legacy evidence"}
-        journal.db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                           (1, "r", "a1", original["id"], "user", None, json.dumps(original),
-                            "legacy evidence", 64 * 1024 * 1024 + 1))
+        original = {
+            "id": "a1:e00000001",
+            "seq": 1,
+            "run_id": "r",
+            "agent_id": "a1",
+            "timestamp": 0,
+            "kind": "user",
+            "cell_id": None,
+            "content": "legacy evidence",
+        }
+        journal.db.execute(
+            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, "r", "a1", original["id"], "user", None, json.dumps(original), "legacy evidence", 64 * 1024 * 1024 + 1),
+        )
         event = journal.append("user", "still recording beyond the former quota")
         assert event["seq"] == 2
         assert not hasattr(journal, "max_bytes")
@@ -115,16 +128,20 @@ def test_epoch_is_one_durable_record(tmp_path):
         event = journal.commit_epoch(["a1:e2"], ["a1:e1"], ["a1:e3"], epoch_id="e2", kernel_epoch="k1")
     with Journal(path, "r") as journal:
         value = json.loads(journal.read(event["id"])["content"])["content"]
-        assert value == {"retained": ["a1:e2"], "evicted": ["a1:e1"],
-                         "pending": ["a1:e3"], "epoch_id": "e2"}
+        assert value == {"retained": ["a1:e2"], "evicted": ["a1:e1"], "pending": ["a1:e3"], "epoch_id": "e2"}
     with pytest.raises(JournalError, match="different run"):
         Journal(path, "wrong-run")
 
 
 def test_historical_snapshot_events_remain_readable_without_memory_runtime(tmp_path):
     path = tmp_path / "historical.db"
-    content = {"snapshot": {"content": "historical notes", "sha256": "old", "size_bytes": 16},
-               "retained": [], "evicted": [], "pending": [], "epoch_id": "x1"}
+    content = {
+        "snapshot": {"content": "historical notes", "sha256": "old", "size_bytes": 16},
+        "retained": [],
+        "evicted": [],
+        "pending": [],
+        "epoch_id": "x1",
+    }
     with Journal(path, "old-run") as journal:
         event = journal.append("epoch_commit", content)
     with Journal(path, "old-run") as journal:

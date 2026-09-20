@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline accounting: python scripts/replay_trace.py JOURNAL [JOURNAL ...]."""
+
 from __future__ import annotations
 
 import argparse
@@ -18,7 +19,9 @@ except ModuleNotFoundError as exc:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Read-only deterministic journal accounting; no model calls or code execution.")
+    parser = argparse.ArgumentParser(
+        description="Read-only deterministic journal accounting; no model calls or code execution."
+    )
     parser.add_argument("journals", nargs="*", type=Path, help="SQLite journals, each reported independently")
     parser.add_argument("--journal", action="append", default=[], type=Path, help="Additional journal; repeatable")
     args = parser.parse_args(argv)
@@ -26,7 +29,9 @@ def main(argv=None):
     if not paths:
         parser.error("supply a journal")
     try:
-        result = {"journals": [{"path": str(path), "accounting": account_trace(journal_events(path))} for path in paths]}
+        result = {
+            "journals": [{"path": str(path), "accounting": account_trace(journal_events(path))} for path in paths]
+        }
         # ASCII JSON escapes control sequences, bidi controls, and terminal escape
         # characters even in hostile metadata/path labels. No transcript text.
         print(json.dumps(result, ensure_ascii=True, allow_nan=False, sort_keys=True, indent=2))

@@ -1,4 +1,5 @@
 """Offline HTML export: journal strings stay data; existing paths stay untouched."""
+
 from __future__ import annotations
 
 import hashlib
@@ -22,8 +23,9 @@ SPEC.loader.exec_module(exporter)
 def database(path, records):
     with sqlite3.connect(path) as connection:
         connection.execute("CREATE TABLE events (seq INTEGER PRIMARY KEY, payload TEXT)")
-        connection.executemany("INSERT INTO events VALUES (?, ?)",
-                               [(index, json.dumps(record)) for index, record in enumerate(records, 1)])
+        connection.executemany(
+            "INSERT INTO events VALUES (?, ?)", [(index, json.dumps(record)) for index, record in enumerate(records, 1)]
+        )
     return path
 
 
@@ -51,31 +53,61 @@ class Document(HTMLParser):
 
 def test_full_context_and_records_are_escaped_chronological_data(tmp_path):
     injected = '</pre></details><script>alert(1)</script><img src="https://invalid.example/exfil" onerror="alert(2)"> & "quoted"'
-    messages = [{"role": "system", "content": "Python only\n" + injected},
-                {"role": "user", "content": "memory α\nline two"},
-                {"role": "assistant", "content": "print('actual cell')"},
-                {"role": "user", "content": "[RUNTIME OBSERVATION]\nstdout: 42\nstderr: diagnostic"}]
+    messages = [
+        {"role": "system", "content": "Python only\n" + injected},
+        {"role": "user", "content": "memory α\nline two"},
+        {"role": "assistant", "content": "print('actual cell')"},
+        {"role": "user", "content": "[RUNTIME OBSERVATION]\nstdout: 42\nstderr: diagnostic"},
+    ]
     records = [
         {"id": injected, "seq": 1, "kind": "source", "content": injected},
-        {"id": "a1:e2", "seq": 2, "kind": "generation_request", "content": {
-            "messages": messages, "provider_request": {"body": {"instructions": injected, "input": messages}},
-            "unknown_metadata": {"nested": [1, True, None]}}},
+        {
+            "id": "a1:e2",
+            "seq": 2,
+            "kind": "generation_request",
+            "content": {
+                "messages": messages,
+                "provider_request": {"body": {"instructions": injected, "input": messages}},
+                "unknown_metadata": {"nested": [1, True, None]},
+            },
+        },
         {"id": "a1:e3", "seq": 3, "kind": injected, "content": {"unfamiliar": "retained completely"}},
     ]
     journal = database(tmp_path / "journal.sqlite", records)
     original = journal.read_bytes()
     original_stat = journal.stat()
     output, count = exporter.export_session(journal)
-    assert count == 3 and output == tmp_path / "session.html"
+    assert count == 3
+    assert output == tmp_path / "session.html"
     html = output.read_text()
     parsed = Document()
     parsed.feed(html)
-    assert "<script>" not in html and "<img " not in html
-    assert {tag for tag, _ in parsed.tags} <= {"html", "head", "meta", "title", "style", "body", "h1", "h3", "p", "code", "details", "summary", "pre"}
+    assert "<script>" not in html
+    assert "<img " not in html
+    assert {tag for tag, _ in parsed.tags} <= {
+        "html",
+        "head",
+        "meta",
+        "title",
+        "style",
+        "body",
+        "h1",
+        "h3",
+        "p",
+        "code",
+        "details",
+        "summary",
+        "pre",
+    }
     assert all(not name.startswith("on") for _, attrs in parsed.tags for name in attrs)
-    policy = next(attrs["content"] for tag, attrs in parsed.tags
-                  if tag == "meta" and attrs.get("http-equiv") == "Content-Security-Policy")
-    assert "default-src 'none'" in policy and "base-uri 'none'" in policy and "form-action 'none'" in policy
+    policy = next(
+        attrs["content"]
+        for tag, attrs in parsed.tags
+        if tag == "meta" and attrs.get("http-equiv") == "Content-Security-Policy"
+    )
+    assert "default-src 'none'" in policy
+    assert "base-uri 'none'" in policy
+    assert "form-action 'none'" in policy
     stored = [json.loads(text) for text in parsed.pres if text.startswith('{\n  "id"')]
     assert stored == records
     assert all(message["content"] in parsed.pres for message in messages)
@@ -90,7 +122,8 @@ def test_source_is_never_executed(tmp_path):
     source = f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')"
     journal = database(tmp_path / "journal.sqlite", [{"kind": "source", "content": source}])
     output, count = exporter.export_session(journal)
-    assert count == 1 and not marker.exists()
+    assert count == 1
+    assert not marker.exists()
     assert source == json.loads(stored_event_json(output))["content"]
 
 
@@ -120,9 +153,11 @@ def test_existing_paths_are_never_overwritten(tmp_path, destination):
     if destination == "file":
         assert output.read_text() == "KEEP EXISTING"
     elif destination == "symlink":
-        assert output.is_symlink() and target.read_text() == "KEEP TARGET"
+        assert output.is_symlink()
+        assert target.read_text() == "KEEP TARGET"
     elif destination == "dangling_symlink":
-        assert output.is_symlink() and not target.exists()
+        assert output.is_symlink()
+        assert not target.exists()
 
 
 @pytest.mark.parametrize("payload", ["{bad JSON", "[]", '{"number": NaN}'])
@@ -160,7 +195,8 @@ def test_missing_database_does_not_create_any_output(tmp_path):
     journal = tmp_path / "missing.sqlite"
     with pytest.raises(FileNotFoundError):
         exporter.export_session(journal)
-    assert not journal.exists() and not (tmp_path / "session.html").exists()
+    assert not journal.exists()
+    assert not (tmp_path / "session.html").exists()
 
 
 def test_cli_emits_file_uri_and_separate_privacy_warning(tmp_path):
@@ -170,11 +206,13 @@ def test_cli_emits_file_uri_and_separate_privacy_warning(tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == output.as_uri()
     assert "%20" in result.stdout
-    assert "may contain secrets" in result.stderr and "not a live view" in result.stderr
+    assert "may contain secrets" in result.stderr
+    assert "not a live view" in result.stderr
     assert "user secret" not in result.stdout + result.stderr
     existing = output.read_bytes()
     retry = subprocess.run([sys.executable, str(SCRIPT), str(journal), str(output)], text=True, capture_output=True)
-    assert retry.returncode == 1 and retry.stdout == ""
+    assert retry.returncode == 1
+    assert retry.stdout == ""
     assert output.read_bytes() == existing
 
 
@@ -182,6 +220,7 @@ def test_cli_malformed_database_reports_failure_without_partial_html(tmp_path):
     journal = tmp_path / "not-sqlite"
     journal.write_text("not a database")
     result = subprocess.run([sys.executable, str(SCRIPT), str(journal)], text=True, capture_output=True)
-    assert result.returncode == 1 and result.stdout == ""
+    assert result.returncode == 1
+    assert result.stdout == ""
     assert "export_session:" in result.stderr
     assert not (tmp_path / "session.html").exists()

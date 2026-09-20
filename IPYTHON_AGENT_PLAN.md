@@ -94,11 +94,13 @@ print(a)
 def sumit(a, b):
     return a + b
 
+
 print(sumit(a, 10))
 ```
 
 ```python
 from pathlib import Path
+
 text = Path("src/example.py").read_text()
 print(text[:4000])
 ```
@@ -173,9 +175,9 @@ IPython `%history`, `In`, and `%whos` are useful, but not the authoritative conv
 The custom journal records original user messages/steering, source, output/display events, errors, say/wait/final events, and child results. Preserve output event ordering as observed, not just concatenated strings. Capture rendered values at execution time; reading history must not call `repr()` again on a live object or re-execute code.
 
 ```python
-history.recent(10)                         # bounded index with IDs
+history.recent(10)  # bounded index with IDs
 history.search("failed assertion", limit=5)
-history.read("a1:c0042", limit=8000)        # source, outputs, status
+history.read("a1:c0042", limit=8000)  # source, outputs, status
 ```
 
 Search returns IDs, kinds, and matching excerpts. Reads return original content with explicit paging offsets/truncation indicators. Large content belongs in immutable artifacts accessed through the same interface. Enforce byte/character limits on the host even if Python asks for an enormous result. Retrievals are separately tagged so searches can exclude repeated retrieval echoes by default.

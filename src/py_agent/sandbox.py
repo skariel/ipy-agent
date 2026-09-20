@@ -9,20 +9,24 @@ must reserve its transport descriptors before redirecting cell standard IO.
 This module does not execute generated source. Workers inherit OS resource
 limits; the application does not impose execution or session resource quotas.
 """
+
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 import errno
 import json
 import os
+from pathlib import Path
 import platform
 import shutil
 import signal
+import socket
 import stat
 import sys
 import sysconfig
 import tempfile
-from pathlib import Path
 from typing import Literal
 
 
@@ -31,7 +35,7 @@ class SandboxUnavailable(RuntimeError):
 
 
 # Trusted, fixed startup probe. No model-provided text enters this program.
-_PROBE = r'''
+_PROBE = r"""
 import errno, json, os, pathlib, socket, sys
 scratch, protected, outside, launcher_tmp = map(pathlib.Path, sys.argv[1:])
 checks = {}
@@ -82,7 +86,7 @@ checks['no_credentials'] = not any(k in os.environ for k in (
     'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'SSH_AUTH_SOCK', 'DOCKER_HOST',
     'PYTHONPATH', 'PYTHONSTARTUP', 'NODE_OPTIONS', 'BASH_ENV', 'ENV'))
 print(json.dumps(checks), flush=True)
-'''
+"""
 
 
 def _absolute_no_symlinks(path: Path) -> Path:
@@ -119,7 +123,9 @@ def _verify_runtime_tree(roots: set[Path], protected: set[Path], *, max_entries:
         path = pending.pop()
         count += 1
         if count > max_entries:
-            raise SandboxUnavailable("Trusted runtime verification exceeded its entry limit; use a smaller dedicated runtime")
+            raise SandboxUnavailable(
+                "Trusted runtime verification exceeded its entry limit; use a smaller dedicated runtime"
+            )
         try:
             info = path.lstat()
             if stat.S_ISLNK(info.st_mode):
@@ -142,7 +148,9 @@ def _verify_runtime_tree(roots: set[Path], protected: set[Path], *, max_entries:
                     for entry in entries:
                         pending.append(Path(entry.path))
                         if len(pending) + count > max_entries:
-                            raise SandboxUnavailable("Trusted runtime verification exceeded its entry limit; use a smaller dedicated runtime")
+                            raise SandboxUnavailable(
+                                "Trusted runtime verification exceeded its entry limit; use a smaller dedicated runtime"
+                            )
             elif not stat.S_ISREG(info.st_mode):
                 raise SandboxUnavailable(f"Unsupported file type in trusted runtime: {path}")
         except (OSError, RuntimeError) as exc:
@@ -154,9 +162,10 @@ def _verify_runtime_tree(roots: set[Path], protected: set[Path], *, max_entries:
 class Sandbox:
     """One persistent sandboxed worker; instances are not reusable after close.
 
-    ``allowed_domains`` applies only to explicitly selected proxy networking.
-    An empty tuple denies all network destinations. DNS, UDP and transparent
-    localhost access are NOT supplied by this proxy mode.
+    ``allowed_domains`` pre-approves destinations for explicitly selected proxy
+    networking. Other destinations invoke ``network_permission`` and fail closed
+    without a callback or approval. DNS, UDP and transparent localhost access are
+    NOT supplied by this proxy mode.
 
     ``start()`` first runs a fixed disposable isolation/stdio probe. Failure
     raises ``SandboxUnavailable`` before any worker/model source is run.
@@ -170,14 +179,15 @@ class Sandbox:
         host_dir: Path,
         scratch: Path,
         *,
-        network: Literal['open', 'proxy'] = 'open',
+        network: Literal["open", "proxy"] = "open",
         allowed_domains: tuple[str, ...] = (),
         startup_timeout: float = 20.0,
+        network_permission: Callable[[str, int | None], Awaitable[bool]] | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve(strict=True)
         if not self.workspace.is_dir():
             raise SandboxUnavailable("Workspace must be an existing directory")
-        self.write_roots = tuple(dict.fromkeys((self.workspace, Path('/tmp'))))
+        self.write_roots = tuple(dict.fromkeys((self.workspace, Path("/tmp"))))
         self.host_dir = _absolute_no_symlinks(host_dir)
         self.scratch = _absolute_no_symlinks(scratch)
         if not self.scratch.is_relative_to(self.workspace):
@@ -186,15 +196,18 @@ class Sandbox:
             raise SandboxUnavailable("Use a private scratch subdirectory, not the workspace itself")
         if self.scratch.is_relative_to(self.host_dir) or self.host_dir.is_relative_to(self.scratch):
             raise SandboxUnavailable("Host control files and writable scratch must be disjoint")
-        if network not in ('open', 'proxy'):
+        if network not in ("open", "proxy"):
             raise ValueError("network must be 'open' or 'proxy'")
         if startup_timeout <= 0:
             raise ValueError("startup_timeout must be positive")
-        if isinstance(allowed_domains, (str, bytes)) or not all(isinstance(d, str) and d and '\x00' not in d for d in allowed_domains):
+        if isinstance(allowed_domains, (str, bytes)) or not all(
+            isinstance(d, str) and d and "\x00" not in d for d in allowed_domains
+        ):
             raise ValueError("allowed_domains must contain nonempty domain strings")
         self.network = network
         self.allowed_domains = tuple(allowed_domains)
         self.startup_timeout = startup_timeout
+        self.network_permission = network_permission
         self.process: asyncio.subprocess.Process | None = None
         self._probe_process: asyncio.subprocess.Process | None = None
         self.preflight_result: dict[str, bool] | None = None
@@ -203,83 +216,94 @@ class Sandbox:
         self._closed = False
         self._starting = False
         self._srt: str | None = None
+        self._node: str | None = None
         self._env: dict[str, str] | None = None
+        self._approval_channels: dict[int, tuple[socket.socket, asyncio.Task[None]]] = {}
         self._runtime_protected: set[Path] = set()
         self._runtime_scan_roots: set[Path] = set()
 
     @property
     def policy(self) -> dict:
         return {
-            'write_roots': [str(root) for root in self.write_roots],
-            'reads': 'all normally readable files (not confidentiality isolation)',
-            'network': self.network,
-            'allowed_domains': list(self.allowed_domains),
-            'network_limitations': 'proxy only: no transparent DNS/UDP/localhost' if self.network == 'proxy' else 'unsupported by current srt CLI',
-            'broad_root_warning': self.workspace in (Path('/'), Path.home().resolve()),
-            'mandatory_srt_write_protections': True,
-            'interrupt': 'kills launcher group; descendant cleanup relies on srt PID namespaces and remains integration-unverified; no rollback or replay',
-            'resource_limits': 'inherited OS limits only; no application execution/session quotas',
+            "write_roots": [str(root) for root in self.write_roots],
+            "reads": "all normally readable files (not confidentiality isolation)",
+            "network": self.network,
+            "allowed_domains": list(self.allowed_domains),
+            "network_limitations": "proxy only: no transparent DNS/UDP/localhost"
+            if self.network == "proxy"
+            else "unsupported by current srt CLI",
+            "broad_root_warning": self.workspace in (Path("/"), Path.home().resolve()),
+            "mandatory_srt_write_protections": True,
+            "interrupt": "kills launcher group; descendant cleanup relies on srt PID namespaces and remains integration-unverified; no rollback or replay",
+            "resource_limits": "inherited OS limits only; no application execution/session quotas",
         }
 
     def _prepare(self) -> None:
-        if platform.system() != 'Linux':
+        if platform.system() != "Linux":
             raise SandboxUnavailable("Only Linux srt isolation is implemented")
-        if self.network == 'open':
+        if self.network == "open":
             raise SandboxUnavailable(
                 "Requested open networking is unavailable through the supported srt CLI: "
                 "its schema requires allowedDomains and always isolates the network namespace. "
                 "No weaker isolation was enabled. Explicitly choose network='proxy' and "
                 "allowed_domains after accepting that DNS/UDP/localhost are not transparent."
             )
-        for command in ('srt', 'bwrap', 'socat', 'rg', 'node'):
+        for command in ("srt", "bwrap", "socat", "rg", "node"):
             if not shutil.which(command):
                 raise SandboxUnavailable(f"Required sandbox executable not found: {command}")
-        self._srt = str(Path(shutil.which('srt')).resolve())
+        self._srt = str(Path(shutil.which("srt")).resolve())
+        self._node = str(Path(shutil.which("node")).resolve())
         _private_directory(self.host_dir)
         _private_directory(self.scratch)
-        for name in ('home', 'tmp', 'ipython', 'cache'):
+        for name in ("home", "tmp", "ipython", "cache"):
             _private_directory(self.scratch / name)
         # srt creates Unix-domain bridge sockets beneath Node's os.tmpdir().
         # Session/workspace paths readily exceed Linux's 107-byte pathname limit.
         # This is host-only control-plane scratch, NOT a worker write permission.
-        self._launcher_tmp = tempfile.TemporaryDirectory(prefix='py-srt-', dir='/tmp')
+        self._launcher_tmp = tempfile.TemporaryDirectory(prefix="py-srt-", dir="/tmp")
         launcher_tmp = _absolute_no_symlinks(Path(self._launcher_tmp.name))
         _private_directory(launcher_tmp)
-        if len(os.fsencode(str(launcher_tmp / ('claude-socks-' + '0' * 16 + '.sock')))) > 107:
+        if len(os.fsencode(str(launcher_tmp / ("claude-socks-" + "0" * 16 + ".sock")))) > 107:
             raise SandboxUnavailable("Host bridge socket directory exceeds Linux's Unix-socket path limit")
         # No inherited PATH, Python/Node startup configuration, proxy credentials,
         # API keys, SSH agent, Docker endpoint, or unrelated file descriptors.
         self._env = {
-            'PATH': '/usr/bin:/bin',
-            'HOME': str(self.scratch / 'home'),
-            'TMPDIR': str(launcher_tmp),
-            'TMP': str(launcher_tmp),
-            'TEMP': str(launcher_tmp),
-            'CLAUDE_CODE_TMPDIR': str(self.scratch / 'tmp'),
-            'IPYTHONDIR': str(self.scratch / 'ipython'),
-            'XDG_CACHE_HOME': str(self.scratch / 'cache'),
-            'LANG': 'C.UTF-8',
-            'LC_ALL': 'C.UTF-8',
-            'TERM': 'dumb',
-            'PAGER': '/bin/cat',
-            'GIT_PAGER': '/bin/cat',
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(self.scratch / "home"),
+            "TMPDIR": str(launcher_tmp),
+            "TMP": str(launcher_tmp),
+            "TEMP": str(launcher_tmp),
+            "CLAUDE_CODE_TMPDIR": str(self.scratch / "tmp"),
+            "IPYTHONDIR": str(self.scratch / "ipython"),
+            "XDG_CACHE_HOME": str(self.scratch / "cache"),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "TERM": "dumb",
+            "PAGER": "/bin/cat",
+            "GIT_PAGER": "/bin/cat",
         }
         # An editable install trusts the entire import root (src), not just its
         # package: a sibling sitecustomize.py can run during the next startup.
         # Base interpreter libraries remain dependencies even inside a venv.
         source_root = Path(__file__).resolve().parent.parent
         prefixes = {Path(sys.prefix).absolute(), Path(sys.base_prefix).absolute()}
-        executable_paths = {Path(shutil.which(command)).resolve() for command in ('srt', 'bwrap', 'socat', 'rg', 'node')}
+        executable_paths = {
+            Path(shutil.which(command)).resolve() for command in ("srt", "bwrap", "socat", "rg", "node")
+        }
         executable_paths.add(Path(sys.executable).resolve())
         srt_root = Path(self._srt).parent.parent
         self._runtime_protected = {
-            source_root, *prefixes, *(p.resolve() for p in prefixes),
-            srt_root, *executable_paths, *(p.parent for p in executable_paths),
+            source_root,
+            *prefixes,
+            *(p.resolve() for p in prefixes),
+            srt_root,
+            *executable_paths,
+            *(p.parent for p in executable_paths),
         }
         # Never recursively scan /usr or /usr/local merely because they are the
         # system prefix. Inspect actual Python library/import paths and binaries.
         self._runtime_scan_roots = {source_root, srt_root, *executable_paths}
-        for name in ('stdlib', 'platstdlib', 'purelib', 'platlib'):
+        for name in ("stdlib", "platstdlib", "purelib", "platlib"):
             path = sysconfig.get_path(name)
             if path:
                 library = Path(path).absolute()
@@ -288,58 +312,171 @@ class Sandbox:
         if sys.prefix != sys.base_prefix:
             self._runtime_scan_roots.add(Path(sys.prefix).absolute())
         protected = self._runtime_protected | {self.host_dir}
-        denied = sorted(str(p) for p in protected
-                        if any(p.is_relative_to(root) for root in self.write_roots))
+        denied = sorted(str(p) for p in protected if any(p.is_relative_to(root) for root in self.write_roots))
         for host_path in (self.host_dir, launcher_tmp):
             if str(host_path) not in denied:
                 denied.append(str(host_path))
         settings = {
-            'network': {
-                'allowedDomains': list(self.allowed_domains),
-                'deniedDomains': [],
-                'strictAllowlist': True,
-                'allowAllUnixSockets': False,
-                'allowLocalBinding': False,
+            "network": {
+                "allowedDomains": list(self.allowed_domains),
+                "deniedDomains": [],
+                "strictAllowlist": False,
+                "allowAllUnixSockets": False,
+                "allowLocalBinding": False,
             },
-            'filesystem': {
-                'denyRead': [],
-                'allowWrite': [str(root) for root in self.write_roots],
-                'denyWrite': denied,
+            "filesystem": {
+                "denyRead": [],
+                "allowWrite": [str(root) for root in self.write_roots],
+                "denyWrite": denied,
             },
-            'enableWeakerNestedSandbox': False,
-            'enableWeakerNetworkIsolation': False,
-            'allowAppleEvents': False,
+            "enableWeakerNestedSandbox": False,
+            "enableWeakerNetworkIsolation": False,
+            "allowAppleEvents": False,
         }
-        fd, name = tempfile.mkstemp(prefix='srt-', suffix='.json', dir=self.host_dir)
+        fd, name = tempfile.mkstemp(prefix="srt-", suffix=".json", dir=self.host_dir)
         self._settings = Path(name)
-        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(settings, stream)
             stream.flush()
             os.fsync(stream.fileno())
+
+    def permanent_protected_paths(self) -> tuple[Path, ...]:
+        """Return the prepared runtime/control paths brokered writes may never touch."""
+        if self._settings is None:
+            self._prepare()
+        assert self._launcher_tmp is not None
+        assert self._settings is not None
+        return tuple(
+            self._runtime_protected
+            | {
+                self.host_dir,
+                Path(self._launcher_tmp.name),
+                self._settings,
+            }
+        )
 
     def _verify_runtime(self) -> None:
         """Required before any preflight or worker process is spawned."""
         if not self._runtime_scan_roots:
             raise SandboxUnavailable("Runtime protection has not been prepared")
-        if self._runtime_scan_roots.intersection({Path('/'), Path('/usr'), Path('/usr/local')}):
-            raise SandboxUnavailable("Cannot bound this runtime layout safely; use a dedicated Python/srt installation rather than scanning a system prefix")
+        if self._runtime_scan_roots.intersection({Path("/"), Path("/usr"), Path("/usr/local")}):
+            raise SandboxUnavailable(
+                "Cannot bound this runtime layout safely; use a dedicated Python/srt installation rather than scanning a system prefix"
+            )
         _verify_runtime_tree(self._runtime_scan_roots, self._runtime_protected)
 
-    async def _spawn(self, argv: list[str]) -> asyncio.subprocess.Process:
-        assert self._srt and self._settings and self._env
-        return await asyncio.create_subprocess_exec(
-            self._srt, '--settings', str(self._settings), '--',
-            '/usr/bin/env', *(f'{key}={self.scratch / "tmp"}' for key in ('TMPDIR', 'TMP', 'TEMP')), *argv,
-            cwd=self.workspace, env=self._env,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            close_fds=True, start_new_session=True,
-            limit=1024 * 1024,
+    async def _spawn(
+        self,
+        argv: list[str],
+        *,
+        permit_network_requests: bool = False,
+    ) -> asyncio.subprocess.Process:
+        assert self._srt
+        assert self._node
+        assert self._settings
+        assert self._env
+        launcher = Path(__file__).resolve().with_name("srt_launcher.mjs")
+        if not launcher.is_file():
+            raise SandboxUnavailable(f"Trusted srt launcher is missing: {launcher}")
+        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        parent.setblocking(False)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                self._node,
+                str(launcher),
+                self._srt,
+                str(self._settings),
+                str(child.fileno()),
+                "--",
+                "/usr/bin/env",
+                *(f"{key}={self.scratch / 'tmp'}" for key in ("TMPDIR", "TMP", "TEMP")),
+                *argv,
+                cwd=self.workspace,
+                env=self._env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                close_fds=True,
+                pass_fds=(child.fileno(),),
+                start_new_session=True,
+                limit=1024 * 1024,
+            )
+        except BaseException:
+            parent.close()
+            raise
+        finally:
+            child.close()
+        task = asyncio.create_task(
+            self._serve_network_permissions(parent, permit_requests=permit_network_requests),
+            name=f"network-permissions-{id(process)}",
         )
+        self._approval_channels[id(process)] = (parent, task)
+        return process
 
-    @staticmethod
-    async def _terminate(process: asyncio.subprocess.Process) -> None:
+    async def _serve_network_permissions(self, channel: socket.socket, *, permit_requests: bool) -> None:
+        loop = asyncio.get_running_loop()
+        buffered = bytearray()
+        try:
+            while True:
+                chunk = await loop.sock_recv(channel, 65536)
+                if not chunk:
+                    return
+                buffered.extend(chunk)
+                if len(buffered) > 65536:
+                    return
+                while b"\n" in buffered:
+                    line, _, remainder = buffered.partition(b"\n")
+                    buffered[:] = remainder
+                    try:
+                        request = json.loads(line)
+                        if (
+                            not isinstance(request, dict)
+                            or set(request) != {"version", "id", "kind", "host", "port"}
+                            or request["version"] != 1
+                            or request["kind"] != "network"
+                            or not isinstance(request["id"], str)
+                            or not request["id"].startswith("net-")
+                            or not isinstance(request["host"], str)
+                            or not request["host"]
+                            or (
+                                request["port"] is not None
+                                and (type(request["port"]) is not int or not 1 <= request["port"] <= 65535)
+                            )
+                        ):
+                            return
+                    except (UnicodeError, ValueError, TypeError):
+                        return
+                    allowed = False
+                    if permit_requests and self.network_permission is not None:
+                        try:
+                            allowed = bool(await self.network_permission(request["host"], request["port"]))
+                        except Exception:
+                            allowed = False
+                    response = (
+                        json.dumps(
+                            {"version": 1, "id": request["id"], "allow": allowed},
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                        ).encode("ascii")
+                        + b"\n"
+                    )
+                    await loop.sock_sendall(channel, response)
+        except (ConnectionError, OSError):
+            return
+        finally:
+            channel.close()
+
+    async def _close_approval_channel(self, process: asyncio.subprocess.Process) -> None:
+        channel = self._approval_channels.pop(id(process), None)
+        if channel is None:
+            return
+        sock, task = channel
+        sock.close()
+        task.cancel()
+        with suppress(asyncio.CancelledError, OSError):
+            await task
+
+    async def _terminate(self, process: asyncio.subprocess.Process) -> None:
         # srt itself does not forward signals to all descendants. Kill its whole
         # original session group. bwrap uses --die-with-parent and PID namespaces;
         # killing its launching shell kills the namespace even if cells setsid().
@@ -352,8 +489,10 @@ class Sandbox:
             pass
         try:
             await asyncio.wait_for(process.wait(), timeout=5)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise SandboxUnavailable("Sandbox process tree did not terminate promptly") from exc
+        finally:
+            await self._close_approval_channel(process)
 
     async def preflight(self) -> dict[str, bool]:
         """Run trusted disposable confinement and standard-descriptor probes."""
@@ -363,10 +502,10 @@ class Sandbox:
             self._prepare()
         self._verify_runtime()
         # Protected sentinel deliberately remains readable but must not be writable.
-        fd, name = tempfile.mkstemp(prefix='protected-probe-', dir=self.host_dir)
+        fd, name = tempfile.mkstemp(prefix="protected-probe-", dir=self.host_dir)
         protected = Path(name)
-        with os.fdopen(fd, 'w') as stream:
-            stream.write('protected')
+        with os.fdopen(fd, "w") as stream:
+            stream.write("protected")
         external: tempfile.TemporaryDirectory | None = None
         try:
             # /tmp is writable. Probe outside both write roots when possible;
@@ -375,50 +514,68 @@ class Sandbox:
             outside = protected
             if not any(outside_root.is_relative_to(root) for root in self.write_roots):
                 try:
-                    external = tempfile.TemporaryDirectory(prefix='py-srt-outside-', dir=outside_root)
+                    external = tempfile.TemporaryDirectory(prefix="py-srt-outside-", dir=outside_root)
                 except OSError as exc:
                     # An owned host directory can have a root-owned/read-only
                     # parent (e.g. /var/lib). Its sentinel still tests protection.
                     if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
                         raise
                 else:
-                    outside = Path(external.name) / 'sentinel'
-                    outside.write_text('outside')
-            process = await self._spawn([
-                sys.executable, '-I', '-c', _PROBE,
-                str(self.scratch), str(protected), str(outside), self._launcher_tmp.name,
-            ])
+                    outside = Path(external.name) / "sentinel"
+                    outside.write_text("outside")
+            process = await self._spawn(
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    _PROBE,
+                    str(self.scratch),
+                    str(protected),
+                    str(outside),
+                    self._launcher_tmp.name,
+                ],
+                permit_network_requests=False,
+            )
             self._probe_process = process
             if self._closed:
                 await self._terminate(process)
                 raise SandboxUnavailable("Sandbox closed during preflight")
             try:
                 stdout, stderr = await asyncio.wait_for(
-                    process.communicate(b'py-srt-stdio-probe\n'), self.startup_timeout
+                    process.communicate(b"py-srt-stdio-probe\n"), self.startup_timeout
                 )
+                await self._close_approval_channel(process)
             except BaseException:
                 await self._terminate(process)
                 raise
             if process.returncode != 0:
-                detail = stderr.decode('utf-8', 'replace')[-2000:]
+                detail = stderr.decode("utf-8", "replace")[-2000:]
                 raise SandboxUnavailable(f"srt isolation preflight failed (exit {process.returncode}): {detail}")
             try:
                 result = json.loads(stdout)
             except (ValueError, UnicodeError) as exc:
                 raise SandboxUnavailable("srt did not preserve a clean stdout transport") from exc
             expected = {
-                'inside_write', 'read_protected', 'protected_write_denied',
-                'outside_write_denied', 'symlink_write_denied', 'rename_denied',
-                'unix_socket_denied', 'stdio', 'no_credentials',
-                'launcher_tmp_write_denied', 'worker_tmp_in_workspace', 'tmp_read_write',
+                "inside_write",
+                "read_protected",
+                "protected_write_denied",
+                "outside_write_denied",
+                "symlink_write_denied",
+                "rename_denied",
+                "unix_socket_denied",
+                "stdio",
+                "no_credentials",
+                "launcher_tmp_write_denied",
+                "worker_tmp_in_workspace",
+                "tmp_read_write",
             }
             if not isinstance(result, dict) or set(result) != expected or any(v is not True for v in result.values()):
                 raise SandboxUnavailable(f"Sandbox enforcement probe failed: {result!r}")
-            if protected.read_text() != 'protected':
+            if protected.read_text() != "protected":
                 raise SandboxUnavailable("Sandbox modified its protected control-plane sentinel")
             self.preflight_result = result
             return result.copy()
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise SandboxUnavailable("srt isolation preflight timed out") from exc
         finally:
             self._probe_process = None
@@ -434,10 +591,13 @@ class Sandbox:
             await self.preflight()
             if self._closed:
                 raise SandboxUnavailable("Sandbox closed during startup")
-            worker = Path(__file__).resolve().with_name('worker.py')
+            worker = Path(__file__).resolve().with_name("worker.py")
             if not worker.is_file():
                 raise SandboxUnavailable(f"Worker bootstrap is missing: {worker}")
-            self.process = await self._spawn([sys.executable, '-I', str(worker)])
+            self.process = await self._spawn(
+                [sys.executable, "-I", str(worker)],
+                permit_network_requests=True,
+            )
             if self._closed:
                 await self._terminate(self.process)
                 raise SandboxUnavailable("Sandbox closed during startup")
@@ -461,6 +621,12 @@ class Sandbox:
         if self.process is not None:
             await self._terminate(self.process)
             self.process = None
+        for channel, task in tuple(self._approval_channels.values()):
+            channel.close()
+            task.cancel()
+            with suppress(asyncio.CancelledError, OSError):
+                await task
+        self._approval_channels.clear()
         if self._settings is not None:
             self._settings.unlink(missing_ok=True)
             self._settings = None
@@ -468,7 +634,7 @@ class Sandbox:
             self._launcher_tmp.cleanup()
             self._launcher_tmp = None
 
-    async def __aenter__(self) -> 'Sandbox':
+    async def __aenter__(self) -> Sandbox:
         await self.start()
         return self
 

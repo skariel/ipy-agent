@@ -1,6 +1,8 @@
 """Real terminal-descriptor exit tests with a fixed stub, no model/worker code."""
+
+from __future__ import annotations
+
 import os
-from pathlib import Path
 import select
 import signal
 import subprocess
@@ -11,7 +13,7 @@ import pytest
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux PTY/signal integration")
 
-SCRIPT = r'''
+SCRIPT = r"""
 import asyncio, sys
 from pathlib import Path
 from py_agent.cli import _run_bounded
@@ -49,42 +51,53 @@ try:
     _run_bounded(main())
 except asyncio.CancelledError:
     sys.exit(143)
-'''
+"""
 
 
-@pytest.mark.parametrize("state,gesture,mode", [
-    ("IDLE", b"\x03", "normal"),
-    ("FAILED", b"\x03", "normal"),
-    ("EXECUTING", b"\x03\x03", "normal"),
-    ("GENERATING", b"\x04", "normal"),
-    ("EXECUTING", b"/quit\r", "multiline"),
-    ("EXECUTING", None, "normal"),  # SIGTERM, not a terminal key
-    ("IDLE", b"\x04", "fragments"),  # arbitrary pipe chunks render as one line
-    ("IDLE", b"/quit\r", "numbering"),  # messages advance prompts; commands/blank do not
-])
+@pytest.mark.parametrize(
+    "state,gesture,mode",
+    [
+        ("IDLE", b"\x03", "normal"),
+        ("FAILED", b"\x03", "normal"),
+        ("EXECUTING", b"\x03\x03", "normal"),
+        ("GENERATING", b"\x04", "normal"),
+        ("EXECUTING", b"/quit\r", "multiline"),
+        ("EXECUTING", None, "normal"),  # SIGTERM, not a terminal key
+        ("IDLE", b"\x04", "fragments"),  # arbitrary pipe chunks render as one line
+        ("IDLE", b"/quit\r", "numbering"),  # messages advance prompts; commands/blank do not
+    ],
+)
 def test_real_tty_exit_restores_shell_and_calls_cleanup(tmp_path, state, gesture, mode):
-    import pty
     import fcntl
+    import pty
     import struct
     import termios
+
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
     before = termios.tcgetattr(slave)
     marker = tmp_path / "closed"
     process = None
     try:
-        process = subprocess.Popen([sys.executable, "-I", "-c", SCRIPT, state, str(marker), mode],
-                                   stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
-                                   env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin", "TERM": "xterm-256color"})
+        process = subprocess.Popen(
+            [sys.executable, "-I", "-c", SCRIPT, state, str(marker), mode],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            start_new_session=True,
+            env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin", "TERM": "xterm-256color"},
+        )
         data = bytearray()
         deadline = time.monotonic() + 5
         # Printing temporarily enters cooked mode. Wait for the prompt redraw
         # after the output before sending a raw-mode exit key.
+
         def ready():
             if mode != "fragments":
                 return b"In [1]:" in data
             position = data.find(b"f file.py")
-            return position >= 0 and b"In [1]:" in data[position + len(b"f file.py"):]
+            return position >= 0 and b"In [1]:" in data[position + len(b"f file.py") :]
+
         while not ready():
             remaining = deadline - time.monotonic()
             assert remaining > 0, repr(bytes(data))
@@ -109,7 +122,8 @@ def test_real_tty_exit_restores_shell_and_calls_cleanup(tmp_path, state, gesture
                     if b"\x1b[6n" in part:
                         os.write(master, b"\x1b[1;1R")
                 assert process.poll() is None, repr(bytes(data))
-            assert b"In [2]:" in data and b"In [4]:" not in data
+            assert b"In [2]:" in data
+            assert b"In [4]:" not in data
         if gesture is None:
             process.send_signal(signal.SIGTERM)
         else:

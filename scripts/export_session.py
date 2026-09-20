@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Export a read-only journal snapshot to inert, private file:// HTML."""
+
 from __future__ import annotations
 
 import argparse
@@ -53,7 +54,7 @@ def render_event(stream, event: dict, number: int) -> None:
     if event.get("kind") == "generation_request" and isinstance(content, dict):
         messages = content.get("messages")
         if isinstance(messages, list):
-            stream.write('<details><summary>Exact model context: messages</summary>\n')
+            stream.write("<details><summary>Exact model context: messages</summary>\n")
             for index, message in enumerate(messages, 1):
                 if isinstance(message, dict):
                     role = message.get("role", "?")
@@ -62,12 +63,14 @@ def render_event(stream, event: dict, number: int) -> None:
                     role, text = "?", message
                 if not isinstance(text, str):
                     text = json.dumps(text, ensure_ascii=True, allow_nan=False, indent=2)
-                stream.write(f'<h3>Message {index}: {html_text(role)}</h3><pre>{html_text(text)}</pre>\n')
-            stream.write('</details>\n')
+                stream.write(f"<h3>Message {index}: {html_text(role)}</h3><pre>{html_text(text)}</pre>\n")
+            stream.write("</details>\n")
     # No field selection or truncation: original provider body, outputs, metadata
     # and all request-message fields remain available, even for unknown events.
     payload = json.dumps(event, ensure_ascii=True, allow_nan=False, indent=2)
-    stream.write(f'<details><summary>Complete stored event (JSON)</summary><pre>{html_text(payload)}</pre></details>\n</details>\n')
+    stream.write(
+        f"<details><summary>Complete stored event (JSON)</summary><pre>{html_text(payload)}</pre></details>\n</details>\n"
+    )
 
 
 def export_session(journal: Path, output: Path | None = None) -> tuple[Path, int]:
@@ -79,15 +82,16 @@ def export_session(journal: Path, output: Path | None = None) -> tuple[Path, int
     created = None
     fd = None
     try:
-        fd = os.open(output.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                     0o600, dir_fd=parent_fd)
+        fd = os.open(
+            output.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent_fd
+        )
         created = os.fstat(fd)
         # Keep the descriptor pinned through failure cleanup to prevent inode
         # reuse if another process unlinks the newly created destination.
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n", closefd=False) as stream:
             os.fchmod(stream.fileno(), 0o600)
             stream.write(HEADER)
-            stream.write(f'<p>Journal: <code>{html_text(journal)}</code></p>\n')
+            stream.write(f"<p>Journal: <code>{html_text(journal)}</code></p>\n")
             count = 0
             events = journal_events(journal)
             try:
@@ -95,7 +99,7 @@ def export_session(journal: Path, output: Path | None = None) -> tuple[Path, int
                     render_event(stream, event, count)
             finally:
                 events.close()
-            stream.write(f'<p>End of snapshot: {count} events.</p></body></html>\n')
+            stream.write(f"<p>End of snapshot: {count} events.</p></body></html>\n")
         return output, count
     except BaseException:
         if created is not None:
@@ -114,11 +118,18 @@ def export_session(journal: Path, output: Path | None = None) -> tuple[Path, int
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Export full session events and model contexts to private, read-only-view HTML. No code execution or network calls.")
+    parser = argparse.ArgumentParser(
+        description="Export full session events and model contexts to private, read-only-view HTML. No code execution or network calls."
+    )
     parser.add_argument("journal", type=Path, help="Explicit journal.sqlite path")
-    parser.add_argument("output", nargs="?", type=Path, help="New HTML file (default: session.html beside the journal); must not exist")
+    parser.add_argument(
+        "output", nargs="?", type=Path, help="New HTML file (default: session.html beside the journal); must not exist"
+    )
     args = parser.parse_args(argv)
-    print("WARNING: the HTML export may contain secrets; keep it private. It is a snapshot, not a live view.", file=sys.stderr)
+    print(
+        "WARNING: the HTML export may contain secrets; keep it private. It is a snapshot, not a live view.",
+        file=sys.stderr,
+    )
     try:
         output, _ = export_session(args.journal, args.output)
         print(output.as_uri())

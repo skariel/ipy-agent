@@ -4,6 +4,7 @@ Usage is reported by litelm, not necessarily the provider's untouched wire usage
 In particular litelm translates Anthropic cache fields and may omit stream input
 usage. Missing counters remain unknown; we never infer cost or sum cache tokens.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -26,8 +27,12 @@ class Completion:
 
     @property
     def successful(self) -> bool:
-        return (self.rejection_reason is None and self.finish_reason == "stop"
-                and isinstance(self.text, str) and bool(self.text.strip()))
+        return (
+            self.rejection_reason is None
+            and self.finish_reason == "stop"
+            and isinstance(self.text, str)
+            and bool(self.text.strip())
+        )
 
 
 class Provider(Protocol):
@@ -88,12 +93,17 @@ def _validate_messages(messages: list[dict], max_tokens: int | None) -> list[dic
     if not isinstance(messages, list) or not messages:
         raise ValueError("messages must be a nonempty explicit context")
     for message in messages:
-        if (not isinstance(message, dict) or not {"role", "content"} <= set(message)
-                or set(message) - {"role", "content", "phase"}
-                or message["role"] not in {"system", "user", "assistant"}
-                or not isinstance(message["content"], str)
-                or ("phase" in message and (message["role"] != "assistant"
-                    or message["phase"] not in {"commentary", "final_answer"}))):
+        if (
+            not isinstance(message, dict)
+            or not {"role", "content"} <= set(message)
+            or set(message) - {"role", "content", "phase"}
+            or message["role"] not in {"system", "user", "assistant"}
+            or not isinstance(message["content"], str)
+            or (
+                "phase" in message
+                and (message["role"] != "assistant" or message["phase"] not in {"commentary", "final_answer"})
+            )
+        ):
             raise ValueError("Only explicit text system/user/assistant messages are supported")
     return deepcopy(messages)
 
@@ -112,10 +122,13 @@ def _payload_error(message: dict, *, streaming: bool = False) -> str | None:
     if message.get("reasoning_content") is not None and not isinstance(message["reasoning_content"], str):
         return "Unsupported reasoning shape"
     blocks = message.get("thinking_blocks")
-    if blocks is not None and (not isinstance(blocks, list) or any(
-        not isinstance(block, dict) or block.get("type") not in {"thinking", "redacted_thinking"}
-        for block in blocks
-    )):
+    if blocks is not None and (
+        not isinstance(blocks, list)
+        or any(
+            not isinstance(block, dict) or block.get("type") not in {"thinking", "redacted_thinking"}
+            for block in blocks
+        )
+    ):
         return "Unsupported thinking blocks"
     return None
 
@@ -162,14 +175,12 @@ class LitelmProvider:
         self.model, self.api_base, self.stream = model, api_base, stream
 
     async def generate(self, messages: list[dict], *, max_tokens: int | None = None) -> Completion:
-        context = [{"role": m["role"], "content": m["content"]}
-                   for m in _validate_messages(messages, max_tokens)]
+        context = [{"role": m["role"], "content": m["content"]} for m in _validate_messages(messages, max_tokens)]
         try:
             import litelm
         except ImportError as exc:
             raise ProviderError("Install the locked litelm dependencies", kind="configuration") from exc
-        kwargs = {"model": self.model, "messages": context,
-                  "stream": self.stream, "num_retries": 0}
+        kwargs = {"model": self.model, "messages": context, "stream": self.stream, "num_retries": 0}
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
         if self.api_base is not None:
@@ -256,8 +267,7 @@ class LitelmProvider:
             reported["normalized"].pop("input_tokens", None)
             if "input_tokens" in first:
                 reported["normalized"]["input_tokens"] = first["input_tokens"]
-        return Completion("".join(texts), reason, reported,
-                          "".join(thinking) or None, {"chunks": chunks}, rejection)
+        return Completion("".join(texts), reason, reported, "".join(thinking) or None, {"chunks": chunks}, rejection)
 
 
 class FakeProvider:
@@ -268,8 +278,9 @@ class FakeProvider:
     ``requests`` contains independent exact input copies.
     """
 
-    def __init__(self, responses, *, model: str = "fake/deterministic", delay: float = 0,
-                 gate: asyncio.Event | None = None):
+    def __init__(
+        self, responses, *, model: str = "fake/deterministic", delay: float = 0, gate: asyncio.Event | None = None
+    ):
         self.model, self.delay, self.gate = model, delay, gate
         self.responses = list(responses)
         self.requests: list[dict] = []

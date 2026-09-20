@@ -3,6 +3,7 @@
 Adjacent stdout/stderr pipe fragments are coalesced without dropping text or
 clipping JSON. There is no second byte-based output budget in the supervisor.
 """
+
 from __future__ import annotations
 
 from copy import deepcopy

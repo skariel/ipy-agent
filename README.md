@@ -26,8 +26,37 @@ uv run --locked py --model openai-codex/gpt-5.6-sol --network proxy
 Select a model available to your account; there is no implicit model choice.
 Dependencies are locked; tested with Python 3.13.11 and IPython 9.10.0.
 `uv` uses copy mode because hardlinked runtime files can bypass pathname-based
-write protection. To repair an older hardlinked install, run
+write protection. To repair an older repository-local environment, run
 `uv sync --locked --reinstall --link-mode copy`.
+
+### Letting the agent edit this repository
+
+The sandbox recursively permits writes beneath `--workspace` (the launch directory
+by default), but always makes its own runtime and import roots read-only. Consequently,
+launching the repository's editable installation with `uv run py` deliberately makes
+`src/` read-only: `src/py_agent` is part of the trusted runtime. A filesystem wildcard
+cannot override that protection.
+
+To let the agent modify the entire current repository, install a non-editable runtime
+outside it. Explicitly reinstall every dependency in copy mode; `--force` alone can
+leave hardlinked dependencies in the tool environment:
+
+```sh
+cd /path/to/py-agent
+uv tool install --force --reinstall --link-mode copy .
+
+~/.local/bin/py \
+  --workspace "$PWD" \
+  --model openai-codex/gpt-5.6-sol \
+  --network proxy
+```
+
+Here `--workspace "$PWD"` covers the directory recursively—no `*` is needed. The
+external tool runtime remains protected while `src/`, `tests/`, and other repository
+files are writable subject to their normal OS permissions. Re-run the installation
+command after changing `py-agent` itself to refresh the installed runtime.
+If startup reports `Trusted runtime has a hardlinked file`, the tool was not fully
+reinstalled in copy mode; run the exact install command above again.
 
 Codex uses **medium reasoning effort** and reads your existing private
 `~/.pi/agent/auth.json` on every request (`--pi-auth PATH` overrides it). Login and
@@ -73,7 +102,9 @@ shared `/tmp` is also read/write. `--host-root` relocates host storage. Other su
 - `ctx(last) 30%/272k` uses reported input tokens for the current context divided
   by its **configured capacity**, not the byte estimate. Unknown usage shows `?`;
   `out(last)` shows reported output tokens. `/usage` provides the detailed counters.
-- `/history [ID [OFFSET]]`, `/usage`, `/help`, `/interrupt`, `/reset`, `/quit`.
+- `/history [ID [OFFSET]]`, `/usage`, `/help`, `/permissions`, `/interrupt`,
+  `/reset`, `/quit`. Permission prompts are resolved with `/approve ID SCOPE` or
+  `/deny ID`; saved grants can be removed with `/revoke ID`.
 - `/reset` explicitly clears conversation at the next request without resetting
   Python or making extra model calls. New input steers the agent, never Python stdin.
 - Empty idle Ctrl-C exits. During work, first Ctrl-C interrupts; a second within
@@ -85,13 +116,63 @@ shared `/tmp` is also read/write. `--host-root` relocates host storage. Other su
 These names are already available to the model:
 
 ```python
-say("Working on it")                  # user-facing progress
-say("The answer", final=True)         # finish after this cell succeeds
-wait()                                # unwind this cell and await user input
+say("Working on it")  # user-facing progress
+say("The answer", final=True)  # finish after this cell succeeds
+wait()  # unwind this cell and await user input
 history.recent(n=10)
 history.search("query", kind=None, limit=20)
 history.read("EVENT_OR_CELL_ID", offset=0, limit=8000)
+
+# Request brokered writes outside the mounted workspace:
+fs = ask_rw_approval(
+    "/outside/project",
+    recursive=True,
+    operations=("create", "modify", "rename", "delete"),
+    reason="Apply the requested migration",
+)
+fs.write_text("relative/file.txt", "new contents")
+fs.mkdir("generated")
+fs.rename("old.txt", "new.txt")
+fs.remove("obsolete.txt")
 ```
+
+### Interactive permissions
+
+With `--network proxy`, a connection to a destination not already covered by
+`--allow-domain` is paused at the host proxy and shown as a permission request.
+Approve or deny it directly in the terminal:
+
+```text
+/approve perm-1 once
+/approve perm-1 session
+/approve perm-1 project
+/approve perm-1 all
+/deny perm-1
+```
+
+Unanswered prompts fail closed after ten minutes. `once` covers one connection
+or one successful brokered filesystem mutation; `session` lasts until this `py`
+process exits. `project` is saved for the exact
+canonical `--workspace`; `all` saves that same exact resource grant for every
+workspace using this host root. Interactive network grants are exact host/port
+pairs and are never silently widened to wildcards.
+
+Persistent grants live in protected host state, separately from model/budget
+configuration:
+
+```text
+~/.py/permissions.json
+```
+
+A custom `--host-root` relocates this file. Use `/permissions` to list pending and
+saved grants and `/revoke PERMISSION_ID` to remove a saved project/all-project
+grant. The writable repository never stores trusted permission policy.
+
+`ask_rw_approval()` returns a supervisor-brokered capability; it does **not**
+remount the live sandbox. Its relative capability methods work after approval,
+but ordinary `open()`, `pathlib`, shell commands, and subprocesses remain confined
+to the original workspace and `/tmp`. Runtime, authentication, journal, launcher,
+and host-control paths are permanent hard denials and cannot be approved.
 
 Without `final=True` or `wait()`, the next model turn follows automatically.
 `print()` and expression results go back as observations. A failed cell does not
@@ -193,14 +274,17 @@ not infer task quality, actual cache behavior or prices.
   exports can also contain secrets. Prefer a disposable workspace.
 - Supported srt cannot provide the originally requested transparent open network.
   Default `--network open` therefore fails closed. Explicit `--network proxy`
-  with no domains denies worker destinations; add `--allow-domain DOMAIN` only
-  as needed. Proxy mode is not transparent DNS/UDP/localhost networking. Provider
-  calls happen in the supervisor, separately from worker network permissions.
+  uses a host-mediated prompt for destinations not covered by `--allow-domain` or
+  a saved grant. Denial, malformed approval IPC, or shutdown fails closed. Proxy
+  mode is not transparent DNS/UDP/localhost networking. Provider calls happen in
+  the supervisor, separately from worker network permissions.
 - Writes are allowed in the workspace **and shared `/tmp`**, subject to normal OS
   permissions. Worker code can modify other writable temporary files there;
   `/tmp` is not session-private. Default `TMPDIR` remains in workspace scratch.
   Host storage, launcher sockets and trusted runtime/import roots remain protected,
-  including when located under `/tmp`. No unsandboxed fallback exists.
+  including when located under `/tmp`. Approved outside-workspace mutations are
+  performed only through the bounded brokered capability API described above.
+  No unsandboxed fallback exists.
 - **No application work quotas:** no request/cell-count ceilings, execution
   deadlines, CPU/address-space/file/descriptor limits, user-message or logical
   frame-size limits, provider response/chunk quotas, journal quota, or history-call

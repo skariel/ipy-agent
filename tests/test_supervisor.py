@@ -4,14 +4,15 @@ The test-local launcher intentionally bypasses isolation to validate coordinatio
 NOT confinement. It is never used by production or with external model output.
 Real Sandbox enforcement is covered separately by opt-in integration tests.
 """
+
 from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
 import json
 import os
-import re
 from pathlib import Path
+import re
 import signal
 import sqlite3
 import sys
@@ -20,15 +21,15 @@ import pytest
 
 from py_agent.history import Journal
 from py_agent.limits import Limits
+from py_agent.protocol import decode_frame, encode_frame
 from py_agent.provider import Completion, FakeProvider, ProviderError
-from py_agent.protocol import encode_frame, decode_frame
 from py_agent.supervisor import Supervisor
 
 WORKER = Path(__file__).resolve().parents[1] / "src/py_agent/worker.py"
 
 # Fixed test-only bootstrap, intentionally kept in the test launcher rather than
 # adding a production path override. Only output's tempfile reference changes.
-WORKER_BOOTSTRAP = r'''
+WORKER_BOOTSTRAP = r"""
 import runpy, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,11 +43,12 @@ def local_mkstemp(**kwargs):
 
 output.tempfile = SimpleNamespace(mkstemp=local_mkstemp)
 runpy.run_path(str(worker), run_name="__main__")
-'''
+"""
 
 
 class TrustedFixtureLauncher:
     """Fixed worker bootstrap for test literals; not an execution backend."""
+
     def __init__(self, directory):
         self.directory = directory
         self.process = None
@@ -57,12 +59,24 @@ class TrustedFixtureLauncher:
         artifacts = self.directory / "output-artifacts"
         artifacts.mkdir(mode=0o700, exist_ok=True)
         self.process = await asyncio.create_subprocess_exec(
-            sys.executable, "-I", "-c", WORKER_BOOTSTRAP, str(WORKER), str(artifacts),
+            sys.executable,
+            "-I",
+            "-c",
+            WORKER_BOOTSTRAP,
+            str(WORKER),
+            str(artifacts),
             cwd=self.directory,
-            env={"HOME": str(self.directory), "IPYTHONDIR": str(self.directory / "profile"),
-                 "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "PAGER": "/bin/cat"},
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, start_new_session=True,
+            env={
+                "HOME": str(self.directory),
+                "IPYTHONDIR": str(self.directory / "profile"),
+                "PATH": "/usr/bin:/bin",
+                "LANG": "C.UTF-8",
+                "PAGER": "/bin/cat",
+            },
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         return self.process
 
@@ -93,8 +107,11 @@ class Observed:
                     self.changed.clear()
                     await self.changed.wait()
         except TimeoutError as exc:
-            diagnostics = [(e["kind"], str(e["content"])[:4096]) for e in self.events
-                           if e["kind"] in {"error", "launcher_stderr", "cell_uncertain", "state"}][-8:]
+            diagnostics = [
+                (e["kind"], str(e["content"])[:4096])
+                for e in self.events
+                if e["kind"] in {"error", "launcher_stderr", "cell_uncertain", "state"}
+            ][-8:]
             raise AssertionError(f"Supervisor wait timed out; latest diagnostics: {diagnostics!r}") from exc
 
     def kind(self, kind):
@@ -105,13 +122,28 @@ class Observed:
 
 
 @asynccontextmanager
-async def running(tmp_path, responses=(), *, provider=None, limits=None, context_window_tokens=None):
+async def running(
+    tmp_path,
+    responses=(),
+    *,
+    provider=None,
+    limits=None,
+    context_window_tokens=None,
+    permissions=None,
+):
     launcher = TrustedFixtureLauncher(tmp_path)
     journal = Journal(tmp_path / "host" / "journal.sqlite", "test_run")
     observed = Observed()
     provider = provider or FakeProvider(responses)
-    supervisor = Supervisor(provider, launcher, journal, limits=limits, on_event=observed,
-                            context_window_tokens=context_window_tokens)
+    supervisor = Supervisor(
+        provider,
+        launcher,
+        journal,
+        limits=limits,
+        on_event=observed,
+        context_window_tokens=context_window_tokens,
+        permissions=permissions,
+    )
     await supervisor.start()
     try:
         yield supervisor, observed, provider, launcher
@@ -126,8 +158,10 @@ def all_events(supervisor, kind=None):
 
 
 async def test_final_is_staged_until_success_and_errors_keep_partial_effects(tmp_path):
-    responses = ["value = 41\nsay('not final', final=True)\nraise ValueError('later failure')",
-                 "say(value + 1, final=True)"]
+    responses = [
+        "value = 41\nsay('not final', final=True)\nraise ValueError('later failure')",
+        "say(value + 1, final=True)",
+    ]
     async with running(tmp_path, responses) as (sup, seen, provider, _):
         sup.submit("Do the fixed test")
         await seen.state(sup, "DONE")
@@ -155,23 +189,33 @@ async def test_question_prose_returns_format_error_then_automatically_retries(tm
 async def test_codex_first_cell_executes_before_next_model_turn_not_its_later_claim(tmp_path, monkeypatch):
     # Fixed trusted cells through the real adapter and test-local worker. No live
     # model, credentials, or arbitrary recorded source is used in this test.
-    import httpx
     import json
     from types import SimpleNamespace
-    from py_agent.codex import CodexProvider
+
+    import httpx
     from test_codex import message, terminal
 
-    monkeypatch.setattr("py_agent.codex.read_codex_credentials",
-                        lambda _: SimpleNamespace(access="mock-token", account_id="mock-account"))
+    from py_agent.codex import CodexProvider
+
+    monkeypatch.setattr(
+        "py_agent.codex.read_codex_credentials",
+        lambda _: SimpleNamespace(access="mock-token", account_id="mock-account"),
+    )
     responses = [
-        terminal(output=[message("value = 42\nprint('verified', value)", phase="commentary"),
-                         message("say('invented missing results', final=True)", phase="final_answer")]),
+        terminal(
+            output=[
+                message("value = 42\nprint('verified', value)", phase="commentary"),
+                message("say('invented missing results', final=True)", phase="final_answer"),
+            ]
+        ),
         terminal(output=[message("say(value, final=True)", phase="final_answer")]),
     ]
     requests = []
+
     def transport(request):
         requests.append(json.loads(request.content))
         return httpx.Response(200, json=responses[len(requests) - 1])
+
     provider = CodexProvider("openai-codex/test", transport=httpx.MockTransport(transport))
     async with running(tmp_path, provider=provider) as (sup, seen, _, launcher):
         sup.submit("inspect the fixed value and report it")
@@ -189,14 +233,17 @@ async def test_codex_first_cell_executes_before_next_model_turn_not_its_later_cl
 
 
 async def test_nonfinal_cell_automatically_returns_stdout_stderr_and_display_to_model(tmp_path):
-    responses = ["import sys\nvalue = 42\nsay('Investigating')\nprint('stdout evidence')\nprint('stderr evidence', file=sys.stderr)\nvalue",
-                 "say(value, final=True)"]
+    responses = [
+        "import sys\nvalue = 42\nsay('Investigating')\nprint('stdout evidence')\nprint('stderr evidence', file=sys.stderr)\nvalue",
+        "say(value, final=True)",
+    ]
     async with running(tmp_path, responses) as (sup, seen, provider, launcher):
         sup.submit("investigate")
         await seen.state(sup, "DONE")
         assert len(provider.requests) == 2
-        observations = "\n".join(m["content"] for m in provider.requests[1]["messages"]
-                                 if m["content"].startswith("[RUNTIME OBSERVATION"))
+        observations = "\n".join(
+            m["content"] for m in provider.requests[1]["messages"] if m["content"].startswith("[RUNTIME OBSERVATION")
+        )
         assert "stdout evidence" in observations
         assert "stderr evidence" in observations
         assert "42" in observations
@@ -206,8 +253,12 @@ async def test_nonfinal_cell_automatically_returns_stdout_stderr_and_display_to_
 
 
 async def test_wait_yields_without_execution_after_it_and_reuses_kernel(tmp_path):
-    async with running(tmp_path, ["value = 9\nsay('question')\nwait()\nvalue = 100",
-                                  "say(value, final=True)"]) as (sup, seen, provider, launcher):
+    async with running(tmp_path, ["value = 9\nsay('question')\nwait()\nvalue = 100", "say(value, final=True)"]) as (
+        sup,
+        seen,
+        provider,
+        launcher,
+    ):
         sup.submit("begin")
         await seen.until(lambda: bool(seen.kind("cell_end")) and sup.state == "IDLE")
         assert len(provider.requests) == 1
@@ -218,16 +269,26 @@ async def test_wait_yields_without_execution_after_it_and_reuses_kernel(tmp_path
 
 
 async def test_wait_and_final_conflict_is_not_completion(tmp_path):
-    async with running(tmp_path, ["say('bad final', final=True)\nwait()", "say('fixed', final=True)"]) as (sup, seen, _, _):
+    async with running(tmp_path, ["say('bad final', final=True)\nwait()", "say('fixed', final=True)"]) as (
+        sup,
+        seen,
+        _,
+        _,
+    ):
         sup.submit("begin")
         await seen.state(sup, "DONE")
         assert seen.kind("cell_end")[0]["content"]["status"] == "invalid_control"
         assert [e["content"] for e in seen.kind("say")] == ["fixed"]
 
 
-@pytest.mark.parametrize("completion", [Completion("effect = 100", finish_reason="length"),
-                                        Completion("effect = 100", rejection_reason="refusal"),
-                                        Completion("")])
+@pytest.mark.parametrize(
+    "completion",
+    [
+        Completion("effect = 100", finish_reason="length"),
+        Completion("effect = 100", rejection_reason="refusal"),
+        Completion(""),
+    ],
+)
 async def test_failed_completions_never_dispatch_partial_source(tmp_path, completion):
     async with running(tmp_path, [completion, "say('effect' in globals(), final=True)"]) as (sup, seen, provider, _):
         sup.submit("begin")
@@ -243,23 +304,30 @@ async def test_failed_completions_never_dispatch_partial_source(tmp_path, comple
 
 async def test_large_valid_cell_executes_then_context_compacts_without_extra_model_turn(tmp_path):
     large = "# " + "x" * 22000 + "\neffect = 999"
-    async with running(tmp_path, [Completion(large, usage={"normalized": {"input_tokens": 22800}}),
-                                  "say(effect, final=True)"],
-                       limits=Limits(input_tokens=24000)) as (sup, seen, provider, launcher):
+    async with running(
+        tmp_path,
+        [Completion(large, usage={"normalized": {"input_tokens": 22800}}), "say(effect, final=True)"],
+        limits=Limits(input_tokens=24000),
+    ) as (sup, seen, provider, launcher):
         uid = sup.submit("preserve this active task: report the computed effect")
         await seen.state(sup, "DONE")
         assert [e["content"] for e in seen.kind("say")] == [999]
         assert [e["content"] for e in seen.kind("source")] == [large, "say(effect, final=True)"]
-        assert len(provider.requests) == 2 and launcher.starts == 1
+        assert len(provider.requests) == 2
+        assert launcher.starts == 1
         assert sup.context.epoch == 2
         messages = provider.requests[1]["messages"]
-        assert not any(m["role"] == "user" and m["content"] == "preserve this active task: report the computed effect" for m in messages)
+        assert not any(
+            m["role"] == "user" and m["content"] == "preserve this active task: report the computed effect"
+            for m in messages
+        )
         assert len(messages) == 1  # whole dispatched conversation is cleared
         assert not any(m["role"] == "assistant" and m["content"] == large for m in messages)
         commit = all_events(sup, "epoch_commit")[-1]
         assert uid in commit["content"]["evicted"]
         sup.context.check(messages)
-        assert not seen.kind("retry") and not seen.kind("error")
+        assert not seen.kind("retry")
+        assert not seen.kind("error")
         assert not seen.kind("checkpoint")
         assert not any(e["content"].get("checkpoint") for e in seen.kind("generation_request"))
 
@@ -290,7 +358,10 @@ async def test_generation_steering_cancels_then_includes_input_once_in_order(tmp
         assert provider.cancelled == 1
         assert [e["content"] for e in seen.kind("say")] == [False]
         messages = provider.requests[-1]["messages"]
-        assert [m["content"] for m in messages if m["content"] in {"first exact input", "second exact input"}] == ["first exact input", "second exact input"]
+        assert [m["content"] for m in messages if m["content"] in {"first exact input", "second exact input"}] == [
+            "first exact input",
+            "second exact input",
+        ]
         assert [e["content"] for e in seen.kind("user_accepted")] == [first, second]
         assert seen.kind("generation_cancelled")[0]["content"]["usage"] == "unknown"
 
@@ -298,12 +369,19 @@ async def test_generation_steering_cancels_then_includes_input_once_in_order(tmp
 class CancellationResistantProvider(FakeProvider):
     async def generate(self, messages, *, max_tokens):
         if not self.requests:
-            self.requests.append({"messages": [m.copy() for m in messages], "max_tokens": max_tokens, "model": self.model})
+            self.requests.append({
+                "messages": [m.copy() for m in messages],
+                "max_tokens": max_tokens,
+                "model": self.model,
+            })
             self.started.set()
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
-                return Completion("say('stale should not run', final=True)", usage={"reported": 7, "normalized": {"input_tokens": 272000}})
+                return Completion(
+                    "say('stale should not run', final=True)",
+                    usage={"reported": 7, "normalized": {"input_tokens": 272000}},
+                )
         return await super().generate(messages, max_tokens=max_tokens)
 
 
@@ -317,15 +395,18 @@ async def test_cancellation_resistant_stale_completion_is_discarded(tmp_path):
         assert [e["content"] for e in seen.kind("say")] == ["fresh"]
         assert len(seen.kind("source")) == 1
         discarded = seen.kind("generation_response")[0]
-        assert discarded["stale"] and discarded["content"]["usage"]["normalized"]["input_tokens"] == 272000
+        assert discarded["stale"]
+        assert discarded["content"]["usage"]["normalized"]["input_tokens"] == 272000
         assert sup.context.epoch == 1
         assert len(all_events(sup, "epoch_commit")) == 1
 
 
 @pytest.mark.parametrize("control", ["wait()", "say('first done', final=True)"])
 async def test_execution_steering_survives_wait_final_boundary(tmp_path, control):
-    source = ("from pathlib import Path\nimport time\nvalue = 8\nsay('running')\n"
-              "while not Path('release').exists():\n    time.sleep(0.005)\n" + control)
+    source = (
+        "from pathlib import Path\nimport time\nvalue = 8\nsay('running')\n"
+        "while not Path('release').exists():\n    time.sleep(0.005)\n" + control
+    )
     async with running(tmp_path, [source, "say(value + 1, final=True)"]) as (sup, seen, provider, _):
         sup.submit("first")
         await seen.until(lambda: any(e["content"] == "running" for e in seen.kind("say")))
@@ -340,8 +421,9 @@ async def test_execution_steering_survives_wait_final_boundary(tmp_path, control
 
 
 async def test_provider_retry_exhaustion_keeps_underlying_error_visible(tmp_path):
-    async with running(tmp_path, [ProviderError("endpoint returned HTTP 503")],
-                       limits=Limits(generation_retries=0)) as (sup, seen, _, _):
+    async with running(
+        tmp_path, [ProviderError("endpoint returned HTTP 503")], limits=Limits(generation_retries=0)
+    ) as (sup, seen, _, _):
         sup.submit("begin")
         await seen.state(sup, "FAILED")
         assert "HTTP 503" in seen.kind("error")[-1]["content"]
@@ -370,6 +452,7 @@ async def test_authentication_failure_pauses_without_blind_retries(tmp_path):
 
 async def test_codex_serialized_request_is_journaled_without_auth_reads(tmp_path):
     from py_agent.codex import CodexProvider
+
     adapter = CodexProvider("openai-codex/test-model")
     provider = FakeProvider(["say('done', final=True)"], model=adapter.model)
     provider.request_details = adapter.request_details
@@ -377,7 +460,9 @@ async def test_codex_serialized_request_is_journaled_without_auth_reads(tmp_path
         sup.submit("begin")
         await seen.state(sup, "DONE")
         request = seen.kind("generation_request")[0]["content"]
-        assert request["provider_request"]["body"] == adapter.build_request(provider.requests[0]["messages"], max_tokens=sup.limits.output_tokens)
+        assert request["provider_request"]["body"] == adapter.build_request(
+            provider.requests[0]["messages"], max_tokens=sup.limits.output_tokens
+        )
         assert request["provider_request"]["output_limit_enforcement"] == "none"
         assert "Authorization" not in json.dumps(request)
 
@@ -390,21 +475,26 @@ async def test_every_journaled_request_matches_provider_submission(tmp_path):
             for key in ("messages", "max_tokens", "model"):
                 assert event["content"][key] == request[key]
         first, second = [r["messages"] for r in provider.requests]
-        assert second[:len(first)] == first
+        assert second[: len(first)] == first
 
 
 async def test_live_memories_variables_and_functions_survive_reset_without_injection_or_replay(tmp_path):
-    first = ("assert memories == []\nmemories.extend(['short-term finding', lambda: 17])\n"
-             "notes_id = id(memories)\nvalue = 17\ndef compute():\n    return value + 1\n"
-             "print('evidence-marker')\nwait()")
-    final = ("assert id(memories) == notes_id\nassert memories[0] == 'short-term finding'\n"
-             "assert memories[1]() == value == 17\nassert compute() == 18\n"
-             "say(history.search('evidence-marker', kind='output', limit=1), final=True)")
+    first = (
+        "assert memories == []\nmemories.extend(['short-term finding', lambda: 17])\n"
+        "notes_id = id(memories)\nvalue = 17\ndef compute():\n    return value + 1\n"
+        "print('evidence-marker')\nwait()"
+    )
+    final = (
+        "assert id(memories) == notes_id\nassert memories[0] == 'short-term finding'\n"
+        "assert memories[1]() == value == 17\nassert compute() == 18\n"
+        "say(history.search('evidence-marker', kind='output', limit=1), final=True)"
+    )
     async with running(tmp_path, [first, "wait()", final]) as (sup, seen, provider, launcher):
         sup.submit("begin")
         await seen.until(lambda: len(seen.kind("cell_end")) == 1 and sup.state == "IDLE")
         assert not (tmp_path / "memory.md").exists()
-        assert not hasattr(sup, "memory") and not hasattr(sup.context, "snapshot")
+        assert not hasattr(sup, "memory")
+        assert not hasattr(sup.context, "snapshot")
         initial_prompt = provider.requests[0]["messages"][0]["content"]
         assert "This context started with 0 memories" in initial_prompt
         assert sup._memories_count == 2
@@ -416,18 +506,22 @@ async def test_live_memories_variables_and_functions_survive_reset_without_injec
         assert len(provider.requests) == 2  # reset never runs an inspection/save cell
         sup.submit("continue after reset")
         await seen.state(sup, "DONE")
-        assert sup.context.epoch == 2 and launcher.starts == 1
+        assert sup.context.epoch == 2
+        assert launcher.starts == 1
         assert provider.requests[1]["messages"][0]["content"] == initial_prompt
         assert "This context started with 2 memories" in provider.requests[2]["messages"][0]["content"]
         assert len(provider.requests) == len(seen.kind("source")) == 3
         assert "short-term finding" not in json.dumps(provider.requests[-1]["messages"])
-        assert not any(m["role"] == "assistant" and "value = 17" in m["content"]
-                       for m in provider.requests[-1]["messages"])
+        assert not any(
+            m["role"] == "assistant" and "value = 17" in m["content"] for m in provider.requests[-1]["messages"]
+        )
         assert seen.kind("say")[-1]["content"][0]["kind"] == "output"
         assert len([e for e in seen.kind("source") if e["content"] == first]) == 1
-        assert not seen.kind("checkpoint") and not seen.kind("memory_draft")
+        assert not seen.kind("checkpoint")
+        assert not seen.kind("memory_draft")
         commits = all_events(sup, "epoch_commit")
-        assert len(commits) == 2 and commits[-1]["content"]["evicted"]
+        assert len(commits) == 2
+        assert commits[-1]["content"]["evicted"]
         assert commits[-1]["starting_memories_count"] == 2
         assert commits[-1]["system_prompt"] == sup.context.contract
         assert all("snapshot" not in event["content"] for event in commits)
@@ -437,12 +531,19 @@ async def test_live_memories_variables_and_functions_survive_reset_without_injec
 async def test_automatic_compaction_preserves_live_memories_without_inserting_them(tmp_path):
     first = "# " + "x" * 22000 + "\nmemories.append('kernel-only note')\nvalue = 17"
     final = "say({'note': memories[0], 'value': value}, final=True)"
-    async with running(tmp_path, [Completion(first, usage={"normalized": {"input_tokens": 258400}}), final]) as (sup, seen, provider, launcher):
+    async with running(tmp_path, [Completion(first, usage={"normalized": {"input_tokens": 258400}}), final]) as (
+        sup,
+        seen,
+        provider,
+        launcher,
+    ):
         uid = sup.submit("perform the fixed task")
         await seen.state(sup, "DONE")
         assert seen.kind("say")[-1]["content"] == {"note": "kernel-only note", "value": 17}
-        assert sup.context.epoch == 2 and launcher.starts == 1
-        assert len(provider.requests) == 2 and len(seen.kind("source")) == 2
+        assert sup.context.epoch == 2
+        assert launcher.starts == 1
+        assert len(provider.requests) == 2
+        assert len(seen.kind("source")) == 2
         assert "kernel-only note" not in json.dumps(provider.requests[1]["messages"])
         assert len(provider.requests[1]["messages"]) == 1
         assert "This context started with 1 memories" in provider.requests[1]["messages"][0]["content"]
@@ -451,7 +552,8 @@ async def test_automatic_compaction_preserves_live_memories_without_inserting_th
         assert commit["content"]["retained"] == []
         assert seen.kind("source")[0]["id"] in commit["content"]["evicted"]
         assert "snapshot" not in commit["content"]
-        assert not seen.kind("memory_draft") and not seen.kind("checkpoint")
+        assert not seen.kind("memory_draft")
+        assert not seen.kind("checkpoint")
 
 
 async def test_steering_cancels_normal_generation_after_synchronous_reset(tmp_path):
@@ -474,7 +576,8 @@ async def test_steering_cancels_normal_generation_after_synchronous_reset(tmp_pa
         assert uid in [e["content"] for e in seen.kind("user_accepted")]
         final_input = [m["content"] for m in provider.requests[-1]["messages"] if m["role"] == "user"]
         assert "original active goal" not in final_input
-        assert "continue" in final_input and "new steering after reset" in final_input
+        assert "continue" in final_input
+        assert "new steering after reset" in final_input
         assert len(all_events(sup, "epoch_commit")) == 2
         assert len(seen.kind("source")) == 2
         assert not seen.kind("checkpoint")
@@ -484,8 +587,9 @@ async def test_steering_cancels_normal_generation_after_synchronous_reset(tmp_pa
 async def test_memory_md_is_ordinary_file_never_observed_or_injected(tmp_path, file_kind):
     path = tmp_path / "memory.md"
     if file_kind in {"text", "oversize", "invalid_utf8"}:
-        path.write_bytes({"text": b"file-only instruction", "oversize": b"x" * 32769,
-                          "invalid_utf8": b"\xff"}[file_kind])
+        path.write_bytes(
+            {"text": b"file-only instruction", "oversize": b"x" * 32769, "invalid_utf8": b"\xff"}[file_kind]
+        )
     elif file_kind == "symlink":
         target = tmp_path / "ordinary-file"
         target.write_text("file-only instruction")
@@ -500,21 +604,29 @@ async def test_memory_md_is_ordinary_file_never_observed_or_injected(tmp_path, f
         sup.submit("continue")
         await seen.state(sup, "DONE")
         assert seen.kind("say")[-1]["content"] == 17
-        assert sup.context.epoch == 2 and launcher.starts == 1
+        assert sup.context.epoch == 2
+        assert launcher.starts == 1
         assert len(provider.requests) == len(seen.kind("source")) == 2
         assert not any(event["kind"].startswith("memory_") for event in seen.events)
         assert "file-only instruction" not in json.dumps(provider.requests)
-        assert not seen.kind("checkpoint") and not seen.kind("error")
+        assert not seen.kind("checkpoint")
+        assert not seen.kind("error")
         if original is None:
             assert not path.exists()
         else:
             current = path.lstat()
-            assert (current.st_ino, current.st_size, current.st_mtime_ns) == (original.st_ino, original.st_size, original.st_mtime_ns)
+            assert (current.st_ino, current.st_size, current.st_mtime_ns) == (
+                original.st_ino,
+                original.st_size,
+                original.st_mtime_ns,
+            )
 
 
 async def test_new_kernel_has_fresh_memories_and_no_variable_restore(tmp_path):
-    for index, source in enumerate(("memories.append('old session')\nold_value = 17\nsay('done', final=True)",
-                                   "say([memories, 'old_value' in globals()], final=True)")):
+    for index, source in enumerate((
+        "memories.append('old session')\nold_value = 17\nsay('done', final=True)",
+        "say([memories, 'old_value' in globals()], final=True)",
+    )):
         directory = tmp_path / str(index)
         directory.mkdir()
         async with running(directory, [source]) as (sup, seen, provider, _):
@@ -535,17 +647,16 @@ async def test_context_window_status_matches_effective_eviction_capacity(tmp_pat
         assert sup.context.messages() == [{"role": "system", "content": sup.context.contract}]
 
 
-
 async def test_reported_low_tokens_keep_large_byte_context_append_only(tmp_path):
     source = "# " + "x" * 26000 + "\nvalue = 17"
-    responses = [Completion(source, usage={"normalized": {"input_tokens": 1000}}),
-                 "say(value, final=True)"]
+    responses = [Completion(source, usage={"normalized": {"input_tokens": 1000}}), "say(value, final=True)"]
     async with running(tmp_path, responses, limits=Limits(input_tokens=24000)) as (sup, seen, provider, _):
         sup.submit("keep the entire conversation")
         await seen.state(sup, "DONE")
-        assert sup.context.epoch == 1 and len(all_events(sup, "epoch_commit")) == 1
+        assert sup.context.epoch == 1
+        assert len(all_events(sup, "epoch_commit")) == 1
         first, second = [request["messages"] for request in provider.requests]
-        assert second[:len(first)] == first
+        assert second[: len(first)] == first
         assert any(message["content"] == source for message in second)
         assert sup.context.estimate(second) > sup.context.window_tokens
         assert sup.context.reported_input_tokens == 1000  # later missing usage doesn't erase it
@@ -554,45 +665,56 @@ async def test_reported_low_tokens_keep_large_byte_context_append_only(tmp_path)
 
 
 async def test_near_capacity_reported_usage_clears_entire_dispatched_context(tmp_path):
-    responses = [Completion("value = 17", usage={"normalized": {"input_tokens": 258399}}),
-                 Completion("value += 1", usage={"normalized": {"input_tokens": 258400}}),
-                 Completion("say(value, final=True)", usage={"normalized": {"input_tokens": 1100}})]
+    responses = [
+        Completion("value = 17", usage={"normalized": {"input_tokens": 258399}}),
+        Completion("value += 1", usage={"normalized": {"input_tokens": 258400}}),
+        Completion("say(value, final=True)", usage={"normalized": {"input_tokens": 1100}}),
+    ]
     async with running(tmp_path, responses) as (sup, seen, provider, launcher):
         uid = sup.submit("calculate this unfinished task")
         await seen.state(sup, "DONE")
-        assert sup.context.epoch == 2 and launcher.starts == 1
+        assert sup.context.epoch == 2
+        assert launcher.starts == 1
         first, second, third = [request["messages"] for request in provider.requests]
-        assert second[:len(first)] == first  # 94.995% must not trigger early eviction
-        assert len(third) == 1 and third[0]["role"] == "system"
+        assert second[: len(first)] == first  # 94.995% must not trigger early eviction
+        assert len(third) == 1
+        assert third[0]["role"] == "system"
         assert "calculate this unfinished task" not in json.dumps(third)
         commit = all_events(sup, "epoch_commit")[-1]
-        assert uid in commit["content"]["evicted"] and commit["content"]["retained"] == []
+        assert uid in commit["content"]["evicted"]
+        assert commit["content"]["retained"] == []
         assert seen.kind("say")[-1]["content"] == 18
         assert sup.status()["context_input_tokens"] == 1100
-        assert not seen.kind("checkpoint") and len(seen.kind("source")) == 3
+        assert not seen.kind("checkpoint")
+        assert len(seen.kind("source")) == 3
 
 
 async def test_late_orphan_usage_cannot_change_new_epoch_capacity(tmp_path):
-    responses = [Completion("wait()", usage={"normalized": {"input_tokens": 1000}}),
-                 Completion("wait()", usage={"normalized": {"input_tokens": 2000}}),
-                 "say('done', final=True)"]
+    responses = [
+        Completion("wait()", usage={"normalized": {"input_tokens": 1000}}),
+        Completion("wait()", usage={"normalized": {"input_tokens": 2000}}),
+        "say('done', final=True)",
+    ]
     async with running(tmp_path, responses) as (sup, seen, provider, _):
         sup.submit("start")
         await seen.until(lambda: len(seen.kind("cell_end")) == 1 and sup.state == "IDLE")
         sup.request_reset()
         sup.submit("new epoch")
         await seen.until(lambda: len(seen.kind("cell_end")) == 2 and sup.state == "IDLE")
-        assert sup.context.epoch == 2 and sup.context.reported_input_tokens == 2000
+        assert sup.context.epoch == 2
+        assert sup.context.reported_input_tokens == 2000
         orphan = asyncio.get_running_loop().create_future()
-        orphan.set_result(Completion("raise AssertionError('must not run')",
-                                     usage={"normalized": {"input_tokens": 272000}}))
+        orphan.set_result(
+            Completion("raise AssertionError('must not run')", usage={"normalized": {"input_tokens": 272000}})
+        )
         sup._late_generation(orphan, "a1:g-old-orphan")
         assert sup.usage[-1]["normalized"]["input_tokens"] == 272000  # retained for audit only
         assert sup.status()["context_input_tokens"] == 2000
         assert not sup.context.needs_reset()
         sup.submit("continue")
         await seen.state(sup, "DONE")
-        assert sup.context.epoch == 2 and len(all_events(sup, "epoch_commit")) == 2
+        assert sup.context.epoch == 2
+        assert len(all_events(sup, "epoch_commit")) == 2
         assert len(seen.kind("source")) == len(provider.requests) == 3
 
 
@@ -609,7 +731,9 @@ async def test_missing_or_unavailable_memories_count_is_unknown_at_next_reset(tm
 
 
 async def test_ordinary_cell_error_after_reset_uses_normal_correction_loop(tmp_path):
-    async with running(tmp_path, ["wait()", "raise ValueError('ordinary cell failed')", "say('corrected', final=True)"]) as (sup, seen, provider, _):
+    async with running(
+        tmp_path, ["wait()", "raise ValueError('ordinary cell failed')", "say('corrected', final=True)"]
+    ) as (sup, seen, provider, _):
         sup.submit("begin")
         await seen.until(lambda: len(seen.kind("cell_end")) == 1 and sup.state == "IDLE")
         sup.request_reset()
@@ -624,7 +748,12 @@ async def test_ordinary_cell_error_after_reset_uses_normal_correction_loop(tmp_p
 
 
 async def test_reset_clears_completed_and_unfinished_dispatched_instructions(tmp_path):
-    async with running(tmp_path, ["say('first done', final=True)", "value = 17\nwait()", "say(value, final=True)"]) as (sup, seen, provider, _):
+    async with running(tmp_path, ["say('first done', final=True)", "value = 17\nwait()", "say(value, final=True)"]) as (
+        sup,
+        seen,
+        provider,
+        _,
+    ):
         old_id = sup.submit("old completed instruction")
         await seen.state(sup, "DONE")
         active_id = sup.submit("new unfinished task")
@@ -641,8 +770,10 @@ async def test_reset_clears_completed_and_unfinished_dispatched_instructions(tmp
 
 
 async def test_steering_during_execution_is_carried_verbatim_into_next_context_reset(tmp_path):
-    active_cell = ("from pathlib import Path\nimport time\nsay('ordinary cell running')\n"
-                   "while not Path('release').exists():\n    time.sleep(0.005)\n")
+    active_cell = (
+        "from pathlib import Path\nimport time\nsay('ordinary cell running')\n"
+        "while not Path('release').exists():\n    time.sleep(0.005)\n"
+    )
     async with running(tmp_path, [active_cell, "say('done', final=True)"]) as (sup, seen, provider, _):
         active_id = sup.submit("original task")
         await seen.until(lambda: any(e["content"] == "ordinary cell running" for e in seen.kind("say")))
@@ -660,15 +791,40 @@ async def test_steering_during_execution_is_carried_verbatim_into_next_context_r
 
 
 async def test_history_broker_honors_requested_page_and_keeps_retrieval_provenance(tmp_path):
-    source = ("page = history.read(history.search('needle', kind='user')[0]['id'], limit=999999)\n"
-              "say({'chars': len(page['content']), 'truncated': page['truncated']}, final=True)")
+    source = (
+        "page = history.read(history.search('needle', kind='user')[0]['id'], limit=999999)\n"
+        "say({'chars': len(page['content']), 'truncated': page['truncated']}, final=True)"
+    )
     async with running(tmp_path, [source], limits=Limits(input_tokens=50000)) as (sup, seen, _, _):
         sup.submit("needle " + "a" * 9000)
         await seen.state(sup, "DONE")
         page = seen.kind("say")[-1]["content"]
-        assert page["chars"] > 9000 and not page["truncated"]
+        assert page["chars"] > 9000
+        assert not page["truncated"]
         assert all_events(sup, "retrieval")
         assert not any(e["kind"] == "retrieval" for e in sup.journal.search("needle"))
+
+
+async def test_rw_approval_blocks_for_user_and_brokers_host_write(tmp_path):
+    from py_agent.permissions import PermissionManager, PermissionStore
+
+    target = tmp_path / "outside"
+    target.mkdir()
+    manager = PermissionManager(PermissionStore(tmp_path / "permissions"), tmp_path)
+    source = (
+        f"fs = ask_rw_approval({str(target)!r}, operations=('create',), reason='write result')\n"
+        "fs.write_text('result.txt', 'approved')\n"
+        "say('done', final=True)"
+    )
+    async with running(tmp_path, [source], permissions=manager) as (sup, seen, _, _):
+        sup.submit("write outside")
+        await seen.until(lambda: bool(seen.kind("permission_request")))
+        request_id = seen.kind("permission_request")[-1]["content"]["request_id"]
+        sup.resolve_permission(request_id, allow=True, scope="project")
+        await seen.state(sup, "DONE")
+        assert (target / "result.txt").read_text() == "approved"
+        assert seen.kind("permission_decision")[-1]["content"]["scope"] == "project"
+        assert all_events(sup, "permission_broker")
 
 
 async def test_actual_worker_crash_stops_without_replay(tmp_path):
@@ -714,10 +870,13 @@ async def test_oversized_output_reaches_model_as_file_notice_and_kernel_continue
         assert len(provider.requests) == 2
         assert len(seen.kind("source")) == 2
         assert [event["content"] for event in seen.kind("say")] == [{"runs": 1, "read_chars": 4000}]
-        assert not seen.kind("error") and not seen.kind("cell_uncertain")
+        assert not seen.kind("error")
+        assert not seen.kind("cell_uncertain")
         assert provider.artifact.stat().st_size == 2000000
-        assert "line\n" * 800 == "".join(event["content"] for event in seen.kind("output")
-                                          if event["cell_id"] == "a1:c000002")
+        assert (
+            "".join(event["content"] for event in seen.kind("output") if event["cell_id"] == "a1:c000002")
+            == "line\n" * 800
+        )
         assert sum(len(event["content"]) for event in seen.kind("output")) < 6000
     # pytest owns the entire artifact directory; no notice-driven unlinking.
 
@@ -725,8 +884,12 @@ async def test_oversized_output_reaches_model_as_file_notice_and_kernel_continue
 @pytest.mark.parametrize("character", ["x", "🐍"])
 @pytest.mark.parametrize("count", [7999, 8000, 8001])
 async def test_output_character_boundary_survives_transport_and_next_cell(tmp_path, character, count):
-    async with running(tmp_path, [f"kept = 42\nprint({character!r} * {count}, end='')",
-                                  "say(kept, final=True)"]) as (sup, seen, provider, _):
+    async with running(tmp_path, [f"kept = 42\nprint({character!r} * {count}, end='')", "say(kept, final=True)"]) as (
+        sup,
+        seen,
+        provider,
+        _,
+    ):
         sup.submit("exercise the output character boundary")
         await seen.state(sup, "DONE")
         outputs = "".join(event["content"] for event in seen.kind("output"))
@@ -737,15 +900,16 @@ async def test_output_character_boundary_survives_transport_and_next_cell(tmp_pa
             assert not artifacts
             observation = json.loads(provider.requests[1]["messages"][-1]["content"].split("\n", 1)[1])
             assert "".join(event.get("text", "") for event in observation["events"]) == character * count
-            assert not observation["truncated"] and observation["omitted_events"] == 0
+            assert not observation["truncated"]
+            assert observation["omitted_events"] == 0
         else:
             assert "size=8001 chars, lines=1" in outputs
             assert "Output too long to display here" in provider.requests[1]["messages"][-1]["content"]
-            assert any(path.read_text(encoding="utf-8") == character * count
-                       for path in artifacts if path.exists())
+            assert any(path.read_text(encoding="utf-8") == character * count for path in artifacts if path.exists())
         assert seen.kind("say")[-1]["content"] == 42
         assert len(provider.requests) == 2
-        assert not seen.kind("error") and not seen.kind("cell_uncertain")
+        assert not seen.kind("error")
+        assert not seen.kind("cell_uncertain")
 
 
 async def test_generation_interrupt_stops_without_replay_and_can_accept_steering(tmp_path):
@@ -790,11 +954,13 @@ async def test_more_than_100_history_calls_do_not_kill_kernel(tmp_path):
         sup.submit("exercise repeated history paging")
         await seen.state(sup, "DONE")
         assert len(seen.kind("retrieval")) == 120
-        assert not seen.kind("error") and not seen.kind("cell_uncertain")
+        assert not seen.kind("error")
+        assert not seen.kind("cell_uncertain")
 
 
 class ScriptedProcess:
     """In-memory malicious-peer fixture; does not execute any source."""
+
     def __init__(self, responder):
         self.stdout = asyncio.StreamReader()
         self.stderr = asyncio.StreamReader()
@@ -827,12 +993,14 @@ class ScriptedProcess:
 
 async def test_more_than_100_provider_requests_are_allowed(tmp_path):
     calls = 0
+
     def respond(cmd):
         nonlocal calls
         calls += 1
         if calls == 121:
             yield {"v": 1, "type": "say", "cell_id": cmd["cell_id"], "content": "finished", "final": True}
         yield {"v": 1, "type": "cell_end", "cell_id": cmd["cell_id"], "status": "success", "execution_count": calls}
+
     peer = ScriptedProcess(respond)
     provider = FakeProvider(["pass"] * 121)
     seen = Observed()
@@ -844,18 +1012,21 @@ async def test_more_than_100_provider_requests_are_allowed(tmp_path):
             await seen.state(sup, "DONE")
             assert len(provider.requests) == sup.status()["requests"] == calls == 121
             assert len(seen.kind("source")) == 121
-            assert not seen.kind("error") and not peer.closed
+            assert not seen.kind("error")
+            assert not peer.closed
         finally:
             await sup.close()
 
 
 async def test_worker_and_launcher_traffic_have_no_cumulative_byte_cutoff(tmp_path):
     block = "x" * 4096
+
     def respond(cmd):
         for _ in range(300):
             yield {"v": 1, "type": "output", "cell_id": cmd["cell_id"], "stream": "stdout", "text": block}
         yield {"v": 1, "type": "say", "cell_id": cmd["cell_id"], "content": "done", "final": True}
         yield {"v": 1, "type": "cell_end", "cell_id": cmd["cell_id"], "status": "success", "execution_count": 1}
+
     peer = ScriptedProcess(respond)
     peer.stderr.feed_data(b"s" * (4096 * 300))
     seen = Observed()
@@ -868,22 +1039,29 @@ async def test_worker_and_launcher_traffic_have_no_cumulative_byte_cutoff(tmp_pa
             await seen.until(lambda: sum(len(e["content"]) for e in seen.kind("launcher_stderr")) == 4096 * 300)
             assert sum(len(e["content"]) for e in seen.kind("output")) == 4096 * 300
             assert len(sup._stderr_tail) == 4096  # diagnostic tail only, not an acceptance cap
-            assert not seen.kind("error") and not peer.closed
+            assert not seen.kind("error")
+            assert not peer.closed
             # Late old-cell text is also preserved, not independently excerpted.
             late = "late-" * 2400
-            peer.stdout.feed_data(encode_frame({"v": 1, "type": "output", "cell_id": "a1:c000001",
-                                               "stream": "stdout", "text": late}))
+            peer.stdout.feed_data(
+                encode_frame({"v": 1, "type": "output", "cell_id": "a1:c000001", "stream": "stdout", "text": late})
+            )
             await seen.until(lambda: any(e.get("asynchronous") for e in seen.kind("output")))
             assert late in sup.context.messages()[-1]["content"]
         finally:
             await sup.close()
 
 
-@pytest.mark.parametrize("responder", [
-    lambda cmd: [{"v": 1, "type": "output", "cell_id": "a1:c999999", "stream": "stdout", "text": "forged"}],
-    lambda cmd: [{"v": 1, "type": "ready", "kernel_pid": 456}],
-    lambda cmd: [{"v": 1, "type": "cell_end", "cell_id": cmd["cell_id"], "status": "success", "execution_count": 1}] * 2,
-])
+@pytest.mark.parametrize(
+    "responder",
+    [
+        lambda cmd: [{"v": 1, "type": "output", "cell_id": "a1:c999999", "stream": "stdout", "text": "forged"}],
+        lambda cmd: [{"v": 1, "type": "ready", "kernel_pid": 456}],
+        lambda cmd: (
+            [{"v": 1, "type": "cell_end", "cell_id": cmd["cell_id"], "status": "success", "execution_count": 1}] * 2
+        ),
+    ],
+)
 async def test_untrusted_unknown_cells_unsolicited_ready_duplicate_end_stop_peer(tmp_path, responder):
     peer = ScriptedProcess(responder)
     journal = Journal(tmp_path / "journal.sqlite", "frames")
@@ -910,7 +1088,8 @@ async def test_nonempty_journal_is_not_a_kernel_resume(tmp_path):
         try:
             with pytest.raises(RuntimeError, match="Reopening runs is not implemented"):
                 await sup.start()
-            assert sup.process is None and not provider.requests
+            assert sup.process is None
+            assert not provider.requests
             assert journal.read(prior["id"])["content"]
         finally:
             await sup.close()
@@ -920,8 +1099,9 @@ async def test_nonempty_journal_is_not_a_kernel_resume(tmp_path):
 # fixed. They are deliberately not xfailed so safety regressions remain visible.
 async def test_failed_steered_generation_pauses_without_consuming_extra_retry(tmp_path):
     gate = asyncio.Event()
-    provider = FakeProvider(["pass", Completion("partial = 1", finish_reason="length"),
-                             "say('unexpected retry', final=True)"], gate=gate)
+    provider = FakeProvider(
+        ["pass", Completion("partial = 1", finish_reason="length"), "say('unexpected retry', final=True)"], gate=gate
+    )
     async with running(tmp_path, provider=provider, limits=Limits(generation_retries=0)) as (sup, seen, _, _):
         sup.submit("begin")
         await provider.started.wait()
@@ -934,24 +1114,29 @@ async def test_failed_steered_generation_pauses_without_consuming_extra_retry(tm
 
 
 async def test_actual_journal_failure_during_output_stops_without_crashing_actor(tmp_path, monkeypatch):
-    source = ("from pathlib import Path\nimport time\nsay('ready')\n"
-              "while not Path('release').exists():\n    time.sleep(0.005)\n"
-              "print('output when storage is unavailable')\nwait()")
+    source = (
+        "from pathlib import Path\nimport time\nsay('ready')\n"
+        "while not Path('release').exists():\n    time.sleep(0.005)\n"
+        "print('output when storage is unavailable')\nwait()"
+    )
     async with running(tmp_path, [source]) as (sup, seen, _, launcher):
         sup.submit("begin")
         await seen.until(lambda: bool(seen.kind("say")))
         append = sup.journal.append
+
         def unavailable(kind, *args, **kwargs):
             if kind == "output":
                 raise sqlite3.OperationalError("database or disk is full")
             return append(kind, *args, **kwargs)
+
         monkeypatch.setattr(sup.journal, "append", unavailable)
         (tmp_path / "release").touch()
         await seen.state(sup, "FAILED")
         await asyncio.wait_for(launcher.process.wait(), 3)
         error = sup._driver.exception() if sup._driver.done() and not sup._driver.cancelled() else None
         assert error is None, f"Storage failure escaped the supervisor actor: {error!r}"
-        assert sup._storage_failed and launcher.process.returncode is not None
+        assert sup._storage_failed
+        assert launcher.process.returncode is not None
 
 
 async def test_successful_final_after_reset_is_a_normal_task_completion(tmp_path):
@@ -963,7 +1148,8 @@ async def test_successful_final_after_reset_is_a_normal_task_completion(tmp_path
         await seen.state(sup, "DONE")
         assert [e["content"] for e in seen.kind("say") if e.get("final")] == ["completed normally"]
         assert len(provider.requests) == len(seen.kind("source")) == 2
-        assert not seen.kind("final_discarded") and not seen.kind("checkpoint")
+        assert not seen.kind("final_discarded")
+        assert not seen.kind("checkpoint")
 
 
 async def test_interrupt_rejects_cancellation_resistant_completion(tmp_path):
@@ -982,11 +1168,13 @@ async def test_interrupt_rejects_cancellation_resistant_completion(tmp_path):
 
 
 async def test_unicode_output_does_not_trigger_byte_based_context_eviction(tmp_path):
-    async with running(tmp_path, ['print("😀" * 5000)', "say('done', final=True)"],
-                       limits=Limits(input_tokens=8000)) as (sup, seen, provider, _):
+    async with running(
+        tmp_path, ['print("😀" * 5000)', "say('done', final=True)"], limits=Limits(input_tokens=8000)
+    ) as (sup, seen, provider, _):
         sup.submit("begin")
         await seen.state(sup, "DONE")
-        assert len(provider.requests) == 2 and sup.context.epoch == 1
+        assert len(provider.requests) == 2
+        assert sup.context.epoch == 1
         sup.context.check(provider.requests[-1]["messages"])
         assert "😀" * 5000 in provider.requests[-1]["messages"][-1]["content"]
         assert "😀" * 5000 in "".join(e["content"] for e in all_events(sup, "output"))
@@ -997,33 +1185,40 @@ async def test_unicode_output_does_not_trigger_byte_based_context_eviction(tmp_p
 
 async def test_sqlite_disk_failure_terminates_idle_kernel(tmp_path, monkeypatch):
     async with running(tmp_path, []) as (sup, seen, _, launcher):
+
         def unavailable(*args, **kwargs):
             raise sqlite3.OperationalError("database or disk is full")
+
         monkeypatch.setattr(sup.journal, "append", unavailable)
         with pytest.raises(sqlite3.OperationalError):
             sup.submit("must fail before acceptance")
         await asyncio.wait_for(launcher.process.wait(), 3)
-        assert sup.state == "FAILED" and sup._storage_failed
+        assert sup.state == "FAILED"
+        assert sup._storage_failed
         assert not sup.pending
         assert any(e.get("persisted") is False for e in seen.events)
 
 
 async def test_epoch_storage_failure_keeps_old_context_and_stops_kernel(tmp_path, monkeypatch):
     async with running(tmp_path, ["say('must not run', final=True)"]) as (sup, seen, provider, launcher):
+
         def unavailable(*args, **kwargs):
             raise sqlite3.OperationalError("database or disk is full")
+
         monkeypatch.setattr(sup.journal, "commit_epoch", unavailable)
         sup.request_reset()
         sup.submit("reset the conversation window")
         await seen.state(sup, "FAILED")
         await asyncio.wait_for(launcher.process.wait(), 3)
         assert sup.context.epoch == 1
-        assert not provider.requests and not seen.kind("source")
+        assert not provider.requests
+        assert not seen.kind("source")
         assert sup._storage_failed
 
 
 async def test_close_kills_worker_without_waiting_for_uncooperative_provider(tmp_path):
     release = asyncio.Event()
+
     class Stubborn(FakeProvider):
         async def generate(self, messages, *, max_tokens):
             self.started.set()
@@ -1033,6 +1228,7 @@ async def test_close_kills_worker_without_waiting_for_uncooperative_provider(tmp
                 except asyncio.CancelledError:
                     pass
             return Completion("say('must not execute', final=True)")
+
     provider = Stubborn([])
     async with running(tmp_path, provider=provider) as (sup, seen, _, launcher):
         sup.submit("begin")
@@ -1048,7 +1244,7 @@ async def test_close_kills_worker_without_waiting_for_uncooperative_provider(tmp
 
 async def test_worker_fatal_diagnostic_is_in_user_visible_failure(tmp_path):
     # A trusted fixture forces the NEXT capture thread to fail deterministically.
-    poison = "import threading\ndef no_threads(*args, **kwargs):\n    raise RuntimeError(\"can't start new thread\")\nthreading.Thread.start = no_threads"
+    poison = 'import threading\ndef no_threads(*args, **kwargs):\n    raise RuntimeError("can\'t start new thread")\nthreading.Thread.start = no_threads'
     async with running(tmp_path, [poison, "print('must not execute')"]) as (sup, seen, _, _):
         sup.submit("begin")
         await seen.state(sup, "FAILED")

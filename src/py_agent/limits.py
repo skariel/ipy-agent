@@ -1,4 +1,7 @@
 """Context capacity and explicit provider/retry configuration, not work quotas."""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 

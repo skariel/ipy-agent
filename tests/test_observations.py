@@ -1,4 +1,7 @@
 """Lossless observation packing: no provider, worker or source execution."""
+
+from __future__ import annotations
+
 from copy import deepcopy
 import random
 
@@ -15,7 +18,8 @@ def test_split_print_arguments_are_one_lossless_stream_run():
     events = [output(f"e{i}", text) for i, text in enumerate(["f", " ", "file.py", "\n"])]
     assert pack_observations(events) == {
         "events": [output("e0", "f file.py\n", last_id="e3")],
-        "truncated": False, "omitted_events": 0,
+        "truncated": False,
+        "omitted_events": 0,
     }
 
 
@@ -27,17 +31,29 @@ def test_many_fragments_coalesce_without_metadata_consuming_a_budget():
 
 
 def test_stream_say_and_display_boundaries_preserve_order():
-    events = [output("e0", "one"), output("e1", "\n"), output("e2", "error", "stderr"),
-              {"id": "e3", "say": "progress", "final": False},
-              output("e4", "42", "display"), output("e5", "43", "display"),
-              output("e6", "last"), output("e7", "\n")]
-    assert pack_observations(events)["events"] == [output("e0", "one\n", last_id="e1"),
-                                                   *events[2:6], output("e6", "last\n", last_id="e7")]
+    events = [
+        output("e0", "one"),
+        output("e1", "\n"),
+        output("e2", "error", "stderr"),
+        {"id": "e3", "say": "progress", "final": False},
+        output("e4", "42", "display"),
+        output("e5", "43", "display"),
+        output("e6", "last"),
+        output("e7", "\n"),
+    ]
+    assert pack_observations(events)["events"] == [
+        output("e0", "one\n", last_id="e1"),
+        *events[2:6],
+        output("e6", "last\n", last_id="e7"),
+    ]
 
 
 def test_origin_metadata_prevents_cross_cell_or_late_stream_merging():
-    events = [output("e0", "one", cell_id="c1"), output("e1", "two", cell_id="c2"),
-              output("e2", "late", cell_id="c2", asynchronous=True)]
+    events = [
+        output("e0", "one", cell_id="c1"),
+        output("e1", "two", cell_id="c2"),
+        output("e2", "late", cell_id="c2", asynchronous=True),
+    ]
     assert pack_observations(events)["events"] == events
 
 
@@ -61,8 +77,11 @@ def test_structured_say_is_preserved_without_serialized_excerpts():
 
 
 def test_input_is_not_mutated_or_aliased():
-    events = [output("e0", "a" * 10000, metadata={"labels": ["unchanged"]}),
-              output("e1", "tail"), {"id": "e2", "say": {"nested": [1]}, "final": False}]
+    events = [
+        output("e0", "a" * 10000, metadata={"labels": ["unchanged"]}),
+        output("e1", "tail"),
+        {"id": "e2", "say": {"nested": [1]}, "final": False},
+    ]
     before = deepcopy(events)
     result = pack_observations(events)
     result["events"][0]["metadata"]["labels"].append("changed result")
@@ -83,11 +102,17 @@ def test_invalid_event_containers_fail_explicitly(events):
 def test_randomized_mixed_events_are_lossless_and_do_not_mutate_input():
     rng = random.Random(3101)
     for _ in range(100):
-        events = [output(f"e{index}", rng.choice(["snow雪", '"quoted"\n', "tail 🐍", "\x00\\"]) * rng.randrange(200),
-                         rng.choice(["stdout", "stderr", "display"]))
-                  for index in range(rng.randrange(1, 30))]
+        events = [
+            output(
+                f"e{index}",
+                rng.choice(["snow雪", '"quoted"\n', "tail 🐍", "\x00\\"]) * rng.randrange(200),
+                rng.choice(["stdout", "stderr", "display"]),
+            )
+            for index in range(rng.randrange(1, 30))
+        ]
         before = deepcopy(events)
         packed = pack_observations(events)
         assert "".join(event["text"] for event in packed["events"]) == "".join(event["text"] for event in events)
-        assert not packed["truncated"] and packed["omitted_events"] == 0
+        assert not packed["truncated"]
+        assert packed["omitted_events"] == 0
         assert events == before

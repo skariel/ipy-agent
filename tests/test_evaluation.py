@@ -1,4 +1,5 @@
 """Offline accounting fixtures. Stored source is data and is never executed."""
+
 from __future__ import annotations
 
 import json
@@ -12,27 +13,37 @@ import pytest
 from py_agent.evaluation import account_trace, journal_events
 from py_agent.history import Journal
 
-
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/replay_trace.py"
 
 
 def event(kind, content, *, timestamp=0, **metadata):
-    return {"run_id": "r1", "agent_id": "a1", "kind": kind, "content": content,
-            "timestamp": timestamp, **metadata}
+    return {"run_id": "r1", "agent_id": "a1", "kind": kind, "content": content, "timestamp": timestamp, **metadata}
 
 
 def request(number, *, checkpoint=False):
-    return event("generation_request", {"model": "example/model", "checkpoint": checkpoint,
-                 "messages": [{"role": "user", "content": "😀" if number == 1 else "x"}],
-                 "estimated_input_tokens": number * 100 + 64},
-                 generation_id=f"g{number}", timestamp=number * 10)
+    return event(
+        "generation_request",
+        {
+            "model": "example/model",
+            "checkpoint": checkpoint,
+            "messages": [{"role": "user", "content": "😀" if number == 1 else "x"}],
+            "estimated_input_tokens": number * 100 + 64,
+        },
+        generation_id=f"g{number}",
+        timestamp=number * 10,
+    )
 
 
 def response(number, usage, *, reason="stop", stale=False, duration=None, timestamp=None):
     extra = {} if duration is None else {"duration": duration}
-    return event("generation_response", {"text": "SECRET SOURCE MUST NOT APPEAR", "finish_reason": reason,
-                 "rejection_reason": None, "usage": usage}, generation_id=f"g{number}", stale=stale,
-                 timestamp=number * 10 if timestamp is None else timestamp, **extra)
+    return event(
+        "generation_response",
+        {"text": "SECRET SOURCE MUST NOT APPEAR", "finish_reason": reason, "rejection_reason": None, "usage": usage},
+        generation_id=f"g{number}",
+        stale=stale,
+        timestamp=number * 10 if timestamp is None else timestamp,
+        **extra,
+    )
 
 
 def reported(**counters):
@@ -42,36 +53,55 @@ def reported(**counters):
 def known_trace():
     return [
         event("epoch_commit", {"epoch_id": "x1"}),
-        request(1), response(1, reported(input_tokens=100, output_tokens=20, total_tokens=120,
-                                      cache_read_tokens=90, reasoning_tokens=3), duration=2),
+        request(1),
+        response(
+            1,
+            reported(input_tokens=100, output_tokens=20, total_tokens=120, cache_read_tokens=90, reasoning_tokens=3),
+            duration=2,
+        ),
         event("source", "raise AssertionError('must never execute stored source')", cell_id="c1"),
         event("dispatch", {}, cell_id="c1", timestamp=10),
         event("say_staged", "SECRET USER TEXT", cell_id="c1", final=True),
         event("cell_end", {"status": "success"}, cell_id="c1", timestamp=12),
         event("say", "SECRET USER TEXT", cell_id="c1", final=True),
-        request(2), event("generation_cancelled", {"generation_id": "g2", "usage": "unknown", "stale": True}, timestamp=23),
+        request(2),
+        event("generation_cancelled", {"generation_id": "g2", "usage": "unknown", "stale": True}, timestamp=23),
         event("checkpoint", "secret checkpoint instructions"),
-        request(3, checkpoint=True), event("generation_cancelled", {"generation_id": "g3", "usage": "unknown", "stale": True}, timestamp=32),
+        request(3, checkpoint=True),
+        event("generation_cancelled", {"generation_id": "g3", "usage": "unknown", "stale": True}, timestamp=32),
         response(3, reported(input_tokens=80, output_tokens=10, cache_creation_tokens=12), stale=True, timestamp=34),
         event("generation_stale", {"generation_id": "g3"}),
-        event("epoch_commit", {"epoch_id": "x2"}), event("retrieval", {"secret_original": "not reported"}),
-        request(4), response(4, reported(input_tokens=110, output_tokens=5), reason="length", duration=5),
-        request(5), event("generation_error", {"generation_id": "g5", "usage": "unknown", "error": "SECRET ERROR"}, timestamp=56),
-        event("source", "invalid literal", cell_id="c2"), event("dispatch", {}, cell_id="c2", timestamp=60),
+        event("epoch_commit", {"epoch_id": "x2"}),
+        event("retrieval", {"secret_original": "not reported"}),
+        request(4),
+        response(4, reported(input_tokens=110, output_tokens=5), reason="length", duration=5),
+        request(5),
+        event("generation_error", {"generation_id": "g5", "usage": "unknown", "error": "SECRET ERROR"}, timestamp=56),
+        event("source", "invalid literal", cell_id="c2"),
+        event("dispatch", {}, cell_id="c2", timestamp=60),
         event("say_staged", "not final", cell_id="c2", final=True),
         event("cell_end", {"status": "error"}, cell_id="c2", timestamp=63),
         event("final_discarded", "cell failed", cell_id="c2"),
-        event("source", "pass", cell_id="c3"), event("dispatch", {}, cell_id="c3", timestamp=70),
+        event("source", "pass", cell_id="c3"),
+        event("dispatch", {}, cell_id="c3", timestamp=70),
         event("cell_uncertain", "unknown effects", cell_id="c3"),
-        event("error", "do not copy the original error"), event("memory_error", "private path"), event("fatal_limit", "disk full"),
+        event("error", "do not copy the original error"),
+        event("memory_error", "private path"),
+        event("fatal_limit", "disk full"),
     ]
 
 
 def test_known_trace_exact_counts_separate_usage_and_unknowns():
     report = account_trace(iter(known_trace()))
     assert {key: value for key, value in report["requests"].items() if key != "records"} == {
-        "count": 5, "observed_generations": 5, "checkpoint_calls": 1, "cancelled": 2,
-        "discarded_stale": 2, "errored": 1, "rejected_responses": 1, "unknown_usage_requests": 2,
+        "count": 5,
+        "observed_generations": 5,
+        "checkpoint_calls": 1,
+        "cancelled": 2,
+        "discarded_stale": 2,
+        "errored": 1,
+        "rejected_responses": 1,
+        "unknown_usage_requests": 2,
     }
     groups = report["reported_usage_by_model_and_source"]
     assert [(g["source"], g["requests"]) for g in groups] == [("reported_by_litelm", 3), ("unknown", 2)]
@@ -85,21 +115,37 @@ def test_known_trace_exact_counts_separate_usage_and_unknowns():
     # Cache and reasoning subsets/premiums were NOT added into input/output.
     assert report["input_size"] == {
         "estimate_method": "Context.estimate: UTF-8 content bytes plus 64 per message, not provider tokens",
-        "estimated_bytes_with_overhead_sum": 1820, "estimates_known": 5,
-        "message_content_utf8_bytes_sum": 8, "content_sizes_known": 5,
+        "estimated_bytes_with_overhead_sum": 1820,
+        "estimates_known": 5,
+        "message_content_utf8_bytes_sum": 8,
+        "content_sizes_known": 5,
     }
-    assert report["generation_latency"] == {"seconds_sum": 20.0, "reported_durations": 2,
-                                              "derived_wall_clock_durations": 3, "unknown": 0}
-    assert report["cells"] == {"sources": 3, "dispatched": 3, "completed": 2,
-                                "statuses": {"error": 1, "success": 1}, "uncertain": 1,
-                                "latency_seconds_sum": 5.0, "latency_known": 2,
-                                "published_finals": 1, "staged_finals": 2, "discarded_final_cells": 1}
+    assert report["generation_latency"] == {
+        "seconds_sum": 20.0,
+        "reported_durations": 2,
+        "derived_wall_clock_durations": 3,
+        "unknown": 0,
+    }
+    assert report["cells"] == {
+        "sources": 3,
+        "dispatched": 3,
+        "completed": 2,
+        "statuses": {"error": 1, "success": 1},
+        "uncertain": 1,
+        "latency_seconds_sum": 5.0,
+        "latency_known": 2,
+        "published_finals": 1,
+        "staged_finals": 2,
+        "discarded_final_cells": 1,
+    }
     assert report["context"] == {"epoch_commits": 2, "transitions": 1, "checkpoint_notices": 1, "retrieval_calls": 1}
     assert report["errors"] == {"runtime_notifications": 1, "memory": 1, "fatal_limits": 1, "provider_requests": 1}
     assert report["cost"] == {"status": "unknown", "amount": None, "currency": None, "price_source": None}
     assert report["anomalies"] == {}
     encoded = json.dumps(report)
-    assert "SECRET" not in encoded and "secret checkpoint" not in encoded and "invalid literal" not in encoded
+    assert "SECRET" not in encoded
+    assert "secret checkpoint" not in encoded
+    assert "invalid literal" not in encoded
 
 
 def test_current_requests_need_no_legacy_checkpoint_fields():
@@ -112,9 +158,12 @@ def test_current_requests_need_no_legacy_checkpoint_fields():
 
 
 def test_late_usage_resolves_cancellation_without_double_counting():
-    events = [request(1), event("generation_cancelled", {"generation_id": "g1", "usage": "unknown"}),
-              response(1, reported(input_tokens=10, output_tokens=2), stale=True),
-              response(1, reported(input_tokens=10, output_tokens=2), stale=True)]
+    events = [
+        request(1),
+        event("generation_cancelled", {"generation_id": "g1", "usage": "unknown"}),
+        response(1, reported(input_tokens=10, output_tokens=2), stale=True),
+        response(1, reported(input_tokens=10, output_tokens=2), stale=True),
+    ]
     report = account_trace(events)
     assert report["requests"]["cancelled"] == 1
     assert report["requests"]["unknown_usage_requests"] == 0
@@ -140,9 +189,14 @@ def test_separate_run_agent_model_and_usage_provenance():
     first = request(1)
     second = {**request(1), "run_id": "r2"}
     second["content"]["model"] = "different/model"
-    events = [first, response(1, reported(input_tokens=7)), second,
-              {**response(1, {"source": "other_convention", "normalized": {"input_tokens": 8}}), "run_id": "r2"},
-              event("epoch_commit", {}), {**event("epoch_commit", {}), "run_id": "r2"}]
+    events = [
+        first,
+        response(1, reported(input_tokens=7)),
+        second,
+        {**response(1, {"source": "other_convention", "normalized": {"input_tokens": 8}}), "run_id": "r2"},
+        event("epoch_commit", {}),
+        {**event("epoch_commit", {}), "run_id": "r2"},
+    ]
     report = account_trace(events)
     assert report["requests"]["count"] == 2
     assert report["context"]["transitions"] == 0
@@ -151,8 +205,10 @@ def test_separate_run_agent_model_and_usage_provenance():
 
 
 def test_orphan_lifecycle_and_missing_latency_are_visible():
-    report = account_trace([event("generation_request", {}),
-                            {k: v for k, v in response(1, {}).items() if k != "timestamp"}])
+    report = account_trace([
+        event("generation_request", {}),
+        {k: v for k, v in response(1, {}).items() if k != "timestamp"},
+    ])
     assert report["requests"]["count"] == 0
     assert report["requests"]["observed_generations"] == 1
     assert report["generation_latency"]["unknown"] == 1
@@ -170,7 +226,8 @@ def test_read_only_journal_preserves_content_permissions_and_does_not_execute(tm
     before, mode = path.read_bytes(), path.stat().st_mode
     report = account_trace(journal_events(path))
     assert report["cells"]["dispatched"] == 1
-    assert path.read_bytes() == before and path.stat().st_mode == mode
+    assert path.read_bytes() == before
+    assert path.stat().st_mode == mode
     assert not marker.exists()
     assert sorted(p.name for p in tmp_path.iterdir()) == [path.name]
     with pytest.raises(FileNotFoundError):
@@ -200,33 +257,43 @@ def test_reader_rejects_invalid_but_accepts_large_records(tmp_path):
 def test_cli_multiple_journals_json_and_terminal_escape_safety(tmp_path):
     path = tmp_path / "journal.sqlite"
     with Journal(path, "cli") as journal:
-        journal.append("generation_request", {"model": "hostile\x1b]52;title\x07\u202e", "messages": [], "max_tokens": 2}, generation_id="a1:g1")
+        journal.append(
+            "generation_request",
+            {"model": "hostile\x1b]52;title\x07\u202e", "messages": [], "max_tokens": 2},
+            generation_id="a1:g1",
+        )
         journal.append("output", "ORIGINAL OUTPUT MUST NOT PRINT \x1b[31m", cell_id="a1:c1")
-    result = subprocess.run([sys.executable, str(SCRIPT), str(path), "--journal", str(path)],
-                            capture_output=True, text=True, check=True)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), str(path), "--journal", str(path)], capture_output=True, text=True, check=True
+    )
     value = json.loads(result.stdout)
     assert len(value["journals"]) == 2
-    assert "\x1b" not in result.stdout and "\u202e" not in result.stdout
-    assert "\\u001b" in result.stdout and "\\u202e" in result.stdout
+    assert "\x1b" not in result.stdout
+    assert "\u202e" not in result.stdout
+    assert "\\u001b" in result.stdout
+    assert "\\u202e" in result.stdout
     assert "ORIGINAL OUTPUT" not in result.stdout
     assert result.stderr == ""
 
 
 def test_cli_requires_a_journal_and_has_no_synthetic_benchmark_options():
     missing = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True, text=True)
-    assert missing.returncode == 2 and "supply a journal" in missing.stderr
-    removed = subprocess.run([sys.executable, str(SCRIPT), "--compare-tails", "0", "3"],
-                             capture_output=True, text=True)
-    assert removed.returncode == 2 and "unrecognized arguments" in removed.stderr
+    assert missing.returncode == 2
+    assert "supply a journal" in missing.stderr
+    removed = subprocess.run([sys.executable, str(SCRIPT), "--compare-tails", "0", "3"], capture_output=True, text=True)
+    assert removed.returncode == 2
+    assert "unrecognized arguments" in removed.stderr
     help_result = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, check=True)
     assert "--compare-tails" not in help_result.stdout
-    assert "--turns" not in help_result.stdout and "--reset-every" not in help_result.stdout
+    assert "--turns" not in help_result.stdout
+    assert "--reset-every" not in help_result.stdout
 
 
 def test_cli_missing_database_reports_only_escaped_stderr(tmp_path):
     path = tmp_path / "missing\x1b[31m.sqlite"
     result = subprocess.run([sys.executable, str(SCRIPT), str(path)], capture_output=True, text=True)
-    assert result.returncode == 1 and result.stdout == ""
+    assert result.returncode == 1
+    assert result.stdout == ""
     assert "\x1b" not in result.stderr
     assert "\\u001b" in result.stderr or "\\\\x1b" in result.stderr
     assert not path.exists()

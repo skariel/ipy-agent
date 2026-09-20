@@ -6,6 +6,7 @@ not accept max_output_tokens. Completed responses are not rejected for exceeding
 an artificial local token budget. Complete-response validation remains; partial
 stream text is never returned for execution.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -21,18 +22,28 @@ from .provider import Completion, ProviderError, _validate_messages
 
 CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 _TERMINAL = {"response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled"}
-_DELTA_EVENTS = {"response.output_text.delta", "response.output_text.done",
-                 "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
-                 "response.reasoning_text.delta", "response.reasoning_text.done"}
+_DELTA_EVENTS = {
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_summary_text.done",
+    "response.reasoning_text.delta",
+    "response.reasoning_text.done",
+}
 _METADATA_EVENTS = {"response.created", "response.in_progress", "response.queued"}
-_PART_EVENTS = {"response.content_part.added", "response.content_part.done",
-                "response.reasoning_summary_part.added", "response.reasoning_summary_part.done"}
+_PART_EVENTS = {
+    "response.content_part.added",
+    "response.content_part.done",
+    "response.reasoning_summary_part.added",
+    "response.reasoning_summary_part.done",
+}
 
 
 def read_codex_credentials(path):
     # Lazy import permits the independent adapter/auth modules to be tested and
     # wired separately. There is no fallback to environment or API-key auth.
     from .codex_auth import read_codex_credentials as read
+
     return read(path)
 
 
@@ -47,8 +58,11 @@ def _unique_object(pairs):
 
 def _parse_event(data: bytes) -> dict:
     try:
-        result = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object,
-                            parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite JSON")))
+        result = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_unique_object,
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite JSON")),
+        )
         if not isinstance(result, dict) or not isinstance(result.get("type"), str):
             raise ValueError("Missing event type")
         return result
@@ -59,8 +73,11 @@ def _parse_event(data: bytes) -> dict:
 def _json_response_event(data: bytes, secrets=()) -> dict:
     """Accept only a native Responses object/envelope, never guessed source."""
     try:
-        obj = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object,
-                         parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite JSON")))
+        obj = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_unique_object,
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite JSON")),
+        )
     except (ValueError, UnicodeError, RecursionError):
         raise ProviderError("Malformed Codex JSON response; no source accepted", kind="response_format") from None
     if isinstance(obj, dict):
@@ -74,7 +91,9 @@ def _json_response_event(data: bytes, secrets=()) -> dict:
         if isinstance(error, str):
             detail = _redact(error, secrets)[:512]
             raise ProviderError(f"Codex returned a JSON error: {detail}; no source accepted", kind="response_error")
-    raise ProviderError("Codex returned unsupported JSON, not a Responses result; no source accepted", kind="response_format")
+    raise ProviderError(
+        "Codex returned unsupported JSON, not a Responses result; no source accepted", kind="response_format"
+    )
 
 
 async def _events(response, secrets=()):
@@ -105,7 +124,7 @@ async def _events(response, secrets=()):
                 scan_from = len(pending)
                 break
             line = bytes(pending[:newline]).removesuffix(b"\r")
-            del pending[:newline + 1]
+            del pending[: newline + 1]
             scan_from = 0
             if not line:
                 if data_lines:
@@ -134,12 +153,18 @@ async def _events(response, secrets=()):
                 elif field == b"event":
                     event_name = value
                 elif field not in (b"id", b"retry"):
-                    raise ProviderError(f"Unsupported Codex SSE field/non-SSE response (Content-Type: {media_type!r}); no source accepted", kind="response_format")
+                    raise ProviderError(
+                        f"Unsupported Codex SSE field/non-SSE response (Content-Type: {media_type!r}); no source accepted",
+                        kind="response_format",
+                    )
     if wire_format == "json":
         yield _json_response_event(bytes(pending), secrets)
         return
     if pending or data_lines or event_name is not None:
-        raise ProviderError(f"Truncated Codex SSE frame or non-SSE response (Content-Type: {media_type!r}); no source accepted", kind="response_format")
+        raise ProviderError(
+            f"Truncated Codex SSE frame or non-SSE response (Content-Type: {media_type!r}); no source accepted",
+            kind="response_format",
+        )
 
 
 def _usage(raw: Any) -> dict:
@@ -149,8 +174,10 @@ def _usage(raw: Any) -> dict:
         raise ProviderError("Unsupported Codex usage shape", kind="shape")
     normalized = {}
     for name, path in {
-        "input_tokens": ("input_tokens",), "output_tokens": ("output_tokens",),
-        "total_tokens": ("total_tokens",), "cache_read_tokens": ("input_tokens_details", "cached_tokens"),
+        "input_tokens": ("input_tokens",),
+        "output_tokens": ("output_tokens",),
+        "total_tokens": ("total_tokens",),
+        "cache_read_tokens": ("input_tokens_details", "cached_tokens"),
         "reasoning_tokens": ("output_tokens_details", "reasoning_tokens"),
     }.items():
         value = raw
@@ -172,8 +199,10 @@ def _item_error(item: Any, *, final=False) -> str | None:
         return "Unexpected Codex tool call or refusal"
     if item["type"] == "reasoning":
         summary = item.get("summary", [])
-        if not isinstance(summary, list) or any(not isinstance(p, dict) or p.get("type") != "summary_text"
-                                              or not isinstance(p.get("text"), str) for p in summary):
+        if not isinstance(summary, list) or any(
+            not isinstance(p, dict) or p.get("type") != "summary_text" or not isinstance(p.get("text"), str)
+            for p in summary
+        ):
             return "Unsupported Codex reasoning summary"
         return None
     if item.get("role") != "assistant":
@@ -185,8 +214,10 @@ def _item_error(item: Any, *, final=False) -> str | None:
     content = item.get("content")
     if not isinstance(content, list):
         return "Unsupported Codex message content"
-    if any(not isinstance(part, dict) or part.get("type") != "output_text"
-           or not isinstance(part.get("text"), str) for part in content):
+    if any(
+        not isinstance(part, dict) or part.get("type") != "output_text" or not isinstance(part.get("text"), str)
+        for part in content
+    ):
         return "Codex refusal or unsupported content block"
     return None
 
@@ -216,8 +247,7 @@ def _completed_items(events):
             if error:
                 return [], error
             completed[index] = item
-    if (not completed or set(completed) != set(added)
-            or sorted(completed) != list(range(len(completed)))):
+    if not completed or set(completed) != set(added) or sorted(completed) != list(range(len(completed))):
         return [], "Codex output-item sequence is incomplete"
     return [completed[index] for index in sorted(completed)], None
 
@@ -258,33 +288,62 @@ class CodexProvider:
             else:
                 # Replay the executed cell's actual phase, not discarded later
                 # messages. Observations remain user input, never assistant output.
-                inputs.append({"type": "message", "role": "assistant", "status": "completed", "phase": message.get("phase", "final_answer"),
-                               "content": [{"type": "output_text", "text": text, "annotations": []}]})
-        return {"model": self.model.split("/", 1)[1], "instructions": "\n\n".join(instructions),
-                "input": inputs, "store": False, "stream": True,
-                "reasoning": {"effort": "medium"}, "text": {"verbosity": "low"}}
+                inputs.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "phase": message.get("phase", "final_answer"),
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                })
+        return {
+            "model": self.model.split("/", 1)[1],
+            "instructions": "\n\n".join(instructions),
+            "input": inputs,
+            "store": False,
+            "stream": True,
+            "reasoning": {"effort": "medium"},
+            "text": {"verbosity": "low"},
+        }
 
     def request_details(self, messages: list[dict], *, max_tokens: int | None = None) -> dict:
         """Exact JSON request plus nonsecret policy, for the supervisor journal."""
-        return {"adapter": "codex_subscription_sse", "url": CODEX_URL,
-                "body": self.build_request(messages, max_tokens=max_tokens),
-                "ignored_max_tokens": max_tokens, "output_limit_enforcement": "none",
-                "auth": "pi_oauth_read_only", "remote_output_token_cap": False}
+        return {
+            "adapter": "codex_subscription_sse",
+            "url": CODEX_URL,
+            "body": self.build_request(messages, max_tokens=max_tokens),
+            "ignored_max_tokens": max_tokens,
+            "output_limit_enforcement": "none",
+            "auth": "pi_oauth_read_only",
+            "remote_output_token_cap": False,
+        }
 
     async def generate(self, messages: list[dict], *, max_tokens: int | None = None) -> Completion:
         body = self.build_request(messages, max_tokens=max_tokens)
         credentials = read_codex_credentials(self.auth_file)
-        headers = {"Authorization": f"Bearer {credentials.access}", "chatgpt-account-id": credentials.account_id,
-                   "OpenAI-Beta": "responses=experimental", "Accept": "text/event-stream",
-                   "Content-Type": "application/json", "originator": "py-agent", "User-Agent": "py-agent/0.1.0"}
+        headers = {
+            "Authorization": f"Bearer {credentials.access}",
+            "chatgpt-account-id": credentials.account_id,
+            "OpenAI-Beta": "responses=experimental",
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+            "originator": "py-agent",
+            "User-Agent": "py-agent/0.1.0",
+        }
         try:
-            async with httpx.AsyncClient(transport=self._transport, follow_redirects=False, trust_env=True,
-                                        timeout=httpx.Timeout(None, connect=20, pool=20)) as client:
+            async with httpx.AsyncClient(
+                transport=self._transport,
+                follow_redirects=False,
+                trust_env=True,
+                timeout=httpx.Timeout(None, connect=20, pool=20),
+            ) as client:
                 async with client.stream("POST", CODEX_URL, json=body, headers=headers) as response:
                     if response.status_code != 200:
                         status = response.status_code
                         if status in {401, 403}:
-                            raise ProviderError(f"Codex authentication rejected (HTTP {status}); refresh your login in pi with /login openai-codex", kind="authentication")
+                            raise ProviderError(
+                                f"Codex authentication rejected (HTTP {status}); refresh your login in pi with /login openai-codex",
+                                kind="authentication",
+                            )
                         kind = "rate_limit" if status == 429 else "overflow" if status == 413 else "provider"
                         raise ProviderError(f"Codex request failed (HTTP {status}); no source accepted", kind=kind)
                     # Validate actual SSE/JSON data, not just the MIME header:
@@ -294,8 +353,14 @@ class CodexProvider:
                     # Provider error/output bodies must not become a token echo.
                     safe_raw = _redact(result.raw, secrets)
                     if safe_raw != result.raw:
-                        return Completion("", "error", _redact(result.usage, secrets), None, safe_raw,
-                                          "Codex response echoed credential material")
+                        return Completion(
+                            "",
+                            "error",
+                            _redact(result.usage, secrets),
+                            None,
+                            safe_raw,
+                            "Codex response echoed credential material",
+                        )
                     return result
         except asyncio.CancelledError:
             raise
@@ -304,7 +369,9 @@ class CodexProvider:
             raise ProviderError(safe, kind=exc.kind) from None
         except Exception as exc:
             # HTTP exceptions can contain request URLs, headers, and secrets.
-            raise ProviderError(f"Codex request failed ({type(exc).__name__}); no source accepted", kind="provider") from None
+            raise ProviderError(
+                f"Codex request failed ({type(exc).__name__}); no source accepted", kind="provider"
+            ) from None
 
     async def _collect(self, response, max_tokens, *, secrets=()):
         terminal = None
@@ -340,7 +407,11 @@ class CodexProvider:
                     else:
                         for item in early_output:
                             rejection = rejection or _item_error(item)
-                    if metadata.get("error") or metadata.get("tools") or metadata.get("status") in {"failed", "cancelled", "incomplete"}:
+                    if (
+                        metadata.get("error")
+                        or metadata.get("tools")
+                        or metadata.get("status") in {"failed", "cancelled", "incomplete"}
+                    ):
                         rejection = rejection or "Unexpected Codex failure or tools in response metadata"
             elif kind in {"response.output_item.added", "response.output_item.done"}:
                 item_events.append(event)
@@ -360,8 +431,14 @@ class CodexProvider:
             raise ProviderError("Codex stream ended without terminal response; no source accepted", kind="shape")
         usage = _usage(terminal.get("usage"))
         status = terminal.get("status")
-        finish = "stop" if terminal_type in {"response.completed", "response.done"} and status == "completed" else "error"
-        if status == "incomplete" and isinstance(terminal.get("incomplete_details"), dict) and terminal["incomplete_details"].get("reason") == "max_output_tokens":
+        finish = (
+            "stop" if terminal_type in {"response.completed", "response.done"} and status == "completed" else "error"
+        )
+        if (
+            status == "incomplete"
+            and isinstance(terminal.get("incomplete_details"), dict)
+            and terminal["incomplete_details"].get("reason") == "max_output_tokens"
+        ):
             finish = "length"
         if finish != "stop" or terminal.get("error") or terminal.get("incomplete_details"):
             rejection = rejection or "Codex response did not complete successfully"
@@ -401,11 +478,24 @@ class CodexProvider:
         text = "".join(part["text"] for part in selected["content"]) if selected else ""
         if not text.strip():
             rejection = rejection or "Codex returned no executable text"
-        raw = {"response": terminal, "events": for_audit, "event_count": event_count,
-               "output_source": output_source, "cell_selection": "first_complete_assistant_message",
-               "selected_phase": selected.get("phase") if selected else None,
-               "discarded_followup_messages": max(0, len(messages) - 1),
-               "ignored_max_tokens": max_tokens, "output_limit_enforcement": "none"}
+        raw = {
+            "response": terminal,
+            "events": for_audit,
+            "event_count": event_count,
+            "output_source": output_source,
+            "cell_selection": "first_complete_assistant_message",
+            "selected_phase": selected.get("phase") if selected else None,
+            "discarded_followup_messages": max(0, len(messages) - 1),
+            "ignored_max_tokens": max_tokens,
+            "output_limit_enforcement": "none",
+        }
         # Rejected content stays only in raw evidence, never in executable text.
-        return Completion(text if rejection is None else "", finish, usage, "\n\n".join(summaries) or None, raw, rejection,
-                          phase=selected.get("phase") if selected else None)
+        return Completion(
+            text if rejection is None else "",
+            finish,
+            usage,
+            "\n\n".join(summaries) or None,
+            raw,
+            rejection,
+            phase=selected.get("phase") if selected else None,
+        )

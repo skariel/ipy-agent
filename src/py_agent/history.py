@@ -3,6 +3,7 @@
 The supervisor must place this database in a sandbox-protected private directory.
 There is no application storage quota; actual storage failures still propagate.
 """
+
 from __future__ import annotations
 
 import json
@@ -86,12 +87,10 @@ class Journal:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def append(self, kind: str, content: Any, cell_id: str | None = None,
-               **metadata: Any) -> dict[str, Any]:
+    def append(self, kind: str, content: Any, cell_id: str | None = None, **metadata: Any) -> dict[str, Any]:
         if not isinstance(kind, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", kind):
             raise ValueError("invalid event kind")
-        if cell_id is not None and (not isinstance(cell_id, str) or
-                                   not cell_id.startswith(self.agent_id + ":")):
+        if cell_id is not None and (not isinstance(cell_id, str) or not cell_id.startswith(self.agent_id + ":")):
             raise ValueError("cell ID is outside this agent")
         reserved = {"id", "seq", "kind", "content", "cell_id", "run_id", "agent_id", "timestamp"}
         if reserved.intersection(metadata):
@@ -100,45 +99,63 @@ class Journal:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             seq = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM events").fetchone()[0]
-            event = {"id": f"{self.agent_id}:e{seq:08d}", "seq": seq,
-                     "run_id": self.run_id, "agent_id": self.agent_id,
-                     "timestamp": time.time(), "kind": kind, "cell_id": cell_id,
-                     "content": content, **metadata}
+            event = {
+                "id": f"{self.agent_id}:e{seq:08d}",
+                "seq": seq,
+                "run_id": self.run_id,
+                "agent_id": self.agent_id,
+                "timestamp": time.time(),
+                "kind": kind,
+                "cell_id": cell_id,
+                "content": content,
+                **metadata,
+            }
             payload = _json(event)
             size = len(payload.encode("utf-8")) + len(search_text.encode("utf-8"))
-            self.db.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (seq, self.run_id, self.agent_id, event["id"], kind,
-                             cell_id, payload, search_text, size))
+            self.db.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (seq, self.run_id, self.agent_id, event["id"], kind, cell_id, payload, search_text, size),
+            )
             self.db.execute("COMMIT")
             return event
         except BaseException:
             self.db.execute("ROLLBACK")
             raise
 
-    def commit_epoch(self, retained: list[str], evicted: list[str],
-                     pending: list[str], *, epoch_id: str | None = None,
-                     **metadata: Any) -> dict[str, Any]:
+    def commit_epoch(
+        self,
+        retained: list[str],
+        evicted: list[str],
+        pending: list[str],
+        *,
+        epoch_id: str | None = None,
+        **metadata: Any,
+    ) -> dict[str, Any]:
         """Commit the retained conversation window as one indivisible event.
 
         The caller owns context-epoch identity and serializes this operation with
         dispatch/steering. Variable contents are not persisted; metadata may
         include the worker-reported count frozen into the epoch's system prompt.
         """
-        return self.append("epoch_commit", {"retained": retained, "evicted": evicted,
-                           "pending": pending, "epoch_id": epoch_id}, **metadata)
+        return self.append(
+            "epoch_commit",
+            {"retained": retained, "evicted": evicted, "pending": pending, "epoch_id": epoch_id},
+            **metadata,
+        )
 
     def recent(self, n: int = 10) -> list[dict[str, Any]]:
         n = _count(n, "n")
         rows = self.db.execute(
             "SELECT event_id,kind,cell_id,search_text FROM events "
             "WHERE run_id=? AND agent_id=? ORDER BY seq DESC LIMIT ?",
-            (self.run_id, self.agent_id, n)).fetchall()
-        return [{"id": eid, "kind": kind, "cell_id": cell,
-                 "excerpt": text[:240], "truncated": len(text) > 240}
-                for eid, kind, cell, text in rows]
+            (self.run_id, self.agent_id, n),
+        ).fetchall()
+        return [
+            {"id": eid, "kind": kind, "cell_id": cell, "excerpt": text[:240], "truncated": len(text) > 240}
+            for eid, kind, cell, text in rows
+        ]
 
-    def search(self, query: str, *, kind: str | None = None,
-               limit: int = 20) -> list[dict[str, Any]]:
+    def search(self, query: str, *, kind: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
         if not isinstance(query, str):
             raise ValueError("query must be text")
         limit = _count(limit, "limit")
@@ -148,8 +165,9 @@ class Journal:
         rows = self.db.execute(
             "SELECT event_id,kind,cell_id,search_text FROM events WHERE run_id=? AND agent_id=? "
             + ("AND kind=? " if kind is not None else "AND kind NOT LIKE 'retrieval%' ")
-            + "ORDER BY seq DESC", (self.run_id, self.agent_id, kind) if kind is not None
-            else (self.run_id, self.agent_id))
+            + "ORDER BY seq DESC",
+            (self.run_id, self.agent_id, kind) if kind is not None else (self.run_id, self.agent_id),
+        )
         result = []
         needle = query.casefold()
         for eid, event_kind, cell, text in rows:
@@ -161,26 +179,35 @@ class Journal:
             # Case folding can change character offsets; excerpts are illustrative,
             # and exact original evidence is available through read().
             start = max(0, index - 80)
-            result.append({"id": eid, "kind": event_kind, "cell_id": cell,
-                           "excerpt": text[start:start + 400], "offset": start})
+            result.append({
+                "id": eid,
+                "kind": event_kind,
+                "cell_id": cell,
+                "excerpt": text[start : start + 400],
+                "offset": start,
+            })
         return result
 
-    def read(self, event_or_cell_id: str, *, offset: int = 0,
-             limit: int = 8000) -> dict[str, Any]:
+    def read(self, event_or_cell_id: str, *, offset: int = 0, limit: int = 8000) -> dict[str, Any]:
         if not isinstance(event_or_cell_id, str) or len(event_or_cell_id) > 200:
             raise ValueError("invalid history ID")
         if type(offset) is not int or offset < 0:
             raise ValueError("offset must be a non-negative integer")
         limit = _count(limit, "limit")
         rows = self.db.execute(
-            "SELECT payload FROM events WHERE run_id=? AND agent_id=? "
-            "AND (event_id=? OR cell_id=?) ORDER BY seq",
-            (self.run_id, self.agent_id, event_or_cell_id, event_or_cell_id)).fetchall()
+            "SELECT payload FROM events WHERE run_id=? AND agent_id=? AND (event_id=? OR cell_id=?) ORDER BY seq",
+            (self.run_id, self.agent_id, event_or_cell_id, event_or_cell_id),
+        ).fetchall()
         if not rows:
             raise KeyError(event_or_cell_id)
         text = "\n".join(row[0] for row in rows)
-        page = text[offset:offset + limit]
+        page = text[offset : offset + limit]
         next_offset = min(len(text), offset + len(page))
-        return {"id": event_or_cell_id, "offset": offset, "content": page,
-                "next_offset": next_offset, "total_chars": len(text),
-                "truncated": next_offset < len(text)}
+        return {
+            "id": event_or_cell_id,
+            "offset": offset,
+            "content": page,
+            "next_offset": next_offset,
+            "total_chars": len(text),
+            "truncated": next_offset < len(text),
+        }

@@ -3,6 +3,7 @@
 These files are ordinary, mutable worker artifacts, not trusted host evidence.
 Only bounded notices cross IPC. No host component opens a supplied pathname.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -62,9 +63,12 @@ class CellOutput:
 
     @staticmethod
     def _same_file(actual, expected):
-        return (stat.S_ISREG(actual.st_mode)
-                and (actual.st_dev, actual.st_ino, actual.st_size, actual.st_mtime_ns)
-                == (expected.st_dev, expected.st_ino, expected.st_size, expected.st_mtime_ns))
+        return stat.S_ISREG(actual.st_mode) and (actual.st_dev, actual.st_ino, actual.st_size, actual.st_mtime_ns) == (
+            expected.st_dev,
+            expected.st_ino,
+            expected.st_size,
+            expected.st_mtime_ns,
+        )
 
     @staticmethod
     def _unlink_same(path, expected):
@@ -87,9 +91,12 @@ class CellOutput:
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             before = os.fstat(fd)
-            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
-                    or stat.S_IMODE(before.st_mode) != 0o600
-                    or before.st_size != self.saved_bytes):
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_size != self.saved_bytes
+            ):
                 return None
             digest = hashlib.sha256()
             remaining = self.saved_bytes
@@ -105,8 +112,7 @@ class CellOutput:
             published = os.lstat(path)
             # Include ctime, ownership and permissions: content/metadata can
             # change during hashing, and the pathname may be swapped altogether.
-            fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns',
-                      'st_uid', 'st_mode')
+            fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_uid", "st_mode")
             signature = lambda info: tuple(getattr(info, field) for field in fields)
             if signature(before) != signature(after) or signature(after) != signature(published):
                 return None
@@ -181,7 +187,7 @@ class CellOutput:
         soft, _ = resource.getrlimit(resource.RLIMIT_FSIZE)
         # Avoid encoding a whole, potentially enormous rendered display at once.
         for start in range(0, len(text), 4096):
-            data = text[start:start + 4096].encode("utf-8", "replace")
+            data = text[start : start + 4096].encode("utf-8", "replace")
             remaining = len(data) if soft == resource.RLIM_INFINITY else max(0, soft - self.saved_bytes)
             clipped = len(data) > remaining
             if clipped:
@@ -236,8 +242,13 @@ class CellOutput:
     def _emit(self, stream, text):
         # Send in modest chunks without imposing a logical output-size cap.
         for start in range(0, len(text), 4096):
-            self.send({"v": 1, "type": "output", "cell_id": self.cell_id,
-                       "stream": stream, "text": text[start:start + 4096]})
+            self.send({
+                "v": 1,
+                "type": "output",
+                "cell_id": self.cell_id,
+                "stream": stream,
+                "text": text[start : start + 4096],
+            })
 
     def _report(self):
         complete = self._cell_finished and self._streams_closed
@@ -246,7 +257,7 @@ class CellOutput:
             return
         self._reported = state
         progress = "" if complete else "; counts so far, more output may follow"
-        message = (f"Output too long to display here (size={self.chars} chars, lines={self.lines}{progress}). ")
+        message = f"Output too long to display here (size={self.chars} chars, lines={self.lines}{progress}). "
         if self._storage_error is None:
             message += f"Saved to {self.path}. "
         else:
@@ -254,15 +265,18 @@ class CellOutput:
             if self.path is not None:
                 message += f"Partial output ({self.saved_bytes} UTF-8 bytes) saved to {self.path}. "
         if complete and self._retained_duplicate is not None:
-            message += (f"Provisional path {self._retained_duplicate} could not be removed "
-                        "(cleanup unavailable). ")
+            message += f"Provisional path {self._retained_duplicate} could not be removed (cleanup unavailable). "
         if self.path is not None:
-            message += (f"Read this UTF-8 file in chunks smaller than {self.limit} characters "
-                        "(for example, f.read(4000)); larger output will be saved again. ")
+            message += (
+                f"Read this UTF-8 file in chunks smaller than {self.limit} characters "
+                "(for example, f.read(4000)); larger output will be saved again. "
+            )
         if not complete:
-            message += ("This path is provisional; use the final reported path after capture completes "
-                        "(content-hashed when publication succeeds). "
-                        "Final counts will be reported when the cell and its output streams finish. ")
+            message += (
+                "This path is provisional; use the final reported path after capture completes "
+                "(content-hashed when publication succeeds). "
+                "Final counts will be reported when the cell and its output streams finish. "
+            )
         self._emit("stdout", message.rstrip() + "\n")
 
     def flush(self):
@@ -312,8 +326,7 @@ def spool_say(cell_id, content):
             return content
         chunks = (content,)
     else:
-        chunks = json.JSONEncoder(ensure_ascii=False, allow_nan=False,
-                                  separators=(",", ":")).iterencode(content)
+        chunks = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":")).iterencode(content)
     notices = []
     output = CellOutput(cell_id, lambda frame: notices.append(frame["text"]))
     for chunk in chunks:
