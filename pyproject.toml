@@ -29,6 +29,82 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = ["sandbox: requires functioning Linux srt isolation", "live: explicitly authorized paid provider calls"]
 
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "scripts", "tests"]
+strict = true
+strict_bytes = true
+local_partial_types = true
+extra_checks = true
+warn_unreachable = true
+warn_unused_configs = true
+disallow_any_decorated = true
+disallow_any_explicit = true
+disallow_any_expr = true
+disallow_any_unimported = true
+enable_error_code = [
+    "deprecated",
+    "exhaustive-match",
+    "ignore-without-code",
+    "possibly-undefined",
+    "redundant-expr",
+    "truthy-bool",
+    "truthy-iterable",
+    "unused-awaitable",
+]
+show_error_code_links = true
+show_error_context = true
+pretty = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+preview = true
+extend-exclude = [".venv", "dist"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+# Mutually exclusive docstring styles and formatter-incompatible rules.
+ignore = ["COM812", "D203", "D213", "ISC001"]
+
+[tool.ruff.lint.flake8-annotations]
+allow-star-arg-any = false
+mypy-init-return = false
+suppress-dummy-args = false
+suppress-none-returning = false
+
+[tool.ruff.lint.flake8-bandit]
+check-typed-exception = true
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = []
+
+[tool.ruff.lint.flake8-builtins]
+strict-checking = true
+
+[tool.ruff.lint.flake8-pytest-style]
+fixture-parentheses = true
+mark-parentheses = true
+parametrize-names-type = "tuple"
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+known-first-party = ["py_agent"]
+required-imports = ["from __future__ import annotations"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.ruff.lint.pyupgrade]
+keep-runtime-typing = false
+
+[tool.ruff.format]
+docstring-code-format = true
+line-ending = "lf"
+preview = true
+quote-style = "double"
+
 [tool.hatch.build.targets.sdist]
 include = ["/src", "/tests", "/scripts", "/README.md", "/PLAN.md", "/IPYTHON_AGENT_PLAN.md", "/pyproject.toml", "/uv.lock"]
 
