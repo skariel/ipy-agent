@@ -1,0 +1,17 @@
+.venv/
+.uv-cache/
+.py/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+# Device placeholders injected by the outer sandbox, not project files.
+/.bash_profile
+/.bashrc
+/.gitconfig
+/.mcp.json
+/.profile
+/.ripgreprc
+/.zprofile
+/.zshrc
