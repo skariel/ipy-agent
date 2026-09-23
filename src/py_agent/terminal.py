@@ -23,12 +23,37 @@ from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import FormattedText, PygmentsTokens
 from prompt_toolkit.history import FileHistory, InMemoryHistory
+from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.styles import Style
 from pygments import lex
 from pygments.lexers import PythonLexer
+
+# prompt_toolkit 3.0.52 otherwise discards xterm's Enter modifier and does
+# not recognize CSI-u Shift+Enter. Preserve it as a distinct two-key gesture.
+_SHIFT_ENTER = (Keys.ShiftEscape, Keys.ControlM)
+ANSI_SEQUENCES["\x1b[13;2u"] = _SHIFT_ENTER
+ANSI_SEQUENCES["\x1b[27;2;13~"] = _SHIFT_ENTER
+
+_COLOR_STYLE = {
+    "user-prompt": "ansicyan bold",
+    "md-heading": "ansicyan bold",
+    "md-bold": "bold",
+    "md-italic": "italic",
+    "md-code": "ansiyellow",
+    "md-quote": "ansigreen italic",
+}
+
+_PERMISSION_CHOICES = (
+    ("deny", "Deny"),
+    ("once", "Once"),
+    ("session", "Session"),
+    ("project", "This project"),
+    ("global", "All projects"),
+)
 
 COMMANDS = (
     "/help",
@@ -49,9 +74,10 @@ which are independent of input numbers. Generated Python is hidden unless /trace
 is on; results stay visible. Thinking animates in the status bar.
 ctx(last) is last reported input tokens / configured context window, not a live
 estimate. Missing counts or window show ?. out(last) is reported output tokens.
-Enter submits; Ctrl-R searches input history; Up/Down navigate it.
-Bracketed paste stays a draft. With --multiline, Enter inserts a newline and
-Esc-Enter submits; /quit + Enter also exits in multiline mode.
+Enter submits; Shift-Enter inserts a newline; Ctrl-R searches input history;
+Up/Down navigate it. Bracketed paste stays a draft. With --multiline, Enter
+inserts a newline and Esc-Enter submits; /quit + Enter also exits in multiline
+mode.
 Ctrl-C interrupts active work or clears a draft; press it again within two
 seconds to exit. Ctrl-C on an empty idle prompt exits immediately. Ctrl-D on an
 empty prompt exits, cancelling active work. Earlier effects are not rolled back.
@@ -59,7 +85,8 @@ empty prompt exits, cancelling active work. Earlier effects are not rolled back.
 /history [ID [OFFSET]] recent evidence, or read a page by event/cell ID
 /usage                reported provider counters and estimated context
 /trace                toggle generated Python and extra audit events
-/approve ID SCOPE     approve a pending permission: once, session, project, all
+Permission requests open an arrow-key selection menu; Enter selects and Esc denies.
+/approve ID SCOPE     fallback approval command: once, session, project, all
 /deny ID              deny a pending permission request
 /permissions          list pending requests and saved project/all-project grants
 /revoke ID             revoke a saved project/all-project permission
@@ -86,6 +113,61 @@ def sanitize(value: Any) -> str:
     # Normalize CR; it must not let untrusted output overwrite preceding text.
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     return "".join(c for c in text if c in "\n\t" or unicodedata.category(c) not in {"Cc", "Cf", "Cs"})
+
+
+def _inline_markdown(text: str, default_style: str = "") -> list[tuple[str, str]]:
+    """Render a deliberately small, safe subset of inline Markdown."""
+    fragments: list[tuple[str, str]] = []
+    pattern = re.compile(r"(`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_|\[[^]\n]+\]\([^)\n]+\))")
+    position = 0
+    for match in pattern.finditer(text):
+        if match.start() > position:
+            fragments.append((default_style, text[position : match.start()]))
+        token = match.group()
+        if token.startswith("`"):
+            fragments.append(("class:md-code", token[1:-1]))
+        elif token.startswith(("**", "__")):
+            fragments.append(("class:md-bold", token[2:-2]))
+        elif token.startswith(("*", "_")):
+            fragments.append(("class:md-italic", token[1:-1]))
+        else:
+            label, target = token[1:].split("](", 1)
+            fragments.extend([(default_style, label), ("class:md-code", f" ({target[:-1]})")])
+        position = match.end()
+    fragments.append((default_style, text[position:]))
+    return fragments
+
+
+def markdown_fragments(value: Any) -> FormattedText:
+    """Convert common Markdown presentation to sanitized prompt_toolkit text."""
+    safe = sanitize(value).strip("\n")
+    if not isinstance(value, str):
+        return FormattedText([("", safe)])
+    fragments: list[tuple[str, str]] = []
+    fenced = False
+    for line_number, line in enumerate(safe.split("\n")):
+        if line_number:
+            fragments.append(("", "\n"))
+        if re.match(r"^\s*```", line):
+            fenced = not fenced
+            continue
+        if fenced:
+            fragments.append(("class:md-code", line))
+            continue
+        heading = re.match(r"^\s{0,3}#{1,6}\s+(.*)$", line)
+        quote = re.match(r"^\s{0,3}>\s?(.*)$", line)
+        bullet = re.match(r"^(\s*)[-+*]\s+(.*)$", line)
+        if heading:
+            fragments.extend(_inline_markdown(heading.group(1), "class:md-heading"))
+        elif quote:
+            fragments.append(("class:md-quote", "│ "))
+            fragments.extend(_inline_markdown(quote.group(1), "class:md-quote"))
+        elif bullet:
+            fragments.append(("", f"{bullet.group(1)}• "))
+            fragments.extend(_inline_markdown(bullet.group(2)))
+        else:
+            fragments.extend(_inline_markdown(line))
+    return FormattedText(fragments)
 
 
 def private_history(path: Path) -> FileHistory:
@@ -190,6 +272,7 @@ class Terminal:
         self._input_number = 1
         self.no_color = no_color
         self.multiline = multiline
+        self._style = Style.from_dict({} if no_color else _COLOR_STYLE)
         self._pending: deque[dict] = deque()
         self._wake = asyncio.Event()
         self._acknowledged: set[str] = set()
@@ -201,6 +284,8 @@ class Terminal:
         self._stream_key = None
         self._stream_partial = ""
         self._stream_open_line = False
+        self._permission_requests: deque[dict] = deque()
+        self._permission_choice = 0
         # Only parser flags, never raw escape payloads. Keep them across stream
         # switches/cell_end because a late subprocess can resume the same pipe.
         self._stream_sanitizers: dict[tuple, _StreamSanitizer] = {}
@@ -218,6 +303,7 @@ class Terminal:
             bottom_toolbar=self._toolbar,
             refresh_interval=0.15,  # redraw thinking animation; no separate task
             color_depth=ColorDepth.DEPTH_1_BIT if no_color else None,
+            style=self._style,
             input=input,
             output=output,
         )
@@ -251,9 +337,42 @@ class Terminal:
             # key events, even in the normal single-line submission mode.
             event.current_buffer.insert_text(event.data.replace("\r\n", "\n").replace("\r", "\n"))
 
+        permission_pending = Condition(lambda: bool(self._permission_requests))
+
+        @bindings.add("left", filter=permission_pending, eager=True)
+        @bindings.add("up", filter=permission_pending, eager=True)
+        def previous_permission_choice(event):
+            self._permission_choice = (self._permission_choice - 1) % len(_PERMISSION_CHOICES)
+            event.app.invalidate()
+
+        @bindings.add("right", filter=permission_pending, eager=True)
+        @bindings.add("down", filter=permission_pending, eager=True)
+        def next_permission_choice(event):
+            self._permission_choice = (self._permission_choice + 1) % len(_PERMISSION_CHOICES)
+            event.app.invalidate()
+
+        @bindings.add("enter", filter=permission_pending, eager=True)
+        def confirm_permission_choice(event):
+            self._resolve_permission_choice()
+            event.app.invalidate()
+
+        @bindings.add("escape", filter=permission_pending, eager=True)
+        def deny_permission_choice(event):
+            self._permission_choice = 0
+            self._resolve_permission_choice()
+            event.app.invalidate()
+
+        @bindings.add("s-escape", "enter")
+        def insert_shift_enter(event):
+            event.current_buffer.insert_text("\n")
+
         @bindings.add("escape", "enter")
-        def submit_multiline(event):
-            event.current_buffer.validate_and_handle()
+        def escape_enter(event):
+            if self.multiline:
+                event.current_buffer.validate_and_handle()
+            else:
+                # Legacy terminals encode Shift-Enter as Escape followed by Enter.
+                event.current_buffer.insert_text("\n")
 
         @bindings.add(
             "enter", filter=Condition(lambda: self.multiline and self.session.default_buffer.text.strip() == "/quit")
@@ -287,6 +406,15 @@ class Terminal:
         return bindings
 
     def _toolbar(self) -> FormattedText:
+        if self._permission_requests:
+            request = self._permission_requests[0]
+            request_id = sanitize(request.get("request_id", "?"))
+            resource = sanitize(request.get("resource", {})).replace("\n", " ")[:120]
+            choices = " | ".join(
+                f"[{label}]" if index == self._permission_choice else label
+                for index, (_, label) in enumerate(_PERMISSION_CHOICES)
+            )
+            return FormattedText([("", f"Permission {request_id}: {resource}  ◀ {choices} ▶  Enter=select Esc=deny")])
         state = self.supervisor.status()
         usage = state.get("usage") or {}
         if isinstance(usage, list):
@@ -327,6 +455,25 @@ class Terminal:
     def on_event(self, event: dict) -> None:
         """Nonblocking rendering callback; never mutates or journals an event."""
         kind = event.get("kind", "")
+        if kind == "permission_request" and isinstance(event.get("content"), dict):
+            request = event["content"]
+            request_id = request.get("request_id")
+            if isinstance(request_id, str) and not any(
+                pending.get("request_id") == request_id for pending in self._permission_requests
+            ):
+                self._permission_requests.append(dict(request))
+                if len(self._permission_requests) == 1:
+                    self._permission_choice = 0
+        elif kind == "permission_decision" and isinstance(event.get("content"), dict):
+            request_id = event["content"].get("request_id")
+            was_active = (
+                bool(self._permission_requests) and self._permission_requests[0].get("request_id") == request_id
+            )
+            self._permission_requests = deque(
+                request for request in self._permission_requests if request.get("request_id") != request_id
+            )
+            if was_active:
+                self._permission_choice = 0
         self.session.app.invalidate()
         if kind == "state":
             return  # Coalesce frequent status changes in the toolbar.
@@ -337,15 +484,16 @@ class Terminal:
             cleaner = self._stream_sanitizers.setdefault(origin, _StreamSanitizer())
             content = event.get("content", "")
             event = {**event, "content": cleaner.feed(content if isinstance(content, str) else sanitize(content))}
-        if kind in {"user_queued", "queued"} and event.get("id"):
-            # Journalled receipts have their own event ID; content references
-            # the USER event. Deduplicate against submit()'s fallback receipt.
-            reference = event.get("content")
-            identifier = reference if isinstance(reference, str) and reference else event["id"]
-            event = {**event, "user_id": identifier}
-            if identifier in self._acknowledged:
-                return
-            self._acknowledged.add(identifier)
+        if kind in {"user_queued", "queued"}:
+            if event.get("id"):
+                # Journalled receipts have their own event ID; content references
+                # the USER event. Keep deduplication without displaying receipts.
+                reference = event.get("content")
+                identifier = reference if isinstance(reference, str) and reference else event["id"]
+                if identifier in self._acknowledged:
+                    return
+                self._acknowledged.add(identifier)
+            return
         failed_cell = (
             kind == "cell_end"
             and isinstance(event.get("content"), dict)
@@ -383,6 +531,18 @@ class Terminal:
         formatted = PygmentsTokens(lex(safe, PythonLexer())) if python and not self.no_color else safe
         print_formatted_text(
             formatted, output=self.session.output, color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None
+        )
+
+    def _emit_markdown(self, content: Any) -> None:
+        self._finish_stream()
+        # Leading and trailing newlines separate agent prose from prompts,
+        # subprocess output, and adjacent messages.
+        fragments = [("", "\n"), *markdown_fragments(content), ("", "\n")]
+        print_formatted_text(
+            FormattedText(fragments),
+            output=self.session.output,
+            style=self._style,
+            color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
         )
 
     def _write_stream(self, text: str) -> None:
@@ -446,9 +606,9 @@ class Terminal:
         kind, content = event.get("kind", "event"), event.get("content", "")
         identifier = event.get("cell_id") or event.get("id") or ""
         if kind in {"user_queued", "queued"}:
-            self._emit(f"Queued {event.get('user_id', identifier)}")
+            return
         elif kind == "say":
-            self._emit(content)
+            self._emit_markdown(content)
         elif kind == "permission_request" and isinstance(content, dict):
             request_id = sanitize(content.get("request_id", "?"))
             permission_kind = sanitize(content.get("permission_kind", "permission"))
@@ -457,7 +617,7 @@ class Terminal:
             message = (
                 f"Permission requested [{request_id}] ({permission_kind}): {resource}"
                 + (f"\nReason: {reason}" if reason else "")
-                + f"\nUse /approve {request_id} once|session|project|all or /deny {request_id}"
+                + "\nChoose in the menu with arrow keys and Enter; Esc denies. Slash commands remain available."
             )
             self._emit(message)
         elif kind in {"source", "cell", "cell_source"}:
@@ -476,6 +636,29 @@ class Terminal:
                 self._emit(f"[cell_end {identifier}] {sanitize(content)}")
         else:
             self._emit(f"[{kind}{' ' + str(identifier) if identifier else ''}] {sanitize(content)}")
+
+    def _resolve_permission_choice(self) -> None:
+        if not self._permission_requests:
+            return
+        request = self._permission_requests[0]
+        request_id = request.get("request_id")
+        if not isinstance(request_id, str):
+            self._permission_requests.popleft()
+            self._permission_choice = 0
+            return
+        scope, _ = _PERMISSION_CHOICES[self._permission_choice]
+        try:
+            self.supervisor.resolve_permission(
+                request_id,
+                allow=scope != "deny",
+                scope="once" if scope == "deny" else scope,
+            )
+        except Exception as exc:
+            self.on_event({"kind": "error", "content": str(exc)})
+        finally:
+            if self._permission_requests and self._permission_requests[0].get("request_id") == request_id:
+                self._permission_requests.popleft()
+            self._permission_choice = 0
 
     async def _render_loop(self) -> None:
         while True:
@@ -587,7 +770,8 @@ class Terminal:
             with patch_stdout(raw=False):
                 while True:
                     try:
-                        line = await self.session.prompt_async(f"In [{self._input_number}]: ", pre_run=self._pre_run)
+                        prompt = FormattedText([("class:user-prompt", f"In [{self._input_number}]: ")])
+                        line = await self.session.prompt_async(prompt, pre_run=self._pre_run)
                         if not await self.handle_line(line):
                             break
                     except _QuitRequested:

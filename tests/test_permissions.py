@@ -59,14 +59,15 @@ async def test_network_scope_lifetimes_and_project_isolation(tmp_path):
     other_project.close()
 
 
-async def test_permission_timeout_denies_and_clears_request(tmp_path):
+async def test_permission_waits_until_decided_without_timeout(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    events = []
-    manager = PermissionManager(PermissionStore(tmp_path / "host"), workspace, emit=events.append, timeout=0.01)
-    assert not await manager.request_network("timeout.example", 443)
-    assert not manager.pending
-    assert events[-1]["content"]["timeout"] is True
+    manager = PermissionManager(PermissionStore(tmp_path / "host"), workspace)
+    request = asyncio.create_task(manager.request_network("waiting.example", 443))
+    await asyncio.sleep(0.02)
+    assert not request.done()
+    manager.resolve(manager.pending[0]["request_id"], allow=False)
+    assert not await request
     manager.close()
 
 

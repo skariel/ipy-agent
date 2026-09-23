@@ -15,7 +15,7 @@ from prompt_toolkit.output import DummyOutput
 import pytest
 
 from py_agent import cli
-from py_agent.terminal import HELP, Terminal, private_history, sanitize
+from py_agent.terminal import HELP, Terminal, markdown_fragments, private_history, sanitize
 
 
 class Output(DummyOutput):
@@ -203,7 +203,52 @@ async def test_paste_remains_draft_output_preserves_cursor_and_quit():
         await asyncio.wait_for(task, 3)
         assert supervisor.closed
         assert supervisor.on_event is callback
-        assert "Queued a1:e1" in output.text
+        assert "Queued a1:e1" not in output.text
+
+
+async def test_permission_selection_menu_preserves_draft_and_resolves_scope():
+    supervisor, output = Supervisor(), Output()
+    with create_pipe_input() as pipe:
+        terminal = Terminal(supervisor, input=pipe, output=output)
+        task = asyncio.create_task(terminal.run())
+        await until(lambda: terminal.session.app.is_running)
+        pipe.send_text("unfinished draft")
+        await until(lambda: terminal.session.default_buffer.text == "unfinished draft")
+        cursor = terminal.session.default_buffer.cursor_position
+        supervisor.on_event({
+            "kind": "permission_request",
+            "content": {
+                "request_id": "perm-menu",
+                "permission_kind": "network",
+                "resource": {"host": "example.com", "port": 443},
+                "reason": "test",
+            },
+        })
+        await until(lambda: bool(terminal._permission_requests))
+        pipe.send_text("\x1b[C\r")  # Deny -> Once -> confirm.
+        await until(lambda: supervisor.permission_decisions == [("perm-menu", True, "once")])
+        assert terminal.session.default_buffer.text == "unfinished draft"
+        assert terminal.session.default_buffer.cursor_position == cursor
+        assert terminal._input_number == 1
+        assert not supervisor.submitted
+
+        supervisor.on_event({
+            "kind": "permission_request",
+            "content": {
+                "request_id": "perm-deny",
+                "permission_kind": "filesystem",
+                "resource": {"path": "/outside"},
+                "reason": "test",
+            },
+        })
+        await until(lambda: bool(terminal._permission_requests))
+        pipe.send_text("\x1b")
+        await until(lambda: len(supervisor.permission_decisions) == 2)
+        assert supervisor.permission_decisions[-1] == ("perm-deny", False, "once")
+        pipe.send_text("\x03")
+        await until(lambda: terminal.session.default_buffer.text == "")
+        pipe.send_text("\x04")
+        await asyncio.wait_for(task, 3)
 
 
 async def test_numbered_prompt_advances_only_after_successful_user_submissions():
@@ -245,17 +290,33 @@ async def test_failed_submission_does_not_advance_prompt_number(monkeypatch):
     assert not terminal._pending
 
 
+@pytest.mark.parametrize("shift_enter", ["\x1b\r", "\x1b[13;2u", "\x1b[27;2;13~"])
+async def test_shift_enter_inserts_newline_and_plain_enter_submits(shift_enter):
+    supervisor, output = Supervisor(), Output()
+    with create_pipe_input() as pipe:
+        terminal = Terminal(supervisor, input=pipe, output=output)
+        task = asyncio.create_task(terminal.run())
+        await until(lambda: terminal.session.app.is_running)
+        pipe.send_text(f"line one{shift_enter}line two")
+        await until(lambda: terminal.session.default_buffer.text == "line one\nline two")
+        assert not supervisor.submitted
+        pipe.send_text("\r")
+        await until(lambda: supervisor.submitted == ["line one\nline two"])
+        pipe.send_text("/quit\r")
+        await asyncio.wait_for(task, 3)
+
+
 async def test_multiline_enter_and_escape_enter():
     supervisor, output = Supervisor(), Output()
     with create_pipe_input() as pipe:
         terminal = Terminal(supervisor, input=pipe, output=output, multiline=True)
         task = asyncio.create_task(terminal.run())
         await until(lambda: terminal.session.app.is_running)
-        pipe.send_text("line one\rline two")
-        await until(lambda: terminal.session.default_buffer.text == "line one\nline two")
+        pipe.send_text("line one\rline two\x1b[27;2;13~line three")
+        await until(lambda: terminal.session.default_buffer.text == "line one\nline two\nline three")
         assert supervisor.submitted == []
         pipe.send_text("\x1b\r")
-        await until(lambda: supervisor.submitted == ["line one\nline two"])
+        await until(lambda: supervisor.submitted == ["line one\nline two\nline three"])
         pipe.send_text("/quit\x1b\r")
         await asyncio.wait_for(task, 3)
 
@@ -740,6 +801,44 @@ async def test_emacs_ctrl_r_and_history_navigation():
         await asyncio.wait_for(task, 3)
 
 
+def test_say_renders_safe_markdown_with_blank_line_separation():
+    output = Output()
+    terminal = Terminal(Supervisor(), output=output, no_color=True)
+    render(terminal, {"kind": "notice", "content": "before"})
+    render(
+        terminal,
+        {
+            "kind": "say",
+            "content": "# Heading\n\n- **bold** and `code`\n> quote\x1b]52;c;SECRET\x07\n<b>literal</b>",
+        },
+    )
+    render(terminal, {"kind": "say", "content": {"answer": "ok"}})
+    render(terminal, {"kind": "notice", "content": "after"})
+    text = output.text.replace("\r\n", "\n")
+    assert "before\n\nHeading" in text
+    assert "• bold and code" in text
+    assert "│ quote" in text
+    assert "<b>literal</b>" in text
+    assert "SECRET" not in text
+    assert "**" not in text and "```" not in text
+    assert 'literal</b>\n\n\n{"answer": "ok"}' in text
+    assert '{"answer": "ok"}\n\n[notice] after' in text
+
+
+def test_markdown_and_prompt_styles_are_color_optional():
+    fragments = markdown_fragments("## **answer** with `code`")
+    assert "".join(text for _, text in fragments) == "answer with code"
+    assert any(style == "class:md-heading" for style, _ in fragments)
+    assert any(style == "class:md-code" for style, _ in fragments)
+
+    colored = Terminal(Supervisor(), output=Output())
+    plain = Terminal(Supervisor(), output=Output(), no_color=True)
+    assert colored._style.get_attrs_for_style_str("class:user-prompt").bold
+    assert colored._style.get_attrs_for_style_str("class:user-prompt").color
+    assert not plain._style.get_attrs_for_style_str("class:user-prompt").bold
+    assert not plain._style.get_attrs_for_style_str("class:user-prompt").color
+
+
 async def test_terminal_queue_preserves_all_events_and_status_unknown():
     terminal = Terminal(Supervisor(), output=Output())
     for i in range(300):
@@ -748,7 +847,8 @@ async def test_terminal_queue_preserves_all_events_and_status_unknown():
     terminal._pending.clear()
     terminal.on_event({"kind": "user_queued", "id": "a1:e1"})
     terminal.on_event({"kind": "user_queued", "id": "a1:e1"})
-    assert len(terminal._pending) == 1
+    assert len(terminal._pending) == 0
+    assert terminal._acknowledged == {"a1:e1"}
     toolbar = "".join(text for _, text in terminal._toolbar())
     assert "ctx(last) ?%/? out(last) ?" in toolbar
     assert "ctx~" not in toolbar
@@ -769,8 +869,8 @@ async def test_journal_queue_receipt_and_submit_fallback_are_one_ack():
     terminal = Terminal(Supervisor(), output=Output())
     terminal.on_event({"kind": "user_queued", "id": "a1:e6", "content": "a1:e5"})
     terminal.on_event({"kind": "user_queued", "id": "a1:e5", "content": ""})
-    assert len(terminal._pending) == 1
-    assert terminal._pending[0]["user_id"] == "a1:e5"
+    assert len(terminal._pending) == 0
+    assert terminal._acknowledged == {"a1:e5"}
 
 
 @pytest.mark.parametrize(

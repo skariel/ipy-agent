@@ -217,15 +217,11 @@ class PermissionManager:
         *,
         protected_paths: Iterable[str | Path] = (),
         emit: Callable[[dict[str, Any]], None] | None = None,
-        timeout: float = 600.0,
     ):
         self.store = store
         self.workspace = str(Path(workspace).resolve(strict=True))
         self.protected = tuple(Path(path).resolve(strict=False) for path in protected_paths)
         self.emit = emit or (lambda event: None)
-        if timeout <= 0:
-            raise ValueError("permission timeout must be positive")
-        self.timeout = timeout
         self._persisted = store.load()
         self._session: list[tuple[str, dict[str, Any]]] = []
         self._pending: dict[str, _Pending] = {}
@@ -267,18 +263,9 @@ class PermissionManager:
             return None
         return self._create_capability(resource, scope)
 
-    async def _decision(self, request: _Pending) -> Scope | None:
-        try:
-            return await asyncio.wait_for(asyncio.shield(request.future), self.timeout)
-        except TimeoutError:
-            if self._pending.pop(request.id, None) is request:
-                if not request.future.done():
-                    request.future.set_result(None)
-                self.emit({
-                    "kind": "permission_decision",
-                    "content": {"request_id": request.id, "allow": False, "scope": None, "timeout": True},
-                })
-            return None
+    @staticmethod
+    async def _decision(request: _Pending) -> Scope | None:
+        return await request.future
 
     def resolve(self, request_id: str, *, allow: bool, scope: Scope = "once") -> None:
         if scope not in SCOPES:

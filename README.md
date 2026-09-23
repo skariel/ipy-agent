@@ -23,8 +23,25 @@ uv sync --locked
 uv run --locked py --model openai-codex/gpt-5.6-sol --network proxy
 ```
 
-Select a model available to your account; there is no implicit model choice.
-Dependencies are locked; tested with Python 3.13.11 and IPython 9.10.0.
+For an external installation that can edit this repository, use the included
+scripts:
+
+```sh
+./install.sh
+./run.sh
+```
+
+`run.sh` defaults to this repository as the workspace, proxy networking, and
+`openai-codex/gpt-5.6-sol`. Override these with `WORKSPACE`, `NETWORK`, and
+`MODEL`; additional command-line options are forwarded to `py`:
+
+```sh
+MODEL=openai/YOUR_MODEL WORKSPACE=/path/to/project ./run.sh --no-color
+```
+
+When invoking `py` directly, select a model available to your account; the CLI
+has no implicit model choice. Dependencies are locked; tested with Python 3.13.11
+and IPython 9.10.0.
 `uv` uses copy mode because hardlinked runtime files can bypass pathname-based
 write protection. To repair an older repository-local environment, run
 `uv sync --locked --reinstall --link-mode copy`.
@@ -94,7 +111,10 @@ shared `/tmp` is also read/write. `--host-root` relocates host storage. Other su
 
 - `In [1]:` accepts natural-language requests, **not direct Python execution**.
   Input numbers advance on successful submissions, not commands or cancelled drafts.
-  Enter submits; Ctrl-R searches history.
+  Enter submits; Shift-Enter inserts a newline; Ctrl-R searches history.
+- Agent `say()` messages render common Markdown and are separated from surrounding
+  terminal output by blank lines. Queue receipts are kept internal rather than shown.
+  Colored `In [n]:` prompts distinguish user input from agent and command output.
 - Generated Python is **hidden by default**; `/trace` shows it as `Python [n]:`
   along with audit events. Results remain visible as `Out[n]:` and stdout/stderr.
   Result numbers identify worker cells, not user-request numbers. Small streams
@@ -109,8 +129,10 @@ shared `/tmp` is also read/write. `--host-root` relocates host storage. Other su
   Python or making extra model calls. New input steers the agent, never Python stdin.
 - Empty idle Ctrl-C exits. During work, first Ctrl-C interrupts; a second within
   two seconds exits. Empty Ctrl-D or `/quit` exits and cancels active work.
-- `--vi`, `--multiline` (Esc-Enter submits), `--no-color` and `--no-input-history`
-  are available. Paste stays a draft; output preserves your draft and cursor.
+- `--vi`, `--multiline` (Enter adds lines and Esc-Enter submits), `--no-color`
+  and `--no-input-history` are available. Paste stays a draft; output preserves
+  your draft and cursor. On legacy terminals that encode Shift-Enter as Esc-Enter,
+  use ordinary Enter for newlines in `--multiline` mode.
   Non-TTY interactive launches are not supported.
 
 These names are already available to the model:
@@ -150,9 +172,11 @@ Approve or deny it directly in the terminal:
 /deny perm-1
 ```
 
-Unanswered prompts fail closed after ten minutes. `once` covers one connection
-or one successful brokered filesystem mutation; `session` lasts until this `py`
-process exits. `project` is saved for the exact
+The menu defaults to **Deny**; use the arrow keys and Enter to choose, or press
+Escape to deny. There is no approval timeout: the request waits until you decide,
+interrupt, or close the session. `once` covers one connection or one successful
+brokered filesystem mutation; `session` lasts until this `py` process exits.
+`project` is saved for the exact
 canonical `--workspace`; `all` saves that same exact resource grant for every
 workspace using this host root. Interactive network grants are exact host/port
 pairs and are never silently widened to wildcards.
