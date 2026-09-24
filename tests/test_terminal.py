@@ -54,6 +54,7 @@ class Supervisor:
         self.on_event = lambda event: None
         self.journal = Journal()
         self.submitted = []
+        self.shell_commands = []
         self.interrupts = 0
         self.resets = 0
         self.closed = False
@@ -76,6 +77,10 @@ class Supervisor:
     def submit(self, text):
         self.submitted.append(text)
         return f"a1:e{len(self.submitted)}"
+
+    async def execute_shell(self, source):
+        self.shell_commands.append(source)
+        return {"status": "success"}
 
     async def interrupt(self):
         self.interrupts += 1
@@ -291,17 +296,28 @@ async def test_failed_submission_does_not_advance_prompt_number(monkeypatch):
 
 
 @pytest.mark.parametrize("shift_enter", ["\x1b\r", "\x1b[13;2u", "\x1b[27;2;13~"])
-async def test_shift_enter_inserts_newline_and_plain_enter_submits(shift_enter):
+async def test_shift_enter_submits(shift_enter):
     supervisor, output = Supervisor(), Output()
     with create_pipe_input() as pipe:
         terminal = Terminal(supervisor, input=pipe, output=output)
         task = asyncio.create_task(terminal.run())
         await until(lambda: terminal.session.app.is_running)
-        pipe.send_text(f"line one{shift_enter}line two")
-        await until(lambda: terminal.session.default_buffer.text == "line one\nline two")
-        assert not supervisor.submitted
-        pipe.send_text("\r")
-        await until(lambda: supervisor.submitted == ["line one\nline two"])
+        pipe.send_text(f"submit me{shift_enter}")
+        await until(lambda: supervisor.submitted == ["submit me"])
+        pipe.send_text("/quit\r")
+        await asyncio.wait_for(task, 3)
+
+
+async def test_smart_enter_continues_after_colon_and_backslash():
+    supervisor, output = Supervisor(), Output()
+    with create_pipe_input() as pipe:
+        terminal = Terminal(supervisor, input=pipe, output=output)
+        task = asyncio.create_task(terminal.run())
+        await until(lambda: terminal.session.app.is_running)
+        pipe.send_text("items:\rfirst\\\rsecond")
+        await until(lambda: terminal.session.default_buffer.text == "items:\n    first\\\n    second")
+        pipe.send_text("\x1b\r")
+        await until(lambda: supervisor.submitted == ["items:\n    first\\\n    second"])
         pipe.send_text("/quit\r")
         await asyncio.wait_for(task, 3)
 
@@ -312,12 +328,12 @@ async def test_multiline_enter_and_escape_enter():
         terminal = Terminal(supervisor, input=pipe, output=output, multiline=True)
         task = asyncio.create_task(terminal.run())
         await until(lambda: terminal.session.app.is_running)
-        pipe.send_text("line one\rline two\x1b[27;2;13~line three")
+        pipe.send_text("line one\rline two\rline three")
         await until(lambda: terminal.session.default_buffer.text == "line one\nline two\nline three")
         assert supervisor.submitted == []
-        pipe.send_text("\x1b\r")
+        pipe.send_text("\x1b[27;2;13~")
         await until(lambda: supervisor.submitted == ["line one\nline two\nline three"])
-        pipe.send_text("/quit\x1b\r")
+        pipe.send_text("/quit\r")
         await asyncio.wait_for(task, 3)
 
 
@@ -331,9 +347,9 @@ async def test_interrupt_is_nonblocking_and_ctrl_c_idle_clears():
         await until(lambda: terminal.session.app.is_running)
         pipe.send_text("draft\x03")
         await until(lambda: supervisor.interrupts == 1)
-        # Interrupt is in progress, yet the composer can accept steering.
-        pipe.send_text(" steering\r")
-        await until(lambda: supervisor.submitted == ["draft steering"])
+        # Ctrl-C clears the draft; the composer can still accept steering.
+        pipe.send_text("steering\r")
+        await until(lambda: supervisor.submitted == ["steering"])
         supervisor.interrupt_gate.set()
         await until(lambda: supervisor.state == "INTERRUPTED")
         pipe.send_text("discard\x03")
@@ -423,6 +439,19 @@ async def test_closed_input_cancels_active_work_instead_of_spinning():
         await asyncio.wait_for(task, 3)
     assert supervisor.closed
     assert "Terminal input closed; cancelling active work" in output.text
+
+
+async def test_bang_command_executes_directly_and_is_not_submitted():
+    supervisor = Supervisor()
+    terminal = Terminal(supervisor, no_color=True)
+
+    assert await terminal.handle_line("!ls -la")
+    assert supervisor.shell_commands == ["!ls -la"]
+    assert supervisor.submitted == []
+    assert terminal._input_number == 2
+
+    with pytest.raises(ValueError, match="nonempty"):
+        await terminal.handle_line("!   ")
 
 
 async def test_commands_do_not_submit_code_and_history_is_paged():
@@ -565,7 +594,7 @@ def test_stream_switches_keep_order_and_late_cell_origin():
     stream(terminal, "right\n")
     stream(terminal, "old\n", cell="a1:c0002", late=True)
     assert output.text.replace("\r\n", "\n") == (
-        "stdout [1]:\nleft\nstderr [1]:\nwarning\nstdout [1]:\nright\nstdout [2] (late):\nold\n"
+        "stdout [1]:\nleft\n\nstderr [1]:\nwarning\n\nstdout [1]:\nright\n\nstdout [2] (late):\nold\n"
     )
 
 
@@ -577,7 +606,7 @@ def test_long_partial_line_is_bounded_without_newlines_or_excerpt_insertion():
         stream(terminal, payload[start : start + 311])
         assert len(terminal._stream_partial.encode("utf-8")) <= 8192
     render(terminal, {"kind": "cell_end", "content": {"status": "success"}})
-    assert output.text.replace("\r\n", "\n") == "stdout [1]:\n" + payload + "\n"
+    assert output.text.replace("\r\n", "\n") == "stdout [1]:\n" + payload + "\n\n"
 
 
 @pytest.mark.parametrize(
@@ -625,6 +654,29 @@ def test_queued_backlog_cannot_expose_escape_payload_or_modify_original_events()
     assert event["content"] == "\x1b]52;c;"
     assert "SECRET" not in output.text
     assert "safe" in output.text
+
+
+def test_python_output_is_limited_to_first_five_lines_across_fragments():
+    output = Output()
+    terminal = Terminal(Supervisor(), output=output, no_color=True)
+    for fragment in ["one\ntwo\n", "three\nfour", "\nfive\nsix\nseven\n"]:
+        stream(terminal, fragment)
+    render(terminal, {"kind": "cell_end", "cell_id": "a1:c0001", "content": {"status": "success"}})
+    assert output.text.replace("\r\n", "\n") == ("stdout [1]:\none\ntwo\nthree\nfour\nfive\n… showing 5 of 7 lines\n\n")
+
+
+def test_markdown_table_is_rendered_as_aligned_columns():
+    fragments = markdown_fragments("| Name | Type |\n|---|---|\n| `README.md` | File |")
+    rendered = "".join(text for _, text in fragments)
+    assert rendered == "Name       Type\nREADME.md  File"
+    assert "|---" not in rendered
+
+
+def test_display_output_is_limited_to_first_five_lines():
+    output = Output()
+    terminal = Terminal(Supervisor(), output=output, no_color=True)
+    stream(terminal, "1\n2\n3\n4\n5\n6", kind="display")
+    assert output.text.replace("\r\n", "\n") == ("Out[1]:\n1\n2\n3\n4\n5\n… showing 5 of 6 lines\n\n")
 
 
 def test_stream_crlf_normalization_survives_pipe_boundaries():
@@ -801,6 +853,16 @@ async def test_emacs_ctrl_r_and_history_navigation():
         await asyncio.wait_for(task, 3)
 
 
+def test_visible_event_blocks_are_separated_by_one_blank_line():
+    output = Output()
+    terminal = Terminal(Supervisor(), output=output, no_color=True)
+    render(terminal, {"kind": "notice", "content": "first"})
+    stream(terminal, "second\n")
+    render(terminal, {"kind": "cell_end", "cell_id": "a1:c0001", "content": {"status": "success"}})
+    render(terminal, {"kind": "say", "content": "third"})
+    assert output.text.replace("\r\n", "\n") == ("[notice] first\n\nstdout [1]:\nsecond\n\nthird\n\n")
+
+
 def test_say_renders_safe_markdown_with_blank_line_separation():
     output = Output()
     terminal = Terminal(Supervisor(), output=output, no_color=True)
@@ -821,7 +883,7 @@ def test_say_renders_safe_markdown_with_blank_line_separation():
     assert "<b>literal</b>" in text
     assert "SECRET" not in text
     assert "**" not in text and "```" not in text
-    assert 'literal</b>\n\n\n{"answer": "ok"}' in text
+    assert 'literal</b>\n\n{"answer": "ok"}' in text
     assert '{"answer": "ok"}\n\n[notice] after' in text
 
 

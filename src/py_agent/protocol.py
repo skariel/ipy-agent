@@ -166,7 +166,7 @@ def validate_frame(frame: Any, *, allowed_types: set[str] | frozenset[str] | Non
             raise ProtocolError("Source must be nonempty text")
     elif kind == "output":
         _keys(frame, base | {"stream", "text"})
-        if frame["stream"] not in ("stdout", "stderr", "display") or not isinstance(frame["text"], str):
+        if frame["stream"] not in ("stdout", "stderr", "display", "markdown") or not isinstance(frame["text"], str):
             raise ProtocolError("Invalid output")
     elif kind == "say":
         _keys(frame, base | {"content", "final"})

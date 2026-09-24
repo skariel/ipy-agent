@@ -150,7 +150,7 @@ class CellOutput:
         # Canonical names deduplicate completed contents. link is no-clobber,
         # including when an existing destination is a symlink or corrupt artifact.
         directory = os.path.dirname(original)
-        named = os.path.join(directory, f"py-output-{self._sha256.hexdigest()}.txt")
+        named = os.path.join(directory, f"py-output-{self._sha256.hexdigest()[:16]}.txt")
         try:
             os.link(original, named, follow_symlinks=False)
         except FileExistsError:

@@ -383,6 +383,15 @@ async def test_render_once_text_only_and_ipython_default_expression_cache(runtim
     assert end(result)["status"] == "success"
 
 
+async def test_markdown_display_preserves_markdown_mime(runtime):
+    result = await runtime.execute(
+        "from IPython.display import Markdown, display\ndisplay(Markdown('| A | B |\\n|---|---|\\n| 1 | 2 |'))"
+    )
+    markdown = [frame for frame in result if frame.get("stream") == "markdown"]
+    assert "".join(frame["text"] for frame in markdown) == "| A | B |\n|---|---|\n| 1 | 2 |"
+    assert end(result)["status"] == "success"
+
+
 async def test_display_function_and_async_cell(runtime):
     result = await runtime.execute(
         "from IPython.display import display\ndisplay({'key': 'value'})\nimport asyncio\nawait asyncio.sleep(0)\n42"
@@ -718,7 +727,7 @@ async def test_large_say_spools_to_final_hash_path_and_keeps_typed_small_replies
     assert path.parent == runtime.workspace / "output-artifacts"
     expected = '{"value":"' + "雪" * 10000 + '"}' if structured else "雪" * 10000
     assert path.read_text(encoding="utf-8") == expected
-    assert len(path.stem.removeprefix("py-output-")) == 64
+    assert len(path.stem.removeprefix("py-output-")) == 16
     assert end(result)["status"] == "success"
     again = await runtime.execute("say({'answer': 42}, final=True)")
     assert [event["content"] for event in again if event["type"] == "say"] == [{"answer": 42}]

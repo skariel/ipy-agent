@@ -20,7 +20,7 @@ import unicodedata
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.filters import Condition
+from prompt_toolkit.filters import Condition, has_focus, is_searching
 from prompt_toolkit.formatted_text import FormattedText, PygmentsTokens
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
@@ -37,9 +37,26 @@ from pygments.lexers import PythonLexer
 _SHIFT_ENTER = (Keys.ShiftEscape, Keys.ControlM)
 ANSI_SEQUENCES["\x1b[13;2u"] = _SHIFT_ENTER
 ANSI_SEQUENCES["\x1b[27;2;13~"] = _SHIFT_ENTER
+# Kitty's keyboard protocol reports modified control keys as CSI-u.  Without
+# these entries Ctrl-C and Alt-Backspace are inserted as visible escape junk.
+ANSI_SEQUENCES["\x1b[99;5u"] = (Keys.ControlC,)
+ANSI_SEQUENCES["\x1b[27;5;99~"] = (Keys.ControlC,)
+ANSI_SEQUENCES["\x1b[127;3u"] = (Keys.Escape, Keys.Backspace)
+ANSI_SEQUENCES["\x1b[27;3;127~"] = (Keys.Escape, Keys.Backspace)
+
+# Ask capable terminals to report key modifiers instead of collapsing
+# Shift-Enter to an indistinguishable carriage return. xterm's
+# modifyOtherKeys protocol and Kitty's keyboard protocol are complementary;
+# unsupported control sequences are safely ignored.
+_EXTENDED_KEYS_ON = "\x1b[>4;2m\x1b[>1u"
+_EXTENDED_KEYS_OFF = "\x1b[<u\x1b[>4;0m"
 
 _COLOR_STYLE = {
-    "user-prompt": "ansicyan bold",
+    "user-prompt": "ansigreen bold",
+    "continuation-prompt": "ansigreen bold",
+    "output-prompt": "ansired bold",
+    "stream-prompt": "ansiblue bold",
+    "output-note": "ansiyellow italic",
     "md-heading": "ansicyan bold",
     "md-bold": "bold",
     "md-italic": "italic",
@@ -69,17 +86,20 @@ COMMANDS = (
     "/quit",
 )
 HELP = """In [n]: accepts agent requests, not direct Python execution. Its number counts
-submitted messages. Out[n]: and stdout/stderr labels use worker cell numbers,
-which are independent of input numbers. Generated Python is hidden unless /trace
+submitted messages and shell commands. Prefix a command with ! to execute it
+directly in the sandbox (for example, !ls). Out[n]: and stdout/stderr labels use
+worker cell numbers, which are independent of input numbers. Generated Python is hidden unless /trace
 is on; results stay visible. Thinking animates in the status bar.
 ctx(last) is last reported input tokens / configured context window, not a live
 estimate. Missing counts or window show ?. out(last) is reported output tokens.
-Enter submits; Shift-Enter inserts a newline; Ctrl-R searches input history;
-Up/Down navigate it. Bracketed paste stays a draft. With --multiline, Enter
-inserts a newline and Esc-Enter submits; /quit + Enter also exits in multiline
-mode.
-Ctrl-C interrupts active work or clears a draft; press it again within two
-seconds to exit. Ctrl-C on an empty idle prompt exits immediately. Ctrl-D on an
+Enter submits a complete line; after a trailing : or \\ it starts an indented
+continuation line. Shift-Enter always submits; Alt-Backspace deletes a word.
+Ctrl-R searches input history; Up/Down navigate it. Bracketed paste stays a
+draft. With --multiline, Enter always inserts a newline and Shift-Enter submits
+(Esc-Enter is a terminal-compatible fallback). /quit + Enter also exits in
+multiline mode.
+Ctrl-C interrupts active work or clears the draft; press it again within two
+seconds to exit. On an empty idle prompt Ctrl-C exits. Ctrl-D on an
 empty prompt exits, cancelling active work. Earlier effects are not rolled back.
 /help                 show this help
 /history [ID [OFFSET]] recent evidence, or read a page by event/cell ID
@@ -138,6 +158,60 @@ def _inline_markdown(text: str, default_style: str = "") -> list[tuple[str, str]
     return fragments
 
 
+def _markdown_table_row(line: str) -> list[str] | None:
+    """Split a simple GFM table row, honoring escaped pipes and inline code."""
+    stripped = line.strip()
+    if "|" not in stripped:
+        return None
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|") and not stripped.endswith(r"\|"):
+        stripped = stripped[:-1]
+    cells, current, escaped, code = [], [], False, False
+    for char in stripped:
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+            current.append(char)
+        elif char == "`":
+            code = not code
+            current.append(char)
+        elif char == "|" and not code:
+            cells.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    cells.append("".join(current).strip())
+    return cells if len(cells) > 1 else None
+
+
+def _markdown_table_separator(line: str, columns: int) -> bool:
+    cells = _markdown_table_row(line)
+    return bool(
+        cells and len(cells) == columns and all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells)
+    )
+
+
+def _table_fragments(rows: list[list[str]]) -> list[tuple[str, str]]:
+    rendered = [[_inline_markdown(cell) for cell in row] for row in rows]
+    widths = [max(sum(len(text) for _, text in row[column]) for row in rendered) for column in range(len(rows[0]))]
+    fragments: list[tuple[str, str]] = []
+    for row_number, row in enumerate(rows):
+        if row_number:
+            fragments.append(("", "\n"))
+        for column, cell in enumerate(row):
+            if column:
+                fragments.append(("", "  "))
+            style = "class:md-heading" if row_number == 0 else ""
+            cell_fragments = _inline_markdown(cell, style)
+            fragments.extend(cell_fragments)
+            visible = sum(len(text) for _, text in cell_fragments)
+            fragments.append((style, " " * (widths[column] - visible)))
+    return fragments
+
+
 def markdown_fragments(value: Any) -> FormattedText:
     """Convert common Markdown presentation to sanitized prompt_toolkit text."""
     safe = sanitize(value).strip("\n")
@@ -145,14 +219,31 @@ def markdown_fragments(value: Any) -> FormattedText:
         return FormattedText([("", safe)])
     fragments: list[tuple[str, str]] = []
     fenced = False
-    for line_number, line in enumerate(safe.split("\n")):
-        if line_number:
+    lines = safe.split("\n")
+    line_number = 0
+    while line_number < len(lines):
+        line = lines[line_number]
+        if fragments:
             fragments.append(("", "\n"))
         if re.match(r"^\s*```", line):
             fenced = not fenced
+            line_number += 1
             continue
         if fenced:
             fragments.append(("class:md-code", line))
+            line_number += 1
+            continue
+        header = _markdown_table_row(line)
+        if header and line_number + 1 < len(lines) and _markdown_table_separator(lines[line_number + 1], len(header)):
+            rows = [header]
+            line_number += 2
+            while line_number < len(lines):
+                row = _markdown_table_row(lines[line_number])
+                if row is None or len(row) != len(header):
+                    break
+                rows.append(row)
+                line_number += 1
+            fragments.extend(_table_fragments(rows))
             continue
         heading = re.match(r"^\s{0,3}#{1,6}\s+(.*)$", line)
         quote = re.match(r"^\s{0,3}>\s?(.*)$", line)
@@ -167,6 +258,7 @@ def markdown_fragments(value: Any) -> FormattedText:
             fragments.extend(_inline_markdown(bullet.group(2)))
         else:
             fragments.extend(_inline_markdown(line))
+        line_number += 1
     return FormattedText(fragments)
 
 
@@ -284,6 +376,10 @@ class Terminal:
         self._stream_key = None
         self._stream_partial = ""
         self._stream_open_line = False
+        self._stream_lines: dict[tuple, int] = {}
+        self._stream_total_lines: dict[tuple, int] = {}
+        self._stream_has_partial: dict[tuple, bool] = {}
+        self._stream_truncation_reported: set[tuple] = set()
         self._permission_requests: deque[dict] = deque()
         self._permission_choice = 0
         # Only parser flags, never raw escape payloads. Keep them across stream
@@ -362,23 +458,38 @@ class Terminal:
             self._resolve_permission_choice()
             event.app.invalidate()
 
-        @bindings.add("s-escape", "enter")
-        def insert_shift_enter(event):
-            event.current_buffer.insert_text("\n")
+        @bindings.add("s-escape", "enter", eager=True)
+        def submit_shift_enter(event):
+            event.current_buffer.validate_and_handle()
 
-        @bindings.add("escape", "enter")
-        def escape_enter(event):
+        @bindings.add("escape", "enter", eager=True)
+        def submit_escape_enter(event):
+            # Legacy terminals encode Shift-Enter as Escape followed by Enter.
+            event.current_buffer.validate_and_handle()
+
+        @bindings.add("escape", "backspace", eager=True)
+        @bindings.add("escape", "delete", eager=True)
+        def delete_previous_word(event):
+            event.current_buffer.delete_word_before_cursor()
+
+        @bindings.add("enter", filter=~permission_pending & has_focus("DEFAULT_BUFFER") & ~is_searching, eager=True)
+        def smart_enter(event):
+            buffer = event.current_buffer
             if self.multiline:
-                event.current_buffer.validate_and_handle()
+                if buffer.text.strip() == "/quit":
+                    event.app.exit(exception=_QuitRequested())
+                else:
+                    buffer.insert_text("\n")
+                return
+            before = buffer.document.current_line_before_cursor
+            stripped = before.rstrip()
+            if stripped.endswith(("\\", ":")):
+                indent = len(before) - len(before.lstrip(" "))
+                if stripped.endswith(":"):
+                    indent += 4
+                buffer.insert_text("\n" + " " * indent)
             else:
-                # Legacy terminals encode Shift-Enter as Escape followed by Enter.
-                event.current_buffer.insert_text("\n")
-
-        @bindings.add(
-            "enter", filter=Condition(lambda: self.multiline and self.session.default_buffer.text.strip() == "/quit")
-        )
-        def quit_multiline(event):
-            event.app.exit(exception=_QuitRequested())
+                buffer.validate_and_handle()
 
         @bindings.add("c-c", eager=True)
         def interrupt(event):
@@ -388,13 +499,11 @@ class Terminal:
                 event.app.exit(exception=_QuitRequested())
                 return
             self._last_ctrl_c = now
-            self.on_event({"kind": "notice", "content": "Press Ctrl-C again to exit."})
+            if event.current_buffer.text:
+                event.current_buffer.reset()
+            self.on_event({"kind": "notice", "content": "Interrupted. Press Ctrl-C again within 2 seconds to exit."})
             if self._active():
                 self._schedule_interrupt()
-            else:
-                # Reset the prompt and history loader together, preserving the
-                # second-press timestamp across prompt resets.
-                event.app.exit(exception=KeyboardInterrupt())
 
         @bindings.add("c-d", eager=True)
         def eof(event):
@@ -526,7 +635,8 @@ class Terminal:
         self._wake.set()
 
     def _emit(self, content, *, python: bool = False) -> None:
-        self._finish_stream()
+        if self._finish_stream():
+            self._blank_line()
         safe = sanitize(content)
         formatted = PygmentsTokens(lex(safe, PythonLexer())) if python and not self.no_color else safe
         print_formatted_text(
@@ -534,12 +644,30 @@ class Terminal:
         )
 
     def _emit_markdown(self, content: Any) -> None:
-        self._finish_stream()
-        # Leading and trailing newlines separate agent prose from prompts,
-        # subprocess output, and adjacent messages.
-        fragments = [("", "\n"), *markdown_fragments(content), ("", "\n")]
+        if self._finish_stream():
+            self._blank_line()
+        fragments = markdown_fragments(content)
         print_formatted_text(
             FormattedText(fragments),
+            output=self.session.output,
+            style=self._style,
+            color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
+        )
+
+    def _emit_heading(self, heading: str, *, display: bool) -> None:
+        if self._finish_stream():
+            self._blank_line()
+        style = "class:output-prompt" if display else "class:stream-prompt"
+        print_formatted_text(
+            FormattedText([(style, heading)]),
+            output=self.session.output,
+            style=self._style,
+            color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
+        )
+
+    def _emit_output_note(self, text: str) -> None:
+        print_formatted_text(
+            FormattedText([("class:output-note", text)]),
             output=self.session.output,
             style=self._style,
             color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
@@ -553,45 +681,76 @@ class Terminal:
             )
             self._stream_open_line = not text.endswith("\n")
 
-    def _finish_stream(self) -> None:
+    def _blank_line(self) -> None:
+        print_formatted_text(
+            "", output=self.session.output, color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None
+        )
+
+    def _finish_stream(self) -> bool:
         if self._stream_key is None:
-            return
+            return False
         self._write_stream(self._stream_partial)
         # This newline separates UI blocks, not arbitrary transport fragments.
         if self._stream_open_line:
             self._write_stream("\n")
+        if self._stream_key is not None and self._stream_lines.get(self._stream_key, 0) < 5:
+            self._stream_lines[self._stream_key] = self._stream_lines.get(self._stream_key, 0) + 1
         self._stream_partial = ""
         self._stream_key = None
+        return True
 
     def _render_output(self, event: dict, content) -> None:
         stream = event.get("stream", "stdout")
-        origin = (event.get("cell_id"), stream)
+        origin = (event.get("cell_id"), stream, bool(event.get("asynchronous")))
         safe = sanitize(content)  # streaming escape state was handled by on_event()
         if not safe:
             return
         late = " (late)" if event.get("asynchronous") else ""
-        label = "Out" if stream == "display" else sanitize(stream)
-        gap = "" if stream == "display" else " "
+        label = "Out" if stream in {"display", "markdown"} else sanitize(stream)
+        gap = "" if stream in {"display", "markdown"} else " "
         heading = f"{label}{gap}[{self._cell_number(event)}]{late}:"
-        if stream == "display":
-            # Display events have no line/continuation marker. Keep their existing
-            # value boundaries, unlike byte-stream stdout/stderr fragments.
-            self._emit(heading)
-            self._emit(safe)
+        if stream in {"display", "markdown"}:
+            # Display values are atomic rather than pipe fragments, but apply the
+            # same concise-output policy to their textual representation.
+            all_lines = safe.splitlines()
+            excerpt = "\n".join(all_lines[:5])
+            if excerpt:
+                self._emit_heading(heading, display=True)
+                if stream == "markdown":
+                    self._emit_markdown(excerpt)
+                else:
+                    self._emit(excerpt)
+                if len(all_lines) > 5:
+                    self._emit_output_note(f"… showing 5 of {len(all_lines)} lines")
+                self._blank_line()
             return
-        key = (*origin, bool(event.get("asynchronous")))
+
+        key = origin
+        self._stream_total_lines[key] = self._stream_total_lines.get(key, 0) + safe.count("\n")
+        if safe:
+            self._stream_has_partial[key] = not safe.endswith("\n")
+        if self._stream_lines.get(key, 0) >= 5:
+            return
         if key != self._stream_key:
-            self._emit(heading)
+            if self._stream_key is not None:
+                self._finish_stream()
+                self._blank_line()
+            self._emit_heading(heading, display=False)
             self._stream_key = key
-        # 2048 Unicode characters occupy at most 8 KiB of UTF-8. No timer task.
-        while safe:
+
+        # Preserve transport fragmentation while exposing at most five logical
+        # lines from each cell/stream. The cap is applied after sanitization.
+        while safe and self._stream_lines.get(key, 0) < 5:
             room = 2048 - len(self._stream_partial)
             piece, safe = safe[:room], safe[room:]
             self._stream_partial += piece
-            newline = self._stream_partial.rfind("\n")
-            if newline >= 0:
-                self._write_stream(self._stream_partial[: newline + 1])
-                self._stream_partial = self._stream_partial[newline + 1 :]
+            while "\n" in self._stream_partial and self._stream_lines.get(key, 0) < 5:
+                line, self._stream_partial = self._stream_partial.split("\n", 1)
+                self._write_stream(line + "\n")
+                self._stream_lines[key] = self._stream_lines.get(key, 0) + 1
+            if self._stream_lines.get(key, 0) >= 5:
+                self._stream_partial = ""
+                return
             if len(self._stream_partial) == 2048:
                 self._write_stream(self._stream_partial)
                 self._stream_partial = ""
@@ -605,10 +764,12 @@ class Terminal:
     def _render_event(self, event: dict) -> None:
         kind, content = event.get("kind", "event"), event.get("content", "")
         identifier = event.get("cell_id") or event.get("id") or ""
+        visible = False
         if kind in {"user_queued", "queued"}:
             return
-        elif kind == "say":
+        if kind == "say":
             self._emit_markdown(content)
+            visible = True
         elif kind == "permission_request" and isinstance(content, dict):
             request_id = sanitize(content.get("request_id", "?"))
             permission_kind = sanitize(content.get("permission_kind", "permission"))
@@ -620,22 +781,40 @@ class Terminal:
                 + "\nChoose in the menu with arrow keys and Enter; Esc denies. Slash commands remain available."
             )
             self._emit(message)
+            visible = True
         elif kind in {"source", "cell", "cell_source"}:
             if self.trace:
                 self._emit(f"Python [{self._cell_number(event)}]:")
                 self._emit(content, python=True)
+                visible = True
         elif kind == "output":
             self._render_output(event, content)
+            return
         elif kind == "cell_end":
-            self._finish_stream()
+            visible = self._finish_stream()
+            cell = event.get("cell_id")
+            for key in list(self._stream_total_lines):
+                if key[0] != cell or key in self._stream_truncation_reported:
+                    continue
+                total = self._stream_total_lines[key] + int(self._stream_has_partial.get(key, False))
+                if total > 5:
+                    self._emit_output_note(f"… showing 5 of {total} lines")
+                    self._stream_truncation_reported.add(key)
+                    visible = True
             if isinstance(content, dict) and content.get("status") not in {"success", "wait"}:
                 self._emit(
-                    f"Cell [{self._cell_number(event)}] {sanitize(content.get('status', 'error'))}: {sanitize(content.get('error', ''))}"
+                    f"Cell [{self._cell_number(event)}] {sanitize(content.get('status', 'error'))}: "
+                    f"{sanitize(content.get('error', ''))}"
                 )
+                visible = True
             elif self.trace:
                 self._emit(f"[cell_end {identifier}] {sanitize(content)}")
+                visible = True
         else:
             self._emit(f"[{kind}{' ' + str(identifier) if identifier else ''}] {sanitize(content)}")
+            visible = True
+        if visible:
+            self._blank_line()
 
     def _resolve_permission_choice(self) -> None:
         if not self._permission_requests:
@@ -697,6 +876,25 @@ class Terminal:
             if self._active():
                 self._emit("Cancelling active work and terminating its descendants; partial effects remain.")
             return False
+        if text.startswith("!"):
+            command = text[1:].strip()
+            if not command:
+                raise ValueError("Shell input must be a nonempty !command")
+            if command == "clear":
+                # This is trusted UI control, unlike worker output (whose ANSI is stripped).
+                self.session.output.write_raw("\x1b[2J\x1b[H")
+                self.session.output.flush()
+                self._input_number += 1
+                return True
+            if command == "ls":
+                text = "!ls -CF --color=never"
+            elif command == "ll":
+                text = "!ls -alF --color=never"
+            elif command.startswith("ll "):
+                text = "!ls -alF --color=never " + command[3:]
+            await self.supervisor.execute_shell(text)
+            self._input_number += 1
+            return True
         if not text.startswith("/"):
             event_id = self.supervisor.submit(text)
             self._input_number += 1
@@ -768,30 +966,46 @@ class Terminal:
         self.supervisor.on_event = self.on_event
         try:
             with patch_stdout(raw=False):
-                while True:
-                    try:
-                        prompt = FormattedText([("class:user-prompt", f"In [{self._input_number}]: ")])
-                        line = await self.session.prompt_async(prompt, pre_run=self._pre_run)
-                        if not await self.handle_line(line):
+                # Without protocol negotiation many terminals send exactly the
+                # same CR byte for Enter and Shift-Enter, making a binding
+                # impossible. Request modifier-aware key sequences while this
+                # prompt owns the terminal and restore the prior mode on exit.
+                self.session.output.write_raw(_EXTENDED_KEYS_ON)
+                self.session.output.flush()
+                try:
+                    while True:
+                        try:
+                            prompt = FormattedText([("class:user-prompt", f"In [{self._input_number}]: ")])
+                            continuation = lambda width, line_number, wrap_count: FormattedText([
+                                ("class:continuation-prompt", " " * max(0, width - 5) + "...: ")
+                            ])
+                            line = await self.session.prompt_async(
+                                prompt, prompt_continuation=continuation, pre_run=self._pre_run
+                            )
+                            self._blank_line()
+                            if not await self.handle_line(line):
+                                break
+                        except _QuitRequested:
+                            if self._active():
+                                self._emit(
+                                    "Exiting: cancelling active work and terminating descendants. Partial effects remain."
+                                )
                             break
-                    except _QuitRequested:
-                        if self._active():
-                            self._emit(
-                                "Exiting: cancelling active work and terminating descendants. Partial effects remain."
-                            )
-                        break
-                    except KeyboardInterrupt:
-                        if self._active():
-                            self._schedule_interrupt()
-                    except EOFError:
-                        # A closed input stream must not spin or orphan work.
-                        if self._active():
-                            self._emit(
-                                "Terminal input closed; cancelling active work and terminating descendants. Partial effects remain."
-                            )
-                        break
-                    except Exception as exc:
-                        self.on_event({"kind": "error", "content": str(exc)})
+                        except KeyboardInterrupt:
+                            if self._active():
+                                self._schedule_interrupt()
+                        except EOFError:
+                            # A closed input stream must not spin or orphan work.
+                            if self._active():
+                                self._emit(
+                                    "Terminal input closed; cancelling active work and terminating descendants. Partial effects remain."
+                                )
+                            break
+                        except Exception as exc:
+                            self.on_event({"kind": "error", "content": str(exc)})
+                finally:
+                    self.session.output.write_raw(_EXTENDED_KEYS_OFF)
+                    self.session.output.flush()
         finally:
             self._closing = True
             try:

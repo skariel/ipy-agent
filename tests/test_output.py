@@ -287,7 +287,7 @@ def test_secure_creation_does_not_follow_existing_symlink(sink, tmp_path, monkey
     monkeypatch.setattr(tempfile, "_get_candidate_names", lambda: iter(["occupied", "fresh"]))
     output.append("stdout", "x" * 9000)
     complete(output)
-    assert Path(output.path).name == f"py-output-{hashlib.sha256(b'x' * 9000).hexdigest()}.txt"
+    assert Path(output.path).name == f"py-output-{hashlib.sha256(b'x' * 9000).hexdigest()[:16]}.txt"
     assert not Path(output.path).is_symlink()
     assert target.read_text() == "unchanged"
 
@@ -312,7 +312,7 @@ def test_short_os_writes_are_retried_without_dropping_bytes(sink, monkeypatch):
     complete(output)
     assert Path(output.path).read_text(encoding="utf-8") == "🐍雪\n"
     assert output.saved_bytes == 8
-    assert hashlib.sha256("🐍雪\n".encode()).hexdigest() in Path(output.path).name
+    assert hashlib.sha256("🐍雪\n".encode()).hexdigest()[:16] in Path(output.path).name
 
 
 def inherited_file_limit(monkeypatch, size):
@@ -351,7 +351,7 @@ def test_spool_over_old_64mib_cap_has_complete_hash_file_with_bounded_memory(sin
     complete(output)
     path = Path(output.path)
     assert path.stat().st_size == output.chars == size
-    assert path.name == f"py-output-{expected_hash.hexdigest()}.txt"
+    assert path.name == f"py-output-{expected_hash.hexdigest()[:16]}.txt"
     assert len(events) == 1
     assert "Full output NOT saved" not in text(events)
 
@@ -393,7 +393,7 @@ print(json.dumps({"path": output.path, "text": "".join(f["text"] for f in frames
 
 
 def hash_path(original, value):
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
     return original.with_name(f"py-output-{digest}.txt")
 
 
@@ -434,7 +434,7 @@ def test_identical_contents_reuse_one_verified_canonical_file(sink):
         assert other.path == output.path
         assert canonical.stat().st_ino == inode
         assert not provisional.exists()
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
     assert canonical.name == f"py-output-{digest}.txt"
     assert canonical.read_text() == value
     assert list(canonical.parent.iterdir()) == [canonical]

@@ -116,8 +116,8 @@ shared `/tmp` is also read/write. `--host-root` relocates host storage. Other su
   terminal output by blank lines. Queue receipts are kept internal rather than shown.
   Colored `In [n]:` prompts distinguish user input from agent and command output.
 - Generated Python is **hidden by default**; `/trace` shows it as `Python [n]:`
-  along with audit events. Results remain visible as `Out[n]:` and stdout/stderr.
-  Result numbers identify worker cells, not user-request numbers. Small streams
+  along with audit events. Results remain visible as `Out[n]:` and stdout/stderr, limited to the first five
+  lines per result stream. Result numbers identify worker cells, not user-request numbers. Small streams
   are buffered until a control boundary or cell completion. A spinner shows thinking.
 - `ctx(last) 30%/272k` uses reported input tokens for the current context divided
   by its **configured capacity**, not the byte estimate. Unknown usage shows `?`;

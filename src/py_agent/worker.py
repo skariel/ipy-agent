@@ -293,10 +293,17 @@ def _shell(bridge, emit_display):
     transformers[:] = [StrictHelpEnd if cls is HelpEnd else cls for cls in transformers]
     # No InteractiveShellApp/profile startup or extension loading occurs.
     shell.set_custom_exc((CellYield,), lambda *args, **kwargs: [])
-    shell.display_formatter.active_types = ["text/plain"]
+    shell.display_formatter.active_types = ["text/plain", "text/markdown"]
     shell.displayhook.write_output_prompt = lambda: None
-    shell.displayhook.write_format_data = lambda data, md_dict=None: emit_display(data.get("text/plain", ""))
-    shell.display_pub.publish = lambda data, **kwargs: emit_display(data.get("text/plain", ""))
+
+    def publish_display(data, **kwargs):
+        if "text/markdown" in data:
+            emit_display(data["text/markdown"], "markdown")
+        else:
+            emit_display(data.get("text/plain", ""), "display")
+
+    shell.displayhook.write_format_data = lambda data, md_dict=None: publish_display(data)
+    shell.display_pub.publish = publish_display
 
     def disabled_debugger(*args, **kwargs):
         raise RuntimeError("Interactive debugging is unavailable; inspect state in another cell")
@@ -335,12 +342,12 @@ class Runner:
             self.capture.output.flush()
         self.transport.send(frame)
 
-    def display(self, text):
+    def display(self, text, stream="display"):
         if text and self.bridge.cell_id:
             # Render once. Drain prior native writes before appending the display
             # to the same cell-wide character budget and optional spill file.
             self.capture.barrier()
-            self.capture.output.append("display", text)
+            self.capture.output.append(stream, text)
 
     def execute(self, frame):
         cell_id, source = frame["cell_id"], frame["source"]

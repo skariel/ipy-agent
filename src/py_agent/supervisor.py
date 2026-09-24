@@ -185,6 +185,22 @@ class Supervisor:
         self._wake.set()
         return event["id"]
 
+    async def execute_shell(self, source):
+        """Execute a user-entered IPython shell escape in the sandbox worker."""
+        if self._closed or self._kernel_dead or self.context is None:
+            raise RuntimeError("No live kernel; start a fresh session. No command was executed.")
+        if not isinstance(source, str) or not source.startswith("!") or not source[1:].strip():
+            raise ValueError("Shell input must be a nonempty !command")
+        if self.cell_id is not None or self.state in {"GENERATING", "EXECUTING"}:
+            raise RuntimeError("Cannot run a shell command while agent work is active; interrupt or wait first.")
+
+        user = self._emit("user", source)
+        self.context.add("user", source, [user["id"]])
+        self.revision += 1
+        result, _ = await self._execute(source, f"shell:{user['id']}")
+        self._state("IDLE" if result["status"] == "success" else "FAILED")
+        return result
+
     def request_reset(self):
         self._reset = True
         # This only changes the next request's context, never runs a cell.
