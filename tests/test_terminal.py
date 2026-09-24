@@ -55,6 +55,7 @@ class Supervisor:
         self.journal = Journal()
         self.submitted = []
         self.shell_commands = []
+        self.python_cells = []
         self.interrupts = 0
         self.resets = 0
         self.closed = False
@@ -80,6 +81,10 @@ class Supervisor:
 
     async def execute_shell(self, source):
         self.shell_commands.append(source)
+        return {"status": "success"}
+
+    async def execute_python(self, source):
+        self.python_cells.append(source)
         return {"status": "success"}
 
     async def interrupt(self):
@@ -912,18 +917,14 @@ def test_markdown_and_prompt_styles_are_color_optional():
     plain = Terminal(Supervisor(), output=Output(), no_color=True)
     assert colored._style.get_attrs_for_style_str("class:user-prompt").bold
     assert colored._style.get_attrs_for_style_str("class:user-prompt").color
-    assert not colored._style.get_attrs_for_style_str("class:user-prompt").bgcolor
-    assert not colored._style.get_attrs_for_style_str("class:user-input").bgcolor
-    backgrounds = {
-        role: colored._style.get_attrs_for_style_str(f"class:{role}").bgcolor
-        for role in ("say", "stdout", "stderr")
-    }
-    assert all(backgrounds.values())
-    assert len(set(backgrounds.values())) == 3
-    assert backgrounds["stdout"] == "16351f"
-    assert backgrounds["stderr"] == "3b2025"
+    assert colored._style.get_attrs_for_style_str("class:user-prompt").bgcolor == "343541"
+    assert colored._style.get_attrs_for_style_str("class:user-input").bgcolor == "343541"
+    assert not colored._style.get_attrs_for_style_str("class:say").bgcolor
+    assert colored._style.get_attrs_for_style_str("class:stdout").bgcolor == "283228"
+    assert colored._style.get_attrs_for_style_str("class:stderr").bgcolor == "3c2828"
     assert not plain._style.get_attrs_for_style_str("class:user-prompt").bold
     assert not plain._style.get_attrs_for_style_str("class:user-prompt").color
+    assert not plain._style.get_attrs_for_style_str("class:user-input").bgcolor
 
 
 async def test_terminal_queue_preserves_all_events_and_status_unknown():
@@ -937,7 +938,11 @@ async def test_terminal_queue_preserves_all_events_and_status_unknown():
     assert len(terminal._pending) == 0
     assert terminal._acknowledged == {"a1:e1"}
     toolbar = "".join(text for _, text in terminal._toolbar())
-    assert "ctx(last) ?%/? out(last) ?" in toolbar
+    assert "?%/? | CH ?% r? w?" in toolbar
+    assert "ctx(last)" not in toolbar
+    assert "out(last)" not in toolbar
+    assert "cache(last)" not in toolbar
+    assert "queued" not in toolbar
     assert "ctx~" not in toolbar
     assert "123" not in toolbar
 
@@ -963,18 +968,18 @@ async def test_journal_queue_receipt_and_submit_fallback_are_one_ack():
 @pytest.mark.parametrize(
     "usage,expected",
     [
-        ([{"normalized": {"input_tokens": 500, "output_tokens": 23}}], "50%/1k out(last) 23"),
+        ([{"normalized": {"input_tokens": 500, "output_tokens": 23}}], "50%/1k"),
         (
             [{"normalized": {"input_tokens": 999}}, {"normalized": {"input_tokens": 600, "output_tokens": 30}}],
-            "60%/1k out(last) 30",
+            "60%/1k",
         ),
-        ([{"normalized": {"input_tokens": 999}}, {}], "?%/1k out(last) ?"),
-        ({"normalized": {"input_tokens": 0, "output_tokens": 0}}, "0%/1k out(last) 0"),
-        ({"normalized": {"output_tokens": 23}}, "?%/1k out(last) 23"),
-        ({"normalized": {"input_tokens": 500}}, "50%/1k out(last) ?"),
-        ({"input_tokens": 500, "output_tokens": 23}, "50%/1k out(last) 23"),
-        ({"normalized": {"input_tokens": None, "output_tokens": None}}, "?%/1k out(last) ?"),
-        ({"normalized": {"input_tokens": True, "output_tokens": -1}}, "?%/1k out(last) ?"),
+        ([{"normalized": {"input_tokens": 999}}, {}], "?%/1k"),
+        ({"normalized": {"input_tokens": 0, "output_tokens": 0}}, "0%/1k"),
+        ({"normalized": {"output_tokens": 23}}, "?%/1k"),
+        ({"normalized": {"input_tokens": 500}}, "50%/1k"),
+        ({"input_tokens": 500, "output_tokens": 23}, "50%/1k"),
+        ({"normalized": {"input_tokens": None, "output_tokens": None}}, "?%/1k"),
+        ({"normalized": {"input_tokens": True, "output_tokens": -1}}, "?%/1k"),
         (
             {
                 "normalized": {
@@ -984,7 +989,7 @@ async def test_journal_queue_receipt_and_submit_fallback_are_one_ack():
                     "reasoning_tokens": 10,
                 }
             },
-            "50%/1k out(last) 23",
+            "50%/1k",
         ),
     ],
 )
@@ -994,7 +999,7 @@ async def test_toolbar_reads_last_reported_tokens_without_estimation_or_cache_ar
     supervisor.status = lambda: {**original, "usage": usage, "context_window_tokens": 1000}
     terminal = Terminal(supervisor, output=Output())
     toolbar = "".join(text for _, text in terminal._toolbar())
-    assert f"ctx(last) {expected}" in toolbar
+    assert expected in toolbar
     assert "ctx~" not in toolbar
     assert "123" not in toolbar
 
@@ -1025,7 +1030,8 @@ async def test_toolbar_context_percentage_uses_only_valid_configured_window(wind
         "usage": [{"normalized": {"input_tokens": input_tokens, "output_tokens": 17}}],
     }
     toolbar = "".join(text for _, text in Terminal(supervisor, output=Output())._toolbar())
-    assert f"ctx(last) {expected} out(last) 17" in toolbar
+    assert expected in toolbar
+    assert " 17" not in toolbar
 
 
 @pytest.mark.parametrize("current,expected", [(81600, "30%/272k"), (None, "?%/272k")])
@@ -1039,14 +1045,17 @@ async def test_toolbar_ignores_orphan_or_previous_epoch_usage(current, expected)
         "usage": [{"normalized": {"input_tokens": 271000, "output_tokens": 23}}],
     }
     terminal = Terminal(supervisor, output=Output())
-    assert f"ctx(last) {expected}" in "".join(text for _, text in terminal._toolbar())
+    assert expected in "".join(text for _, text in terminal._toolbar())
 
 
 def test_config_exact_schema_and_types(tmp_path):
     path = tmp_path / "config.toml"
-    path.write_text('model="openai/explicit"\nstream=true\n[budgets]\ninput_tokens=10000\noutput_tokens=4000\n')
+    path.write_text(
+        'model="openai-codex/explicit"\nstream=true\neffort="high"\n[budgets]\ninput_tokens=10000\noutput_tokens=4000\n'
+    )
     config = cli.load_config(path)
-    assert config["model"] == "openai/explicit"
+    assert config["model"] == "openai-codex/explicit"
+    assert config["effort"] == "high"
     assert config["budgets"]["output_tokens"] == 4000
     path.write_text("context_window_tokens=272000")
     assert cli.load_config(path)["context_window_tokens"] == 272000
@@ -1055,6 +1064,8 @@ def test_config_exact_schema_and_types(tmp_path):
         'api_key="secret"',
         "model=123",
         'stream="yes"',
+        'effort="maximum"',
+        "effort=3",
         "[budgets]\nunknown=12",
         "[budgets]\nmax_requests=true",
         "budgets=12",
@@ -1330,14 +1341,15 @@ def test_toolbar_labels_latest_and_session_cache_rates_reads_and_writes():
     }
     terminal = Terminal(supervisor, output=Output())
     toolbar = "".join(text for _, text in terminal._toolbar())
-    assert "ctx(last) 30%/1k out(last) 4" in toolbar
-    assert "cache(last) 53% | cache(session) 50% r200 w30" in toolbar
+    assert "30%/1k |" in toolbar
+    assert " 4" not in toolbar
+    assert "CH 50% r200 w30" in toolbar
 
 
 def test_toolbar_keeps_unknown_cache_counters_unknown():
     terminal = Terminal(Supervisor(), output=Output())
     toolbar = "".join(text for _, text in terminal._toolbar())
-    assert "cache(last) ?% | cache(session) ?% r? w?" in toolbar
+    assert "CH ?% r? w?" in toolbar
 
 
 def test_toolbar_keeps_partially_reported_session_counters_unknown():
@@ -1358,4 +1370,4 @@ def test_toolbar_keeps_partially_reported_session_counters_unknown():
     }
     terminal = Terminal(supervisor, output=Output())
     toolbar = "".join(text for _, text in terminal._toolbar())
-    assert "cache(last) 50% | cache(session) ?% r? w?" in toolbar
+    assert "CH ?% r? w?" in toolbar

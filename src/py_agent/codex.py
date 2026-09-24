@@ -22,6 +22,7 @@ import httpx
 from .provider import Completion, ProviderError, _validate_messages
 
 CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
+REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 _TERMINAL = {"response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled"}
 _DELTA_EVENTS = {
     "response.output_text.delta",
@@ -274,13 +275,17 @@ class CodexProvider:
         auth_file: Path | None = None,
         *,
         session_id: str | None = None,
+        effort: str = "medium",
         transport=None,
     ):
         if not isinstance(model, str) or not re.fullmatch(r"openai-codex/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", model):
             raise ValueError("Select an explicit openai-codex/<model> model")
         if session_id is not None and (not isinstance(session_id, str) or not session_id):
             raise ValueError("session_id must be a nonempty string")
+        if effort not in REASONING_EFFORTS:
+            raise ValueError("Unsupported Codex reasoning effort")
         self.model = model
+        self.effort = effort
         self.auth_file = Path(auth_file) if auth_file is not None else Path.home() / ".pi/agent/auth.json"
         # A provider instance belongs to one py run. This opaque random value is
         # independent of prompts, paths, and credentials and survives every turn.
@@ -316,7 +321,7 @@ class CodexProvider:
             "prompt_cache_key": self.session_id,
             "store": False,
             "stream": True,
-            "reasoning": {"effort": "medium"},
+            "reasoning": {"effort": self.effort},
             "text": {"verbosity": "low"},
         }
 

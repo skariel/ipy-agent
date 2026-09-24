@@ -809,6 +809,13 @@ async def test_auth_validation_error_does_not_send_request(monkeypatch):
     assert requests == []
 
 
+def test_configured_reasoning_effort_is_sent_exactly():
+    provider = codex.CodexProvider("openai-codex/model", effort="xhigh")
+    assert provider.build_request(MESSAGES)["reasoning"] == {"effort": "xhigh"}
+    with pytest.raises(ValueError, match="reasoning effort"):
+        codex.CodexProvider("openai-codex/model", effort="maximum")
+
+
 def test_session_affinity_is_stable_opaque_and_provider_local():
     sensitive = "/private/workspace/token-secret"
     first = codex.CodexProvider(

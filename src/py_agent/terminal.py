@@ -32,6 +32,7 @@ from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.lexers import SimpleLexer
 from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
@@ -60,11 +61,13 @@ _EXTENDED_KEYS_OFF = "\x1b[<u\x1b[>4;0m"
 _COLOR_STYLE = {
     # User input stays on the terminal's normal background. Agent messages and
     # process streams use subtle, semantic panels: blue, green, and red.
-    "user-prompt": "ansigreen bold",
-    "say": "bg:#172b4d",
-    "stdout": "bg:#16351f",
-    "stderr": "bg:#3b2025",
-    "continuation-prompt": "ansigreen bold",
+    "user-prompt": "ansigreen bold bg:#343541",
+    "user-input": "bg:#343541",
+    # Match pi's dark tool-result panels. These are forced through true-color
+    # rendering below so a 256-color approximation cannot turn green into gray.
+    "stdout": "bg:#283228",
+    "stderr": "bg:#3c2828",
+    "continuation-prompt": "ansigreen bold bg:#343541",
     "output-prompt": "ansired bold",
     "stream-prompt": "ansiblue bold",
     "output-note": "ansiyellow italic",
@@ -97,12 +100,14 @@ COMMANDS = (
     "/quit",
 )
 HELP = """In [n]: accepts agent requests, not direct Python execution. Its number counts
-submitted messages and shell commands. Prefix a command with ! to execute it
-directly in the sandbox (for example, !ls). Out[n]: and stdout/stderr labels use
+submitted messages and direct cells. Prefix a command with ! to execute it
+directly in the sandbox (for example, !ls). Prefix Python with @ to execute it in
+the same live IPython namespace as the agent; IPython % and %% magics work inside
+that cell. Out[n]: and stdout/stderr labels use
 worker cell numbers, which are independent of input numbers. Generated Python is hidden unless /trace
 is on; results stay visible. Thinking animates in the status bar.
-ctx(last) is last reported input tokens / configured context window, not a live
-estimate. Missing counts or window show ?. out(last) is reported output tokens.
+The status bar shows last reported input tokens / configured context window.
+Missing values show ?. CH is the session's weighted cumulative cache-hit percentage.
 Enter submits a complete line; after a trailing : or \\ it starts an indented
 continuation line. Shift-Enter always submits; Alt-Backspace deletes a word.
 Ctrl-R searches input history; Up/Down navigate it. Bracketed paste stays a
@@ -405,6 +410,7 @@ class Terminal:
             key_bindings=self._bindings(),
             completer=WordCompleter(COMMANDS, sentence=True),
             complete_while_typing=False,
+            lexer=SimpleLexer("class:user-input"),
             enable_history_search=True,
             enable_system_prompt=False,
             enable_open_in_editor=False,
@@ -585,12 +591,7 @@ class Terminal:
                 (cache_totals["cache_read_tokens"] * 100 + cache_totals["input_tokens"] // 2)
                 // cache_totals["input_tokens"]
             )
-        latest_rate = "?"
-        latest_input = normalized.get("input_tokens") if isinstance(normalized, dict) else None
-        latest_read = normalized.get("cache_read_tokens") if isinstance(normalized, dict) else None
-        if type(latest_input) is int and latest_input > 0 and type(latest_read) is int and latest_read >= 0:
-            latest_rate = str((latest_read * 100 + latest_input // 2) // latest_input)
-        cache_usage = f"cache(last) {latest_rate}% | cache(session) {session_rate}% r{cache_read} w{cache_write}"
+        cache_usage = f"CH {session_rate}% r{cache_read} w{cache_write}"
 
         window = state.get("context_window_tokens")
         context_usage = "?%/?"
@@ -613,9 +614,7 @@ class Terminal:
             activity = phase
         text = (
             f"{activity} | {state.get('model', '?')} | "
-            f"{state.get('cell_id') or '-'} {state.get('context_epoch', '-')} | "
-            f"queued {state.get('queued', 0)} | ctx(last) {context_usage} "
-            f"out(last) {reported('output_tokens')} | {cache_usage}" + (" | TRACE" if self.trace else "")
+            f"{context_usage} | {cache_usage}" + (" | TRACE" if self.trace else "")
         )
         return FormattedText([("", sanitize(text).replace("\n", " ").replace("\t", " "))])
 
@@ -715,7 +714,7 @@ class Terminal:
             formatted,
             output=self.session.output,
             style=self._style,
-            color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
+            color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else ColorDepth.TRUE_COLOR,
         )
 
     def _panel_blank(self, role: str) -> None:
@@ -723,7 +722,7 @@ class Terminal:
             self._panel_line(FormattedText([]), role)
 
     def _emit(self, content, *, python: bool = False, role: str = "") -> None:
-        if self._finish_stream() and self.no_color:
+        if self._finish_stream():
             self._blank_line()
         safe = sanitize(content)
         formatted = PygmentsTokens(lex(safe, PythonLexer())) if python and not self.no_color else safe
@@ -739,7 +738,7 @@ class Terminal:
             )
 
     def _emit_markdown(self, content: Any, *, role: str = "") -> None:
-        if self._finish_stream() and self.no_color:
+        if self._finish_stream():
             self._blank_line()
         fragments = markdown_fragments(content)
         if role:
@@ -754,7 +753,7 @@ class Terminal:
             )
 
     def _emit_heading(self, heading: str, *, display: bool, role: str) -> None:
-        if self._finish_stream() and self.no_color:
+        if self._finish_stream():
             self._blank_line()
         self._panel_blank(role)
         prompt = "output-prompt" if display else "stream-prompt"
@@ -781,7 +780,7 @@ class Terminal:
                     end="",
                     output=self.session.output,
                     style=self._style,
-                    color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
+                    color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else ColorDepth.TRUE_COLOR,
                 )
                 self._stream_line_has_text = True
                 self._stream_column = (self._stream_column + fragment_list_width([("", part)])) % width
@@ -793,7 +792,7 @@ class Terminal:
                     FormattedText([(f"class:{role}", " " * padding)]),
                     output=self.session.output,
                     style=self._style,
-                    color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
+                    color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else ColorDepth.TRUE_COLOR,
                 )
                 self._stream_column = 0
                 self._stream_line_has_text = False
@@ -804,7 +803,7 @@ class Terminal:
             "", output=self.session.output, color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None
         )
 
-    def _finish_stream(self) -> bool:
+    def _finish_stream(self, *, pad: bool = True) -> bool:
         if self._stream_key is None:
             return False
         role = "stderr" if self._stream_key[1] == "stderr" else "stdout"
@@ -814,7 +813,8 @@ class Terminal:
             self._write_stream("\n")
         if self._stream_key is not None and self._stream_lines.get(self._stream_key, 0) < 5:
             self._stream_lines[self._stream_key] = self._stream_lines.get(self._stream_key, 0) + 1
-        self._panel_blank(role)
+        if pad:
+            self._panel_blank(role)
         self._stream_partial = ""
         self._stream_key = None
         self._stream_column = 0
@@ -846,8 +846,7 @@ class Terminal:
                 if len(all_lines) > 5:
                     self._emit_output_note(f"… showing 5 of {len(all_lines)} lines", role=role)
                 self._panel_blank(role)
-                if self.no_color:
-                    self._blank_line()
+                self._blank_line()
             return
 
         key = origin
@@ -859,8 +858,7 @@ class Terminal:
         if key != self._stream_key:
             if self._stream_key is not None:
                 self._finish_stream()
-                if self.no_color:
-                    self._blank_line()
+                self._blank_line()
             self._emit_heading(heading, display=False, role=role)
             self._stream_key = key
             self._stream_column = 0
@@ -896,12 +894,10 @@ class Terminal:
         if kind in {"user_queued", "queued"}:
             return
         if kind == "say":
-            if self._finish_stream() and self.no_color:
-                self._blank_line()
-            self._panel_blank("say")
-            self._emit_markdown(content, role="say")
-            self._panel_blank("say")
-            visible = self.no_color
+            self._finish_stream()
+            self._blank_line()
+            self._emit_markdown(content)
+            visible = True
         elif kind == "permission_request" and isinstance(content, dict):
             request_id = sanitize(content.get("request_id", "?"))
             permission_kind = sanitize(content.get("permission_kind", "permission"))
@@ -923,7 +919,12 @@ class Terminal:
             self._render_output(event, content)
             return
         elif kind == "cell_end":
-            visible = self._finish_stream() and self.no_color
+            active_key = self._stream_key
+            active_role = (
+                "stderr" if active_key is not None and active_key[1] == "stderr" else "stdout"
+            )
+            finished = self._finish_stream(pad=False)
+            visible = finished
             cell = event.get("cell_id")
             for key in list(self._stream_total_lines):
                 if key[0] != cell or key in self._stream_truncation_reported:
@@ -933,10 +934,12 @@ class Terminal:
                     self._emit_output_note(
                         f"… showing 5 of {total} lines",
                         role="stderr" if key[1] == "stderr" else "stdout",
-                        padded=True,
+                        padded=key != active_key,
                     )
                     self._stream_truncation_reported.add(key)
                     visible = True
+            if finished:
+                self._panel_blank(active_role)
             if isinstance(content, dict) and content.get("status") not in {"success", "wait"}:
                 self._emit(
                     f"Cell [{self._cell_number(event)}] {sanitize(content.get('status', 'error'))}: "
@@ -1012,6 +1015,15 @@ class Terminal:
             if self._active():
                 self._emit("Cancelling active work and terminating its descendants; partial effects remain.")
             return False
+        if text.startswith("@"):
+            source = text[1:]
+            if source.startswith(" "):
+                source = source[1:]
+            if not source.strip():
+                raise ValueError("Direct Python input must follow @")
+            await self.supervisor.execute_python(source)
+            self._input_number += 1
+            return True
         if text.startswith("!"):
             command = text[1:].strip()
             if not command:

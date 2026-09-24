@@ -20,6 +20,7 @@ from .terminal import run as run_terminal
 from .terminal import sanitize
 
 BUDGET_TYPES = {field.name: int for field in fields(Limits)}
+CODEX_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -40,6 +41,11 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument(
         "--pi-auth", type=Path, help="Codex only: read-only pi auth file (default: ~/.pi/agent/auth.json)"
+    )
+    result.add_argument(
+        "--effort",
+        choices=CODEX_EFFORTS,
+        help="Codex reasoning effort (default: medium)",
     )
     result.add_argument(
         "--api-base", help="Explicit API-key provider endpoint (not allowed for Codex subscription credentials)"
@@ -160,7 +166,7 @@ def load_config(path: Path, *, required: bool = False) -> dict:
         config = tomllib.loads(data.decode("utf-8"))
     finally:
         os.close(fd)
-    unknown = set(config) - {"model", "api_base", "stream", "budgets", "context_window_tokens"}
+    unknown = set(config) - {"model", "api_base", "stream", "effort", "budgets", "context_window_tokens"}
     if unknown:
         raise ValueError(f"Unknown configuration fields: {', '.join(sorted(unknown))}; permissions are CLI-only")
     for key in ("model", "api_base"):
@@ -168,6 +174,8 @@ def load_config(path: Path, *, required: bool = False) -> dict:
             raise ValueError(f"Configuration {key} must be nonempty text")
     if "stream" in config and type(config["stream"]) is not bool:
         raise ValueError("Configuration stream must be true or false")
+    if "effort" in config and config["effort"] not in CODEX_EFFORTS:
+        raise ValueError("Configuration effort must be one of: " + ", ".join(CODEX_EFFORTS))
     if "context_window_tokens" in config:
         value = config["context_window_tokens"]
         if type(value) is not int or value <= 0:
@@ -231,13 +239,16 @@ def _make_provider(args, config, workspace, *, session_id=None):
         if auth_file.is_relative_to(workspace) or auth_file.is_relative_to(Path("/tmp")):
             raise ValueError("Codex auth.json must be outside the worker's writable workspace and /tmp")
         read_codex_credentials(auth_file)  # fail before startup, without logging/storing credentials
+        effort = args.effort or config.get("effort", "medium")
         print(
-            "Codex subscription via read-only pi auth. Reasoning effort: medium. Refresh/login through pi if expired. "
-            "No client-side Codex output-token cap."
+            f"Codex subscription via read-only pi auth. Reasoning effort: {effort}. "
+            "Refresh/login through pi if expired. No client-side Codex output-token cap."
         )
-        return CodexProvider(model, auth_file=auth_file, session_id=session_id)
+        return CodexProvider(model, auth_file=auth_file, session_id=session_id, effort=effort)
     if args.pi_auth:
         raise ValueError("--pi-auth requires an openai-codex/MODEL model")
+    if args.effort is not None or "effort" in config:
+        raise ValueError("effort is only supported for openai-codex/MODEL")
     return LitelmProvider(
         model, api_base=api_base, stream=args.stream if args.stream is not None else config.get("stream", False)
     )
@@ -408,7 +419,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.allow_domain and args.network != "proxy":
             raise ValueError("--allow-domain requires explicit --network proxy")
-        if args.fake_responses and (args.model or args.api_base or args.stream):
+        if args.fake_responses and (args.model or args.api_base or args.stream or args.effort):
             raise ValueError("--fake-responses cannot be combined with live provider flags")
         config_path = args.config if args.config is not None else args.host_root / "config.toml"
         config = load_config(config_path, required=args.config is not None)

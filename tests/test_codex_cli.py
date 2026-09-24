@@ -28,6 +28,7 @@ def test_explicit_codex_selection_and_default_auth(tmp_path, monkeypatch, capsys
     )
     assert isinstance(provider, CodexProvider)
     assert provider.session_id == "stable-run-id"
+    assert provider.effort == "medium"
     assert provider.auth_file == auth
     assert reads == [auth]
     assert "No client-side Codex output-token cap" in capsys.readouterr().out
@@ -38,9 +39,12 @@ def test_configured_codex_and_explicit_auth_file(tmp_path, monkeypatch):
     reads = []
     monkeypatch.setattr("py_agent.codex_auth.read_codex_credentials", lambda path: reads.append(path))
     provider = _make_provider(
-        arguments("--pi-auth", str(auth)), {"model": "openai-codex/test-model", "stream": False}, tmp_path / "workspace"
+        arguments("--pi-auth", str(auth), "--effort", "high"),
+        {"model": "openai-codex/test-model", "stream": False, "effort": "low"},
+        tmp_path / "workspace",
     )
     assert provider.model == "openai-codex/test-model"
+    assert provider.effort == "high"
     assert reads == [auth]
 
 
@@ -75,6 +79,11 @@ def test_auth_under_shared_tmp_rejected_before_reading(monkeypatch):
             {},
             Path("/home/py-test-workspace"),
         )
+
+
+def test_effort_not_sent_to_non_codex_provider(tmp_path):
+    with pytest.raises(ValueError, match="only supported for openai-codex"):
+        _make_provider(arguments("--model", "openai/example", "--effort", "high"), {}, tmp_path)
 
 
 def test_pi_auth_not_sent_to_litelm(tmp_path):

@@ -204,6 +204,23 @@ class Supervisor:
         self._state("IDLE" if result["status"] == "success" else "FAILED")
         return result
 
+    async def execute_python(self, source):
+        """Execute a user-authored cell in the agent's live IPython namespace."""
+        if self._closed or self._kernel_dead or self.context is None:
+            raise RuntimeError("No live kernel; start a fresh session. No cell was executed.")
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("Direct Python input must be a nonempty cell")
+        if self.cell_id is not None or self.state in {"GENERATING", "EXECUTING"}:
+            raise RuntimeError("Cannot run a direct Python cell while agent work is active; interrupt or wait first.")
+
+        submitted = "@" + source
+        user = self._emit("user", submitted)
+        self.context.add("user", submitted, [user["id"]])
+        self.revision += 1
+        result, _ = await self._execute(source, f"user-python:{user['id']}")
+        self._state("IDLE" if result["status"] == "success" else "FAILED")
+        return result
+
     def request_reset(self):
         self._reset = True
         # This only changes the next request's context, never runs a cell.

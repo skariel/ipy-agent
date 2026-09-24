@@ -75,8 +75,9 @@ command after changing `py-agent` itself to refresh the installed runtime.
 If startup reports `Trusted runtime has a hardlinked file`, the tool was not fully
 reinstalled in copy mode; run the exact install command above again.
 
-Codex uses **medium reasoning effort** and reads your existing private
-`~/.pi/agent/auth.json` on every request (`--pi-auth PATH` overrides it). Login and
+Codex defaults to **medium reasoning effort**; select another supported level with
+`--effort none|minimal|low|medium|high|xhigh` or `effort` in private config. It reads
+existing private `~/.pi/agent/auth.json` on every request (`--pi-auth PATH` overrides it). Login and
 refresh remain pi's job; py never rewrites the shared credentials. Auth must be
 outside both the writable workspace and `/tmp`. Codex uses a fixed endpoint,
 not `--api-base`.
@@ -91,9 +92,8 @@ a new py run gets a new ID;
 it is not derived from prompts, paths, or credentials. No `conversation_id` or
 cache-retention field is sent.
 
-The toolbar reports `cache(last)` (the latest request's
-`cached_tokens / input_tokens`) and `cache(session)` (the weighted cumulative
-`sum(cached_tokens) / sum(input_tokens)`). `r` and `w` are cumulative
+The toolbar reports `CH` as the session's weighted cumulative cache-hit rate
+(`sum(cached_tokens) / sum(input_tokens)`). `r` and `w` are cumulative
 provider-reported cache-read and cache-write token counts. Missing counters stay
 unknown (`?`), and a reported write count of zero remains zero; py never infers
 or invents cache writes. These counters describe provider accounting, not task
@@ -117,7 +117,7 @@ No output-token cap is supplied by default; `--output-tokens` is an optional
 explicit API-key-provider setting. Native providers/SDKs may have their own limits.
 
 Optional private `~/.py/config.toml` can hold `model`, `api_base`, `stream`,
-`context_window_tokens` and a
+Codex `effort`, `context_window_tokens` and a
 `[budgets]` table matching supported CLI budget flags. Run `py --help` for options.
 Explicit configuration must be outside both the writable workspace and `/tmp`,
 or under the protected host root. `--workspace` selects the project write root;
@@ -126,18 +126,25 @@ shared `/tmp` is also read/write. `--host-root` relocates host storage. Other su
 ## Terminal and Python API
 
 - `In [1]:` accepts natural-language requests, **not direct Python execution**.
-  Input numbers advance on successful submissions, not commands or cancelled drafts.
-  Enter submits; Shift-Enter inserts a newline; Ctrl-R searches history.
-- Agent `say()` messages render common Markdown and are separated from surrounding
-  terminal output by blank lines. Queue receipts are kept internal rather than shown.
-  Colored `In [n]:` prompts distinguish user input from agent and command output.
+  Input numbers advance on successful submissions and direct cells, not local slash
+  commands or cancelled drafts. Enter submits; Shift-Enter inserts a newline;
+  Ctrl-R searches history.
+- Agent `say()` messages render common Markdown without a background and are separated
+  from surrounding terminal output by blank lines. User input uses pi's gray message
+  background. Queue receipts are kept internal rather than shown.
+- Prefix a cell with `@` to execute user-authored Python directly in the same live
+  IPython process and namespace used by the agent: `@x = 3`, then `@print(x)`.
+  Multiline input works with `--multiline`; start with `@` and put the cell below it.
+  IPython `%`/`%%` magics and `!` escapes work inside a direct cell. A leading `@`
+  is py's direct-cell marker, not an IPython magic (Python still uses `@` for
+  decorators inside the cell). Direct cells are rejected while agent work is active.
 - Generated Python is **hidden by default**; `/trace` shows it as `Python [n]:`
   along with audit events. Results remain visible as `Out[n]:` and stdout/stderr, limited to the first five
   lines per result stream. Result numbers identify worker cells, not user-request numbers. Small streams
   are buffered until a control boundary or cell completion. A spinner shows thinking.
-- `ctx(last) 30%/272k` uses reported input tokens for the current context divided
-  by its **configured capacity**, not the byte estimate. Unknown usage shows `?`;
-  `out(last)` shows reported output tokens. `/usage` provides the detailed counters.
+- `30%/272k` uses reported input tokens for the current context divided by its
+  **configured capacity**, not the byte estimate. `CH` is the weighted session
+  cache-hit percentage. Unknown usage shows `?`; `/usage` provides detailed counters.
 - `/history [ID [OFFSET]]`, `/usage`, `/help`, `/permissions`, `/interrupt`,
   `/reset`, `/quit`. Permission prompts are resolved with `/approve ID SCOPE` or
   `/deny ID`; saved grants can be removed with `/revoke ID`.
