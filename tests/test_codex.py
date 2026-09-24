@@ -105,7 +105,10 @@ def setup(events=None, *, data=None, stream=None, status=200, headers=None):
         return httpx.Response(status, headers={"content-type": "text/event-stream", **(headers or {})}, stream=stream)
 
     provider = codex.CodexProvider(
-        "openai-codex/gpt-test", auth_file=Path("/fake/auth.json"), transport=httpx.MockTransport(handle)
+        "openai-codex/gpt-test",
+        auth_file=Path("/fake/auth.json"),
+        session_id="opaque-test-run-id",
+        transport=httpx.MockTransport(handle),
     )
     return provider, requests, stream
 
@@ -125,8 +128,15 @@ async def test_exact_request_no_tools_history_or_unsupported_output_cap(auth):
     assert request.headers["authorization"] == "Bearer " + SECRET
     assert request.headers["chatgpt-account-id"] == ACCOUNT
     assert request.headers["openai-beta"] == "responses=experimental"
+    assert request.headers["session-id"] == "opaque-test-run-id"
+    assert request.headers["x-client-request-id"] == "opaque-test-run-id"
     body = json.loads(request.content)
     assert body == details["body"] == provider.build_request(MESSAGES, max_tokens=30)
+    assert body["prompt_cache_key"] == request.headers["session-id"]
+    assert details["headers"] == {
+        "session-id": request.headers["session-id"],
+        "x-client-request-id": request.headers["x-client-request-id"],
+    }
     assert body["store"] is False
     assert body["stream"] is True
     assert body["instructions"] == "raw Python only"
@@ -797,3 +807,30 @@ async def test_auth_validation_error_does_not_send_request(monkeypatch):
     with pytest.raises(ProviderError, match="expired"):
         await provider.generate(MESSAGES, max_tokens=30)
     assert requests == []
+
+
+def test_session_affinity_is_stable_opaque_and_provider_local():
+    sensitive = "/private/workspace/token-secret"
+    first = codex.CodexProvider(
+        "openai-codex/model",
+        auth_file=Path(sensitive),
+        session_id="run-a-opaque",
+    )
+    second = codex.CodexProvider("openai-codex/model", session_id="run-b-opaque")
+
+    first_body = first.build_request(MESSAGES)
+    later_body = first.build_request([*MESSAGES, {"role": "user", "content": sensitive}])
+    assert first_body["prompt_cache_key"] == later_body["prompt_cache_key"] == "run-a-opaque"
+    assert first.request_details(MESSAGES)["headers"] == {
+        "session-id": "run-a-opaque",
+        "x-client-request-id": "run-a-opaque",
+    }
+    assert second.build_request(MESSAGES)["prompt_cache_key"] == "run-b-opaque"
+    assert first_body["prompt_cache_key"] != second.build_request(MESSAGES)["prompt_cache_key"]
+    assert sensitive not in first_body["prompt_cache_key"]
+
+
+def test_default_session_affinity_is_unique_per_provider():
+    first = codex.CodexProvider("openai-codex/model")
+    second = codex.CodexProvider("openai-codex/model")
+    assert first.session_id != second.session_id

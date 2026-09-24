@@ -83,6 +83,22 @@ not `--api-base`.
 Credentials are not injected into worker environment or request journals, but
 readable credential files are subject to the privacy warning below.
 
+Provider prompt caching is automatic when supported. For Codex, py sends the
+run's random opaque ID as `prompt_cache_key` and in the `session-id` and
+`x-client-request-id` headers, matching pi's current provider behavior. The ID
+remains stable across turns, steering restarts, context epochs, and `/reset`, and
+a new py run gets a new ID;
+it is not derived from prompts, paths, or credentials. No `conversation_id` or
+cache-retention field is sent.
+
+The toolbar reports `cache(last)` (the latest request's
+`cached_tokens / input_tokens`) and `cache(session)` (the weighted cumulative
+`sum(cached_tokens) / sum(input_tokens)`). `r` and `w` are cumulative
+provider-reported cache-read and cache-write token counts. Missing counters stay
+unknown (`?`), and a reported write count of zero remains zero; py never infers
+or invents cache writes. These counters describe provider accounting, not task
+quality, price, or guaranteed cache performance.
+
 **Codex has no client-side output-token cap.** `--output-tokens` is not enforced
 by this adapter; the backend does not accept that request parameter. Reported
 usage is accounting, not a reason to reject completed code. Incomplete/failed

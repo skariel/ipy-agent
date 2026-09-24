@@ -208,7 +208,7 @@ def _print_policy(sandbox, *, verbose=False) -> None:
         )
 
 
-def _make_provider(args, config, workspace):
+def _make_provider(args, config, workspace, *, session_id=None):
     from .provider import FakeProvider, LitelmProvider
 
     if args.fake_responses:
@@ -235,7 +235,7 @@ def _make_provider(args, config, workspace):
             "Codex subscription via read-only pi auth. Reasoning effort: medium. Refresh/login through pi if expired. "
             "No client-side Codex output-token cap."
         )
-        return CodexProvider(model, auth_file=auth_file)
+        return CodexProvider(model, auth_file=auth_file, session_id=session_id)
     if args.pi_auth:
         raise ValueError("--pi-auth requires an openai-codex/MODEL model")
     return LitelmProvider(
@@ -313,7 +313,7 @@ async def _run(args: argparse.Namespace, config: dict) -> int:
         )
         if type(context_window) is not int or context_window <= 0:
             raise ValueError("context_window_tokens must be a positive integer")
-        provider = _make_provider(args, config, workspace)
+        provider = _make_provider(args, config, workspace, session_id=run_id)
         journal = Journal(host_session / "journal.sqlite", run_id)
 
         def startup_event(event: dict) -> None:

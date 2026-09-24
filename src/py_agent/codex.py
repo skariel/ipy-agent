@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 import re
 from typing import Any
+import uuid
 
 import httpx
 
@@ -178,6 +179,7 @@ def _usage(raw: Any) -> dict:
         "output_tokens": ("output_tokens",),
         "total_tokens": ("total_tokens",),
         "cache_read_tokens": ("input_tokens_details", "cached_tokens"),
+        "cache_write_tokens": ("input_tokens_details", "cache_write_tokens"),
         "reasoning_tokens": ("output_tokens_details", "reasoning_tokens"),
     }.items():
         value = raw
@@ -266,11 +268,23 @@ def _redact(value, secrets):
 
 
 class CodexProvider:
-    def __init__(self, model: str, auth_file: Path | None = None, *, transport=None):
+    def __init__(
+        self,
+        model: str,
+        auth_file: Path | None = None,
+        *,
+        session_id: str | None = None,
+        transport=None,
+    ):
         if not isinstance(model, str) or not re.fullmatch(r"openai-codex/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", model):
             raise ValueError("Select an explicit openai-codex/<model> model")
+        if session_id is not None and (not isinstance(session_id, str) or not session_id):
+            raise ValueError("session_id must be a nonempty string")
         self.model = model
         self.auth_file = Path(auth_file) if auth_file is not None else Path.home() / ".pi/agent/auth.json"
+        # A provider instance belongs to one py run. This opaque random value is
+        # independent of prompts, paths, and credentials and survives every turn.
+        self.session_id = session_id or uuid.uuid4().hex
         self._transport = transport  # deterministic tests; never an endpoint override
 
     def build_request(self, messages: list[dict], *, max_tokens: int | None = None) -> dict:
@@ -299,6 +313,7 @@ class CodexProvider:
             "model": self.model.split("/", 1)[1],
             "instructions": "\n\n".join(instructions),
             "input": inputs,
+            "prompt_cache_key": self.session_id,
             "store": False,
             "stream": True,
             "reasoning": {"effort": "medium"},
@@ -311,6 +326,7 @@ class CodexProvider:
             "adapter": "codex_subscription_sse",
             "url": CODEX_URL,
             "body": self.build_request(messages, max_tokens=max_tokens),
+            "headers": {"session-id": self.session_id, "x-client-request-id": self.session_id},
             "ignored_max_tokens": max_tokens,
             "output_limit_enforcement": "none",
             "auth": "pi_oauth_read_only",
@@ -326,6 +342,8 @@ class CodexProvider:
             "OpenAI-Beta": "responses=experimental",
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
+            "session-id": self.session_id,
+            "x-client-request-id": self.session_id,
             "originator": "py-agent",
             "User-Agent": "py-agent/0.1.0",
         }

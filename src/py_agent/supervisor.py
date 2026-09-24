@@ -12,7 +12,7 @@ from dataclasses import asdict
 import sqlite3
 import time
 
-from .context import Context
+from .context import Context, session_metadata
 from .limits import Limits
 from .observations import pack_observations
 from .protocol import WORKER_TYPES, ProtocolError, encode_frame, read_frame, write_frame
@@ -40,6 +40,8 @@ class Supervisor:
             raise ValueError("context_window_tokens must be a positive integer")
         self._memories_count = 0
         self._namespace_summary = {"variables": [], "truncated": False}
+        workspace = getattr(sandbox, "workspace", None)
+        self._session_summary = session_metadata(workspace)
         self.on_event = on_event or (lambda event: None)
         self.state = "IDLE"
         self.context = None
@@ -150,6 +152,7 @@ class Supervisor:
                 context_window_tokens=self.context_window_tokens,
                 memories_count=self._memories_count,
                 namespace_summary=self._namespace_summary,
+                session_summary=self._session_summary,
             )
             self.context.check(self.context.messages())
             self._commit_epoch(

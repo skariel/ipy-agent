@@ -308,6 +308,21 @@ async def test_shift_enter_submits(shift_enter):
         await asyncio.wait_for(task, 3)
 
 
+@pytest.mark.parametrize("alt_backspace", ["\x1b\x7f", "\x1b[127;3u", "\x1b[27;3;127~"])
+async def test_alt_backspace_deletes_previous_word(alt_backspace):
+    supervisor, output = Supervisor(), Output()
+    with create_pipe_input() as pipe:
+        terminal = Terminal(supervisor, input=pipe, output=output)
+        task = asyncio.create_task(terminal.run())
+        await until(lambda: terminal.session.app.is_running)
+        pipe.send_text(f"hello brave world{alt_backspace}")
+        await until(lambda: terminal.session.default_buffer.text == "hello brave ")
+        pipe.send_text("\x03")
+        await until(lambda: terminal.session.default_buffer.text == "")
+        pipe.send_text("/quit\r")
+        await asyncio.wait_for(task, 3)
+
+
 async def test_smart_enter_continues_after_colon_and_backslash():
     supervisor, output = Supervisor(), Output()
     with create_pipe_input() as pipe:
@@ -897,6 +912,16 @@ def test_markdown_and_prompt_styles_are_color_optional():
     plain = Terminal(Supervisor(), output=Output(), no_color=True)
     assert colored._style.get_attrs_for_style_str("class:user-prompt").bold
     assert colored._style.get_attrs_for_style_str("class:user-prompt").color
+    assert not colored._style.get_attrs_for_style_str("class:user-prompt").bgcolor
+    assert not colored._style.get_attrs_for_style_str("class:user-input").bgcolor
+    backgrounds = {
+        role: colored._style.get_attrs_for_style_str(f"class:{role}").bgcolor
+        for role in ("say", "stdout", "stderr")
+    }
+    assert all(backgrounds.values())
+    assert len(set(backgrounds.values())) == 3
+    assert backgrounds["stdout"] == "16351f"
+    assert backgrounds["stderr"] == "3b2025"
     assert not plain._style.get_attrs_for_style_str("class:user-prompt").bold
     assert not plain._style.get_attrs_for_style_str("class:user-prompt").color
 
@@ -1276,3 +1301,61 @@ async def test_cli_integration_fake_provider_wiring_and_cleanup(
     assert captured["terminal_kwargs"]["multiline"] is True
     with pytest.raises(Exception):
         captured["journal"].recent()  # Connection was closed.
+
+
+def test_toolbar_labels_latest_and_session_cache_rates_reads_and_writes():
+    supervisor = Supervisor()
+    original = supervisor.status()
+    supervisor.status = lambda: {
+        **original,
+        "usage": [
+            {
+                "normalized": {
+                    "input_tokens": 100,
+                    "output_tokens": 2,
+                    "cache_read_tokens": 40,
+                    "cache_creation_tokens": 10,
+                }
+            },
+            {
+                "normalized": {
+                    "input_tokens": 300,
+                    "output_tokens": 4,
+                    "cache_read_tokens": 160,
+                    "cache_write_tokens": 20,
+                }
+            },
+        ],
+        "context_window_tokens": 1000,
+    }
+    terminal = Terminal(supervisor, output=Output())
+    toolbar = "".join(text for _, text in terminal._toolbar())
+    assert "ctx(last) 30%/1k out(last) 4" in toolbar
+    assert "cache(last) 53% | cache(session) 50% r200 w30" in toolbar
+
+
+def test_toolbar_keeps_unknown_cache_counters_unknown():
+    terminal = Terminal(Supervisor(), output=Output())
+    toolbar = "".join(text for _, text in terminal._toolbar())
+    assert "cache(last) ?% | cache(session) ?% r? w?" in toolbar
+
+
+def test_toolbar_keeps_partially_reported_session_counters_unknown():
+    supervisor = Supervisor()
+    original = supervisor.status()
+    supervisor.status = lambda: {
+        **original,
+        "usage": [
+            {"normalized": {"input_tokens": 100}},
+            {
+                "normalized": {
+                    "input_tokens": 100,
+                    "cache_read_tokens": 50,
+                    "cache_write_tokens": 0,
+                }
+            },
+        ],
+    }
+    terminal = Terminal(supervisor, output=Output())
+    toolbar = "".join(text for _, text in terminal._toolbar())
+    assert "cache(last) 50% | cache(session) ?% r? w?" in toolbar

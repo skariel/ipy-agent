@@ -20,8 +20,14 @@ def test_explicit_codex_selection_and_default_auth(tmp_path, monkeypatch, capsys
     monkeypatch.setattr("py_agent.codex_auth.DEFAULT_AUTH_FILE", auth)
     reads = []
     monkeypatch.setattr("py_agent.codex_auth.read_codex_credentials", lambda path: reads.append(path))
-    provider = _make_provider(arguments("--model", "openai-codex/test-model"), {}, tmp_path / "workspace")
+    provider = _make_provider(
+        arguments("--model", "openai-codex/test-model"),
+        {},
+        tmp_path / "workspace",
+        session_id="stable-run-id",
+    )
     assert isinstance(provider, CodexProvider)
+    assert provider.session_id == "stable-run-id"
     assert provider.auth_file == auth
     assert reads == [auth]
     assert "No client-side Codex output-token cap" in capsys.readouterr().out

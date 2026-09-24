@@ -22,6 +22,7 @@ COUNTERS = (
     "total_tokens",
     "cache_read_tokens",
     "cache_creation_tokens",
+    "cache_write_tokens",
     "reasoning_tokens",
 )
 

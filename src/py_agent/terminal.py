@@ -21,7 +21,13 @@ from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.filters import Condition, has_focus, is_searching
-from prompt_toolkit.formatted_text import FormattedText, PygmentsTokens
+from prompt_toolkit.formatted_text import (
+    FormattedText,
+    PygmentsTokens,
+    fragment_list_width,
+    split_lines,
+    to_formatted_text,
+)
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 from prompt_toolkit.key_binding import KeyBindings
@@ -52,7 +58,12 @@ _EXTENDED_KEYS_ON = "\x1b[>4;2m\x1b[>1u"
 _EXTENDED_KEYS_OFF = "\x1b[<u\x1b[>4;0m"
 
 _COLOR_STYLE = {
+    # User input stays on the terminal's normal background. Agent messages and
+    # process streams use subtle, semantic panels: blue, green, and red.
     "user-prompt": "ansigreen bold",
+    "say": "bg:#172b4d",
+    "stdout": "bg:#16351f",
+    "stderr": "bg:#3b2025",
     "continuation-prompt": "ansigreen bold",
     "output-prompt": "ansired bold",
     "stream-prompt": "ansiblue bold",
@@ -376,6 +387,8 @@ class Terminal:
         self._stream_key = None
         self._stream_partial = ""
         self._stream_open_line = False
+        self._stream_column = 0
+        self._stream_line_has_text = False
         self._stream_lines: dict[tuple, int] = {}
         self._stream_total_lines: dict[tuple, int] = {}
         self._stream_has_partial: dict[tuple, bool] = {}
@@ -470,7 +483,12 @@ class Terminal:
         @bindings.add("escape", "backspace", eager=True)
         @bindings.add("escape", "delete", eager=True)
         def delete_previous_word(event):
-            event.current_buffer.delete_word_before_cursor()
+            buffer = event.current_buffer
+            offset = buffer.document.find_start_of_previous_word()
+            if offset is None:
+                offset = -buffer.cursor_position
+            if offset:
+                buffer.delete_before_cursor(count=-offset)
 
         @bindings.add("enter", filter=~permission_pending & has_focus("DEFAULT_BUFFER") & ~is_searching, eager=True)
         def smart_enter(event):
@@ -526,13 +544,53 @@ class Terminal:
             return FormattedText([("", f"Permission {request_id}: {resource}  ◀ {choices} ▶  Enter=select Esc=deny")])
         state = self.supervisor.status()
         usage = state.get("usage") or {}
-        if isinstance(usage, list):
-            usage = usage[-1] if usage else {}
-        normalized = usage.get("normalized", usage) if isinstance(usage, dict) else {}
+        reports = usage if isinstance(usage, list) else [usage]
+        last_usage = usage[-1] if isinstance(usage, list) and usage else usage
+        normalized = last_usage.get("normalized", last_usage) if isinstance(last_usage, dict) else {}
 
         def reported(name):
             value = normalized.get(name) if isinstance(normalized, dict) else None
             return value if type(value) is int and value >= 0 else "?"
+
+        cache_totals = {"input_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0}
+        cache_complete = {name: bool(reports) for name in cache_totals}
+        for report in reports:
+            counters = report.get("normalized", report) if isinstance(report, dict) else {}
+            if not isinstance(counters, dict):
+                cache_complete = {name: False for name in cache_complete}
+                continue
+            for name in ("input_tokens", "cache_read_tokens"):
+                value = counters.get(name)
+                if type(value) is int and value >= 0:
+                    cache_totals[name] += value
+                else:
+                    cache_complete[name] = False
+            # Providers use both names for the same cache-write counter.
+            value = counters.get("cache_write_tokens")
+            if type(value) is not int or value < 0:
+                value = counters.get("cache_creation_tokens")
+            if type(value) is int and value >= 0:
+                cache_totals["cache_write_tokens"] += value
+            else:
+                cache_complete["cache_write_tokens"] = False
+        cache_read = cache_totals["cache_read_tokens"] if cache_complete["cache_read_tokens"] else "?"
+        cache_write = cache_totals["cache_write_tokens"] if cache_complete["cache_write_tokens"] else "?"
+        session_rate = "?"
+        if (
+            cache_complete["input_tokens"]
+            and cache_complete["cache_read_tokens"]
+            and cache_totals["input_tokens"] > 0
+        ):
+            session_rate = str(
+                (cache_totals["cache_read_tokens"] * 100 + cache_totals["input_tokens"] // 2)
+                // cache_totals["input_tokens"]
+            )
+        latest_rate = "?"
+        latest_input = normalized.get("input_tokens") if isinstance(normalized, dict) else None
+        latest_read = normalized.get("cache_read_tokens") if isinstance(normalized, dict) else None
+        if type(latest_input) is int and latest_input > 0 and type(latest_read) is int and latest_read >= 0:
+            latest_rate = str((latest_read * 100 + latest_input // 2) // latest_input)
+        cache_usage = f"cache(last) {latest_rate}% | cache(session) {session_rate}% r{cache_read} w{cache_write}"
 
         window = state.get("context_window_tokens")
         context_usage = "?%/?"
@@ -557,7 +615,7 @@ class Terminal:
             f"{activity} | {state.get('model', '?')} | "
             f"{state.get('cell_id') or '-'} {state.get('context_epoch', '-')} | "
             f"queued {state.get('queued', 0)} | ctx(last) {context_usage} "
-            f"out(last) {reported('output_tokens')}" + (" | TRACE" if self.trace else "")
+            f"out(last) {reported('output_tokens')} | {cache_usage}" + (" | TRACE" if self.trace else "")
         )
         return FormattedText([("", sanitize(text).replace("\n", " ").replace("\t", " "))])
 
@@ -634,52 +692,112 @@ class Terminal:
         self._pending.append(dict(event))
         self._wake.set()
 
-    def _emit(self, content, *, python: bool = False) -> None:
-        if self._finish_stream():
+    def _panel_width(self) -> int:
+        try:
+            return max(1, self.session.output.get_size().columns)
+        except (AttributeError, OSError):
+            return 80
+
+    def _panel_line(self, fragments, role: str) -> None:
+        parts = list(to_formatted_text(fragments))
+        if self.no_color:
+            formatted = FormattedText(parts)
+        else:
+            styled = []
+            for style, text, *handler in parts:
+                styled.append(((f"class:{role} " + style).rstrip(), text, *handler))
+            panel_width = self._panel_width()
+            content_width = fragment_list_width(styled)
+            padding = panel_width if content_width == 0 else (-content_width) % panel_width
+            styled.append((f"class:{role}", " " * padding))
+            formatted = FormattedText(styled)
+        print_formatted_text(
+            formatted,
+            output=self.session.output,
+            style=self._style,
+            color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
+        )
+
+    def _panel_blank(self, role: str) -> None:
+        if not self.no_color:
+            self._panel_line(FormattedText([]), role)
+
+    def _emit(self, content, *, python: bool = False, role: str = "") -> None:
+        if self._finish_stream() and self.no_color:
             self._blank_line()
         safe = sanitize(content)
         formatted = PygmentsTokens(lex(safe, PythonLexer())) if python and not self.no_color else safe
-        print_formatted_text(
-            formatted, output=self.session.output, color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None
-        )
+        if role:
+            for line in split_lines(to_formatted_text(formatted)):
+                self._panel_line(FormattedText(line), role)
+        else:
+            print_formatted_text(
+                formatted,
+                output=self.session.output,
+                style=self._style,
+                color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
+            )
 
-    def _emit_markdown(self, content: Any) -> None:
-        if self._finish_stream():
+    def _emit_markdown(self, content: Any, *, role: str = "") -> None:
+        if self._finish_stream() and self.no_color:
             self._blank_line()
         fragments = markdown_fragments(content)
-        print_formatted_text(
-            FormattedText(fragments),
-            output=self.session.output,
-            style=self._style,
-            color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
-        )
+        if role:
+            for line in split_lines(fragments):
+                self._panel_line(FormattedText(line), role)
+        else:
+            print_formatted_text(
+                FormattedText(fragments),
+                output=self.session.output,
+                style=self._style,
+                color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
+            )
 
-    def _emit_heading(self, heading: str, *, display: bool) -> None:
-        if self._finish_stream():
+    def _emit_heading(self, heading: str, *, display: bool, role: str) -> None:
+        if self._finish_stream() and self.no_color:
             self._blank_line()
-        style = "class:output-prompt" if display else "class:stream-prompt"
-        print_formatted_text(
-            FormattedText([(style, heading)]),
-            output=self.session.output,
-            style=self._style,
-            color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
-        )
+        self._panel_blank(role)
+        prompt = "output-prompt" if display else "stream-prompt"
+        self._panel_line(FormattedText([(f"class:{prompt}", heading)]), role)
 
-    def _emit_output_note(self, text: str) -> None:
-        print_formatted_text(
-            FormattedText([("class:output-note", text)]),
-            output=self.session.output,
-            style=self._style,
-            color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
-        )
+    def _emit_output_note(self, text: str, *, role: str = "stdout", padded: bool = False) -> None:
+        if padded:
+            self._panel_blank(role)
+        self._panel_line(FormattedText([("class:output-note", text)]), role)
+        if padded:
+            self._panel_blank(role)
 
     def _write_stream(self, text: str) -> None:
-        """Already sanitized text: preserve its newlines, including their absence."""
-        if text:
-            print_formatted_text(
-                text, end="", output=self.session.output, color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None
-            )
-            self._stream_open_line = not text.endswith("\n")
+        """Render sanitized stream fragments while completing each colored row."""
+        if not text:
+            return
+        role = "stderr" if self._stream_key and self._stream_key[1] == "stderr" else "stdout"
+        width = self._panel_width()
+        parts = text.split("\n")
+        for index, part in enumerate(parts):
+            if part:
+                print_formatted_text(
+                    FormattedText([(f"class:{role}", part)]),
+                    end="",
+                    output=self.session.output,
+                    style=self._style,
+                    color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
+                )
+                self._stream_line_has_text = True
+                self._stream_column = (self._stream_column + fragment_list_width([("", part)])) % width
+            if index < len(parts) - 1:
+                padding = 0
+                if not self.no_color and (self._stream_column or not self._stream_line_has_text):
+                    padding = width - self._stream_column
+                print_formatted_text(
+                    FormattedText([(f"class:{role}", " " * padding)]),
+                    output=self.session.output,
+                    style=self._style,
+                    color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else None,
+                )
+                self._stream_column = 0
+                self._stream_line_has_text = False
+        self._stream_open_line = not text.endswith("\n")
 
     def _blank_line(self) -> None:
         print_formatted_text(
@@ -689,14 +807,18 @@ class Terminal:
     def _finish_stream(self) -> bool:
         if self._stream_key is None:
             return False
+        role = "stderr" if self._stream_key[1] == "stderr" else "stdout"
         self._write_stream(self._stream_partial)
         # This newline separates UI blocks, not arbitrary transport fragments.
         if self._stream_open_line:
             self._write_stream("\n")
         if self._stream_key is not None and self._stream_lines.get(self._stream_key, 0) < 5:
             self._stream_lines[self._stream_key] = self._stream_lines.get(self._stream_key, 0) + 1
+        self._panel_blank(role)
         self._stream_partial = ""
         self._stream_key = None
+        self._stream_column = 0
+        self._stream_line_has_text = False
         return True
 
     def _render_output(self, event: dict, content) -> None:
@@ -709,20 +831,23 @@ class Terminal:
         label = "Out" if stream in {"display", "markdown"} else sanitize(stream)
         gap = "" if stream in {"display", "markdown"} else " "
         heading = f"{label}{gap}[{self._cell_number(event)}]{late}:"
+        role = "stderr" if stream == "stderr" else "stdout"
         if stream in {"display", "markdown"}:
             # Display values are atomic rather than pipe fragments, but apply the
             # same concise-output policy to their textual representation.
             all_lines = safe.splitlines()
             excerpt = "\n".join(all_lines[:5])
             if excerpt:
-                self._emit_heading(heading, display=True)
+                self._emit_heading(heading, display=True, role=role)
                 if stream == "markdown":
-                    self._emit_markdown(excerpt)
+                    self._emit_markdown(excerpt, role=role)
                 else:
-                    self._emit(excerpt)
+                    self._emit(excerpt, role=role)
                 if len(all_lines) > 5:
-                    self._emit_output_note(f"… showing 5 of {len(all_lines)} lines")
-                self._blank_line()
+                    self._emit_output_note(f"… showing 5 of {len(all_lines)} lines", role=role)
+                self._panel_blank(role)
+                if self.no_color:
+                    self._blank_line()
             return
 
         key = origin
@@ -734,9 +859,12 @@ class Terminal:
         if key != self._stream_key:
             if self._stream_key is not None:
                 self._finish_stream()
-                self._blank_line()
-            self._emit_heading(heading, display=False)
+                if self.no_color:
+                    self._blank_line()
+            self._emit_heading(heading, display=False, role=role)
             self._stream_key = key
+            self._stream_column = 0
+            self._stream_line_has_text = False
 
         # Preserve transport fragmentation while exposing at most five logical
         # lines from each cell/stream. The cap is applied after sanitization.
@@ -768,8 +896,12 @@ class Terminal:
         if kind in {"user_queued", "queued"}:
             return
         if kind == "say":
-            self._emit_markdown(content)
-            visible = True
+            if self._finish_stream() and self.no_color:
+                self._blank_line()
+            self._panel_blank("say")
+            self._emit_markdown(content, role="say")
+            self._panel_blank("say")
+            visible = self.no_color
         elif kind == "permission_request" and isinstance(content, dict):
             request_id = sanitize(content.get("request_id", "?"))
             permission_kind = sanitize(content.get("permission_kind", "permission"))
@@ -791,14 +923,18 @@ class Terminal:
             self._render_output(event, content)
             return
         elif kind == "cell_end":
-            visible = self._finish_stream()
+            visible = self._finish_stream() and self.no_color
             cell = event.get("cell_id")
             for key in list(self._stream_total_lines):
                 if key[0] != cell or key in self._stream_truncation_reported:
                     continue
                 total = self._stream_total_lines[key] + int(self._stream_has_partial.get(key, False))
                 if total > 5:
-                    self._emit_output_note(f"… showing 5 of {total} lines")
+                    self._emit_output_note(
+                        f"… showing 5 of {total} lines",
+                        role="stderr" if key[1] == "stderr" else "stdout",
+                        padded=True,
+                    )
                     self._stream_truncation_reported.add(key)
                     visible = True
             if isinstance(content, dict) and content.get("status") not in {"success", "wait"}:
