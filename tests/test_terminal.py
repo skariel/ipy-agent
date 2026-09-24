@@ -474,6 +474,20 @@ async def test_bang_command_executes_directly_and_is_not_submitted():
         await terminal.handle_line("!   ")
 
 
+async def test_at_cell_executes_directly_in_live_python_namespace():
+    supervisor = Supervisor()
+    terminal = Terminal(supervisor, no_color=True)
+
+    assert await terminal.handle_line("@ answer = 42")
+    assert await terminal.handle_line("@\n%time print(answer)")
+    assert supervisor.python_cells == ["answer = 42", "\n%time print(answer)"]
+    assert supervisor.submitted == []
+    assert terminal._input_number == 3
+
+    with pytest.raises(ValueError, match="must follow"):
+        await terminal.handle_line("@   ")
+
+
 async def test_commands_do_not_submit_code_and_history_is_paged():
     supervisor, output = Supervisor(), Output()
     terminal = Terminal(supervisor, output=output)
@@ -917,9 +931,9 @@ def test_markdown_and_prompt_styles_are_color_optional():
     plain = Terminal(Supervisor(), output=Output(), no_color=True)
     assert colored._style.get_attrs_for_style_str("class:user-prompt").bold
     assert colored._style.get_attrs_for_style_str("class:user-prompt").color
-    assert colored._style.get_attrs_for_style_str("class:user-prompt").bgcolor == "343541"
-    assert colored._style.get_attrs_for_style_str("class:user-input").bgcolor == "343541"
-    assert not colored._style.get_attrs_for_style_str("class:say").bgcolor
+    assert not colored._style.get_attrs_for_style_str("class:user-prompt").bgcolor
+    assert not colored._style.get_attrs_for_style_str("class:user-input").bgcolor
+    assert colored._style.get_attrs_for_style_str("class:say").bgcolor == "343541"
     assert colored._style.get_attrs_for_style_str("class:stdout").bgcolor == "283228"
     assert colored._style.get_attrs_for_style_str("class:stderr").bgcolor == "3c2828"
     assert not plain._style.get_attrs_for_style_str("class:user-prompt").bold

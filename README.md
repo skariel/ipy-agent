@@ -129,8 +129,8 @@ shared `/tmp` is also read/write. `--host-root` relocates host storage. Other su
   Input numbers advance on successful submissions and direct cells, not local slash
   commands or cancelled drafts. Enter submits; Shift-Enter inserts a newline;
   Ctrl-R searches history.
-- Agent `say()` messages render common Markdown without a background and are separated
-  from surrounding terminal output by blank lines. User input uses pi's gray message
+- Agent `say()` messages render common Markdown on pi's gray message background and
+  are separated from surrounding terminal output by blank lines. User input has no
   background. Queue receipts are kept internal rather than shown.
 - Prefix a cell with `@` to execute user-authored Python directly in the same live
   IPython process and namespace used by the agent: `@x = 3`, then `@print(x)`.

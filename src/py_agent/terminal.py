@@ -32,7 +32,6 @@ from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.lexers import SimpleLexer
 from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
@@ -61,13 +60,13 @@ _EXTENDED_KEYS_OFF = "\x1b[<u\x1b[>4;0m"
 _COLOR_STYLE = {
     # User input stays on the terminal's normal background. Agent messages and
     # process streams use subtle, semantic panels: blue, green, and red.
-    "user-prompt": "ansigreen bold bg:#343541",
-    "user-input": "bg:#343541",
+    "user-prompt": "ansigreen bold",
+    "say": "bg:#343541",
     # Match pi's dark tool-result panels. These are forced through true-color
     # rendering below so a 256-color approximation cannot turn green into gray.
     "stdout": "bg:#283228",
     "stderr": "bg:#3c2828",
-    "continuation-prompt": "ansigreen bold bg:#343541",
+    "continuation-prompt": "ansigreen bold",
     "output-prompt": "ansired bold",
     "stream-prompt": "ansiblue bold",
     "output-note": "ansiyellow italic",
@@ -410,7 +409,6 @@ class Terminal:
             key_bindings=self._bindings(),
             completer=WordCompleter(COMMANDS, sentence=True),
             complete_while_typing=False,
-            lexer=SimpleLexer("class:user-input"),
             enable_history_search=True,
             enable_system_prompt=False,
             enable_open_in_editor=False,
@@ -894,9 +892,11 @@ class Terminal:
         if kind in {"user_queued", "queued"}:
             return
         if kind == "say":
-            self._finish_stream()
-            self._blank_line()
-            self._emit_markdown(content)
+            if self._finish_stream():
+                self._blank_line()
+            self._panel_blank("say")
+            self._emit_markdown(content, role="say")
+            self._panel_blank("say")
             visible = True
         elif kind == "permission_request" and isinstance(content, dict):
             request_id = sanitize(content.get("request_id", "?"))
