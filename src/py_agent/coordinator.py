@@ -1,0 +1,1784 @@
+"""Frontend-independent serialized coordinator with explicit service selection."""
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import math
+import re
+import shlex
+from dataclasses import dataclass, replace
+from enum import Enum
+from types import MappingProxyType
+from uuid import uuid4
+
+from .configuration import ApplyAt, ConfigSnapshot, ConfigStore
+from .contracts import (
+    AgentDecision,
+    CompletenessResult,
+    CompletionResult,
+    ContextSnapshot,
+    ExecutorCapabilities,
+    ExecutorCapabilityError,
+    ExecutionRequest,
+    ExecutionResult,
+    InputHandler,
+    InputReply,
+    InputRequest,
+    InputUnavailableError,
+    InspectionResult,
+    ModelRequest,
+    ModelResponse,
+    Origin,
+    OutputEvent,
+    RoutedAction,
+    SayOutput,
+    UserAction,
+)
+from .plugins import PluginError, PluginRuntime
+from .session_journal import (
+    MAX_EVENT_BYTES,
+    MAX_HISTORY_PAGE_CHARS,
+    MAX_HISTORY_SEARCH_BYTES,
+    MAX_HISTORY_SEARCH_QUERY_CHARS,
+    MAX_HISTORY_SEARCH_SCAN,
+    JournalError,
+    JournalService,
+    NoPersistenceJournal,
+)
+
+
+HISTORY_DEFAULT_LIMIT = 10
+HISTORY_MAX_ITEMS = 20
+HISTORY_MAX_PAGE_CHARS = 4_000
+HISTORY_MAX_COMMAND_CHARS = 1_024
+HISTORY_MAX_OFFSET = MAX_EVENT_BYTES
+HISTORY_MAX_SENSITIVE_VALUES = 256
+HISTORY_MAX_SENSITIVE_CHARS = 65_536
+HISTORY_MAX_SENSITIVE_VALUE_CHARS = 256
+MODEL_OBSERVATION_MAX_EVENTS = 256
+MODEL_OBSERVATION_MAX_DISPLAY_CHARS = 8_000
+MODEL_OBSERVATION_MAX_MIME_TYPES = 16
+_OBSERVATION_MIME_TYPE = re.compile(r"[A-Za-z0-9!#$&^_.+-]{1,64}/[A-Za-z0-9!#$&^_.+-]{1,64}\Z")
+_TERMINAL_ESCAPE = re.compile(
+    r"(?:"
+    r"\x1b\].*?(?:\x07|\x1b\\|\x9c)|\x9d.*?(?:\x07|\x1b\\|\x9c)|"
+    r"\x1b[P^_X].*?(?:\x1b\\|\x9c)|[\x90\x98\x9e\x9f].*?\x9c|"
+    r"\x1b\[[0-?]*[ -/]*[@-~]|\x9b[0-?]*[ -/]*[@-~]|\x1b[@-_]"
+    r")",
+    re.DOTALL,
+)
+_TERMINAL_INCOMPLETE_ESCAPE = re.compile(
+    r"(?:\x1b\].*|\x9d.*|\x1b[P^_X].*|[\x90\x98\x9e\x9f].*|"
+    r"\x1b\[[0-?]*[ -/]*|\x9b[0-?]*[ -/]*)\Z",
+    re.DOTALL,
+)
+_HISTORY_USAGE = (
+    "Usage: /history [recent [COUNT]] | /history search [--limit COUNT] "
+    "[--kind KIND] QUERY | /history page EVENT_ID [OFFSET [CHARS]]"
+)
+
+
+def _strip_observation_terminal_controls(text: str) -> str:
+    safe = _TERMINAL_ESCAPE.sub("", text)
+    safe = _TERMINAL_INCOMPLETE_ESCAPE.sub("", safe)
+    return re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", safe)
+
+
+def _bounded_plain_fallback(
+    text: str, limit: int = MODEL_OBSERVATION_MAX_DISPLAY_CHARS,
+) -> str:
+    """Keep bounded plain text, stripping terminal control sequences."""
+    truncated = len(text) > limit
+    safe = _strip_observation_terminal_controls(text[:limit])
+    if truncated:
+        marker = "\n[plain-text fallback truncated]"
+        if limit <= len(marker):
+            return marker[:limit]
+        safe = safe[:limit - len(marker)] + marker
+    return safe
+
+
+def _observation_mime_types(data: object) -> tuple[list[str], bool]:
+    if not hasattr(data, "keys"):
+        return [], False
+    mime_types = []
+    for name in data:
+        if not isinstance(name, str) or _OBSERVATION_MIME_TYPE.fullmatch(name) is None:
+            continue
+        if len(mime_types) >= MODEL_OBSERVATION_MAX_MIME_TYPES:
+            return mime_types, True
+        mime_types.append(name)
+    return mime_types, False
+
+
+class State(str, Enum):
+    NEW = "new"
+    IDLE = "idle"
+    GENERATING = "generating"
+    EXECUTING = "executing"
+    WAITING_FOR_INPUT = "waiting-for-input"
+    COMMAND = "command"
+    STOPPING = "stopping"
+    FAILED = "failed"
+    CLOSED = "closed"
+
+
+@dataclass(frozen=True)
+class Submission:
+    action: RoutedAction
+    result: ExecutionResult | None = None
+    message: str = ""
+    execution: ExecutionRequest | None = None
+    response: ModelResponse | None = None
+    say_outputs: tuple[SayOutput, ...] = ()
+    executions: tuple[tuple[ExecutionRequest, ExecutionResult], ...] = ()
+    events: tuple[OutputEvent, ...] = ()
+
+    def __post_init__(self):
+        events = tuple(self.events)
+        if any(not isinstance(event, OutputEvent) for event in events):
+            raise TypeError("Submission events must contain OutputEvent records")
+        object.__setattr__(self, "events", events)
+
+
+class Coordinator:
+    def __init__(
+        self,
+        runtime: PluginRuntime,
+        *,
+        router: str,
+        provider: str,
+        interpreter: str,
+        executor: str,
+        context: object | None = None,
+        observations: object | None = None,
+        command_registry: object | None = None,
+        config_store: ConfigStore | None = None,
+        journal: JournalService | None = None,
+        model: str | None = None,
+        executor_wrappers: tuple[str, ...] = (),
+        config_revision: int = 0,
+        shutdown_timeout: float = 5.0,
+        max_agent_steps: int = 16,
+    ):
+        if type(max_agent_steps) is not int or max_agent_steps <= 0:
+            raise ValueError("max_agent_steps must be a positive integer")
+        if isinstance(shutdown_timeout, bool) or not isinstance(shutdown_timeout, (int, float)):
+            raise ValueError("shutdown_timeout must be a finite positive number")
+        try:
+            shutdown_timeout = float(shutdown_timeout)
+        except OverflowError:
+            raise ValueError("shutdown_timeout must be a finite positive number") from None
+        if not math.isfinite(shutdown_timeout) or shutdown_timeout <= 0:
+            raise ValueError("shutdown_timeout must be a finite positive number")
+        if config_store is not None and not isinstance(config_store, ConfigStore):
+            raise TypeError("config_store must be a ConfigStore or None")
+        if type(config_revision) is not int or config_revision < 0:
+            raise ValueError("config_revision must be a nonnegative integer")
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            raise ValueError("model must be nonempty text or None")
+
+        if not isinstance(runtime, PluginRuntime):
+            raise TypeError("runtime must be a PluginRuntime")
+        creation_config = config_store.snapshot if config_store is not None else None
+        if creation_config is not None and not isinstance(creation_config, ConfigSnapshot):
+            raise TypeError("Configuration store returned an invalid snapshot")
+        if isinstance(executor_wrappers, (str, bytes)):
+            raise TypeError("executor_wrappers must be a sequence of qualified wrapper IDs")
+        try:
+            selected_wrappers = tuple(executor_wrappers)
+        except TypeError:
+            raise TypeError("executor_wrappers must be a sequence of qualified wrapper IDs") from None
+        if (any(not isinstance(name, str) or not name.strip() for name in selected_wrappers)
+                or len(selected_wrappers) != len(set(selected_wrappers))):
+            raise ValueError("Executor wrapper IDs must be unique nonempty text")
+        unknown_wrappers = set(selected_wrappers) - runtime.executor_wrappers.keys()
+        if unknown_wrappers:
+            raise PluginError(f"No enabled executor wrappers named {sorted(unknown_wrappers)}")
+        registered_names = getattr(command_registry, "commands", {})
+        if isinstance(registered_names, dict) or hasattr(registered_names, "keys"):
+            configured_names = set(registered_names)
+            if "history" in configured_names:
+                raise PluginError("Configured command collides with coordinator built-in command: history")
+            conflicts = set(runtime.commands) & (configured_names | {"history"})
+            if conflicts:
+                raise PluginError(f"External commands collide with configured or built-in commands: {sorted(conflicts)}")
+
+        self.router = self._sync_factory(runtime.select("router", router).factory)
+        self.provider = self._sync_factory(runtime.select("provider", provider).factory)
+        self.interpreter = self._sync_factory(runtime.select("interpreter", interpreter).factory)
+        self.executor = self._sync_factory(runtime.select("executor", executor).factory)
+        for wrapper_name in selected_wrappers:
+            wrapper = runtime.executor_wrappers.get(wrapper_name)
+            if wrapper is None:
+                raise PluginError(f"No enabled executor wrapper named {wrapper_name}")
+            self.executor = self._sync_factory(wrapper.factory, self.executor)
+        self.context_service = context
+        self.observations = observations
+        self.command_registry = command_registry
+        self.external_commands = runtime.commands
+        self.config_store = config_store
+        self._plugin_runtime = runtime
+        # Runtime factories are created at different application boundaries.
+        # Keep restart and epoch snapshots separate from each request's desired
+        # snapshot; none of these changes replaces selected long-lived services.
+        self._context: list[tuple[str, str]] = []
+        self._context_epoch = 0
+        self._restart_config = creation_config
+        self._epoch_config = self._restart_config
+        self._epoch_config_epoch = self._read_context_epoch()
+        self._observer_registrations = runtime.observers
+        output_observers = {}
+        observer_config = self._restart_config
+        for registration in self._observer_registrations:
+            observer = self._sync_factory(
+                registration.create, self._plugin_config(
+                    registration.plugin_id, observer_config, observer_config, observer_config,
+                    observer_config,
+                ),
+            )
+            if not callable(getattr(observer, "observe", None)):
+                raise TypeError(f"Observer {registration.qualified_name} must expose observe(event)")
+            output_observers[registration.qualified_name] = observer
+        self.output_observers = MappingProxyType(output_observers)
+        self._event_sequence = 0
+        self.best_effort_observer_failures = 0
+        self.provider_id = provider
+        self.model = model or getattr(self.provider, "model", provider)
+        self.session_id = uuid4().hex
+        self.config_revision = config_revision
+        self.journal = NoPersistenceJournal() if journal is None else journal
+        self._require_methods(
+            self.journal, "start", "record_model_request", "record_provider_usage",
+            "record_execution_source", "record_execution_result", "record_uncertain_execution",
+            "set_sensitive_values", "recent", "search", "read", "end", "close",
+        )
+        if type(getattr(self.journal, "persisted", None)) is not bool:
+            raise TypeError("Selected journal must declare whether it persists records")
+        self._history_sensitive_values: set[str] = set()
+        self._history_sensitive_chars = 0
+        self._history_content_hidden = False
+        self._journal_sensitive_config_ready = True
+        self._capture_history_sensitive_config(creation_config)
+        self._journal_started = False
+        self._journal_closed = False
+        self._journal_failed = False
+        self._shutdown_timeout = shutdown_timeout
+        self.max_agent_steps = max_agent_steps
+        self.state = State.NEW
+
+        self._lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._close_task: asyncio.Task | None = None
+        self._executor_close_attempted = False
+        self._active_task: asyncio.Task | None = None
+        self._active_operation_id: str | None = None
+        self._active_model_request: ModelRequest | None = None
+        self._active_provider_usage_recorded = False
+        self._active_execution_request: ExecutionRequest | None = None
+        self._active_execution_result_recorded = False
+        self._execution_active = False
+        self._generation: asyncio.Task | None = None
+        # Minimal context fallback for embedders that do not select a context
+        # policy. Production CLI sessions select ProductionContextAdapter.
+        self._require_methods(self.router, "route")
+        self._require_methods(self.provider, "generate")
+        self._require_methods(self.interpreter, "interpret")
+        self._require_methods(self.executor, "start", "execute", "interrupt", "close")
+        if not isinstance(getattr(self.executor, "capabilities", None), ExecutorCapabilities):
+            raise TypeError("Selected executor must declare ExecutorCapabilities")
+
+    @staticmethod
+    def _sync_factory(factory, *args):
+        value = factory(*args)
+        if inspect.isawaitable(value):
+            close = getattr(value, "close", None)
+            if callable(close):
+                close()
+            raise TypeError("Plugin factories must be synchronous")
+        return value
+
+    @staticmethod
+    def _require_methods(service, *names: str) -> None:
+        missing = [name for name in names if not callable(getattr(service, name, None))]
+        if missing:
+            raise TypeError(f"Selected service is missing callable methods: {', '.join(missing)}")
+
+    def _set_state_unless_stopping(self, state: State) -> None:
+        if self.state not in (State.STOPPING, State.CLOSED):
+            self.state = state
+
+    def _commit_fallback_context(self, user_text: str, assistant_text: str,
+                                 observation: str | None = None, *, include_user: bool = True) -> None:
+        if include_user:
+            self._context.append(("user", user_text))
+        self._context.append(("assistant", assistant_text))
+        if observation is not None:
+            self._context.append(("observation", observation[:8000]))
+        self._context_epoch += 1
+
+    def _operation_is_current(self, operation_id: str, state: State) -> bool:
+        return self._active_operation_id == operation_id and self.state is state
+
+    def _current_config(self) -> ConfigSnapshot | None:
+        if self.config_store is None:
+            return None
+        snapshot = self.config_store.snapshot
+        if not isinstance(snapshot, ConfigSnapshot):
+            raise TypeError("Configuration store returned an invalid snapshot")
+        return snapshot
+
+    def _capture_history_sensitive_config(self, snapshot: ConfigSnapshot | None) -> None:
+        """Retain bounded sensitive values and install write-time journal redaction."""
+        if snapshot is None or self.config_store is None:
+            return
+        for name, field in self.config_store.registry.fields.items():
+            if not field.sensitive:
+                continue
+            entry = snapshot.entries.get(name)
+            if entry is None or entry.value is None or entry.value == "":
+                continue
+            value = entry.value
+            if not isinstance(value, str):
+                self._history_content_hidden = True
+                if getattr(self.journal, "persisted", None) is True:
+                    self._journal_sensitive_config_ready = False
+                continue
+            if len(value) < 4 or len(value) > HISTORY_MAX_SENSITIVE_VALUE_CHARS:
+                self._history_content_hidden = True
+            if value in self._history_sensitive_values:
+                continue
+            if (len(self._history_sensitive_values) >= HISTORY_MAX_SENSITIVE_VALUES
+                    or self._history_sensitive_chars + len(value) > HISTORY_MAX_SENSITIVE_CHARS):
+                self._history_content_hidden = True
+                self._journal_sensitive_config_ready = False
+                continue
+            self._history_sensitive_values.add(value)
+            self._history_sensitive_chars += len(value)
+        if getattr(self.journal, "persisted", None) is True:
+            try:
+                self.journal.set_sensitive_values(tuple(sorted(self._history_sensitive_values)))
+            except Exception:
+                self._journal_sensitive_config_ready = False
+
+    def _history_patterns(self) -> tuple[str, ...]:
+        patterns = set()
+        for value in self._history_sensitive_values:
+            patterns.add(value)
+            escaped = json.dumps(value, ensure_ascii=False)[1:-1]
+            if escaped:
+                patterns.add(escaped)
+        return tuple(sorted(patterns, key=len, reverse=True))
+
+    def _redact_history_text(self, text: str, *, preserve_offsets: bool = False) -> str:
+        if self._history_content_hidden:
+            return "[history content hidden to protect sensitive configuration]"
+        if self._history_sensitive_values and not preserve_offsets:
+            # recent/search API excerpts may cut through a sensitive value. The
+            # paged read path uses overlap-aware masking; short excerpts are
+            # omitted whenever config-derived secret values are in scope.
+            return "[history excerpt hidden to protect sensitive configuration]"
+        patterns = self._history_patterns()
+        if not patterns:
+            return text
+        matcher = re.compile("|".join(re.escape(pattern) for pattern in patterns), re.IGNORECASE)
+        return matcher.sub(
+            lambda match: ("█" * len(match.group(0))) if preserve_offsets else "[REDACTED]",
+            text,
+        )
+
+    def _read_history_page(self, event_id: str, offset: int, limit: int) -> dict[str, object]:
+        page = self.journal.read(self.session_id, event_id, offset=offset, limit=limit)
+        content = page.get("content")
+        if not isinstance(content, str):
+            raise JournalError("Journal returned an invalid history page")
+        if self._history_content_hidden:
+            page["content"] = self._redact_history_text(content)
+            return page
+        patterns = self._history_patterns()
+        if not patterns or not content:
+            page["content"] = content
+            return page
+        overlap = max(map(len, patterns)) - 1
+        start = max(0, offset - overlap)
+        page_chars = len(content)
+        extended_limit = min(
+            MAX_HISTORY_PAGE_CHARS,
+            (offset - start) + page_chars + overlap,
+        )
+        extended = self.journal.read(
+            self.session_id, event_id, offset=start, limit=extended_limit,
+        )
+        surrounding = extended.get("content")
+        if not isinstance(surrounding, str):
+            raise JournalError("Journal returned an invalid history page")
+        masked = self._redact_history_text(surrounding, preserve_offsets=True)
+        page_start = offset - start
+        page["content"] = masked[page_start:page_start + page_chars]
+        return page
+
+    def _read_context_epoch(self) -> int | None:
+        """Read the context epoch when the selected context service exposes it."""
+        if self.context_service is None:
+            return self._context_epoch
+        epoch = getattr(self.context_service, "epoch", None)
+        if type(epoch) is int and epoch >= 0:
+            return epoch
+        snapshot = getattr(self.context_service, "snapshot", None)
+        if callable(snapshot):
+            try:
+                value = snapshot()
+            except Exception:
+                return None
+            if isinstance(value, ContextSnapshot):
+                return value.epoch
+        return None
+
+    def _observe_context_epoch(
+        self, epoch: int | None, *, config: ConfigSnapshot | None = None,
+    ) -> None:
+        """Latch EPOCH settings only after the context reports a newer epoch."""
+        if type(epoch) is not int or epoch < 0:
+            return
+        if self._epoch_config_epoch is None:
+            # The initial epoch could not be inspected; treat the first observed
+            # value as a baseline rather than an unverified epoch transition.
+            self._epoch_config_epoch = epoch
+        elif epoch > self._epoch_config_epoch:
+            self._epoch_config = self._current_config() if config is None else config
+            self._epoch_config_epoch = epoch
+
+    def _plugin_config(
+        self,
+        plugin_id: str,
+        request_snapshot: ConfigSnapshot | None,
+        cell_snapshot: ConfigSnapshot | None,
+        epoch_snapshot: ConfigSnapshot | None,
+        immediate_snapshot: ConfigSnapshot | None,
+    ) -> MappingProxyType:
+        """Resolve one factory namespace using each field's declared boundary.
+
+        ``request_snapshot`` is fixed for a submission. ``cell_snapshot`` is
+        captured once per command/model cell, ``epoch_snapshot`` advances only
+        when the context epoch does, and immediate settings are sampled just
+        before each factory call. Observer factories pass the creation snapshot
+        for every boundary because observer instances are long-lived.
+        """
+        snapshots = {
+            ApplyAt.IMMEDIATE: immediate_snapshot,
+            ApplyAt.REQUEST: request_snapshot,
+            ApplyAt.CELL: cell_snapshot,
+            ApplyAt.EPOCH: epoch_snapshot,
+            ApplyAt.RESTART: self._restart_config,
+        }
+        values = {}
+        for name, field in self._plugin_runtime.config.fields.items():
+            if field.owner != plugin_id:
+                continue
+            snapshot = snapshots[field.apply_at]
+            entry = snapshot.entries.get(name) if snapshot is not None else None
+            values[name.removeprefix(plugin_id + ".")] = field.default if entry is None else entry.value
+        return MappingProxyType(values)
+
+    async def _run_context_transforms(
+        self,
+        snapshot: ContextSnapshot,
+        request_config: ConfigSnapshot | None,
+        cell_config: ConfigSnapshot | None,
+        epoch_config: ConfigSnapshot | None,
+    ) -> ContextSnapshot:
+        current = snapshot
+        trace = list(snapshot.transform_trace)
+        for registration in self._plugin_runtime.transforms["context"]:
+            immediate_config = self._current_config()
+            stage = self._sync_factory(
+                registration.create, self._plugin_config(
+                    registration.plugin_id, request_config, cell_config, epoch_config, immediate_config,
+                ),
+            )
+            transform = getattr(stage, "transform", None)
+            if not callable(transform):
+                raise TypeError(f"Context transform {registration.qualified_name} must expose transform(snapshot)")
+            result = transform(current)
+            if not inspect.isawaitable(result):
+                raise TypeError(f"Context transform {registration.qualified_name} must be async")
+            candidate = await result
+            if not isinstance(candidate, ContextSnapshot):
+                raise TypeError(f"Context transform {registration.qualified_name} must return ContextSnapshot")
+            if candidate.epoch != current.epoch:
+                raise ValueError(f"Context transform {registration.qualified_name} cannot change the context epoch")
+            trace.append(registration.qualified_name)
+            current = replace(candidate, transform_trace=tuple(trace))
+        return current
+
+    async def _run_model_transforms(
+        self,
+        request: ModelRequest,
+        request_config: ConfigSnapshot | None,
+        cell_config: ConfigSnapshot | None,
+        epoch_config: ConfigSnapshot | None,
+    ) -> ModelRequest:
+        current = request
+        trace = list(request.transform_trace)
+        for registration in self._plugin_runtime.transforms["model-request"]:
+            immediate_config = self._current_config()
+            stage = self._sync_factory(
+                registration.create, self._plugin_config(
+                    registration.plugin_id, request_config, cell_config, epoch_config, immediate_config,
+                ),
+            )
+            transform = getattr(stage, "transform", None)
+            if not callable(transform):
+                raise TypeError(f"Model transform {registration.qualified_name} must expose transform(request)")
+            result = transform(current)
+            if not inspect.isawaitable(result):
+                raise TypeError(f"Model transform {registration.qualified_name} must be async")
+            candidate = await result
+            if not isinstance(candidate, ModelRequest):
+                raise TypeError(f"Model transform {registration.qualified_name} must return ModelRequest")
+            if candidate.origin != current.origin:
+                raise ValueError(f"Model transform {registration.qualified_name} cannot change request origin")
+            if candidate.context.epoch != current.context.epoch:
+                raise ValueError(f"Model transform {registration.qualified_name} cannot change the context epoch")
+            context = replace(candidate.context, transform_trace=current.context.transform_trace)
+            trace.append(registration.qualified_name)
+            current = replace(candidate, context=context, transform_trace=tuple(trace))
+        return current
+
+    @staticmethod
+    def _validate_execution_result(request: ExecutionRequest, result: ExecutionResult) -> None:
+        if not isinstance(result, ExecutionResult):
+            raise TypeError("Executor must return an ExecutionResult")
+        if result.origin != request.origin:
+            raise RuntimeError("Executor returned a result for a different origin")
+        if result.status not in ("success", "error", "cancelled", "uncertain"):
+            raise RuntimeError(f"Executor returned unknown status: {result.status!r}")
+        if not isinstance(result.stdout, str) or not isinstance(result.stderr, str):
+            raise TypeError("Executor output streams must be text")
+        if result.error is not None and not isinstance(result.error, str):
+            raise TypeError("Executor error must be text or None")
+        if type(result.final) is not bool:
+            raise TypeError("Execution final marker must be a boolean")
+
+    def _route_query(self, code: str) -> RoutedAction:
+        """Apply the configured input router without dispatching an execution."""
+        config = self._current_config()
+        revision = config.revision if config is not None else self.config_revision
+        origin = Origin(self.session_id, uuid4().hex, "inspection", revision)
+        if not code:
+            return RoutedAction(origin, "ask", "")
+        try:
+            routed = self.router.route(UserAction(origin, code))
+        except ValueError:
+            # Prefix-only editor buffers are valid completion/completeness
+            # requests even though they are not executable submissions yet.
+            if code.startswith("@") and not code[1:].strip():
+                return RoutedAction(origin, "execute", code[1:], "ipython")
+            if code.startswith("!") and not code[1:].strip():
+                return RoutedAction(origin, "execute", code, "ipython")
+            if code.startswith("%") and not code[1:].strip():
+                return RoutedAction(origin, "execute", code, "ipython")
+            if code.startswith("/") and not code[1:].strip():
+                return RoutedAction(origin, "command", code[1:])
+            raise
+        if not isinstance(routed, RoutedAction) or routed.origin != origin:
+            raise TypeError("Router returned an invalid query action")
+        if routed.kind not in ("ask", "execute", "command") or not isinstance(routed.source, str):
+            raise TypeError("Router returned an invalid query action")
+        return routed
+
+    @staticmethod
+    def _query_prefix_offset(code: str, routed: RoutedAction) -> int:
+        # The default direct-Python route removes exactly one leading @.
+        # Other routers may assign @ differently, so do not invent an offset.
+        return 1 if code.startswith("@") and routed.kind == "execute" and routed.source == code[1:] else 0
+
+    @staticmethod
+    def _check_query_cursor(code: str, cursor_pos: int) -> None:
+        if not isinstance(code, str):
+            raise TypeError("Query source must be text")
+        if type(cursor_pos) is not int or not 0 <= cursor_pos <= len(code):
+            raise ValueError("Query cursor position is outside the source")
+
+    async def complete(self, code: str, cursor_pos: int) -> CompletionResult:
+        """Complete direct input in the selected executor's persistent namespace."""
+        self._check_query_cursor(code, cursor_pos)
+        async with self._lock:
+            if self.state is not State.IDLE:
+                raise RuntimeError("Session busy or unavailable")
+            task = asyncio.current_task()
+            self._active_task = task
+            try:
+                routed = self._route_query(code)
+                if routed.kind != "execute":
+                    return CompletionResult((), cursor_pos, cursor_pos)
+                offset = self._query_prefix_offset(code, routed)
+                if offset and cursor_pos == 0:
+                    return CompletionResult((), 0, 0)
+                capabilities = self.executor.capabilities
+                method = getattr(self.executor, "complete", None)
+                if not capabilities.completion or not callable(method):
+                    raise ExecutorCapabilityError("completion")
+                result = await method(routed.source, cursor_pos - offset)
+                if not isinstance(result, CompletionResult):
+                    raise TypeError("Executor completion must return CompletionResult")
+                start, end = result.cursor_start + offset, result.cursor_end + offset
+                if end > len(code) or start > end:
+                    raise ValueError("Executor returned an invalid completion cursor range")
+                return CompletionResult(result.matches, start, end, result.metadata)
+            finally:
+                if self._active_task is task:
+                    self._active_task = None
+
+    async def inspect(self, code: str, cursor_pos: int, detail_level: int = 0) -> InspectionResult:
+        """Inspect a direct-input name in the selected worker without evaluating code."""
+        self._check_query_cursor(code, cursor_pos)
+        if type(detail_level) is not int or detail_level not in (0, 1):
+            raise ValueError("Inspection detail level must be 0 or 1")
+        async with self._lock:
+            if self.state is not State.IDLE:
+                raise RuntimeError("Session busy or unavailable")
+            task = asyncio.current_task()
+            self._active_task = task
+            try:
+                routed = self._route_query(code)
+                if routed.kind != "execute":
+                    return InspectionResult(False)
+                offset = self._query_prefix_offset(code, routed)
+                if offset and cursor_pos == 0:
+                    return InspectionResult(False)
+                capabilities = self.executor.capabilities
+                method = getattr(self.executor, "inspect", None)
+                if not capabilities.inspection or not callable(method):
+                    raise ExecutorCapabilityError("inspection")
+                result = await method(routed.source, cursor_pos - offset, detail_level)
+                if not isinstance(result, InspectionResult):
+                    raise TypeError("Executor inspection must return InspectionResult")
+                return result
+            finally:
+                if self._active_task is task:
+                    self._active_task = None
+
+    @staticmethod
+    def _parse_completeness(source: str) -> CompletenessResult:
+        try:
+            from IPython.core.inputtransformer2 import TransformerManager
+
+            status, indent = TransformerManager().check_complete(source)
+            spaces = " " * min(indent, 80) if type(indent) is int and indent > 0 else ""
+            return CompletenessResult(status, spaces)
+        except ImportError:
+            try:
+                compiled = compile(source, "<jupyter-is-complete>", "exec")
+                del compiled
+            except (SyntaxError, OverflowError, ValueError):
+                try:
+                    import codeop
+                    compiled = codeop.compile_command(source, symbol="exec")
+                except (SyntaxError, OverflowError, ValueError):
+                    return CompletenessResult("invalid")
+                return CompletenessResult("incomplete" if compiled is None else "invalid")
+            return CompletenessResult("complete")
+        except (SyntaxError, OverflowError, ValueError):
+            return CompletenessResult("invalid")
+
+    async def is_complete(self, code: str) -> CompletenessResult:
+        """Check routed input completeness without executing it or using the worker."""
+        if not isinstance(code, str):
+            return CompletenessResult("invalid")
+        async with self._lock:
+            if self.state is not State.IDLE:
+                raise RuntimeError("Session busy or unavailable")
+            task = asyncio.current_task()
+            self._active_task = task
+            try:
+                routed = self._route_query(code)
+                if routed.kind != "execute":
+                    return CompletenessResult("complete")
+                return self._parse_completeness(routed.source)
+            finally:
+                if self._active_task is task:
+                    self._active_task = None
+
+    @staticmethod
+    def _say_text(content: object) -> str:
+        if isinstance(content, str):
+            return content
+        return json.dumps(content, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+    @staticmethod
+    def _visible_say_outputs(result: ExecutionResult) -> tuple[SayOutput, ...]:
+        return tuple(
+            output for output in result.say_outputs
+            if not output.final or result.status == "success"
+        )
+
+    @classmethod
+    def _visible_says(cls, result: ExecutionResult) -> tuple[str, ...]:
+        return tuple(cls._say_text(output.content) for output in cls._visible_say_outputs(result))
+
+    async def _publish_output(self, request: ExecutionRequest, result: ExecutionResult) -> tuple[OutputEvent, ...]:
+        origin = request.origin
+        events: list[OutputEvent] = []
+
+        def append(kind: str, data: dict[str, object], *, display_id: str | None = None,
+                   metadata: dict[str, object] | None = None) -> None:
+            self._event_sequence += 1
+            events.append(OutputEvent(
+                origin, self._event_sequence, kind, data, display_id,
+                metadata or {}, request.author,
+            ))
+
+        if result.output_events:
+            for output in result.output_events:
+                if output.kind == "stream":
+                    data = dict(output.data)
+                    data["author"] = request.author
+                    append("stream", data)
+                else:
+                    append(
+                        output.kind, dict(output.data), display_id=output.display_id,
+                        metadata=dict(output.metadata),
+                    )
+        else:
+            for stream, text in (("stdout", result.stdout), ("stderr", result.stderr)):
+                if text:
+                    append("stream", {"name": stream, "text": text, "author": request.author})
+
+        for output in result.say_outputs:
+            if output.final and result.status != "success":
+                continue  # Staged finals are not user-visible until successful completion.
+            append(
+                "display", {"text/plain": self._say_text(output.content)},
+                metadata={"py_agent_source": "say", "final": output.final},
+            )
+        if result.error or result.status not in ("success", "error"):
+            append("error", {
+                "ename": "ExecutionError", "evalue": result.error or result.status,
+            })
+        elif result.status == "error":
+            append("error", {
+                "ename": "ExecutionError", "evalue": result.error or "Execution failed",
+            })
+        for event in events:
+            for registration in self._observer_registrations:
+                observer = self.output_observers[registration.qualified_name]
+                try:
+                    delivered = observer.observe(event)
+                    if not inspect.isawaitable(delivered):
+                        raise TypeError(f"Observer {registration.qualified_name} must be async")
+                    await delivered
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if registration.critical:
+                        raise
+                    self.best_effort_observer_failures += 1
+        return tuple(events)
+
+    def _model_options(self, snapshot: ConfigSnapshot | None) -> dict[str, str]:
+        options: dict[str, str] = {}
+        if snapshot is None:
+            return options
+        max_tokens = snapshot.entries.get("model.max_tokens")
+        if (self.provider_id == "litelm" and max_tokens is not None
+                and type(max_tokens.value) is int and max_tokens.value > 0):
+            options["max_tokens"] = str(max_tokens.value)
+        effort = snapshot.entries.get("model.effort")
+        if effort is not None and isinstance(effort.value, str) and self.provider_id == "codex":
+            options["effort"] = effort.value
+        return options
+
+    def _prepare_context(self, text: str, request_id: str) -> ContextSnapshot:
+        if self.context_service is not None:
+            prepare = getattr(self.context_service, "prepare_request", None)
+            if callable(prepare):
+                snapshot = prepare(text, request_id)
+                if not isinstance(snapshot, ContextSnapshot):
+                    raise TypeError("Context service must return a ContextSnapshot")
+                return snapshot
+            # The v1 ContextService protocol exposes reset policy and usage
+            # accounting but not mutation methods. Keep a minimal compatible
+            # append-only snapshot until a service supplies the richer adapter.
+            needs_reset = getattr(self.context_service, "needs_reset", None)
+            if callable(needs_reset) and needs_reset():
+                self._context.clear()
+                self._context_epoch += 1
+        return ContextSnapshot(self._context_epoch, (*self._context, ("user", text)))
+
+    def _latest_context(self) -> ContextSnapshot:
+        snapshot = getattr(self.context_service, "snapshot", None) if self.context_service is not None else None
+        if callable(snapshot):
+            value = snapshot()
+            if not isinstance(value, ContextSnapshot):
+                raise TypeError("Context service snapshot() must return ContextSnapshot")
+            return value
+        return ContextSnapshot(self._context_epoch, tuple(self._context))
+
+    @staticmethod
+    def _agent_protocol_context(snapshot: ContextSnapshot) -> ContextSnapshot:
+        """Correct old advisory-final wording and state this coordinator's loop contract."""
+        correction = (
+            "Autonomous multi-cell protocol: say(text, final=False) emits a user-visible message. "
+            "A non-final say is progress only. The coordinator runs another provider/execution step "
+            "after every successful non-final cell; finish the task with say(answer, final=True). "
+            "Only a final say from a successfully completed cell completes the task; a final say in a "
+            "failed cell is discarded. Intermediate say messages and execution observations are "
+            "visible on the next step."
+        )
+        messages = []
+        phases = list(snapshot.message_phases)
+        found_protocol = False
+        for role, content in snapshot.messages:
+            if role == "system":
+                content = content.replace(
+                    "final is\ncurrently advisory only.",
+                    "final=True explicitly requests completion, but completion is committed only after success.",
+                )
+            if role == "system" and correction in content:
+                found_protocol = True
+            messages.append((role, content))
+        if not found_protocol:
+            system_index = next((i for i, (role, _) in enumerate(messages) if role == "system"), None)
+            if system_index is None:
+                messages.append(("system", correction))
+                phases.append(None)
+            else:
+                role, content = messages[system_index]
+                messages[system_index] = (role, content.rstrip() + "\n\n" + correction)
+        return replace(snapshot, messages=tuple(messages), message_phases=tuple(phases))
+
+    def _packed_observation(self, request: ExecutionRequest, result: ExecutionResult):
+        if result.origin != request.origin:
+            raise RuntimeError("Cannot pack output from a different execution origin")
+        events = []
+        omitted_events = 0
+        event_index = 0
+        display_chars_remaining = MODEL_OBSERVATION_MAX_DISPLAY_CHARS
+        origin = request.origin
+        common = {
+            "session_id": origin.session_id,
+            "request_id": origin.request_id,
+            "frontend_id": origin.frontend_id,
+            "config_revision": origin.config_revision,
+            "generation_id": origin.generation_id,
+            "execution_id": origin.execution_id,
+            "author": request.author,
+        }
+
+        def append_event(data: dict[str, object]) -> None:
+            nonlocal event_index, omitted_events
+            if len(events) < MODEL_OBSERVATION_MAX_EVENTS:
+                events.append({"event_index": event_index, **data, **common})
+            else:
+                omitted_events += 1
+            event_index += 1
+
+        if result.output_events:
+            seen_streams = set()
+            for output in result.output_events:
+                if output.kind == "stream":
+                    name, text = output.data.get("name"), output.data.get("text")
+                    if name in ("stdout", "stderr") and isinstance(text, str) and text:
+                        seen_streams.add(name)
+                        append_event({
+                            "stream": name,
+                            "text": _strip_observation_terminal_controls(text),
+                        })
+                elif output.kind in ("display", "execute_result", "update"):
+                    mime_types, mime_types_truncated = _observation_mime_types(output.data)
+                    fallback = output.data.get("text/plain")
+                    if isinstance(fallback, str) and display_chars_remaining:
+                        display = _bounded_plain_fallback(fallback, display_chars_remaining)
+                        display_chars_remaining -= len(display)
+                    else:
+                        display = ""
+                    if not display:
+                        summary = ", ".join(mime_types) or "no safe MIME types"
+                        if mime_types_truncated:
+                            summary += ", additional MIME types omitted"
+                        display = f"[rich output omitted; available MIME types: {summary}]"
+                    append_event({
+                        "display": display,
+                        "output_kind": output.kind,
+                        "mime_types": mime_types,
+                        "mime_types_truncated": mime_types_truncated,
+                    })
+                elif output.kind == "clear":
+                    clear_event = {"clear": True, "output_kind": "clear"}
+                    wait = output.data.get("wait")
+                    if type(wait) is bool:
+                        clear_event["wait"] = wait
+                    append_event(clear_event)
+            for stream, text in (("stdout", result.stdout), ("stderr", result.stderr)):
+                if text and stream not in seen_streams:
+                    append_event({
+                        "stream": stream,
+                        "text": _strip_observation_terminal_controls(text),
+                    })
+        else:
+            for stream, text in (("stdout", result.stdout), ("stderr", result.stderr)):
+                if text:
+                    append_event({
+                        "stream": stream,
+                        "text": _strip_observation_terminal_controls(text),
+                    })
+
+        for output in result.say_outputs:
+            content = output.content
+            if isinstance(content, str):
+                content = _strip_observation_terminal_controls(content)
+            append_event({"say": content, "final": output.final})
+        if result.status != "success":
+            append_event({
+                "error": _strip_observation_terminal_controls(
+                    result.error or f"Execution {result.status}"
+                ),
+                "status": result.status,
+            })
+        if omitted_events:
+            events.append({
+                "event_index": event_index,
+                "omitted_events": omitted_events,
+                **common,
+            })
+
+        if self.observations is None:
+            observed = [
+                event.get("text", event.get("display", ""))
+                for event in events
+                if "stream" in event or "display" in event
+            ]
+            observed = [text for text in observed if isinstance(text, str) and text]
+            if result.output_events:
+                output_text = "\n".join(observed)
+            else:
+                output_text = "".join(
+                    event["text"] for event in events if "stream" in event
+                )
+            says = "\n".join(
+                _strip_observation_terminal_controls(self._say_text(output.content))
+                for output in result.say_outputs
+            )
+            if says:
+                output_text += ("\n" if output_text else "") + says
+            if omitted_events:
+                output_text += (
+                    ("\n" if output_text else "")
+                    + f"[{omitted_events} execution output events omitted]"
+                )
+            error = _strip_observation_terminal_controls(result.error or "no error details")
+            return output_text + (
+                f"\nExecution {result.status}: {error}"
+                if result.status != "success" else ""
+            )
+        pack = getattr(self.observations, "pack", None)
+        if not callable(pack):
+            raise TypeError("Selected observation service must expose pack")
+        packed = pack(events)
+        if not hasattr(packed, "items"):
+            raise TypeError("Observation service must return a mapping")
+        return packed
+
+    def _abandon_context(self, request_id: str) -> None:
+        if self.context_service is None:
+            return
+        abandon = getattr(self.context_service, "abandon_request", None)
+        if callable(abandon):
+            abandon(request_id)
+
+    def _commit_context(self, request_id: str, user_text: str, assistant_text: str,
+                        observation=None, phase: str | None = None, *, include_user: bool = True) -> None:
+        if self.context_service is None:
+            text = None
+            if observation is not None:
+                if isinstance(observation, str):
+                    text = observation
+                else:
+                    text = json.dumps(observation, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            self._commit_fallback_context(user_text, assistant_text, text, include_user=include_user)
+            return
+        commit = getattr(self.context_service, "commit_response", None)
+        if callable(commit):
+            commit(request_id, assistant_text, observation=observation, phase=phase)
+            if callable(getattr(self.context_service, "snapshot", None)):
+                return
+        text = observation if isinstance(observation, str) else (
+            json.dumps(observation, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            if observation is not None else None
+        )
+        self._commit_fallback_context(user_text, assistant_text, text, include_user=include_user)
+
+    def _journal_record(self, method: str, *args, **kwargs) -> None:
+        if not self._journal_sensitive_config_ready:
+            self._journal_failed = True
+            self._set_state_unless_stopping(State.FAILED)
+            raise JournalError(
+                "Sensitive configuration exceeds journal redaction limits; operation stopped without replay"
+            )
+        if self._journal_failed:
+            raise JournalError("Durable journal failed; the session is fail-closed and will not replay work")
+        try:
+            result = getattr(self.journal, method)(*args, **kwargs)
+            if inspect.isawaitable(result):
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+                raise TypeError("Coordinator journal methods must commit synchronously")
+        except Exception as exc:
+            self._journal_failed = True
+            self._set_state_unless_stopping(State.FAILED)
+            raise JournalError(
+                "Durable journal failed; the operation stopped without replay"
+            ) from exc
+
+    def _record_provider_usage(
+        self, request: ModelRequest, response: ModelResponse | None, *, outcome: str,
+    ) -> None:
+        if self._active_model_request is request and self._active_provider_usage_recorded:
+            return
+        self._journal_record("record_provider_usage", request, response, outcome=outcome)
+        if self._active_model_request is request:
+            self._active_provider_usage_recorded = True
+
+    def _record_execution_result(self, request: ExecutionRequest, result: ExecutionResult) -> None:
+        if self._active_execution_request is request and self._active_execution_result_recorded:
+            return
+        self._journal_record("record_execution_result", request, result)
+        if self._active_execution_request is request:
+            self._active_execution_result_recorded = True
+
+    def _record_uncertain_execution(self, request: ExecutionRequest, reason: str) -> None:
+        if self._active_execution_request is request and self._active_execution_result_recorded:
+            return
+        self._journal_record("record_uncertain_execution", request, reason)
+        if self._active_execution_request is request:
+            self._active_execution_result_recorded = True
+
+    async def _execute_dispatched(self, request: ExecutionRequest) -> ExecutionResult:
+        """Commit source before dispatch and result before publishing its output."""
+        self._journal_record("record_execution_source", request)
+        self._active_execution_request = request
+        self._active_execution_result_recorded = False
+        self._execution_active = True
+        try:
+            try:
+                result = await self.executor.execute(request)
+            except asyncio.CancelledError:
+                self._record_uncertain_execution(
+                    request, "Executor call was cancelled; side effects may have occurred",
+                )
+                raise
+            except Exception as exc:
+                self._record_uncertain_execution(request, f"Executor raised {type(exc).__name__}")
+                raise
+        finally:
+            self._execution_active = False
+        try:
+            self._validate_execution_result(request, result)
+        except Exception as exc:
+            self._record_uncertain_execution(request, f"Executor returned an invalid result: {type(exc).__name__}")
+            raise
+        self._record_execution_result(request, result)
+        return result
+
+    async def _close_executor(self) -> None:
+        if self._executor_close_attempted:
+            return
+        self._executor_close_attempted = True
+        await self.executor.close()
+
+    def _close_journal(self, state: str) -> None:
+        if self._journal_closed:
+            return
+        failure = None
+        try:
+            if self._journal_started and not self._journal_failed:
+                self._journal_record("end", self.session_id, self.config_revision, state)
+        except BaseException as exc:
+            failure = exc
+        try:
+            self.journal.close()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+            elif hasattr(failure, "add_note"):
+                failure.add_note(f"Journal close also failed: {type(exc).__name__}")
+        finally:
+            self._journal_closed = True
+        if failure is not None:
+            raise failure
+
+    async def start(self) -> None:
+        async with self._lifecycle_lock:
+            if self.state is not State.NEW:
+                raise RuntimeError("Coordinator cannot start unless it is new")
+            try:
+                config = self._current_config()
+                if config is not None:
+                    self.config_revision = config.revision
+                self._journal_record(
+                    "start", self.session_id, self.config_revision, self.provider_id, self.model,
+                )
+                self._journal_started = True
+                await self.executor.start()
+            except BaseException:
+                self.state = State.FAILED
+                try:
+                    await self._close_executor()
+                except BaseException:
+                    # Preserve startup failure; close() remains safe to call.
+                    pass
+                try:
+                    self._close_journal(State.FAILED.value)
+                except BaseException:
+                    # Preserve startup failure; the journal has still been closed.
+                    pass
+                raise
+            self.state = State.IDLE
+
+    async def submit(
+        self,
+        frontend_id: str,
+        text: str,
+        *,
+        allow_stdin: bool = False,
+        input_handler: InputHandler | None = None,
+    ) -> Submission:
+        if self.state is not State.IDLE or self._lock.locked():
+            raise RuntimeError("Session busy or unavailable")
+        async with self._lock:
+            if self.state is not State.IDLE:
+                raise RuntimeError("Session busy or unavailable")
+            if not isinstance(frontend_id, str) or not isinstance(text, str):
+                raise TypeError("Frontend ID and submission text must be text")
+            if type(allow_stdin) is not bool:
+                raise TypeError("allow_stdin must be a boolean")
+            if input_handler is not None and not callable(input_handler):
+                raise TypeError("input_handler must be callable or None")
+
+            task = asyncio.current_task()
+            operation_id = uuid4().hex
+            self._active_task = task
+            self._active_operation_id = operation_id
+            config = self._current_config()
+            self._capture_history_sensitive_config(config)
+            self._observe_context_epoch(self._read_context_epoch(), config=config)
+            revision = config.revision if config is not None else self.config_revision
+            self.config_revision = revision
+            origin = Origin(self.session_id, uuid4().hex, frontend_id, revision)
+
+            def execution_input_handler(execution_origin: Origin) -> InputHandler | None:
+                if not allow_stdin or input_handler is None:
+                    return None
+
+                async def dispatch_input(input_request: InputRequest) -> InputReply:
+                    if (
+                        not isinstance(input_request, InputRequest)
+                        or input_request.origin != execution_origin
+                        or input_request.owner_frontend_id != frontend_id
+                    ):
+                        raise InputUnavailableError(
+                            "Interactive input request does not belong to this execution frontend",
+                        )
+                    if (
+                        self._active_execution_request is None
+                        or self._active_execution_request.origin != execution_origin
+                        or self.state is not State.EXECUTING
+                    ):
+                        raise InputUnavailableError("Interactive input execution is no longer active")
+                    self.state = State.WAITING_FOR_INPUT
+                    try:
+                        response = input_handler(input_request)
+                        if not inspect.isawaitable(response):
+                            raise TypeError("Frontend input handler must be async")
+                        reply = await response
+                        if (
+                            not isinstance(reply, InputReply)
+                            or reply.origin != input_request.origin
+                            or reply.sequence != input_request.sequence
+                            or reply.owner_frontend_id != input_request.owner_frontend_id
+                            or reply.password is not input_request.password
+                        ):
+                            raise InputUnavailableError(
+                                "Frontend input reply did not match its originating request",
+                            )
+                        return reply
+                    finally:
+                        if self.state is State.WAITING_FOR_INPUT:
+                            self.state = State.EXECUTING
+
+                return dispatch_input
+
+            context_pending = False
+            try:
+                routed = self.router.route(UserAction(origin, text))
+                if not isinstance(routed, RoutedAction):
+                    raise TypeError("Router must return a RoutedAction")
+                if routed.origin != origin:
+                    raise ValueError("Router changed request origin")
+                if routed.kind not in ("ask", "execute", "command"):
+                    raise ValueError(f"Router returned unknown action kind: {routed.kind!r}")
+                if not isinstance(routed.source, str):
+                    raise TypeError("Routed action source must be text")
+                if not routed.source.strip():
+                    raise ValueError("Router returned an empty source")
+                if routed.language is not None and not isinstance(routed.language, str):
+                    raise TypeError("Routed action language must be text or None")
+
+                if routed.kind == "command":
+                    self.state = State.COMMAND
+                    message = await self._dispatch_command(routed.source, config)
+                    if not self._operation_is_current(operation_id, State.COMMAND):
+                        raise asyncio.CancelledError
+                    if self.config_store is not None:
+                        self.config_revision = self.config_store.snapshot.revision
+                        self._capture_history_sensitive_config(self.config_store.snapshot)
+                    if (not self._journal_sensitive_config_ready
+                            and getattr(self.journal, "persisted", None) is True):
+                        message += (
+                            "\nWarning: sensitive configuration exceeds journal redaction limits; "
+                            "further persisted operations will stop safely."
+                        )
+                    self._set_state_unless_stopping(State.IDLE)
+                    return Submission(routed, message=message)
+
+                if routed.kind == "ask":
+                    context_pending = callable(getattr(self.context_service, "prepare_request", None))
+                    initial_context = self._prepare_context(routed.source, origin.request_id)
+                    self._observe_context_epoch(initial_context.epoch)
+                    context_committed = False
+                    visible_messages: list[str] = []
+                    visible_outputs: list[SayOutput] = []
+                    published_events: list[OutputEvent] = []
+                    executions: list[tuple[ExecutionRequest, ExecutionResult]] = []
+                    last_result = None
+                    last_execution = None
+                    last_response = None
+
+                    for step in range(1, self.max_agent_steps + 1):
+                        self.state = State.GENERATING
+                        generation_id = uuid4().hex
+                        generation_origin = Origin(
+                            origin.session_id, origin.request_id, origin.frontend_id,
+                            origin.config_revision, generation_id,
+                        )
+                        snapshot = initial_context if step == 1 else self._latest_context()
+                        self._observe_context_epoch(snapshot.epoch)
+                        cell_config = self._current_config()
+                        epoch_config = self._epoch_config
+                        context = await self._run_context_transforms(
+                            self._agent_protocol_context(snapshot), config, cell_config, epoch_config,
+                        )
+                        model_request = ModelRequest(
+                            generation_origin, context, self.model, self._model_options(config),
+                        )
+                        model_request = await self._run_model_transforms(
+                            model_request, config, cell_config, epoch_config,
+                        )
+                        if not self._operation_is_current(operation_id, State.GENERATING):
+                            raise asyncio.CancelledError
+                        # This is the final post-transform request actually dispatched to
+                        # the provider. Persist it before any provider-side effect.
+                        self._active_model_request = model_request
+                        self._active_provider_usage_recorded = False
+                        self._journal_record("record_model_request", model_request)
+                        generation = asyncio.create_task(
+                            self.provider.generate(model_request),
+                            name=f"py-agent-generation-{generation_id}",
+                        )
+                        self._generation = generation
+                        try:
+                            try:
+                                response = await generation
+                            except asyncio.CancelledError:
+                                self._record_provider_usage(model_request, None, outcome="cancelled")
+                                raise
+                            except Exception:
+                                self._record_provider_usage(model_request, None, outcome="failed")
+                                raise
+                        finally:
+                            if self._generation is generation:
+                                self._generation = None
+
+                        if not isinstance(response, ModelResponse):
+                            self._record_provider_usage(model_request, None, outcome="failed")
+                            raise TypeError("Provider must return a ModelResponse")
+                        self._record_provider_usage(model_request, response, outcome="returned")
+                        if not self._operation_is_current(operation_id, State.GENERATING):
+                            raise asyncio.CancelledError
+                        if not isinstance(response.text, str):
+                            raise TypeError("Provider response text must be text")
+                        last_response = response
+                        record_usage = getattr(self.context_service, "record_response", None)
+                        if callable(record_usage):
+                            record_usage(response)
+                        decision = self.interpreter.interpret(response)
+                        if not isinstance(decision, AgentDecision):
+                            raise TypeError("Interpreter must return an AgentDecision")
+                        if decision.kind not in ("execute", "finish", "wait", "reject"):
+                            raise ValueError(f"Interpreter returned unknown decision: {decision.kind!r}")
+                        if not isinstance(decision.source, str) or not isinstance(decision.reason, str):
+                            raise TypeError("Decision source and reason must be text")
+
+                        if decision.kind != "execute" or not decision.source.strip():
+                            if context_pending:
+                                self._abandon_context(origin.request_id)
+                                context_pending = False
+                            self._set_state_unless_stopping(State.IDLE)
+                            if decision.kind == "finish":
+                                reason = decision.reason or "Agent did not call say(final=True); the request is not complete."
+                            elif decision.kind == "wait":
+                                reason = decision.reason or "Agent is waiting; no final answer was committed."
+                            elif decision.kind == "reject":
+                                reason = decision.reason or "Provider response was rejected; no source was executed."
+                            else:
+                                reason = "Interpreter returned empty execution source; no source was executed."
+                            if visible_messages:
+                                visible_messages.append(reason)
+                            else:
+                                visible_messages = [reason]
+                            return Submission(
+                                routed, result=last_result, message="\n".join(visible_messages),
+                                execution=last_execution, response=response,
+                                say_outputs=tuple(visible_outputs), executions=tuple(executions),
+                                events=tuple(published_events),
+                            )
+
+                        self.state = State.EXECUTING
+                        execution_origin = Origin(
+                            origin.session_id, origin.request_id, origin.frontend_id,
+                            origin.config_revision, generation_id, uuid4().hex,
+                        )
+                        execution_request = ExecutionRequest(
+                            execution_origin, decision.source, "agent", "ipython",
+                            allow_stdin=allow_stdin,
+                            input_handler=execution_input_handler(execution_origin),
+                        )
+                        result = await self._execute_dispatched(execution_request)
+
+                        if not self._operation_is_current(operation_id, State.EXECUTING):
+                            raise asyncio.CancelledError
+                        published_events.extend(await self._publish_output(execution_request, result))
+                        if not self._operation_is_current(operation_id, State.EXECUTING):
+                            raise asyncio.CancelledError
+                        visible_outputs.extend(self._visible_say_outputs(result))
+                        visible_messages.extend(self._visible_says(result))
+                        last_result, last_execution = result, execution_request
+                        executions.append((execution_request, result))
+
+                        observation = self._packed_observation(execution_request, result)
+                        self._commit_context(
+                            origin.request_id, routed.source, decision.source, observation,
+                            phase=response.phase, include_user=not context_committed,
+                        )
+                        context_committed = True
+                        context_pending = False
+
+                        if result.status in ("uncertain", "cancelled"):
+                            self._set_state_unless_stopping(State.FAILED)
+                            if result.status == "uncertain":
+                                visible_messages.append(
+                                    "Execution result is uncertain; no source will be replayed. The session is paused."
+                                )
+                            return Submission(
+                                routed, result=result, message="\n".join(visible_messages),
+                                execution=execution_request, response=response,
+                                say_outputs=tuple(visible_outputs), executions=tuple(executions),
+                                events=tuple(published_events),
+                            )
+                        if result.final:
+                            self._set_state_unless_stopping(State.IDLE)
+                            return Submission(
+                                routed, result=result, message="\n".join(visible_messages),
+                                execution=execution_request, response=response,
+                                say_outputs=tuple(visible_outputs), executions=tuple(executions),
+                                events=tuple(published_events),
+                            )
+
+                    self._set_state_unless_stopping(State.IDLE)
+                    visible_messages.append(
+                        f"Agent paused after {self.max_agent_steps} execution steps without a successful "
+                        "say(final=True); submit another request to continue."
+                    )
+                    return Submission(
+                        routed, result=last_result, message="\n".join(visible_messages),
+                        execution=last_execution, response=last_response,
+                        say_outputs=tuple(visible_outputs), executions=tuple(executions),
+                        events=tuple(published_events),
+                    )
+
+                # Direct execution bypasses provider and agent policy exactly once.
+                generation_id = None
+                author = "user"
+                if self._active_operation_id != operation_id or self.state is not State.IDLE:
+                    raise asyncio.CancelledError
+                self.state = State.EXECUTING
+                execution_origin = Origin(
+                    origin.session_id, origin.request_id, origin.frontend_id,
+                    origin.config_revision, None, uuid4().hex,
+                )
+                execution_request = ExecutionRequest(
+                    execution_origin, routed.source, author,
+                    routed.language if routed.language else "ipython",
+                    allow_stdin=allow_stdin,
+                    input_handler=execution_input_handler(execution_origin),
+                )
+                result = await self._execute_dispatched(execution_request)
+                if not self._operation_is_current(operation_id, State.EXECUTING):
+                    raise asyncio.CancelledError
+                published_events = await self._publish_output(execution_request, result)
+                if not self._operation_is_current(operation_id, State.EXECUTING):
+                    raise asyncio.CancelledError
+                self._set_state_unless_stopping(
+                    State.FAILED if result.status in ("uncertain", "cancelled") else State.IDLE,
+                )
+                return Submission(
+                    routed, result=result, message="\n".join(self._visible_says(result)),
+                    execution=execution_request,
+                    say_outputs=self._visible_say_outputs(result),
+                    events=published_events,
+                )
+            except asyncio.CancelledError:
+                if context_pending:
+                    try:
+                        self._abandon_context(origin.request_id)
+                    except Exception:
+                        pass
+                if self.state is State.GENERATING:
+                    self._set_state_unless_stopping(State.IDLE)
+                elif self.state in (State.EXECUTING, State.COMMAND):
+                    # Execution/commands may already have side effects; never replay them.
+                    self._set_state_unless_stopping(State.FAILED)
+                raise
+            except Exception:
+                if context_pending:
+                    try:
+                        self._abandon_context(origin.request_id)
+                    except Exception:
+                        pass
+                if self.state is State.GENERATING:
+                    self._set_state_unless_stopping(State.IDLE)
+                elif self.state in (State.EXECUTING, State.COMMAND):
+                    self._set_state_unless_stopping(State.FAILED)
+                raise
+            finally:
+                if self._active_task is task:
+                    self._active_task = None
+                if self._active_operation_id == operation_id:
+                    self._active_operation_id = None
+
+    async def _dispatch_command(self, source: str, config: ConfigSnapshot | None) -> str:
+        parts = source.split(None, 1)
+        name = parts[0] if parts else ""
+        arguments = parts[1].strip() if len(parts) > 1 else ""
+        core_commands = getattr(self.command_registry, "commands", {})
+        try:
+            if name == "history":
+                self._capture_history_sensitive_config(self._current_config())
+                return self._history_command(arguments)
+            if name in core_commands:
+                response = self.command_registry.dispatch(name, arguments)
+            elif name in self.external_commands:
+                registration = self.external_commands[name]
+                self._observe_context_epoch(self._read_context_epoch())
+                cell_config = self._current_config()
+                command = self._sync_factory(
+                    registration.create, self._plugin_config(
+                        registration.plugin_id, config, cell_config, self._epoch_config, cell_config,
+                    ),
+                )
+                execute = getattr(command, "execute", None)
+                if not callable(execute):
+                    return "Command service returned an invalid handler."
+                response = execute(arguments)
+                if inspect.isawaitable(response):
+                    response = await response
+            elif self.command_registry is None and not self.external_commands:
+                return "Command service is not configured"
+            else:
+                return "Unknown command"
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return "Command failed; no configuration change was committed."
+        if isinstance(response, str):
+            return response
+        ok, message = getattr(response, "ok", None), getattr(response, "text", None)
+        if type(ok) is not bool or not isinstance(message, str):
+            return "Command service returned an invalid response."
+        return message
+
+    def _history_command(self, arguments: str) -> str:
+        if getattr(self.journal, "persisted", None) is False:
+            return (
+                "History persistence is disabled: this session selected the explicit "
+                "no-persistence journal. No history is stored or replayed."
+            )
+        if getattr(self.journal, "persisted", None) is not True:
+            return "History viewing is unavailable for the selected journal service."
+        if any(not callable(getattr(self.journal, name, None)) for name in ("recent", "search", "read")):
+            return "History viewing is unavailable for the selected journal service."
+        if not isinstance(arguments, str) or len(arguments) > HISTORY_MAX_COMMAND_CHARS:
+            return _HISTORY_USAGE
+        try:
+            tokens = shlex.split(arguments, posix=True)
+        except ValueError:
+            return _HISTORY_USAGE
+        operation = tokens[0] if tokens else "recent"
+        if operation == "recent":
+            values = tokens[1:]
+            count = self._history_count(values, default=HISTORY_DEFAULT_LIMIT)
+            if count is None:
+                return _HISTORY_USAGE
+            return self._history_recent(count)
+        if operation.isdecimal() and len(tokens) == 1:
+            count = self._history_count(tokens, default=HISTORY_DEFAULT_LIMIT)
+            return self._history_recent(count) if count is not None else _HISTORY_USAGE
+        if operation == "search":
+            return self._history_search(tokens[1:])
+        if operation in {"page", "read"}:
+            return self._history_page(tokens[1:])
+        return _HISTORY_USAGE
+
+    @staticmethod
+    def _history_count(values: list[str], *, default: int) -> int | None:
+        if not values:
+            return default
+        if len(values) != 1 or not values[0].isdecimal() or len(values[0]) > 3:
+            return None
+        count = int(values[0])
+        return count if 1 <= count <= HISTORY_MAX_ITEMS else None
+
+    @staticmethod
+    def _history_integer(value: str, *, maximum: int) -> int | None:
+        if not value.isdecimal() or len(value) > len(str(maximum)):
+            return None
+        number = int(value)
+        return number if number <= maximum else None
+
+    def _history_recent(self, count: int) -> str:
+        try:
+            entries = self.journal.recent(self.session_id, limit=count)
+        except Exception:
+            return "History is unavailable because the journal could not be read."
+        if not entries:
+            return "No history entries are recorded for this session. History is read-only; nothing is replayed."
+        lines = ["Recent journal events (newest first; read-only, never replayed):"]
+        for entry in entries[:count]:
+            if not isinstance(entry, dict):
+                continue
+            event_id = entry.get("id")
+            kind = entry.get("kind")
+            request_id = entry.get("request_id")
+            excerpt = entry.get("excerpt")
+            if not isinstance(event_id, str) or not isinstance(kind, str) or not isinstance(excerpt, str):
+                continue
+            safe_excerpt = self._redact_history_text(excerpt[:240])
+            safe_id = event_id[:128]
+            safe_kind = kind[:100]
+            request = f" request={request_id[:128]}" if isinstance(request_id, str) else ""
+            lines.append(f"{safe_id} {safe_kind}{request}: {safe_excerpt}")
+        if len(lines) == 1:
+            return "No readable history entries are available. History is read-only; nothing is replayed."
+        return "\n".join(lines)
+
+    def _history_search(self, tokens: list[str]) -> str:
+        count = HISTORY_DEFAULT_LIMIT
+        kind = None
+        query_tokens = []
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "--limit" and not query_tokens and index + 1 < len(tokens):
+                parsed = self._history_count([tokens[index + 1]], default=HISTORY_DEFAULT_LIMIT)
+                if parsed is None:
+                    return _HISTORY_USAGE
+                count = parsed
+                index += 2
+                continue
+            if token == "--kind" and not query_tokens and index + 1 < len(tokens):
+                kind = tokens[index + 1]
+                if not kind or len(kind) > 100 or "\x00" in kind:
+                    return _HISTORY_USAGE
+                index += 2
+                continue
+            if token.startswith("--") and not query_tokens:
+                return _HISTORY_USAGE
+            query_tokens.append(token)
+            index += 1
+        query = " ".join(query_tokens)
+        if not query or len(query) > MAX_HISTORY_SEARCH_QUERY_CHARS:
+            return _HISTORY_USAGE
+        try:
+            entries = self.journal.search(
+                self.session_id, query, kind=kind, limit=count,
+                scan_limit=MAX_HISTORY_SEARCH_SCAN,
+            )
+        except Exception:
+            return "History search is unavailable; check the query and journal."
+        lines = [
+            f"History search (at most {MAX_HISTORY_SEARCH_SCAN} events / "
+            f"{MAX_HISTORY_SEARCH_BYTES} bytes checked; read-only, never replayed):"
+        ]
+        for entry in entries[:count]:
+            if not isinstance(entry, dict):
+                continue
+            event_id = entry.get("id")
+            event_kind = entry.get("kind")
+            excerpt = entry.get("excerpt")
+            if not isinstance(event_id, str) or not isinstance(event_kind, str) or not isinstance(excerpt, str):
+                continue
+            request_id = entry.get("request_id")
+            request = f" request={request_id[:128]}" if isinstance(request_id, str) else ""
+            offset = entry.get("offset")
+            location = (
+                f" around={offset}"
+                if type(offset) is int and 0 <= offset <= HISTORY_MAX_OFFSET else ""
+            )
+            safe_excerpt = self._redact_history_text(excerpt[:400])
+            lines.append(
+                f"{event_id[:128]} {event_kind[:100]}{request}{location}: {safe_excerpt}"
+            )
+        if len(lines) == 1:
+            lines.append("No matches.")
+        return "\n".join(lines)
+
+    def _history_page(self, tokens: list[str]) -> str:
+        if not 1 <= len(tokens) <= 3 or re.fullmatch(r"e[0-9]{12}", tokens[0]) is None:
+            return _HISTORY_USAGE
+        offset = self._history_integer(
+            tokens[1], maximum=HISTORY_MAX_OFFSET,
+        ) if len(tokens) >= 2 else 0
+        limit = self._history_integer(
+            tokens[2], maximum=HISTORY_MAX_PAGE_CHARS,
+        ) if len(tokens) >= 3 else min(2_000, HISTORY_MAX_PAGE_CHARS)
+        if offset is None or limit is None or limit < 1:
+            return _HISTORY_USAGE
+        try:
+            page = self._read_history_page(tokens[0], offset, limit)
+        except KeyError:
+            return "No history event matches that ID in this session."
+        except Exception:
+            return "History page is unavailable because the journal could not be read."
+        content = page.get("content")
+        next_offset = page.get("next_offset")
+        total_chars = page.get("total_chars")
+        if (not isinstance(content, str) or type(next_offset) is not int
+                or type(total_chars) is not int or next_offset < offset
+                or next_offset > MAX_HISTORY_OFFSET or total_chars < next_offset
+                or total_chars > MAX_HISTORY_OFFSET):
+            return "History page is unavailable because the journal returned invalid data."
+        lines = [
+            f"Journal event {tokens[0]} characters {offset}-{next_offset} of {total_chars} "
+            "(read-only; history is never replayed):",
+            content,
+        ]
+        if page.get("truncated") is True:
+            lines.append(f"Next page: /history page {tokens[0]} {next_offset} {limit}")
+        return "\n".join(lines)
+
+    async def interrupt(self) -> None:
+        if self.state in (State.STOPPING, State.CLOSED, State.NEW, State.IDLE, State.FAILED):
+            return
+        if self.state is State.GENERATING:
+            # Invalidate before requesting cancellation. Even a provider that
+            # suppresses cancellation cannot cause its late response to execute.
+            self._active_operation_id = None
+            generation = self._generation
+            if generation is not None and not generation.done():
+                generation.cancel()
+            elif self._active_task is not None and self._active_task is not asyncio.current_task():
+                # Async transforms run before a provider task exists.
+                self._active_task.cancel()
+            return
+        if self.state is State.COMMAND:
+            # Commands may have external side effects too; cancel once and do
+            # not advertise the session as safe to replay.
+            self._active_operation_id = None
+            self.state = State.FAILED
+            active = self._active_task
+            if active is not None and active is not asyncio.current_task():
+                active.cancel()
+            return
+        if self.state in (State.EXECUTING, State.WAITING_FOR_INPUT):
+            self._active_operation_id = None
+            self.state = State.FAILED  # execution/output state may be uncertain
+            if self._execution_active:
+                await self.executor.interrupt()
+            else:
+                active = self._active_task
+                if active is not None and active is not asyncio.current_task():
+                    active.cancel()
+
+    async def close(self) -> None:
+        task = asyncio.current_task()
+        if task is self._active_task:
+            raise RuntimeError("Cannot close a coordinator from an active submission")
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_impl(), name="py-agent-coordinator-close")
+        await asyncio.shield(self._close_task)
+
+    async def _close_impl(self) -> None:
+        async with self._lifecycle_lock:
+            if self.state is State.CLOSED:
+                return
+            was_executing = self._execution_active
+            self.state = State.STOPPING
+            self._active_operation_id = None
+            generation = self._generation
+            if generation is not None and not generation.done():
+                generation.cancel()
+            active = self._active_task
+            failure = None
+            if active is not None and active is not asyncio.current_task():
+                active.cancel()
+                # Give cancellation a bounded chance to unwind. A provider may
+                # suppress cancellation; its invalidated result cannot dispatch.
+                done, _ = await asyncio.wait({active}, timeout=self._shutdown_timeout)
+                if active in done:
+                    await asyncio.gather(active, return_exceptions=True)
+                else:
+                    if was_executing:
+                        try:
+                            await self.executor.interrupt()
+                        except BaseException:
+                            pass
+                    done, _ = await asyncio.wait({active}, timeout=min(self._shutdown_timeout, 1.0))
+                    if active in done:
+                        await asyncio.gather(active, return_exceptions=True)
+                    elif not self._journal_failed:
+                        # The operation is now explicitly marked as uncertain or
+                        # cancelled before its journal is closed. Late completions
+                        # cannot overwrite that terminal evidence or be replayed.
+                        try:
+                            if (self._active_execution_request is not None
+                                    and not self._active_execution_result_recorded):
+                                self._record_uncertain_execution(
+                                    self._active_execution_request,
+                                    "Coordinator shutdown timed out; execution outcome may be uncertain",
+                                )
+                            if (self._active_model_request is not None
+                                    and not self._active_provider_usage_recorded):
+                                self._record_provider_usage(
+                                    self._active_model_request, None, outcome="cancelled",
+                                )
+                        except BaseException as exc:
+                            failure = exc
+            try:
+                await self._close_executor()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+            try:
+                self._close_journal(State.STOPPING.value)
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+                elif hasattr(failure, "add_note"):
+                    failure.add_note(f"Journal shutdown also failed: {type(exc).__name__}")
+            finally:
+                self.state = State.CLOSED
+            if failure is not None:
+                raise failure
