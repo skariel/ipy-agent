@@ -379,6 +379,53 @@ class LocalExecutor:
             raise _ProtocolError("Malformed worker output storage acknowledgement")
         return tuple(indexes)
 
+    async def store_collapsed(self, text: str) -> int:
+        """Losslessly archive text as ``collapsed[index]`` without executing a cell.
+
+        A transaction owns the channel across all chunks. Only the final reply
+        confirms an archive; callers must not remove originals before it arrives.
+        Cancellation/protocol failure invalidates the worker just like a query.
+        """
+        if not isinstance(text, str):
+            raise TypeError("Collapsed storage requires text")
+        request_id = uuid4().hex
+        chunk_chars = 32_768  # Even 12-byte JSON escapes fit well within MAX_FRAME.
+        async with self._execute_lock:
+            process = self.process
+            if not self._started or self._closed or process is None or process.returncode is not None:
+                raise RuntimeError("Worker unavailable for collapsed storage")
+            try:
+                for offset in range(0, max(1, len(text)), chunk_chars):
+                    chunk = text[offset:offset + chunk_chars]
+                    final = offset + len(chunk) == len(text)
+                    await self._send(process, _encode_frame({
+                        "type": "store_collapsed", "version": 1, "request_id": request_id,
+                        "offset": offset, "text": chunk, "final": final,
+                    }))
+                    while True:
+                        frame = await self._receive(process)
+                        if frame.get("type") not in ("output", "rich_output"):
+                            break
+                    expected_type = "collapsed_stored" if final else "collapsed_chunk_stored"
+                    value_key = "index" if final else "offset"
+                    value = frame.get(value_key)
+                    if (set(frame) != {"type", "version", "request_id", value_key}
+                            or type(frame.get("version")) is not int or frame["version"] != 1
+                            or frame.get("type") != expected_type
+                            or frame.get("request_id") != request_id
+                            or type(value) is not int
+                            or (value < 1 if final else value != offset + len(chunk))):
+                        raise _ProtocolError("Malformed collapsed storage acknowledgement")
+                    if final:
+                        return value
+            except asyncio.CancelledError:
+                await asyncio.shield(self._stop_process(process))
+                raise
+            except (OSError, EOFError, asyncio.IncompleteReadError, TypeError, ValueError, RuntimeError) as exc:
+                await self._stop_process(process)
+                raise RuntimeError("Collapsed storage failed; the persistent namespace is unavailable") from exc
+        raise AssertionError("Collapsed storage transaction did not finish")
+
     @staticmethod
     def _validate_query(code: str, cursor_pos: int) -> None:
         if not isinstance(code, str):

@@ -314,6 +314,28 @@ async def test_coordinator_selects_external_executor_wrapper_and_transforms(exam
 
 
 @pytest.mark.asyncio
+async def test_executor_wrapper_forwards_available_archive_capabilities(examples):
+    class ArchivingDelegate(_DelegateExecutor):
+        async def store_collapsed(self, text):
+            self.archive = text
+            return 7
+
+        async def store_outputs(self, texts):
+            self.outputs = texts
+            return (1,)
+
+    delegate = ArchivingDelegate()
+    wrapper = examples["plugin_executor"].ExecutionAuditWrapper(delegate)
+    assert await wrapper.store_collapsed("exact archive") == 7
+    assert delegate.archive == "exact archive"
+    assert await wrapper.store_outputs(("result",)) == (1,)
+    assert delegate.outputs == ("result",)
+    assert wrapper.execution_count == 0
+    unsupported = examples["plugin_executor"].ExecutionAuditWrapper(_DelegateExecutor())
+    assert not hasattr(unsupported, "store_collapsed")
+
+
+@pytest.mark.asyncio
 async def test_executor_wrapper_cancellation_is_forwarded_once_without_replay(examples):
     delegate = _DelegateExecutor(block=True)
     wrapper = examples["plugin_executor"].ExecutionAuditWrapper(delegate)

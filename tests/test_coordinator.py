@@ -28,7 +28,7 @@ from py_agent.contracts import (
 from py_agent.coordinator import MAX_PENDING_ACTIONS, Coordinator, State, Submission
 from py_agent.local_executor import LocalExecutor
 from py_agent.provider import ProviderError
-from py_agent.production_services import ProductionContextAdapter
+from py_agent.production_services import ProductionContextAdapter, ProductionObservationAdapter
 from py_agent import plain_terminal
 from py_agent.plugins import Contributions, PluginManifest, PluginRuntime, TransformContribution, hookimpl
 from py_agent.session_journal import JournalError, NoPersistenceJournal, SQLiteSessionJournal
@@ -108,6 +108,12 @@ class CaptureExecutor:
     def __init__(self):
         self.requests = []
         self.closed = 0
+        self.collapsed = {}
+
+    async def store_collapsed(self, text):
+        index = len(self.collapsed) + 1
+        self.collapsed[index] = text
+        return index
 
     async def start(self):
         return None
@@ -941,12 +947,11 @@ async def test_unlimited_agent_loop_still_bounds_consecutive_invalid_model_cells
 
 
 @pytest.mark.asyncio
-async def test_long_agent_task_resets_reported_full_context_without_losing_active_request():
+async def test_long_agent_task_forces_collapse_without_resetting_or_losing_active_request():
     from py_agent.limits import Limits
-    from py_agent.production_services import ProductionContextAdapter
 
     class ReportingProvider:
-        model = "offline/reset"
+        model = "offline/collapse-required"
 
         def __init__(self):
             self.requests = []
@@ -968,17 +973,25 @@ async def test_long_agent_task_resets_reported_full_context_without_losing_activ
     coordinator = Coordinator(
         runtime, router="default", provider="fake", interpreter="basic", executor="local",
         context=ProductionContextAdapter(limits=Limits(input_tokens=100)),
+        observations=ProductionObservationAdapter(),
     )
     provider, executor = ReportingProvider(), FinalOnSecondCell()
     coordinator.provider, coordinator.executor = provider, executor
     await coordinator.start()
     try:
         submission = await coordinator.submit("terminal", "find the bug")
-        assert submission.result.final
-        assert [request.context.epoch for request in provider.requests] == [1, 2]
-        assert ("user", "find the bug") in provider.requests[1].context.messages
-        assert not any(role == "assistant" and text == "pass"
-                       for role, text in provider.requests[1].context.messages)
+        assert not submission.result.final
+        assert "3 consecutive invalid" in submission.message
+        assert len(executor.requests) == 1  # Only the cell before forced mode may execute.
+        assert [request.context.epoch for request in provider.requests] == [1, 1, 1, 1]
+        for request in provider.requests[1:]:
+            assert ("user", "[context boundary u1]\nfind the bug") in request.context.messages
+            assert ("assistant", "pass") in request.context.messages
+            assert any(role == "system" and "FORCED COLLAPSE MODE" in text
+                       for role, text in request.context.messages)
+        assert coordinator.context_service.force_collapse
+        assert not coordinator.context_service.needs_reset()
+        assert not executor.collapsed  # Rejected ordinary code never archives or evicts.
     finally:
         await coordinator.close()
 

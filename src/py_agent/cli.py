@@ -103,7 +103,7 @@ def default_parser() -> argparse.ArgumentParser:
     result.add_argument("--config", type=Path, help="Typed JSON configuration file")
     result.add_argument("--max-tokens", type=int, help="Optional provider response token limit")
     result.add_argument("--max-agent-steps", type=int, help="Optional per-request step cap; 0 (default) means unlimited")
-    result.add_argument("--context-window-tokens", type=int, help="Context reset capacity; applies after restart")
+    result.add_argument("--context-window-tokens", type=int, help="Context capacity for collapse pressure; applies after restart")
     result.add_argument("--startup-timeout", type=float, help="Local IPython worker startup timeout")
     result.add_argument("--max-output-chars", type=int, help="Maximum retained worker output characters")
     result.add_argument(
@@ -156,7 +156,7 @@ def _core_config_registry():
         ConfigField("executor.wrappers", "core", str, "", apply_at=ApplyAt.RESTART,
                     documentation="Comma-separated qualified executor wrapper IDs, applied in order."),
         ConfigField("context.window_tokens", "core", int, 272000, minimum=1, maximum=10000000,
-                    apply_at=ApplyAt.RESTART, documentation="Reported-usage context reset threshold."),
+                    apply_at=ApplyAt.RESTART, documentation="Context capacity in tokens; reported usage over 90% forces collapse."),
         ConfigField("executor.startup_timeout", "core", float, 15.0, minimum=0.1, maximum=300.0,
                     apply_at=ApplyAt.RESTART, documentation="Local worker startup timeout in seconds."),
         ConfigField("executor.max_output_chars", "core", int, 262144, minimum=1, maximum=1048576,

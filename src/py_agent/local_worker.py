@@ -344,6 +344,17 @@ def _validate_request(frame: dict[str, Any]) -> tuple[Any, ...] | None:
         return "execute", execution_id, author, source, origin
 
     kind = frame.get("type")
+    if kind == "store_collapsed":
+        if set(frame) != {"type", "version", "request_id", "offset", "text", "final"}:
+            raise ProtocolError("Invalid collapsed storage request fields")
+        request_id, offset, text, final = (
+            frame["request_id"], frame["offset"], frame["text"], frame["final"],
+        )
+        if (not _is_id(request_id) or type(offset) is not int or offset < 0
+                or not isinstance(text, str) or len(text) > 32_768
+                or type(final) is not bool or (not text and not final)):
+            raise ProtocolError("Invalid collapsed storage request")
+        return "store_collapsed", request_id, offset, text, final
     if kind == "store_outputs":
         if set(frame) != {"type", "version", "request_id", "texts"}:
             raise ProtocolError("Invalid output storage request fields")
@@ -1174,6 +1185,38 @@ def _store_output(shell: Any, text: str) -> int:
     return index
 
 
+class _CollapsedStorage:
+    """Stage one chunked transaction, publishing only complete lossless strings."""
+
+    def __init__(self) -> None:
+        self.archives: dict[int, str] = {}
+        self.next_index = 1
+        self.request_id: str | None = None
+        self.offset = 0
+        self.chunks: list[str] = []
+
+    def append(self, request_id: str, offset: int, text: str, final: bool) -> int | None:
+        if self.request_id is None:
+            if offset != 0:
+                raise ProtocolError("Collapsed archive must start at offset zero")
+            self.request_id = request_id
+        if request_id != self.request_id or offset != self.offset:
+            raise ProtocolError("Collapsed archive chunk is out of sequence")
+        self.chunks.append(text)
+        self.offset += len(text)
+        if not final:
+            return None
+        while self.next_index in self.archives:
+            self.next_index += 1
+        index = self.next_index
+        self.archives[index] = "".join(self.chunks)
+        self.next_index += 1
+        self.request_id = None
+        self.offset = 0
+        self.chunks = []
+        return index
+
+
 def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: dict[str, Any]) -> None:
     global _ACTIVE_INPUT_FUNCTIONS
     null_in, null_out, null_err = _NULL_STREAMS
@@ -1392,9 +1435,11 @@ def main() -> None:
     config.HistoryManager.hist_file = ":memory:"
     config.HistoryManager.db_cache_size = 0
     config.InteractiveShell.colors = "nocolor"
+    collapsed = _CollapsedStorage()
     shell = InteractiveShell.instance(
         config=config,
-        user_ns={"say": lambda text, final=False: print(text), "memories": [], "outputs": {}},
+        user_ns={"say": lambda text, final=False: print(text), "memories": [], "outputs": {},
+                 "collapsed": collapsed.archives},
     )
     _install_noninteractive_system(shell)
     _send({"type": "ready", "version": PROTOCOL_VERSION})
@@ -1411,6 +1456,17 @@ def main() -> None:
             if kind == "execute":
                 _, execution_id, author, source, origin = request
                 _run_cell(shell, execution_id, author, source, origin)
+            elif kind == "store_collapsed":
+                _, request_id, offset, text, final = request
+                index = collapsed.append(request_id, offset, text, final)
+                if index is None:
+                    _send({"type": "collapsed_chunk_stored", "version": PROTOCOL_VERSION,
+                           "request_id": request_id, "offset": collapsed.offset})
+                else:
+                    # Rebinding the public name must not discard earlier archives.
+                    shell.user_ns["collapsed"] = collapsed.archives
+                    _send({"type": "collapsed_stored", "version": PROTOCOL_VERSION,
+                           "request_id": request_id, "index": index})
             elif kind == "store_outputs":
                 _, request_id, texts = request
                 indexes = [_store_output(shell, _redact_text(text)) for text in texts]

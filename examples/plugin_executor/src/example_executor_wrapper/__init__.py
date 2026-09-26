@@ -27,6 +27,12 @@ class ExecutionAuditWrapper:
         self.delegate = delegate
         self.capabilities = capabilities
         self.execution_count = 0
+        # Preserve optional host-control capabilities without advertising ones
+        # the delegate does not implement. These are not executed Python cells.
+        for name in ("store_outputs", "store_collapsed"):
+            method = getattr(delegate, name, None)
+            if callable(method):
+                setattr(self, name, method)
 
     async def start(self) -> None:
         await self.delegate.start()

@@ -190,6 +190,9 @@ class JournalService(Protocol):
     def record_provider_usage(
         self, request: ModelRequest, response: ModelResponse | None, *, outcome: str,
     ) -> None: ...
+    def record_context_collapse(
+        self, request: ModelRequest, source: str, *, outcome: str, detail: str = "",
+    ) -> None: ...
     def record_execution_source(self, request: ExecutionRequest) -> None: ...
     def record_execution_result(self, request: ExecutionRequest, result: ExecutionResult) -> None: ...
     def record_uncertain_execution(self, request: ExecutionRequest, reason: str) -> None: ...
@@ -222,6 +225,11 @@ class NoPersistenceJournal:
 
     def record_provider_usage(
         self, request: ModelRequest, response: ModelResponse | None, *, outcome: str,
+    ) -> None:
+        return None
+
+    def record_context_collapse(
+        self, request: ModelRequest, source: str, *, outcome: str, detail: str = "",
     ) -> None:
         return None
 
@@ -494,6 +502,26 @@ class SQLiteSessionJournal:
         self._append(
             "provider_usage", identity["session_id"], identity["request_id"],
             identity["config_revision"], content,
+            frontend_id=identity["frontend_id"], generation_id=identity["generation_id"],
+        )
+
+    def record_context_collapse(
+        self, request: ModelRequest, source: str, *, outcome: str, detail: str = "",
+    ) -> None:
+        """Audit coordinator control cells without claiming Python execution.
+
+        Keep the original call even when active context contains only a receipt.
+        Like dispatched source, oversized records are rejected, never truncated.
+        """
+        identity = self._request_identity(request)
+        if outcome not in {"requested", "succeeded", "rejected"}:
+            raise JournalError("Invalid context collapse outcome")
+        if not isinstance(source, str) or not isinstance(detail, str):
+            raise JournalError("Context collapse source and detail must be text")
+        self._append(
+            "context_collapse", identity["session_id"], identity["request_id"],
+            identity["config_revision"],
+            {"source": source, "outcome": outcome, "detail": detail},
             frontend_id=identity["frontend_id"], generation_id=identity["generation_id"],
         )
 

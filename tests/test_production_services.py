@@ -137,7 +137,7 @@ def test_invalid_max_tokens_is_rejected_before_provider_call():
     assert backend.requests == []
 
 
-def test_context_adapter_preserves_phases_and_delegates_usage_and_reset_policy():
+def test_context_adapter_preserves_phases_and_uses_forced_collapse_without_reset():
     context = Context(Limits(input_tokens=100), session_summary={"current_path": "/tmp", "git": None})
     adapter = ProductionContextAdapter(context)
     adapter.add("user", "old task")
@@ -152,7 +152,7 @@ def test_context_adapter_preserves_phases_and_delegates_usage_and_reset_policy()
     assert "ask_rw_approval" not in messages[0]["content"]
     assert "Runtime security:" not in messages[0]["content"]
     assert messages[1:] == (
-        {"role": "user", "content": "old task"},
+        {"role": "user", "content": "[context boundary u1]\nold task"},
         {"role": "assistant", "content": "x = 1", "phase": "commentary"},
         {
             "role": "user",
@@ -164,18 +164,24 @@ def test_context_adapter_preserves_phases_and_delegates_usage_and_reset_policy()
         ModelResponse("x", usage={"source": "reported", "normalized": {"input_tokens": 95}})
     )
     assert adapter.reported_input_tokens == 95
-    assert adapter.needs_reset()
+    assert not adapter.needs_reset()
+    assert not adapter.force_collapse  # Enforcement is latched at generation preparation.
+    adapter.prepare_generation()
+    assert adapter.force_collapse
+    assert any("FORCED COLLAPSE MODE" in text for role, text in adapter.snapshot().messages
+               if role == "system")
     adapter.record_response(ModelResponse("x", usage={"source": "unknown", "normalized": {}}))
     assert adapter.reported_input_tokens == 95  # absent counters do not erase real usage
 
     pending = adapter.add("user", "pending task", refs=("pending-id",))
     retained, evicted = adapter.retention({"pending-id"})
     assert retained == [pending]
-    assert len(evicted) == 2
+    assert len(evicted) == 3  # The fresh forced-mode boundary is also evicted explicitly.
     adapter.commit_epoch(retained, memories_count=1)
     assert adapter.epoch == 2
     assert adapter.reported_input_tokens is None
     assert not adapter.needs_reset()
+    assert not adapter.force_collapse
 
 
 @pytest.mark.asyncio
@@ -269,7 +275,7 @@ def test_silent_cells_do_not_inject_a_completed_observation():
 def test_default_model_messages_contain_only_plain_execution_feedback():
     adapter = ProductionContextAdapter(limits=Limits())
     snapshot = adapter.prepare_request("inspect", "request-1")
-    assert snapshot.messages[1] == ("user", "inspect")
+    assert snapshot.messages[1] == ("user", "[context boundary u1]\ninspect")
     observation = ProductionObservationAdapter().pack([
         {"stream": "stdout", "text": "found\n", "session_id": "hidden-session",
          "request_id": "hidden-request", "execution_id": "hidden-execution"},
@@ -277,7 +283,7 @@ def test_default_model_messages_contain_only_plain_execution_feedback():
     adapter.commit_response("request-1", "print('found')", observation=observation)
     messages = adapter.provider_messages(adapter.snapshot())
     assert messages[1:] == (
-        {"role": "user", "content": "inspect"},
+        {"role": "user", "content": "[context boundary u1]\ninspect"},
         {"role": "assistant", "content": "print('found')"},
         {"role": "user", "content": "stdout:\nfound\n"},
     )

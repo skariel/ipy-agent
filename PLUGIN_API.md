@@ -51,6 +51,15 @@ Transformations are trusted code, not a sandbox. Keep them deterministic and sid
 
 `ExecutorWrapperContribution(name, factory)` registers a decorator with a factory shaped as `factory(delegate) -> Executor`. Wrappers are not activated merely because their plugin is loaded: select them explicitly by qualified ID in caller-specified order with `Coordinator(..., executor_wrappers=("plugin-id:name",))`. The coordinator owns lifecycle calls on the outermost wrapper; each wrapper must forward lifecycle correctly. Wrappers must preserve cancellation and must not replay side-effecting `execute` calls. Capability declarations are part of the public executor contract; each resulting executor must declare `ExecutorCapabilities`.
 
+Production context requires an executor exposing `async store_collapsed(text: str) -> int`;
+startup rejects an incompatible context/executor combination. This host-control operation
+must store the exact archive string in the live namespace as `collapsed[index]` and
+return a distinct positive index only after complete storage. It must not execute Python
+source. A transport failure or cancellation fails the session, since the persistent
+namespace may be unavailable. Wrappers must forward this method when their delegate
+supports it, as well as optional `store_outputs` archival; do not advertise unsupported
+capabilities. The example audit wrapper demonstrates this forwarding.
+
 ## Output observers, failure policy, and backpressure
 
 `ObserverContribution(name, factory, critical=True)` registers an async observer exposing `observe(OutputEvent)`. Events are frozen records with copied, read-only string data and their originating session/request/generation/execution identity. Sequence numbers increase monotonically within a coordinator. Current coordinator events cover execution stdout, stderr, and errors; rich worker display/update events are not yet connected to this publication path.

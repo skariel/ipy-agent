@@ -53,6 +53,12 @@ class InertExecutor:
     def __init__(self):
         self.requests = []
         self.closed = False
+        self.collapsed = {}
+
+    async def store_collapsed(self, text):
+        index = len(self.collapsed) + 1
+        self.collapsed[index] = text
+        return index
 
     async def start(self):
         return None

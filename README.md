@@ -105,6 +105,28 @@ do not restrict side effects from successfully dispatched code. Execution has
 no application deadline. Interrupting or losing the
 worker may lose the live namespace, and side effects are not rolled back or replayed.
 
+### Context collapse
+
+The model manages working memory with a standalone cell containing exactly one
+literal-string call: `collapse("start_id", "end_id", "summary")`. Only user
+messages and automatic markers expose boundary IDs; markers appear every 10
+completed cells, after their results. The range is **start-inclusive,
+end-exclusive**. Its summary keeps the start ID, while the end's exact user text
+(or prior summary) is appended to it and the old end record is removed. A pure
+marker end has no text to preserve. Summaries can be collapsed again.
+
+Original structured messages are archived losslessly as JSON strings in
+`collapsed[index]` before context changes. These are live-session archives, not
+durable recovery; inspect small slices in Python. Successful collapse cells
+become short receipts instead of repeating the summary. The optional journal
+retains the original call, subject to its normal secret redaction.
+
+Every 50 model responses, a reminder asks the model to preserve working memory
+and remove the rest from active context. Reported usage **over 90%** of
+`context.window_tokens` adds a fresh marker and forces a single collapse call;
+other cells cannot execute in that mode. This replaces automatic whole-history
+eviction in production. A collapse must reduce context size.
+
 ### Configuration and provenance
 
 Pass `--config PATH` to select an optional flat JSON file of typed scalar settings;

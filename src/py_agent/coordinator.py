@@ -14,6 +14,7 @@ from enum import Enum
 from types import MappingProxyType
 from uuid import uuid4
 
+from .collapse_control import parse_collapse
 from .configuration import ApplyAt, ConfigSnapshot, ConfigStore
 from .contracts import (
     AgentDecision,
@@ -259,6 +260,7 @@ class Coordinator:
         self._require_methods(
             self.journal, "start", "record_model_request", "record_provider_usage",
             "record_execution_source", "record_execution_result", "record_uncertain_execution",
+            "record_context_collapse",
             "set_sensitive_values", "recent", "search", "read", "end", "close",
         )
         if type(getattr(self.journal, "persisted", None)) is not bool:
@@ -1294,6 +1296,11 @@ class Coordinator:
                     "start", self.session_id, self.config_revision, self.provider_id, self.model,
                 )
                 self._journal_started = True
+                if (callable(getattr(self.context_service, "collapse", None))
+                        and not callable(getattr(self.executor, "store_collapsed", None))):
+                    raise ExecutorCapabilityError(
+                        "store_collapsed archival required by the selected context service"
+                    )
                 await self.executor.start()
             except BaseException:
                 self.state = State.FAILED
@@ -1786,9 +1793,17 @@ class Coordinator:
                                     messages=(*snapshot.messages, *(("user", text) for _, text in dispatched_steering)),
                                     message_phases=(*snapshot.message_phases, *((None,) * len(dispatched_steering))),
                                 )
+                        prepare_generation = getattr(self.context_service, "prepare_generation", None)
+                        if callable(prepare_generation):
+                            prepare_generation()
+                            snapshot = self._latest_context()
+                        forced_collapse = getattr(self.context_service, "force_collapse", False) is True
                         if steering_awaiting_dispatch:
+                            render_user = getattr(self.context_service, "render_user", None)
                             additions = tuple(
-                                ("user", item.action.source) for item in steering_awaiting_dispatch
+                                ("user", render_user(item.action.source, item.action.origin.request_id)
+                                 if callable(render_user) else item.action.source)
+                                for item in steering_awaiting_dispatch
                             )
                             snapshot = replace(
                                 snapshot,
@@ -1909,6 +1924,76 @@ class Coordinator:
                             exhausted = preflight_exhausted(response)
                             if exhausted is not None:
                                 return exhausted
+                            continue
+                        # Context control is host-owned and never executed in the
+                        # Python worker. Enforce the policy that accompanied this
+                        # generation, not usage first reported by its response.
+                        collapse_args = None
+                        collapse_error = None
+                        try:
+                            collapse_args = parse_collapse(response.text, forced=forced_collapse)
+                        except ValueError as exc:
+                            collapse_error = str(exc)
+                        if collapse_args is not None or collapse_error is not None:
+                            self._journal_record(
+                                "record_context_collapse", model_request, response.text,
+                                outcome="requested",
+                            )
+                            if collapse_error is None:
+                                collapse = getattr(self.context_service, "collapse", None)
+                                store_collapsed = getattr(self.executor, "store_collapsed", None)
+                                if not callable(collapse) or not callable(store_collapsed):
+                                    collapse_error = "Collapse is unavailable for the selected context/executor services."
+                                else:
+                                    async def store_archive(text, store=store_collapsed):
+                                        try:
+                                            index = await store(text)
+                                        except BaseException:
+                                            # Archive transport may terminate the
+                                            # persistent worker, even on cancellation.
+                                            # Never resume with a potentially lost namespace.
+                                            self._set_state_unless_stopping(State.FAILED)
+                                            raise
+                                        if not self._operation_is_current(operation_id, State.GENERATING):
+                                            raise asyncio.CancelledError
+                                        return index
+
+                                    try:
+                                        receipt = await collapse(*collapse_args, store_archive)
+                                    except (ValueError, TypeError) as exc:
+                                        if self.state is State.FAILED:
+                                            raise
+                                        collapse_error = str(exc)[:500]
+                            if collapse_error is not None:
+                                self._journal_record(
+                                    "record_context_collapse", model_request, response.text,
+                                    outcome="rejected", detail=collapse_error,
+                                )
+                                self._commit_context(
+                                    origin.request_id, routed.source,
+                                    "[collapse cell rejected; no code executed]",
+                                    {"preflight": {"executed": False, "error": collapse_error}},
+                                    phase=response.phase, include_user=not context_committed,
+                                )
+                                context_committed = True
+                                context_pending = False
+                                exhausted = preflight_exhausted(response)
+                                if exhausted is not None:
+                                    return exhausted
+                            else:
+                                # Only the receipt remains at the call site. The
+                                # original source is retained in the audit journal.
+                                self._commit_context(
+                                    origin.request_id, routed.source, receipt, None,
+                                    phase=response.phase, include_user=not context_committed,
+                                )
+                                context_committed = True
+                                context_pending = False
+                                invalid_generations = 0
+                                self._journal_record(
+                                    "record_context_collapse", model_request, response.text,
+                                    outcome="succeeded", detail=receipt,
+                                )
                             continue
                         decision = self.interpreter.interpret(response)
                         if not isinstance(decision, AgentDecision):
@@ -2074,6 +2159,9 @@ class Coordinator:
                         context_committed = True
                         context_pending = False
                         if result.status in ("success", "error"):
+                            completed_cell = getattr(self.context_service, "completed_cell", None)
+                            if callable(completed_cell):
+                                completed_cell()
                             await self._archive_context_outputs()
                             if not self._operation_is_current(operation_id, State.EXECUTING):
                                 raise asyncio.CancelledError
