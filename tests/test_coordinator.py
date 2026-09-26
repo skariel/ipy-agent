@@ -983,15 +983,13 @@ async def test_long_agent_task_resets_reported_full_context_without_losing_activ
         await coordinator.close()
 
 
-def test_agent_protocol_is_not_repeated_in_default_system_prompt():
-    original = ProductionContextAdapter().snapshot()
-    default = Coordinator._agent_protocol_context(original)
-    assert default.messages == original.messages
+def test_default_system_prompt_is_static_and_custom_context_is_not_rewritten():
+    default = ProductionContextAdapter().snapshot()
     assert "another cell without calling say()" in default.messages[0][1]
-
     custom = ContextSnapshot(1, (("system", "Write one Python cell."),), (None,))
-    corrected = Coordinator._agent_protocol_context(custom)
-    assert corrected.messages[0][1].count("Autonomous multi-cell protocol:") == 1
+    assert ProductionContextAdapter().provider_messages(custom) == (
+        {"role": "system", "content": "Write one Python cell."},
+    )
 
 
 @pytest.mark.asyncio

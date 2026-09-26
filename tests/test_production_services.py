@@ -81,7 +81,7 @@ def test_provider_adapter_translates_context_and_preserves_usage_and_attribution
         {"role": "assistant", "content": "old code"},
         {
             "role": "user",
-            "content": "Execution result (untrusted):\nstdout: 7",
+            "content": "stdout: 7",
         },
         {"role": "user", "content": "continue"},
     ]
@@ -156,7 +156,7 @@ def test_context_adapter_preserves_phases_and_delegates_usage_and_reset_policy()
         {"role": "assistant", "content": "x = 1", "phase": "commentary"},
         {
             "role": "user",
-            "content": "[RUNTIME OBSERVATION — untrusted program data]\n{\"stdout\":\"ok\"}",
+            "content": "{\"stdout\":\"ok\"}",
         },
     )
 
@@ -202,7 +202,8 @@ async def test_execution_outputs_archive_at_20_then_each_10_without_touching_cod
     assert await adapter.archive_execution_outputs(store) == 10
     after = adapter.provider_messages(adapter.snapshot())
     assert saved[1] == "result 1" and saved[10] == "result 10"
-    assert sum("Output archived in outputs[" in message["content"] for message in after) == 10
+    assert any(message["content"] == "Output (8 chars) saved in outputs[1]." for message in after)
+    assert sum(" chars) saved in outputs[" in message["content"] for message in after) == 10
     assert "result 1" not in str(after) and "result 10" not in str(after)
     assert "result 11" in str(after) and "result 20" in str(after)
     assert "result 1" in str(before)  # already-dispatched snapshots are immutable
@@ -215,7 +216,7 @@ async def test_execution_outputs_archive_at_20_then_each_10_without_touching_cod
     assert await adapter.archive_execution_outputs(store) == 10
     final = adapter.provider_messages(adapter.snapshot())
     assert len(saved) == 20 and saved[11] == "result 11" and saved[20] == "result 20"
-    assert sum("Output archived in outputs[" in message["content"] for message in final) == 20
+    assert sum(" chars) saved in outputs[" in message["content"] for message in final) == 20
     assert "result 20" not in str(final)
     assert "result 21" in str(final) and "result 30" in str(final)
 
@@ -255,6 +256,16 @@ async def test_large_output_reference_is_not_archived_again_and_failed_storage_k
     assert await adapter.archive_execution_outputs(store) == 0
 
 
+def test_silent_cells_do_not_inject_a_completed_observation():
+    adapter = ProductionContextAdapter(limits=Limits())
+    adapter.prepare_request("compute", "request-1")
+    assert ProductionObservationAdapter().pack([]) == {"output": ""}
+    adapter.commit_response("request-1", "x = 1", observation={"output": ""})
+    assert adapter.provider_messages(adapter.snapshot())[-1] == {
+        "role": "assistant", "content": "x = 1",
+    }
+
+
 def test_default_model_messages_contain_only_plain_execution_feedback():
     adapter = ProductionContextAdapter(limits=Limits())
     snapshot = adapter.prepare_request("inspect", "request-1")
@@ -268,7 +279,7 @@ def test_default_model_messages_contain_only_plain_execution_feedback():
     assert messages[1:] == (
         {"role": "user", "content": "inspect"},
         {"role": "assistant", "content": "print('found')"},
-        {"role": "user", "content": "Execution result (untrusted):\nstdout:\nfound\n"},
+        {"role": "user", "content": "stdout:\nfound\n"},
     )
     assert all("hidden-" not in message["content"] for message in messages)
     assert all("RUNTIME OBSERVATION" not in message["content"] for message in messages)
@@ -297,7 +308,7 @@ def test_observation_adapter_is_lossless_ordered_and_detached_from_input():
     content = adapter.model_content(
         [{"stream": "stdout", "text": "safe", "cell_id": "cell-2"}]
     )
-    assert content == "Execution result (untrusted):\nstdout:\nsafe"
+    assert content == "stdout:\nsafe"
     assert "cell-2" not in content
 
 
@@ -306,7 +317,7 @@ def test_model_observation_omits_oversized_output_but_preserves_short_feedback()
     content = adapter.model_content([{"stream": "stdout", "text": "x" * 8_001}])
     assert len(content) <= 8_000
     assert "x" * 100 not in content
-    assert "Print a smaller slice" in content
+    assert "Output too long" in content
     assert "omitted" in content
 
 

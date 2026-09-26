@@ -881,13 +881,18 @@ class LocalExecutor:
                                 raise _ProtocolError("Malformed worker output reference")
                             index = reference["index"]
                             omitted = reference["omitted_chars"]
-                            notice = (
-                                f"Output exceeded 8000 characters and was removed from the transcript. "
-                                f"Saved as outputs[{index}] (str; {reference['retained_chars']} "
-                                f"characters retained"
-                                + (f", {omitted} omitted" if omitted else "")
-                                + f"). Print a smaller slice: print(outputs[{index}][:4000]).\n"
-                            )
+                            total = reference["original_chars"]
+                            if omitted:
+                                notice = (
+                                    f"Output too long ({total} chars). First "
+                                    f"{reference['retained_chars']} chars saved in outputs[{index}]; "
+                                    "truncated.\n"
+                                )
+                            else:
+                                notice = (
+                                    f"Output too long ({total} chars). "
+                                    f"Saved in outputs[{index}], fully retained.\n"
+                                )
                             safe_events = []
                             inserted = False
                             for output in output_events:

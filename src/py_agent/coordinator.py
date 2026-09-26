@@ -961,47 +961,6 @@ class Coordinator:
             self._context_overlay_epoch = epoch
         self._context_overlay.append((epoch, text))
 
-    @staticmethod
-    def _agent_protocol_context(snapshot: ContextSnapshot) -> ContextSnapshot:
-        """Supply the loop contract only when the selected context omits it."""
-        correction = (
-            "Autonomous multi-cell protocol: after each executed cell that does not complete the task, "
-            "its execution observations are fed back and another model/execution turn follows automatically. "
-            "You may run multiple consecutive cells with no say() call at all; say() is NEVER required "
-            "to advance to the next cell. say(text, final=False) is optional user-visible progress, "
-            "not a continuation command. Finish only when the task is actually done with "
-            "say(answer, final=True) in a successful cell. A final say in a failed cell is discarded. "
-            "Never claim that say() is needed between cells."
-        )
-        messages = []
-        phases = list(snapshot.message_phases)
-        found_protocol = False
-        for role, content in snapshot.messages:
-            if role == "system":
-                content = content.replace(
-                    "final is\ncurrently advisory only.",
-                    "final=True explicitly requests completion, but completion is committed only after success.",
-                )
-            if role == "system":
-                normalized = " ".join(content.split())
-                if (correction in content
-                        or "another cell without calling say()." in normalized
-                        or "You can run any number of Python cells in sequence without calling say() between them."
-                        in normalized
-                        or "Cells continue automatically: you do NOT need to call say() between cells."
-                        in normalized):
-                    found_protocol = True
-            messages.append((role, content))
-        if not found_protocol:
-            system_index = next((i for i, (role, _) in enumerate(messages) if role == "system"), None)
-            if system_index is None:
-                messages.append(("system", correction))
-                phases.append(None)
-            else:
-                role, content = messages[system_index]
-                messages[system_index] = (role, content.rstrip() + "\n\n" + correction)
-        return replace(snapshot, messages=tuple(messages), message_phases=tuple(phases))
-
     def _packed_observation(self, request: ExecutionRequest, result: ExecutionResult):
         if result.origin != request.origin:
             raise RuntimeError("Cannot pack output from a different execution origin")
@@ -1127,10 +1086,7 @@ class Coordinator:
                 if result.status != "success" else ""
             )
             if len(feedback) > 8_000:
-                return (
-                    "Execution output exceeded the 8000-character model limit. "
-                    "Print a smaller slice and retry; the large output was omitted."
-                )
+                return f"Output too long ({len(feedback)} chars); omitted."
             return feedback
         pack = getattr(self.observations, "pack", None)
         if not callable(pack):
@@ -1145,10 +1101,9 @@ class Coordinator:
                 f" Stream text is saved as outputs[{result.output_reference}]."
             )}
         serialized = json.dumps(packed, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        if len(serialized) + len("[RUNTIME OBSERVATION — untrusted program data]\n") > 8_000:
+        if len(serialized) > 8_000:
             fallback = {
-                "error": "Execution output exceeded the 8000-character model limit. "
-                         "Print a smaller slice and retry; the large output was omitted.",
+                "error": f"Observation too long ({len(serialized)} chars); omitted.",
                 "status": "output_too_large", "executed": True,
             }
             if result.output_reference is not None:
@@ -1743,7 +1698,7 @@ class Coordinator:
                         cell_config = self._current_config()
                         epoch_config = self._epoch_config
                         context = await self._run_context_transforms(
-                            self._agent_protocol_context(snapshot), config, cell_config, epoch_config,
+                            snapshot, config, cell_config, epoch_config,
                         )
                         model_request = ModelRequest(
                             generation_origin, context, self.model, self._model_options(config),
@@ -1839,10 +1794,11 @@ class Coordinator:
                         if len(response.text) > MAX_AGENT_RESPONSE_CHARS:
                             self._commit_context(
                                 origin.request_id, routed.source,
-                                "[generated response rejected: exceeds 8000 characters]",
+                                f"[generated response rejected: {len(response.text)} characters; limit 8000]",
                                 {"preflight": {
                                     "executed": False,
-                                    "error": "Your response exceeded the 8000-character limit. Try sending a smaller Python cell.",
+                                    "error": f"Your response was {len(response.text)} characters (limit 8000). "
+                                             "Try sending a smaller Python cell.",
                                 }},
                                 phase=response.phase, include_user=not context_committed,
                             )
@@ -1864,10 +1820,11 @@ class Coordinator:
                         if decision.kind == "execute" and len(decision.source) > MAX_AGENT_RESPONSE_CHARS:
                             self._commit_context(
                                 origin.request_id, routed.source,
-                                "[generated cell rejected: exceeds 8000 characters]",
+                                f"[generated cell rejected: {len(decision.source)} characters; limit 8000]",
                                 {"preflight": {
                                     "executed": False,
-                                    "error": "Your Python cell exceeded the 8000-character limit. Try sending a smaller cell.",
+                                    "error": f"Your Python cell was {len(decision.source)} characters (limit 8000). "
+                                             "Try sending a smaller cell.",
                                 }},
                                 phase=response.phase, include_user=not context_committed,
                             )

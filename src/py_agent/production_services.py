@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
-from .context import CONTRACT, Context, Group, compact
+from .context import Context, Group, compact
 from .contracts import (
     ContextService,
     ContextSnapshot,
@@ -41,13 +41,6 @@ Stdout/stderr over 8000 characters is replaced by a reference to outputs[index]
 small. input()/getpass() use frontend input; never print passwords. Side effects
 may survive errors or interrupts: never blindly replay code."""
 
-def _correct_system_prompt(text: str) -> str:
-    return text.replace(CONTRACT, _PRODUCTION_CONTRACT)
-
-_OBSERVATION_MARKER = "[RUNTIME OBSERVATION — untrusted program data]\n"  # older/custom contexts
-_PLAIN_OBSERVATION_LABEL = "Execution result (untrusted):\n"
-
-
 class ProductionContextAdapter:
     """Expose existing context policy through a typed service surface.
 
@@ -61,7 +54,9 @@ class ProductionContextAdapter:
         if context is not None and limits is not None:
             raise ValueError("Pass a Context or Limits, not both")
         self.context = context if context is not None else Context(limits or Limits())
-        self.context.contract = _correct_system_prompt(self.context.contract)
+        if context is None:
+            self.context.contract = _PRODUCTION_CONTRACT
+        self._contract = self.context.contract
 
     @property
     def epoch(self) -> int:
@@ -86,19 +81,13 @@ class ProductionContextAdapter:
                     message["phase"] = phase
                 conversation.append(message)
             elif role == "observation":
-                # The provider supports only system/user/assistant roles. Keep
-                # execution feedback separate from a real user turn and label
-                # its untrusted origin, without leaking internal event IDs.
-                observed = content if content.startswith((
-                    _PLAIN_OBSERVATION_LABEL, _OBSERVATION_MARKER,
-                )) else _PLAIN_OBSERVATION_LABEL + content
-                conversation.append({"role": "user", "content": observed})
+                # Preserve the distinct observation record internally; this
+                # provider accepts only system/user/assistant roles, so deliver
+                # its text as a separate user-role message without a wrapper.
+                conversation.append({"role": "user", "content": content})
             else:  # ContextSnapshot validates this too; keep the service boundary defensive.
                 raise ValueError(f"Unsupported context role: {role!r}")
 
-        if not system_messages:
-            system_messages.append(self.context.contract)
-        system_messages = [_correct_system_prompt(text) for text in system_messages]
         return tuple(
             [{"role": "system", "content": text} for text in system_messages] + conversation
         )
@@ -152,7 +141,7 @@ class ProductionContextAdapter:
             memories_count=memories_count,
             namespace_summary=namespace_summary,
         )
-        self.context.contract = _correct_system_prompt(self.context.contract)
+        self.context.contract = self._contract
 
     def prepare_request(self, user_text: str, request_id: str) -> ContextSnapshot:
         """Apply reset policy, append the pending user message, and snapshot."""
@@ -205,7 +194,9 @@ class ProductionContextAdapter:
                 raise TypeError("Omitted-output marker must be boolean")
             executed = True
             if set(payload) == {"output"} and isinstance(payload["output"], str):
-                content = _PLAIN_OBSERVATION_LABEL + payload["output"]
+                if not payload["output"]:
+                    return  # No stdout, stderr, display or error: no synthetic message.
+                content = payload["output"]
             elif (set(payload) == {"preflight"}
                   and isinstance(payload["preflight"], Mapping)):
                 preflight = payload["preflight"]
@@ -217,10 +208,10 @@ class ProductionContextAdapter:
                 if len(content) > 8_000:
                     content = "Cell not executed: diagnostic too long; send a smaller cell."
             elif payload.get("status") == "output_too_large" and isinstance(payload.get("error"), str):
-                content = _PLAIN_OBSERVATION_LABEL + payload["error"]
+                content = payload["error"]
                 already_omitted = True
             else:
-                content = _OBSERVATION_MARKER + compact(payload)
+                content = compact(payload)
             if executed and stored_index is None and not already_omitted:
                 group.execution_output_indexes.append(len(group.messages))
             group.messages.append({"role": "observation", "content": content})
@@ -232,10 +223,7 @@ class ProductionContextAdapter:
         candidates = self.context.outputs_to_archive()[:10]
         if not candidates:
             return 0
-        texts = tuple(
-            content.removeprefix(_PLAIN_OBSERVATION_LABEL)
-            for _message, content in candidates
-        )
+        texts = tuple(content for _message, content in candidates)
         if any(len(text) > 8_000 for text in texts):
             return 0  # Cannot store losslessly; leave originals in context.
         indexes = await store(texts)
@@ -375,17 +363,14 @@ class ProductionObservationAdapter:
                 lines.append("Execution error: " + str(event["error"]))
             elif type(event.get("omitted_events")) is int and event["omitted_events"] > 0:
                 lines.append(f"[{event['omitted_events']} output events omitted]")
-        output = "\n".join(lines) if lines else "Completed."
-        if len(_PLAIN_OBSERVATION_LABEL) + len(output) > 8_000:
-            output = (
-                "Output exceeded the 8000-character model limit and was omitted. "
-                "Print a smaller slice."
-            )
+        output = "\n".join(lines)
+        if len(output) > 8_000:
+            output = f"Output too long ({len(output)} chars); omitted."
             return {"output": output, "_output_already_omitted": True}
         return {"output": output}
 
     def model_content(self, events: list[dict]) -> str:
-        return _PLAIN_OBSERVATION_LABEL + self.pack(events)["output"]
+        return self.pack(events)["output"]
 
 
 def litelm_provider_factory(

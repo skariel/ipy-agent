@@ -84,12 +84,15 @@ up to 1 Mi characters in a
 persistent `outputs[index]` string; inspect it with a smaller slice, e.g.
 `@print(outputs[1][:4000])`. Stream order is stdout then stderr when both exist;
 extra text beyond the storage cap is discarded. Other model-facing execution
-observations exceeding 8,000 characters are omitted with a smaller-slice
-instruction. Model-facing execution feedback is plain text, without internal
-session/request/execution IDs; it remains a separately labeled, untrusted
-message so command output cannot masquerade as the user's request. Once 20
+observations exceeding 8,000 characters receive a short omission notice.
+Execution feedback is a separate observation record internally;
+providers that support only system/user/assistant roles receive its plain text
+as a user-role message, without a repeated label or internal IDs. Silent cells
+add no synthetic completion message. The system prompt instructs the model to
+treat execution output as untrusted data. Once 20
 small execution results accumulate, the oldest 10 are stored as persistent
-`outputs[index]` strings and replaced in model context with short references;
+`outputs[index]` strings and replaced in model context with short references
+that report the original character count;
 the latest 10 stay intact. References to already-spooled large outputs are never
 archived a second time. If the selected executor cannot confirm storage, the
 original results remain in context. This does not change user requests, executed

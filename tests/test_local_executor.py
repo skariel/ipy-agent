@@ -156,8 +156,8 @@ async def test_large_stdout_is_replaced_by_persistent_output_reference():
         assert sum(len(event.data["text"]) for event in previews) <= 512
         assert result.status == "success"
         assert result.output_reference == 1
-        assert "outputs[1]" in result.stdout
-        assert "Print a smaller slice" in result.stdout
+        assert "(8101 chars)" in result.stdout
+        assert "outputs[1], fully retained" in result.stdout
         assert "x" * 100 not in result.stdout
         assert "x" * 100 not in str(result.output_events)
         excerpt = await executor.execute(request("print(outputs[1][100:112])", author="agent"))
@@ -169,6 +169,20 @@ async def test_large_stdout_is_replaced_by_persistent_output_reference():
         archived = await executor.execute(request("print(outputs[2], outputs[3])", author="agent"))
         assert "old observation another old observation" in archived.stdout
         assert archived.output_reference is None
+    finally:
+        await executor.close()
+
+
+@pytest.mark.asyncio
+async def test_truncated_large_output_notice_does_not_claim_full_retention():
+    executor = LocalExecutor()
+    await executor.start()
+    try:
+        result = await executor.execute(request("print('x' * 1048580)", author="agent"))
+        assert "Output too long (1048581 chars)" in result.stdout
+        assert "First 1048576 chars saved in outputs[1]; truncated." in result.stdout
+        excerpt = await executor.execute(request("print(len(outputs[1]))", author="agent"))
+        assert excerpt.stdout.strip() == "1048576"
     finally:
         await executor.close()
 
