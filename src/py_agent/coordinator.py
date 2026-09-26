@@ -2,30 +2,34 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
+from dataclasses import dataclass, replace
+from enum import Enum
 import inspect
 from itertools import count
 import json
 import math
+from pathlib import Path
 import re
 import shlex
-from collections import deque
-from dataclasses import dataclass, replace
-from enum import Enum
 from types import MappingProxyType
 from uuid import uuid4
 
 from .collapse_control import parse_collapse
 from .configuration import ApplyAt, ConfigSnapshot, ConfigStore
+from .context_export import default_export_path, write_context_html
 from .contracts import (
+    MAX_FRONTEND_ID_CHARS,
+    MAX_QUEUED_ACTION_CHARS,
     AgentDecision,
     CompletenessResult,
     CompletionResult,
     ContextSnapshot,
-    ExecutorCapabilities,
-    ExecutorCapabilityError,
     ExecutionOutput,
     ExecutionRequest,
     ExecutionResult,
+    ExecutorCapabilities,
+    ExecutorCapabilityError,
     InputHandler,
     InputReply,
     InputRequest,
@@ -33,8 +37,6 @@ from .contracts import (
     InspectionResult,
     ModelRequest,
     ModelResponse,
-    MAX_FRONTEND_ID_CHARS,
-    MAX_QUEUED_ACTION_CHARS,
     Origin,
     OutputEvent,
     ProgressCallback,
@@ -57,7 +59,6 @@ from .session_journal import (
     JournalService,
     NoPersistenceJournal,
 )
-
 
 MAX_PENDING_ACTIONS = 32
 HISTORY_DEFAULT_LIMIT = 10
@@ -90,6 +91,8 @@ _HISTORY_USAGE = (
     "Usage: /history [recent [COUNT]] | /history search [--limit COUNT] "
     "[--kind KIND] QUERY | /history page EVENT_ID [OFFSET [CHARS]]"
 )
+_CONTEXT_USAGE = "Usage: /context save [PATH]"
+_COORDINATOR_COMMANDS = frozenset({"history", "context"})
 
 
 def _strip_observation_terminal_controls(text: str) -> str:
@@ -205,9 +208,13 @@ class Coordinator:
         registered_names = getattr(command_registry, "commands", {})
         if isinstance(registered_names, dict) or hasattr(registered_names, "keys"):
             configured_names = set(registered_names)
-            if "history" in configured_names:
-                raise PluginError("Configured command collides with coordinator built-in command: history")
-            conflicts = set(runtime.commands) & (configured_names | {"history"})
+            builtin_conflicts = configured_names & _COORDINATOR_COMMANDS
+            if builtin_conflicts:
+                raise PluginError(
+                    "Configured command collides with coordinator built-in command: "
+                    + ", ".join(sorted(builtin_conflicts))
+                )
+            conflicts = set(runtime.commands) & (configured_names | _COORDINATOR_COMMANDS)
             if conflicts:
                 raise PluginError(f"External commands collide with configured or built-in commands: {sorted(conflicts)}")
 
@@ -2322,6 +2329,8 @@ class Coordinator:
             if name == "history":
                 self._capture_history_sensitive_config(self._current_config())
                 return self._history_command(arguments)
+            if name == "context":
+                return self._context_command(arguments)
             if name in core_commands:
                 response = self.command_registry.dispatch(name, arguments)
             elif name in self.external_commands:
@@ -2353,6 +2362,124 @@ class Coordinator:
         if type(ok) is not bool or not isinstance(message, str):
             return "Command service returned an invalid response."
         return message
+
+    def _context_export_payload(self) -> dict[str, object]:
+        """Capture current context plus the exact most recent provider request."""
+        snapshot = self._latest_context()
+
+        def snapshot_data(value: ContextSnapshot) -> dict[str, object]:
+            return {
+                "epoch": value.epoch,
+                "messages": [
+                    {"role": role, "content": content, "phase": phase}
+                    for (role, content), phase in zip(
+                        value.messages, value.message_phases, strict=True,
+                    )
+                ],
+                "transform_trace": list(value.transform_trace),
+            }
+
+        request = self._active_model_request
+        request_data = None
+        if request is not None:
+            request_data = {
+                "origin": vars(request.origin),
+                "model": request.model,
+                "options": dict(request.options),
+                "transform_trace": list(request.transform_trace),
+                "context": snapshot_data(request.context),
+            }
+
+        context = getattr(self.context_service, "context", None)
+        raw_groups = []
+        for group in getattr(context, "groups", ()):
+            raw_groups.append({
+                "messages": [dict(message) for message in getattr(group, "messages", ())],
+                "refs": list(getattr(group, "refs", ())),
+                "execution_output_indexes": list(
+                    getattr(group, "execution_output_indexes", ()),
+                ),
+            })
+        archives = []
+        for index, raw in sorted(getattr(context, "collapsed", {}).items()):
+            try:
+                content = json.loads(raw)
+            except (TypeError, ValueError):
+                content = raw
+            archives.append({"index": index, "content": content})
+
+        capabilities = getattr(self.executor, "capabilities", None)
+        capability_data = vars(capabilities) if isinstance(capabilities, ExecutorCapabilities) else None
+        core_commands = getattr(self.command_registry, "commands", {})
+        return {
+            "export": {
+                "format": "py-context-html-v1",
+                "session_id": self.session_id,
+                "provider_id": self.provider_id,
+                "model": self.model,
+                "config_revision": self.config_revision,
+                "warning": "Contains sensitive, unredacted session context.",
+            },
+            "current_context": snapshot_data(snapshot),
+            "last_model_request": request_data,
+            "runtime": {
+                "services": {
+                    "router": type(self.router).__name__,
+                    "provider": type(self.provider).__name__,
+                    "interpreter": type(self.interpreter).__name__,
+                    "executor": type(self.executor).__name__,
+                    "context": type(self.context_service).__name__
+                    if self.context_service is not None else None,
+                    "observations": type(self.observations).__name__
+                    if self.observations is not None else None,
+                },
+                "executor_capabilities": capability_data,
+                "commands": sorted(
+                    set(core_commands) | set(self.external_commands) | _COORDINATOR_COMMANDS
+                ),
+                "context_transforms": [
+                    item.qualified_name for item in self._plugin_runtime.transforms["context"]
+                ],
+                "model_request_transforms": [
+                    item.qualified_name
+                    for item in self._plugin_runtime.transforms["model-request"]
+                ],
+                "model_tools": {
+                    "registered": [],
+                    "note": (
+                        "This agent does not send structured tool definitions to the model; "
+                        "Python/IPython execution is specified by the system prompt, and its "
+                        "observations are included in the messages above."
+                    ),
+                },
+            },
+            "raw_context": {
+                "groups": raw_groups,
+                "reported_input_tokens": getattr(context, "reported_input_tokens", None),
+                "window_tokens": getattr(context, "window_tokens", None),
+            },
+            "collapsed_archives": archives,
+        }
+
+    def _context_command(self, arguments: str) -> str:
+        if not isinstance(arguments, str) or len(arguments) > 4096:
+            return _CONTEXT_USAGE
+        try:
+            tokens = shlex.split(arguments, posix=True)
+        except ValueError:
+            return _CONTEXT_USAGE
+        if tokens and tokens[0] != "save":
+            return _CONTEXT_USAGE
+        if len(tokens) > 2:
+            return _CONTEXT_USAGE
+        path = default_export_path(self.session_id) if len(tokens) < 2 else Path(tokens[1])
+        try:
+            saved = write_context_html(path, self._context_export_payload())
+        except FileExistsError:
+            return f"Context export refused to overwrite existing file: {path}"
+        except OSError as exc:
+            return f"Context export failed: {exc}"
+        return f"Saved private context explorer to {saved} (file mode 0600)."
 
     def _history_command(self, arguments: str) -> str:
         if getattr(self.journal, "persisted", None) is False:

@@ -123,7 +123,9 @@ class _PromptResult:
     mode_generation: int
 
 
-RESERVED_COMMANDS = frozenset({"help", "status", "interrupt", "quit", "exit", "history"})
+RESERVED_COMMANDS = frozenset({
+    "help", "status", "interrupt", "quit", "exit", "history", "context",
+})
 
 
 HELP = """Enter an English request to ask the explicitly selected provider.
@@ -138,6 +140,7 @@ Slash commands remain deferred. Queue order is preserved; nothing interrupts the
 /history                list recent journal events (read-only; disabled without --journal)
 /history search QUERY   search recent journal events
 /history page ID [OFFSET [CHARS]]  read one bounded event page; never replays code
+/context save [PATH]   save a private, standalone HTML context explorer
 Enabled plugins may add slash commands.
 /help                  show this help
 /status                show coordinator state and selected provider

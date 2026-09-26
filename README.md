@@ -66,7 +66,11 @@ It accepts
 English requests, `@` Python,
 `!` shell escapes, `%` IPython magics, and the
 built-in slash commands `/help`, `/status`, `/interrupt`, `/quit`, `/config`,
-`/plugins`, and `/history` (when a journal is selected). `say(text, final=False)` publishes progress; a successful cell
+`/plugins`, `/context`, and `/history` (when a journal is selected). `/context save [PATH]`
+writes a private (mode `0600`), standalone HTML explorer containing the current
+live messages, system prompt, last exact dispatched request, runtime/tool
+metadata, raw context groups, and collapsed archives; it is intentionally unredacted
+and must be treated as sensitive. `say(text, final=False)` publishes progress; a successful cell
 calling `say(text, final=True)` completes the request. Without it, the agent
 continues until interrupted or finished by default; `--max-agent-steps N` (or
 `agent.max_steps`) opts into a per-request cap. Zero means unlimited for
