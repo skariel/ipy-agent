@@ -54,15 +54,35 @@ class ProviderError(RuntimeError):
 
 
 def _json_object(value: Any) -> dict:
+    original = value
     if hasattr(value, "model_dump"):
-        value = value.model_dump()
+        try:
+            value = value.model_dump(mode="json")
+        except TypeError:
+            value = value.model_dump()
+    if isinstance(value, dict):
+        try:
+            encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+            return json.loads(encoded)
+        except (TypeError, ValueError):
+            # Some compatibility wrappers implement model_dump() by walking
+            # Pydantic internals (including sets) but expose valid JSON through
+            # json(). Prefer that provider-owned serialization as a fallback.
+            pass
+    serializer = getattr(original, "json", None)
+    if callable(serializer):
+        try:
+            encoded = serializer()
+            if isinstance(encoded, bytes):
+                encoded = encoded.decode("utf-8")
+            decoded = json.loads(encoded)
+            if isinstance(decoded, dict):
+                return decoded
+        except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+            pass
     if not isinstance(value, dict):
         raise ProviderError("Unsupported provider response object", kind="shape")
-    try:
-        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
-    except (TypeError, ValueError) as exc:
-        raise ProviderError("Non-JSON provider response", kind="shape") from exc
-    return json.loads(encoded)
+    raise ProviderError("Non-JSON provider response", kind="shape")
 
 
 def normalize_usage(raw: dict | None) -> dict:

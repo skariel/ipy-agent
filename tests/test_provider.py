@@ -104,6 +104,25 @@ class Stream:
         self.closed = True
 
 
+def test_json_method_recovers_from_litelm_wrapper_with_non_json_model_dump(monkeypatch):
+    raw = response()
+
+    class CompatibilityResponse:
+        def model_dump(self, **_kwargs):
+            return {"pydantic_internal_set": {"field"}}
+
+        def json(self):
+            import json
+
+            return json.dumps(raw)
+
+    calls = install(monkeypatch, CompatibilityResponse())
+    result = asyncio.run(LitelmProvider("openai/configured").generate(MESSAGES))
+    assert result.successful
+    assert result.raw == raw
+    assert calls[0]["model"] == "openai/configured"
+
+
 def test_complete_explicit_context_no_tools_or_hidden_history(monkeypatch):
     raw = response(reasoning_content="private reasoning; not executable")
     calls = install(monkeypatch, SimpleNamespace(model_dump=lambda: raw))
