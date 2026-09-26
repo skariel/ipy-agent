@@ -10,24 +10,40 @@ from types import SimpleNamespace
 import pytest
 
 from py_agent.provider import (
-    Completion, FakeProvider, LitelmProvider, ProviderError, _litelm_failure_kind, normalize_usage,
+    Completion,
+    FakeProvider,
+    LitelmProvider,
+    ProviderError,
+    _litelm_failure_kind,
+    normalize_usage,
 )
 
 MESSAGES = [{"role": "system", "content": "raw Python only"}, {"role": "user", "content": "go"}]
 
 
+@pytest.fixture(autouse=True)
+def isolated_pi_auth(tmp_path, monkeypatch):
+    monkeypatch.setattr("py_agent.codex_auth.DEFAULT_AUTH_FILE", tmp_path / "missing-auth.json")
+
+
 @pytest.mark.parametrize(
     ("status", "expected"),
-    [(400, "request"), (401, "authentication"), (403, "authentication"),
-     (408, "timeout"), (413, "overflow"), (429, "rate_limit"),
-     (500, "provider"), (503, "provider")],
+    [
+        (400, "request"),
+        (401, "authentication"),
+        (403, "authentication"),
+        (408, "timeout"),
+        (413, "overflow"),
+        (429, "rate_limit"),
+        (500, "provider"),
+        (503, "provider"),
+    ],
 )
 def test_litelm_retry_classification_is_explicit(status, expected):
     error = RuntimeError("credentials must never be logged")
     error.status_code = status
     assert _litelm_failure_kind(error) == expected
     assert _litelm_failure_kind(ValueError("local plugin bug")) == "internal"
-
 
 
 def response(content="say('ok', final=True)", *, reason="stop", **message):
@@ -150,6 +166,39 @@ def test_bad_responses_never_successful(monkeypatch, raw):
     result = asyncio.run(LitelmProvider("fake/model").generate(MESSAGES, max_tokens=10))
     assert not result.successful
     assert result.raw == raw
+
+
+def test_pi_auth_key_and_effort_are_passed_without_entering_messages(monkeypatch, tmp_path):
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"deepseek":{"type":"api_key","key":"synthetic-private-key"}}')
+    auth.chmod(0o600)
+    calls = install(monkeypatch, SimpleNamespace(model_dump=lambda: response()))
+    provider = LitelmProvider("deepseek/deepseek-flash", auth_file=auth)
+    provider.effort = "high"
+
+    result = asyncio.run(provider.generate(MESSAGES))
+
+    assert result.successful
+    assert calls[0]["api_key"] == "synthetic-private-key"
+    assert calls[0]["reasoning_effort"] == "high"
+    assert calls[0]["messages"] == MESSAGES
+
+
+def test_live_model_change_resolves_the_new_provider_key(monkeypatch, tmp_path):
+    auth = tmp_path / "auth.json"
+    auth.write_text(
+        '{"deepseek":{"type":"api_key","key":"deepseek-private"},'
+        '"openrouter":{"type":"api_key","key":"openrouter-private"}}',
+    )
+    auth.chmod(0o600)
+    calls = install(monkeypatch, SimpleNamespace(model_dump=lambda: response()))
+    provider = LitelmProvider("deepseek/deepseek-flash", auth_file=auth)
+    asyncio.run(provider.generate(MESSAGES))
+    provider.set_model("openrouter/deepseek/deepseek-flash")
+    asyncio.run(provider.generate(MESSAGES))
+
+    assert [call["api_key"] for call in calls] == ["deepseek-private", "openrouter-private"]
+    assert calls[1]["model"] == "openrouter/deepseek/deepseek-flash"
 
 
 def test_unknown_usage_does_not_become_zero():

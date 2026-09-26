@@ -125,6 +125,7 @@ class _PromptResult:
 
 RESERVED_COMMANDS = frozenset({
     "help", "status", "interrupt", "quit", "exit", "history", "context",
+    "model", "effort",
 })
 
 
@@ -141,6 +142,8 @@ Slash commands remain deferred. Queue order is preserved; nothing interrupts the
 /history search QUERY   search recent journal events
 /history page ID [OFFSET [CHARS]]  read one bounded event page; never replays code
 /context save [PATH]   save a private, standalone HTML context explorer
+/model [MODEL_ID]       show or change the active model for this session
+/effort [PRESET]        show or change reasoning effort for this session
 Enabled plugins may add slash commands.
 /help                  show this help
 /status                show coordinator state and selected provider

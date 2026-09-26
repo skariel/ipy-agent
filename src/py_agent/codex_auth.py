@@ -1,7 +1,8 @@
-"""Read-only pi Codex credentials; never execute key commands or rotate tokens.
+"""Read-only Pi credentials; never execute key commands or rotate tokens.
 
-Pi remains the owner of OAuth login and refresh. Re-read each generation so a
-refresh made by pi is picked up without restarting py. No secrets in repr/errors.
+Pi remains the owner of login and refresh. Credentials are re-read for each
+request so atomic updates are picked up without restarting py. No secrets appear
+in reprs or errors.
 """
 
 from __future__ import annotations
@@ -28,6 +29,12 @@ class CodexCredentials:
     expires: float
 
 
+@dataclass(frozen=True)
+class ApiKeyCredentials:
+    provider: str
+    key: str = field(repr=False)
+
+
 def _error(message):
     return ProviderError("Codex authentication: " + message, kind="authentication")
 
@@ -41,9 +48,9 @@ def _unique_object(pairs):
     return result
 
 
-def read_codex_credentials(path: Path | None = None) -> CodexCredentials:
-    """Bounded, symlink-safe read of a private auth.json. No writes or networking."""
-    path = Path(os.path.abspath(path if path is not None else DEFAULT_AUTH_FILE))
+def _read_auth_document(path: Path, *, error, missing: str | None = None) -> dict | None:
+    """Bounded, symlink-safe read shared by OAuth and static API-key entries."""
+    path = Path(os.path.abspath(path))
     parent_fd = file_fd = None
     try:
         parent_fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
@@ -59,16 +66,16 @@ def read_codex_credentials(path: Path | None = None) -> CodexCredentials:
             or before.st_mode & 0o077
             or before.st_nlink != 1
         ):
-            raise _error("auth.json must be an owned regular single-link file with mode 0600 (no symlinks)")
+            raise error("auth.json must be an owned regular single-link file with mode 0600 (no symlinks)")
         if before.st_size > MAX_AUTH_BYTES:
-            raise _error("auth.json exceeds the 1 MiB read limit")
+            raise error("auth.json exceeds the 1 MiB read limit")
         with os.fdopen(file_fd, "rb", closefd=False) as stream:
             data = stream.read(MAX_AUTH_BYTES + 1)
         after = os.fstat(file_fd)
         current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
         if len(data) > MAX_AUTH_BYTES or identity(before) != identity(after) or identity(after) != identity(current):
-            raise _error("auth.json changed during reading; retry after pi finishes updating it")
+            raise error("auth.json changed during reading; retry after pi finishes updating it")
         document = json.loads(
             data.decode("utf-8"),
             object_pairs_hook=_unique_object,
@@ -77,16 +84,30 @@ def read_codex_credentials(path: Path | None = None) -> CodexCredentials:
     except ProviderError:
         raise
     except FileNotFoundError:
-        raise _error("auth.json not found; log in with pi's /login openai-codex") from None
+        if missing is None:
+            return None
+        raise error(missing) from None
     except (OSError, ValueError, UnicodeError, RecursionError):
-        raise _error("cannot safely read auth.json; check permissions, JSON format and symlinks") from None
+        raise error("cannot safely read auth.json; check permissions, JSON format and symlinks") from None
     finally:
         if file_fd is not None:
             os.close(file_fd)
         if parent_fd is not None:
             os.close(parent_fd)
+    if not isinstance(document, dict):
+        raise error("auth.json must contain a JSON object")
+    return document
 
-    entry = document.get("openai-codex") if isinstance(document, dict) else None
+
+def read_codex_credentials(path: Path | None = None) -> CodexCredentials:
+    """Read and validate Pi's Codex OAuth entry without refreshing it."""
+    document = _read_auth_document(
+        Path(path) if path is not None else DEFAULT_AUTH_FILE,
+        error=_error,
+        missing="auth.json not found; log in with pi's /login openai-codex",
+    )
+    assert document is not None
+    entry = document.get("openai-codex")
     if not isinstance(entry, dict) or entry.get("type") != "oauth":
         raise _error("no openai-codex OAuth login; use pi's /login openai-codex")
     access, account_id, expires = entry.get("access"), entry.get("accountId"), entry.get("expires")
@@ -101,3 +122,44 @@ def read_codex_credentials(path: Path | None = None) -> CodexCredentials:
             "pi's token is expired or about to expire. Refresh/login in pi (/login openai-codex), then retry. py reads but never rewrites pi's shared credentials"
         )
     return CodexCredentials(access=access, account_id=account_id, expires=expires)
+
+
+def read_provider_api_key(
+    provider: str,
+    path: Path | None = None,
+) -> ApiKeyCredentials | None:
+    """Read one static provider key from Pi auth, or return None when absent.
+
+    Command-backed ``!…`` keys remain Pi-owned and are not executed by py.
+    A present but malformed matching entry fails closed rather than silently
+    selecting an unrelated environment credential.
+    """
+    if (
+        not isinstance(provider, str)
+        or not 1 <= len(provider) <= 128
+        or provider != provider.strip()
+        or any(ord(character) < 33 or ord(character) > 126 for character in provider)
+    ):
+        raise ProviderError("Pi authentication: invalid provider identifier", kind="authentication")
+
+    def api_error(message: str) -> ProviderError:
+        return ProviderError(f"Pi authentication for {provider}: {message}", kind="authentication")
+
+    document = _read_auth_document(
+        Path(path) if path is not None else DEFAULT_AUTH_FILE,
+        error=api_error,
+    )
+    if document is None or provider not in document:
+        return None
+    entry = document[provider]
+    if not isinstance(entry, dict) or entry.get("type") != "api_key":
+        raise api_error("matching entry is not a static API key")
+    key = entry.get("key")
+    if (
+        not isinstance(key, str)
+        or not 1 <= len(key) <= 65_536
+        or key.startswith("!")
+        or any(ord(character) < 33 or ord(character) > 126 for character in key)
+    ):
+        raise api_error("matching entry has no usable static API key")
+    return ApiKeyCredentials(provider, key)

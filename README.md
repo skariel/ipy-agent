@@ -28,14 +28,17 @@ For an installed, non-editable tool copy, use the repository scripts:
 
 ```sh
 ./install.sh
-./run.sh                              # fake provider; no model calls
+./run.sh                              # litelm + deepseek/deepseek-flash
+PROVIDER=fake ./run.sh                # deterministic local wiring; no model calls
 PROVIDER=codex MODEL=openai-codex/YOUR_MODEL ./run.sh
 ./run.sh --config /path/to/trusted-settings.json  # uses that file's provider
 ```
 
 `run.sh` forwards extra `py` arguments and starts in your current directory,
-or in `WORKSPACE` when set. It does not choose a paid provider by default.
-Installing/running this way requires no sandbox tools. The installed copy must
+or in `WORKSPACE` when set. With no provider, model, or config selection it defaults
+to `litelm` with `deepseek/deepseek-flash`; requests occur only after submitting
+English input. Use `PROVIDER=fake` for the no-network fixture. Installing/running
+this way requires no sandbox tools. The installed copy must
 be reinstalled after source changes.
 
 The fake provider is deterministic, makes no model request, and is **not a language
@@ -47,10 +50,14 @@ uv run --locked py --provider litelm --model openai/YOUR_MODEL
 uv run --locked py --provider codex --model openai-codex/YOUR_MODEL
 ```
 
-Configure litelm credentials through its normal provider environment. Codex uses
-pi subscription credentials (login/refresh remain pi's responsibility); `--pi-auth`
-can select the auth file. A provider request is made only after submitting an
-English request. There is no implicit provider or production model selection.
+The litelm adapter reads matching static API-key entries from Pi's private
+`~/.pi/agent/auth.json` on each request (or from `--pi-auth PATH`) and passes only
+the selected model provider's key to litelm. If no matching entry exists, litelm's
+normal provider environment remains available. Command-backed `!…` keys and OAuth
+entries are not executed by this adapter. Codex uses Pi subscription credentials
+(login/refresh remain Pi's responsibility). A provider request is made only after submitting an
+English request. The `py` CLI itself still requires an explicit provider/model;
+only `run.sh` supplies the DeepSeek Flash launcher default.
 Recognized transient provider failures (rate limits, transport/timeouts, and
 server 5xx errors) receive up to two retries before any Python cell executes;
 a lost response can still mean both model attempts were billed. Authentication,
@@ -66,7 +73,9 @@ It accepts
 English requests, `@` Python,
 `!` shell escapes, `%` IPython magics, and the
 built-in slash commands `/help`, `/status`, `/interrupt`, `/quit`, `/config`,
-`/plugins`, `/context`, and `/history` (when a journal is selected). `/context save [PATH]`
+`/plugins`, `/model`, `/effort`, `/context`, and `/history` (when a journal is selected).
+`/model [MODEL_ID]` and `/effort [PRESET]` apply immediate, session-local overrides;
+they do not change the selected provider or persist configuration. `/context save [PATH]`
 writes a private (mode `0600`), standalone HTML explorer containing the current
 live messages, system prompt, last exact dispatched request, runtime/tool
 metadata, raw context groups, and collapsed archives; it is intentionally unredacted

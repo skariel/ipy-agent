@@ -92,7 +92,10 @@ _HISTORY_USAGE = (
     "[--kind KIND] QUERY | /history page EVENT_ID [OFFSET [CHARS]]"
 )
 _CONTEXT_USAGE = "Usage: /context save [PATH]"
-_COORDINATOR_COMMANDS = frozenset({"history", "context"})
+_MODEL_USAGE = "Usage: /model [MODEL_ID]"
+_EFFORT_PRESETS = ("none", "minimal", "low", "medium", "high", "xhigh")
+_EFFORT_USAGE = "Usage: /effort [none|minimal|low|medium|high|xhigh]"
+_COORDINATOR_COMMANDS = frozenset({"history", "context", "model", "effort"})
 
 
 def _strip_observation_terminal_controls(text: str) -> str:
@@ -261,6 +264,7 @@ class Coordinator:
         self.best_effort_observer_failures = 0
         self.provider_id = provider
         self.model = model or getattr(self.provider, "model", provider)
+        self._effort_override: str | None = None
         self.session_id = uuid4().hex
         self.config_revision = config_revision
         self.journal = NoPersistenceJournal() if journal is None else journal
@@ -879,15 +883,17 @@ class Coordinator:
 
     def _model_options(self, snapshot: ConfigSnapshot | None) -> dict[str, str]:
         options: dict[str, str] = {}
-        if snapshot is None:
-            return options
-        max_tokens = snapshot.entries.get("model.max_tokens")
-        if (self.provider_id == "litelm" and max_tokens is not None
-                and type(max_tokens.value) is int and max_tokens.value > 0):
-            options["max_tokens"] = str(max_tokens.value)
-        effort = snapshot.entries.get("model.effort")
-        if effort is not None and isinstance(effort.value, str) and self.provider_id == "codex":
-            options["effort"] = effort.value
+        if snapshot is not None:
+            max_tokens = snapshot.entries.get("model.max_tokens")
+            if (self.provider_id == "litelm" and max_tokens is not None
+                    and type(max_tokens.value) is int and max_tokens.value > 0):
+                options["max_tokens"] = str(max_tokens.value)
+        if self._effort_override is not None and self.provider_id in {"litelm", "codex"}:
+            options["effort"] = self._effort_override
+        elif snapshot is not None and self.provider_id == "codex":
+            effort = snapshot.entries.get("model.effort")
+            if effort is not None and isinstance(effort.value, str):
+                options["effort"] = effort.value
         return options
 
     def _prepare_context(self, text: str, request_id: str) -> ContextSnapshot:
@@ -2331,6 +2337,10 @@ class Coordinator:
                 return self._history_command(arguments)
             if name == "context":
                 return self._context_command(arguments)
+            if name == "model":
+                return self._model_command(arguments)
+            if name == "effort":
+                return self._effort_command(arguments, config)
             if name in core_commands:
                 response = self.command_registry.dispatch(name, arguments)
             elif name in self.external_commands:
@@ -2418,6 +2428,7 @@ class Coordinator:
                 "provider_id": self.provider_id,
                 "model": self.model,
                 "config_revision": self.config_revision,
+                "effort_override": self._effort_override,
                 "warning": "Contains sensitive, unredacted session context.",
             },
             "current_context": snapshot_data(snapshot),
@@ -2460,6 +2471,57 @@ class Coordinator:
             },
             "collapsed_archives": archives,
         }
+
+    def _model_command(self, arguments: str) -> str:
+        if not isinstance(arguments, str) or len(arguments) > 512:
+            return _MODEL_USAGE
+        try:
+            tokens = shlex.split(arguments, posix=True)
+        except ValueError:
+            return _MODEL_USAGE
+        if not tokens:
+            return f"Model: {self.model} (provider: {self.provider_id})"
+        if len(tokens) != 1:
+            return _MODEL_USAGE
+        setter = getattr(self.provider, "set_model", None)
+        if not callable(setter):
+            return "Live model changes are unavailable for the selected provider."
+        previous = self.model
+        try:
+            setter(tokens[0])
+            selected = getattr(self.provider, "model", None)
+            if not isinstance(selected, str) or not selected:
+                raise TypeError("provider returned invalid model state")
+        except (TypeError, ValueError) as exc:
+            return f"Model was not changed: {exc}"
+        self.model = selected
+        return f"Model changed for this session: {previous} -> {selected}"
+
+    def _configured_effort(self, config: ConfigSnapshot | None) -> str | None:
+        if self.provider_id != "codex" or config is None:
+            return None
+        entry = config.entries.get("model.effort")
+        return entry.value if entry is not None and isinstance(entry.value, str) else None
+
+    def _effort_command(self, arguments: str, config: ConfigSnapshot | None) -> str:
+        if not isinstance(arguments, str) or len(arguments) > 32:
+            return _EFFORT_USAGE
+        value = arguments.strip().lower()
+        if not value:
+            effective = self._effort_override or self._configured_effort(config) or "provider default"
+            return f"Effort: {effective}. Presets: {', '.join(_EFFORT_PRESETS)}"
+        if value not in _EFFORT_PRESETS or any(character.isspace() for character in value):
+            return _EFFORT_USAGE
+        if self.provider_id not in {"litelm", "codex"}:
+            return "Effort presets are unavailable for the selected provider."
+        self._effort_override = value
+        note = (
+            " DeepSeek treats non-none presets as thinking enabled and may not "
+            "distinguish every level."
+            if self.provider_id == "litelm" and self.model.startswith("deepseek/")
+            else ""
+        )
+        return f"Effort changed for this session: {value}.{note}"
 
     def _context_command(self, arguments: str) -> str:
         if not isinstance(arguments, str) or len(arguments) > 4096:

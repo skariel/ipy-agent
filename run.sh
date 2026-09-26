@@ -28,17 +28,24 @@ for argument in "$@"; do
     esac
 done
 
-# No implicit paid provider request. Override through CLI flags or the explicit
-# PROVIDER and MODEL environment variables; the CLI validates combinations.
+# The installed launcher defaults to DeepSeek Flash through litelm. A provider
+# flag, PROVIDER/MODEL, or an explicitly selected config always takes precedence.
+selected_provider=""
 if [[ "$has_provider" == false ]]; then
     if [[ -n "${PROVIDER:-}" ]]; then
-        arguments+=(--provider "$PROVIDER")
+        selected_provider="$PROVIDER"
+        arguments+=(--provider "$selected_provider")
     elif [[ "$has_config" == false ]]; then
-        arguments+=(--provider fake)
+        selected_provider="litelm"
+        arguments+=(--provider "$selected_provider")
     fi
 fi
-if [[ "$has_model" == false && -n "${MODEL:-}" ]]; then
-    arguments+=(--model "$MODEL")
+if [[ "$has_model" == false ]]; then
+    if [[ -n "${MODEL:-}" ]]; then
+        arguments+=(--model "$MODEL")
+    elif [[ "$has_config" == false && "$has_provider" == false && "$selected_provider" == "litelm" ]]; then
+        arguments+=(--model "deepseek/deepseek-flash")
+    fi
 fi
 
 if [[ -n "${WORKSPACE:-}" ]]; then

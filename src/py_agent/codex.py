@@ -278,8 +278,7 @@ class CodexProvider:
         effort: str = "medium",
         transport=None,
     ):
-        if not isinstance(model, str) or not re.fullmatch(r"openai-codex/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", model):
-            raise ValueError("Select an explicit openai-codex/<model> model")
+        model = self._validated_model(model)
         if session_id is not None and (not isinstance(session_id, str) or not session_id):
             raise ValueError("session_id must be a nonempty string")
         if effort not in REASONING_EFFORTS:
@@ -291,6 +290,17 @@ class CodexProvider:
         # independent of prompts, paths, and credentials and survives every turn.
         self.session_id = session_id or uuid.uuid4().hex
         self._transport = transport  # deterministic tests; never an endpoint override
+
+    @staticmethod
+    def _validated_model(model: str) -> str:
+        if not isinstance(model, str) or not re.fullmatch(
+            r"openai-codex/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", model,
+        ):
+            raise ValueError("Select an explicit openai-codex/<model> model")
+        return model
+
+    def set_model(self, model: str) -> None:
+        self.model = self._validated_model(model)
 
     def build_request(self, messages: list[dict], *, max_tokens: int | None = None) -> dict:
         messages = _validate_messages(messages, max_tokens)

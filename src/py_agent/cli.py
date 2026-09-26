@@ -99,7 +99,10 @@ def default_parser() -> argparse.ArgumentParser:
         help="Buffer a complete litelm stream before interpreting it",
     )
     result.add_argument("--effort", choices=CODEX_EFFORTS, help="Codex reasoning effort")
-    result.add_argument("--pi-auth", type=Path, help="Codex only: pi OAuth auth file")
+    result.add_argument(
+        "--pi-auth", type=Path,
+        help="Pi auth.json path for built-in Codex and API-key providers",
+    )
     result.add_argument("--config", type=Path, help="Typed JSON configuration file")
     result.add_argument("--max-tokens", type=int, help="Optional provider response token limit")
     result.add_argument("--max-agent-steps", type=int, help="Optional per-request step cap; 0 (default) means unlimited")
@@ -208,6 +211,7 @@ def _default_runtime(enabled: tuple[str, ...], options: dict):
             raise ValueError("The selected litelm provider requires a model")
         return litelm_provider_factory(
             model, api_base=options["api_base"], stream=options["stream"],
+            auth_file=options["auth_file"],
         )()
 
     def create_codex():
@@ -501,8 +505,8 @@ def _prepare_configuration(args: argparse.Namespace) -> _CliConfiguration:
         raise ValueError("Codex does not support a client-side output token cap")
     if provider not in {"fake", "litelm", "codex"} and snapshot.get("model.max_tokens"):
         raise ValueError("model.max_tokens is not supported by the selected third-party provider")
-    if getattr(args, "pi_auth", None) is not None and provider != "codex":
-        raise ValueError("--pi-auth requires --provider codex")
+    if getattr(args, "pi_auth", None) is not None and provider not in {"litelm", "codex"}:
+        raise ValueError("--pi-auth requires --provider litelm or codex")
 
     options.update({
         "model": model,

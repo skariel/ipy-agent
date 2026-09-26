@@ -239,6 +239,33 @@ def test_production_never_evicts_history_at_old_reset_threshold():
 
 
 @pytest.mark.asyncio
+async def test_output_archival_keeps_collapsed_summaries_and_their_archives():
+    adapter = populated()
+    collapse_store = Store()
+    await adapter.collapse("u1", "u2", "Keep this collapsed summary.", collapse_store)
+    summary = adapter.context.groups[0].messages[0].copy()
+    archived_original = adapter.context.collapsed[1]
+
+    for number in range(1, 21):
+        adapter.commit_response(
+            "new", f"cell_{number}()", observation={"output": f"new output {number}"},
+        )
+
+    saved_outputs = {}
+
+    async def store_outputs(texts):
+        indexes = tuple(range(1, len(texts) + 1))
+        saved_outputs.update(zip(indexes, texts, strict=True))
+        return indexes
+
+    assert await adapter.archive_execution_outputs(store_outputs) == 10
+    assert adapter.context.groups[0].messages == [summary]
+    assert "Keep this collapsed summary." in adapter.snapshot().messages[1][1]
+    assert adapter.context.collapsed[1] == archived_original
+    assert len(saved_outputs) == 10
+
+
+@pytest.mark.asyncio
 async def test_end_group_trailing_observation_and_archive_indexes_survive():
     adapter = populated()
     end_group = adapter.context.groups[2]

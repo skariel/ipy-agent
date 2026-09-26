@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from py_agent.codex_auth import MAX_AUTH_BYTES, read_codex_credentials
+from py_agent.codex_auth import (
+    MAX_AUTH_BYTES,
+    read_codex_credentials,
+    read_provider_api_key,
+)
 from py_agent.provider import ProviderError
 
 
@@ -41,6 +45,39 @@ def test_read_only_and_secrets_not_in_repr(auth):
     assert "synthetic-private" not in repr(credential)
     assert "account-123" not in repr(credential)
     assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+
+
+def test_reads_static_keys_for_any_provider_without_leaking_them(auth):
+    path, document = auth
+    document.update({
+        "deepseek": {"type": "api_key", "key": "synthetic-deepseek-key"},
+        "openrouter": {"type": "api_key", "key": "synthetic-openrouter-key"},
+    })
+    path.write_text(json.dumps(document))
+
+    deepseek = read_provider_api_key("deepseek", path)
+    openrouter = read_provider_api_key("openrouter", path)
+    assert deepseek is not None and deepseek.key == "synthetic-deepseek-key"
+    assert openrouter is not None and openrouter.key == "synthetic-openrouter-key"
+    assert "synthetic" not in repr(deepseek)
+    assert read_provider_api_key("missing", path) is None
+
+
+def test_static_key_entries_fail_closed_and_never_execute_commands(auth, monkeypatch):
+    path, document = auth
+    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: pytest.fail("must not execute"))
+    for entry in (
+        {"type": "oauth", "key": "synthetic-secret"},
+        {"type": "api_key", "key": ""},
+        {"type": "api_key", "key": "!printf synthetic-secret"},
+        {"type": "api_key", "key": "synthetic-secret\nheader"},
+    ):
+        document["deepseek"] = entry
+        path.write_text(json.dumps(document))
+        with pytest.raises(ProviderError) as error:
+            read_provider_api_key("deepseek", path)
+        assert error.value.kind == "authentication"
+        assert "synthetic-secret" not in str(error.value)
 
 
 def test_rereads_after_pi_refresh(auth):

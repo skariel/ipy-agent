@@ -343,6 +343,16 @@ class ProductionProviderAdapter:
         model = getattr(adapter, "model", None)
         self.model = model if isinstance(model, str) else "unknown"
 
+    def set_model(self, model: str) -> None:
+        setter = getattr(self.adapter, "set_model", None)
+        if not callable(setter):
+            raise ValueError("Selected provider does not support live model changes")
+        setter(model)
+        selected = getattr(self.adapter, "model", None)
+        if not isinstance(selected, str) or not selected:
+            raise TypeError("Provider model setter returned invalid state")
+        self.model = selected
+
     def _max_tokens(self, request: ModelRequest) -> int | None:
         option = request.options.get("max_tokens")
         if option is None:
@@ -359,8 +369,9 @@ class ProductionProviderAdapter:
             raise TypeError("Production provider requires a ModelRequest")
         messages = self.context.provider_messages(request.context)
         effort = request.options.get("effort")
+        supports_effort = hasattr(self.adapter, "effort")
         previous_effort = getattr(self.adapter, "effort", None)
-        change_effort = isinstance(effort, str) and previous_effort is not None
+        change_effort = isinstance(effort, str) and supports_effort
         if change_effort:
             # Coordinator submissions are serialized. Apply request-scoped
             # Codex effort without changing the adapter's configured baseline.
@@ -453,13 +464,16 @@ def litelm_provider_factory(
     *,
     api_base: str | None = None,
     stream: bool = False,
+    auth_file=None,
 ) -> Callable[[], Any]:
     """Return a lazy factory for the existing API-key provider adapter."""
 
     def create():
         from .provider import LitelmProvider
 
-        return LitelmProvider(model, api_base=api_base, stream=stream)
+        return LitelmProvider(
+            model, api_base=api_base, stream=stream, auth_file=auth_file,
+        )
 
     return create
 

@@ -12,6 +12,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 import inspect
 import json
+from pathlib import Path
+import re
 from typing import Any, Protocol
 
 
@@ -197,6 +199,9 @@ def _litelm_failure_kind(exc: Exception) -> str:
     return "internal"
 
 
+_MODEL_ID = re.compile(r"[^\x00-\x20\x7f]{1,512}\Z")
+
+
 class LitelmProvider:
     """API-key client; no pi subscription authentication or server-side history.
 
@@ -204,10 +209,26 @@ class LitelmProvider:
     billing for interrupted calls and independently reject stale generations.
     """
 
-    def __init__(self, model: str, api_base: str | None = None, stream: bool = False):
-        if not isinstance(model, str) or not model.strip():
-            raise ValueError("An explicit provider/model is required")
-        self.model, self.api_base, self.stream = model, api_base, stream
+    def __init__(
+        self,
+        model: str,
+        api_base: str | None = None,
+        stream: bool = False,
+        auth_file: Path | None = None,
+    ):
+        self.model = self._validated_model(model)
+        self.api_base, self.stream = api_base, stream
+        self.auth_file = Path(auth_file) if auth_file is not None else None
+        self.effort: str | None = None
+
+    @staticmethod
+    def _validated_model(model: str) -> str:
+        if not isinstance(model, str) or _MODEL_ID.fullmatch(model) is None:
+            raise ValueError("An explicit bounded provider/model ID without whitespace is required")
+        return model
+
+    def set_model(self, model: str) -> None:
+        self.model = self._validated_model(model)
 
     async def generate(self, messages: list[dict], *, max_tokens: int | None = None) -> Completion:
         context = [{"role": m["role"], "content": m["content"]} for m in _validate_messages(messages, max_tokens)]
@@ -216,6 +237,14 @@ class LitelmProvider:
         except ImportError as exc:
             raise ProviderError("Install the locked litelm dependencies", kind="configuration") from exc
         kwargs = {"model": self.model, "messages": context, "stream": self.stream, "num_retries": 0}
+        provider_id = self.model.split("/", 1)[0] if "/" in self.model else "openai"
+        from .codex_auth import read_provider_api_key
+
+        credential = read_provider_api_key(provider_id, self.auth_file)
+        if credential is not None:
+            kwargs["api_key"] = credential.key
+        if self.effort is not None:
+            kwargs["reasoning_effort"] = self.effort
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
         if self.api_base is not None:
