@@ -1347,9 +1347,10 @@ class Coordinator:
     ) -> QueueTicket:
         """Accept bounded FIFO work without cancelling the active provider or cell.
 
-        Leading English asks may be committed as steering at a safe cell boundary.
-        Direct cells and slash commands remain deferred until the active turn ends;
-        an English ask behind one cannot overtake it.
+        Leading English asks become steering at a safe cell boundary. Direct
+        @/!/% cells run at that boundary before the next model request, without
+        interrupting execution. Slash commands wait for the turn to finish and
+        block later queue items; no item overtakes an earlier one.
         """
         if self.state in (State.NEW, State.STOPPING, State.FAILED, State.CLOSED):
             raise RuntimeError("Session unavailable for queued actions")
@@ -1456,14 +1457,6 @@ class Coordinator:
                 self._queue_worker = None
             self._start_queue_worker_if_idle()
 
-    async def _consume_queued_steering(self) -> tuple[_QueuedAction, ...]:
-        """Reserve leading English asks for the next request, without mutating context yet."""
-        async with self._queue_lock:
-            selected = []
-            while self._pending_actions and self._pending_actions[0].action.kind == "ask":
-                selected.append(self._pending_actions.popleft())
-        return tuple(selected)
-
     async def submit(
         self,
         frontend_id: str,
@@ -1508,15 +1501,19 @@ class Coordinator:
                 else Origin(self.session_id, uuid4().hex, frontend_id, revision)
             )
 
-            def execution_input_handler(execution_origin: Origin) -> InputHandler | None:
-                if not allow_stdin or input_handler is None:
+            def execution_input_handler(
+                execution_origin: Origin, *, enabled: bool = allow_stdin,
+                handler: InputHandler | None = input_handler,
+                owner: str = frontend_id,
+            ) -> InputHandler | None:
+                if not enabled or handler is None:
                     return None
 
                 async def dispatch_input(input_request: InputRequest) -> InputReply:
                     if (
                         not isinstance(input_request, InputRequest)
                         or input_request.origin != execution_origin
-                        or input_request.owner_frontend_id != frontend_id
+                        or input_request.owner_frontend_id != owner
                     ):
                         raise InputUnavailableError(
                             "Interactive input request does not belong to this execution frontend",
@@ -1529,7 +1526,7 @@ class Coordinator:
                         raise InputUnavailableError("Interactive input execution is no longer active")
                     self.state = State.WAITING_FOR_INPUT
                     try:
-                        response = input_handler(input_request)
+                        response = handler(input_request)
                         if not inspect.isawaitable(response):
                             raise TypeError("Frontend input handler must be async")
                         reply = await response
@@ -1550,8 +1547,11 @@ class Coordinator:
 
                 return dispatch_input
 
-            def execution_output_handler(execution_origin: Origin, author: str):
-                if on_progress is None:
+            def execution_output_handler(
+                execution_origin: Origin, author: str,
+                *, progress: ProgressCallback | None = on_progress,
+            ):
+                if progress is None:
                     return None
 
                 async def deliver(output: ExecutionOutput) -> None:
@@ -1566,7 +1566,7 @@ class Coordinator:
                     # Frontend-only provisional preview: never add it to model
                     # context, journal, or observer history. The completed cell
                     # result remains the single authoritative output record.
-                    delivered = on_progress(event)
+                    delivered = progress(event)
                     if not inspect.isawaitable(delivered):
                         raise TypeError("Request progress callback must be async")
                     await delivered
@@ -1578,6 +1578,105 @@ class Coordinator:
             context_pending = False
             steering_awaiting_dispatch: list[_QueuedAction] = []
             steering_commit_started = False
+
+            async def run_queued_direct(item: _QueuedAction) -> None:
+                """Execute a user cell at a model boundary without ending the agent turn."""
+                action = item.action
+                queued_origin = action.origin
+                execution_origin = Origin(
+                    queued_origin.session_id, queued_origin.request_id,
+                    queued_origin.frontend_id, queued_origin.config_revision,
+                    None, uuid4().hex,
+                )
+                execution_request = ExecutionRequest(
+                    execution_origin, action.source, "user",
+                    action.language or "ipython",
+                    allow_stdin=item.allow_stdin,
+                    input_handler=execution_input_handler(
+                        execution_origin, enabled=item.allow_stdin,
+                        handler=item.input_handler, owner=queued_origin.frontend_id,
+                    ),
+                    output_handler=execution_output_handler(
+                        execution_origin, "user", progress=item.on_progress,
+                    ),
+                )
+                previous_state = self.state
+                self.state = State.EXECUTING
+                events: list[OutputEvent] = []
+                dispatched = False
+                try:
+                    events.append(await self._emit_progress(
+                        execution_origin,
+                        {"phase": "execution_start", "author": "user",
+                         "text": "Executing queued user cell."},
+                        on_progress=item.on_progress, operation_id=operation_id,
+                        expected_state=State.EXECUTING, author="user",
+                    ))
+                    dispatched = True
+                    result = await self._execute_dispatched(execution_request)
+                    if not self._operation_is_current(operation_id, State.EXECUTING):
+                        raise asyncio.CancelledError
+                    events.extend(await self._publish_output(
+                        execution_request, result, on_progress=item.on_progress,
+                        operation_id=operation_id,
+                    ))
+                    events.append(await self._emit_progress(
+                        execution_origin,
+                        {"phase": "cell_complete", "step": 1, "status": result.status,
+                         "text": f"Queued user cell completed with status {result.status}."},
+                        on_progress=item.on_progress, operation_id=operation_id,
+                        expected_state=State.EXECUTING, author="user",
+                    ))
+                    if not self._operation_is_current(operation_id, State.EXECUTING):
+                        raise asyncio.CancelledError
+                    submission = Submission(
+                        action, result=result, execution=execution_request,
+                        message="\n".join(self._visible_says(result)),
+                        say_outputs=self._visible_say_outputs(result),
+                        events=tuple(events),
+                    )
+                    self._complete_queue_item(
+                        item, QueueOutcome(queued_origin, "completed", submission=submission),
+                    )
+                    if result.status in ("uncertain", "cancelled"):
+                        self._set_state_unless_stopping(State.FAILED)
+                        raise RuntimeError("Queued cell result is uncertain; agent turn stopped without replay")
+                except asyncio.CancelledError:
+                    if dispatched:
+                        self._set_state_unless_stopping(State.FAILED)
+                    self._complete_queue_item(item, QueueOutcome(
+                        queued_origin, "interrupted",
+                        error="Queued cell interrupted; side effects may have occurred",
+                    ))
+                    raise
+                except Exception as exc:
+                    if dispatched:
+                        self._set_state_unless_stopping(State.FAILED)
+                    self._complete_queue_item(item, QueueOutcome(
+                        queued_origin, "failed",
+                        error=f"Queued cell failed; side effects may have occurred: {exc}",
+                    ))
+                    raise
+                finally:
+                    if self.state is State.EXECUTING:
+                        self.state = previous_state
+
+            async def drain_boundary_queue() -> None:
+                # Reserve leading English steering in FIFO order and execute
+                # direct cells before the next provider call. A slash command
+                # at the head remains deferred and blocks everything behind it.
+                async with self._queue_lock:
+                    boundary_count = len(self._pending_actions)
+                for _ in range(boundary_count):
+                    async with self._queue_lock:
+                        if not self._pending_actions or self._pending_actions[0].action.kind == "command":
+                            return
+                        item = self._pending_actions.popleft()
+                    if item.action.kind == "ask":
+                        steering_awaiting_dispatch.append(item)
+                    else:
+                        await run_queued_direct(item)
+
             try:
                 routed = (
                     _queued_action.action if _queued_action is not None
@@ -1639,6 +1738,12 @@ class Coordinator:
                     # explicitly selected positive limit pauses a long task.
                     steps = count(1) if self.max_agent_steps == 0 else range(1, self.max_agent_steps + 1)
                     for step in steps:
+                        if step > 1:
+                            await drain_boundary_queue()
+                            if self._active_operation_id != operation_id or self.state in (
+                                State.FAILED, State.STOPPING, State.CLOSED,
+                            ):
+                                raise asyncio.CancelledError
                         self.state = State.GENERATING
                         generation_id = uuid4().hex
                         generation_origin = Origin(
@@ -1654,11 +1759,8 @@ class Coordinator:
                             on_progress=on_progress, operation_id=operation_id,
                             expected_state=State.GENERATING,
                         ))
-                        # Freeze the next request only after taking steering queued
-                        # before context assembly. Later arrivals wait for the
-                        # following cell; no stage or validator is bypassed.
-                        if step > 1:
-                            steering_awaiting_dispatch.extend(await self._consume_queued_steering())
+                        # Leading queued steering was reserved at this safe
+                        # boundary, before context assembly and transforms.
                         reset_needed = getattr(self.context_service, "needs_reset", None)
                         reset_this_step = step > 1 and callable(reset_needed) and reset_needed()
                         if reset_this_step:

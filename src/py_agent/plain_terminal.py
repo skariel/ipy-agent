@@ -127,8 +127,9 @@ RESERVED_COMMANDS = frozenset({"help", "status", "interrupt", "quit", "exit", "h
 
 
 HELP = """Enter an English request to ask the explicitly selected provider.
-While work runs, the composer remains available: English queues as steering when
-possible; direct cells and slash commands run later in FIFO order.
+While work runs, the composer remains available: English becomes steering and
+@/!/% cells execute after the current agent cell, before its next model call.
+Slash commands remain deferred. Queue order is preserved; nothing interrupts the cell.
 @python                execute Python/IPython in the shared local namespace
 !shell                 execute an IPython shell escape in that namespace
 %magic                 execute an IPython magic
@@ -1023,7 +1024,7 @@ class PlainTerminal:
                     acknowledgement = f"Queued steering (position {ticket.position})."
                 else:
                     acknowledgement = f"Queued action (position {ticket.position})."
-                self._write(acknowledgement)
+                self._write(acknowledgement, end="\n\n")
                 self._input_number += 1
                 self.session.app.invalidate()
                 watcher = asyncio.create_task(

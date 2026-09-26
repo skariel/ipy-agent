@@ -29,7 +29,9 @@ permission broker or credential isolation. To isolate execution, users must run
 `--plugin isolated-executor --executor isolated` and a trusted wrapper config.
 `py` does not verify the wrapper's actual isolation policy.
 
-The default TTY path handles one request at a time. An English request iterates
+The default TTY path serializes execution: queued `@`/`!`/`%` cells run after a
+completed agent cell and before its next provider request, never concurrently.
+Slash commands remain queued until the active turn finishes. An English request iterates
 provider responses and generated cells until a successful `say(..., final=True)`
 or interruption; a positive `agent.max_steps` opts into a step limit (default 0,
 unlimited). Execution results become observations for later steps;

@@ -651,7 +651,7 @@ async def test_terminal_accepts_fifo_queue_input_while_active_without_interrupti
 
     assert coordinator.queued[0][1] == "please steer this task"
     assert coordinator.interruptions == 0
-    assert "Queued steering (position 1)." in output.text
+    assert "Queued steering (position 1).\n\n" in output.text
 
 
 async def test_completed_composer_prompt_racing_stdin_is_not_used_as_the_stdin_reply(monkeypatch):

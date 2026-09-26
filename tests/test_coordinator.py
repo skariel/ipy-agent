@@ -1321,23 +1321,19 @@ async def test_direct_queue_barrier_prevents_later_english_from_overtaking_fifo(
             direct.completion, later_english.completion,
         ), timeout=3)
 
-        assert direct_outcome.status == english_outcome.status == "completed"
+        assert direct_outcome.status == "completed"
+        assert english_outcome.status == "steered"
         direct_submission = direct_outcome.submission
-        english_submission = english_outcome.submission
         assert isinstance(direct_submission, Submission)
-        assert isinstance(english_submission, Submission)
         assert direct_submission.action.origin.request_id == direct.origin.request_id
         assert direct_submission.execution.origin.request_id == direct.origin.request_id
-        assert english_submission.action.origin.request_id == later_english.origin.request_id
-        assert [request.author for request in executor.requests] == [
-            "agent", "agent", "user", "agent",
-        ]
-        assert len(provider.requests) == 3
+        assert [request.author for request in executor.requests] == ["agent", "user", "agent"]
+        assert len(provider.requests) == 2
         assert all(
             "English queued behind direct" not in content
-            for _role, content in provider.requests[1].context.messages
+            for _role, content in provider.requests[0].context.messages
         )
-        assert provider.requests[2].context.messages[-1] == (
+        assert provider.requests[1].context.messages[-1] == (
             "user", "English queued behind direct",
         )
     finally:
@@ -1346,7 +1342,139 @@ async def test_direct_queue_barrier_prevents_later_english_from_overtaking_fifo(
 
 
 @pytest.mark.asyncio
-async def test_all_direct_routes_and_commands_wait_until_active_agent_finishes():
+async def test_queued_python_shell_magic_run_at_next_cell_boundary_before_model_call():
+    first_generation = asyncio.Event()
+    release_first = asyncio.Event()
+    second_generation = asyncio.Event()
+    release_second = asyncio.Event()
+    observed_before_second = []
+
+    class Provider:
+        model = "offline/cell-boundary"
+        calls = 0
+
+        async def generate(self, _request):
+            self.calls += 1
+            if self.calls == 1:
+                first_generation.set()
+                await release_first.wait()
+            elif self.calls == 2:
+                observed_before_second.extend(request.author for request in executor.requests)
+                second_generation.set()
+                await release_second.wait()
+            return ModelResponse("pass", provider_id="offline", model=self.model)
+
+    class Executor(CaptureExecutor):
+        async def execute(self, request):
+            self.requests.append(request)
+            if request.author == "agent" and sum(
+                item.author == "agent" for item in self.requests
+            ) == 2:
+                return ExecutionResult(
+                    request.origin, "success",
+                    say_outputs=(SayOutput("done", final=True),), final=True,
+                )
+            if request.author == "user" and request.source == "len(outputs)":
+                return ExecutionResult(request.origin, "success", output_events=(
+                    ExecutionOutput("execute_result", {"text/plain": "17"}),
+                ))
+            return ExecutionResult(request.origin, "success", stdout=request.source)
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(runtime, router="default", provider="fake",
+                              interpreter="basic", executor="local")
+    executor = Executor()
+    coordinator.executor, coordinator.provider = executor, Provider()
+    await coordinator.start()
+    active = asyncio.create_task(coordinator.submit("terminal", "do a long task"))
+    try:
+        await asyncio.wait_for(first_generation.wait(), timeout=3)
+        sources = ("@len(outputs)", "!echo queued", "%time pass")
+        tickets = [await coordinator.enqueue("terminal", text) for text in sources]
+        release_first.set()
+        outcomes = await asyncio.wait_for(asyncio.gather(
+            *(ticket.completion for ticket in tickets),
+        ), timeout=3)
+        await asyncio.wait_for(second_generation.wait(), timeout=3)
+        assert [outcome.status for outcome in outcomes] == ["completed"] * 3
+        assert observed_before_second == ["agent", "user", "user", "user"]
+        assert outcomes[0].submission.result.output_events[0].data["text/plain"] == "17"
+        assert any(event.kind == "execute_result" and event.data["text/plain"] == "17"
+                   for event in outcomes[0].submission.events)
+        assert [outcome.submission.result.stdout for outcome in outcomes[1:]] == [
+            "!echo queued", "%time pass",
+        ]
+        assert [outcome.submission.execution.origin.request_id for outcome in outcomes] == [
+            ticket.origin.request_id for ticket in tickets
+        ]
+        assert not active.done()
+        release_second.set()
+        await asyncio.wait_for(active, timeout=3)
+    finally:
+        release_first.set()
+        release_second.set()
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_command_blocks_later_direct_cell_at_agent_boundary():
+    first_started, release_first = asyncio.Event(), asyncio.Event()
+    second_started, release_second = asyncio.Event(), asyncio.Event()
+
+    class Provider:
+        model = "offline/command-barrier"
+        calls = 0
+
+        async def generate(self, _request):
+            self.calls += 1
+            if self.calls == 1:
+                first_started.set()
+                await release_first.wait()
+            else:
+                second_started.set()
+                await release_second.wait()
+            return ModelResponse("pass")
+
+    class Executor(CaptureExecutor):
+        async def execute(self, request):
+            self.requests.append(request)
+            if request.author == "agent" and sum(
+                item.author == "agent" for item in self.requests
+            ) == 2:
+                return ExecutionResult(request.origin, "success", final=True,
+                                       say_outputs=(SayOutput("done", final=True),))
+            return ExecutionResult(request.origin, "success")
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(runtime, router="default", provider="fake",
+                              interpreter="basic", executor="local")
+    executor = Executor()
+    coordinator.provider, coordinator.executor = Provider(), executor
+    await coordinator.start()
+    active = asyncio.create_task(coordinator.submit("terminal", "ongoing"))
+    try:
+        await asyncio.wait_for(first_started.wait(), 3)
+        command = await coordinator.enqueue("terminal", "/unknown")
+        direct = await coordinator.enqueue("terminal", "@len(outputs)")
+        release_first.set()
+        await asyncio.wait_for(second_started.wait(), 3)
+        assert [request.author for request in executor.requests] == ["agent"]
+        assert not direct.completion.done()
+        release_second.set()
+        await asyncio.wait_for(active, 3)
+        outcomes = await asyncio.wait_for(asyncio.gather(
+            command.completion, direct.completion,
+        ), 3)
+        assert [outcome.status for outcome in outcomes] == ["completed", "completed"]
+        assert [request.author for request in executor.requests] == ["agent", "agent", "user"]
+    finally:
+        release_first.set()
+        release_second.set()
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_direct_routes_and_commands_follow_an_immediate_final_cell():
     class BlockingProvider:
         model = "offline/direct-serialization"
 
