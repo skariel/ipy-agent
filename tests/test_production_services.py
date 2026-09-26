@@ -178,6 +178,36 @@ def test_context_adapter_preserves_phases_and_delegates_usage_and_reset_policy()
     assert not adapter.needs_reset()
 
 
+def test_execution_outputs_compact_at_20_then_each_10_without_touching_code_or_preflight():
+    adapter = ProductionContextAdapter(limits=Limits())
+    adapter.prepare_request("real user task", "request-1")
+    adapter.commit_response(
+        "request-1", "bad python", observation={"preflight": {"executed": False, "error": "syntax"}},
+    )
+    for number in range(1, 20):
+        adapter.commit_response("request-1", f"cell_{number}()", observation={"output": f"result {number}"})
+    before = adapter.provider_messages(adapter.snapshot())
+    assert "result 1" in str(before)
+    assert "output removed" not in str(before)
+    adapter.commit_response("request-1", "cell_20()", observation={"output": "result 20"})
+    after = adapter.provider_messages(adapter.snapshot())
+    assert sum(message["content"] == "output removed" for message in after) == 10
+    assert "result 1" not in str(after) and "result 10" not in str(after)
+    assert "result 11" in str(after) and "result 20" in str(after)
+    assert "result 1" in str(before)  # already-dispatched snapshots are immutable
+    assert "real user task" in str(after) and "cell_1()" in str(after)
+    assert "Cell not executed: syntax" in str(after)
+    for number in range(21, 30):
+        adapter.commit_response("request-1", f"cell_{number}()", observation={"output": f"result {number}"})
+    assert sum(message["content"] == "output removed"
+               for message in adapter.provider_messages(adapter.snapshot())) == 10
+    adapter.commit_response("request-1", "cell_30()", observation={"output": "result 30"})
+    final = adapter.provider_messages(adapter.snapshot())
+    assert sum(message["content"] == "output removed" for message in final) == 20
+    assert "result 20" not in str(final)
+    assert "result 21" in str(final) and "result 30" in str(final)
+
+
 def test_default_model_messages_contain_only_plain_execution_feedback():
     adapter = ProductionContextAdapter(limits=Limits())
     snapshot = adapter.prepare_request("inspect", "request-1")

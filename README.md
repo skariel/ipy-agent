@@ -59,9 +59,10 @@ request, format, and unknown local errors are not retried.
 The default frontend requires a TTY; batch/JSON mode is not implemented. While
 an agent request runs, the status bar shows activity, with completed-cell
 output and `say()` messages below. Provider text is not streamed live. The
-local executor shows one short provisional stdout/stderr preview while a cell
-runs; its final redacted result remains authoritative, and oversized output
-is still stored as `outputs[index]`. Silent code can appear idle. It accepts
+terminal displays each stdout/stderr stream once, after its cell finishes;
+it suppresses provisional executor previews to avoid duplicate output panels.
+Oversized output is stored as `outputs[index]`. Silent code can appear idle.
+It accepts
 English requests, `@` Python,
 `!` shell escapes, `%` IPython magics, and the
 built-in slash commands `/help`, `/status`, `/interrupt`, `/quit`, `/config`,
@@ -76,9 +77,9 @@ append-only SQLite history; without it persistence is explicitly disabled.
 Prompts, code and output in that journal remain sensitive. `input()` and
 `getpass()` request correlated frontend input; unavailable frontends fail clearly.
 Stdout/stderr over 8,000 characters is replaced by a short notice in the
-completed terminal result, journal and model context. An optional, frontend-only
-provisional preview of at most 512 characters may have appeared before the cell
-finished; it is never added to the model context or journal. The worker retains
+completed terminal result, journal and model context. Other frontends may
+consume a provisional executor preview of up to 512 characters; it never enters
+the model context or journal. The worker retains
 up to 1 Mi characters in a
 persistent `outputs[index]` string; inspect it with a smaller slice, e.g.
 `@print(outputs[1][:4000])`. Stream order is stdout then stderr when both exist;
@@ -86,7 +87,10 @@ extra text beyond the storage cap is discarded. Other model-facing execution
 observations exceeding 8,000 characters are omitted with a smaller-slice
 instruction. Model-facing execution feedback is plain text, without internal
 session/request/execution IDs; it remains a separately labeled, untrusted
-message so command output cannot masquerade as the user's request. User
+message so command output cannot masquerade as the user's request. Once 20
+execution results remain in the model context, the oldest 10 become `output
+removed`; the latest 10 stay intact. This repeats every 10 new results and
+does not change user requests, executed source, or the optional journal. User
 messages are not clipped. Model responses over 8,000 characters are
 rejected without execution and the model is asked for a smaller cell. Generated
 cells cannot publish more than 8,000 characters of `say()` content; direct user

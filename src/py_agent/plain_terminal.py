@@ -175,8 +175,6 @@ class PlainTerminal:
         self._input_number = 1
         self._cell_number = 0
         self._execution_numbers: dict[str, int] = {}
-        self._live_previews: dict[tuple[str, str], str] = {}
-        self._previewed_streams: set[tuple[str, str]] = set()
         self._stream_name: str | None = None
         self._stream_fragments: list[str] = []
         self._prompt_lock = _prompt_lock_for(coordinator)
@@ -329,7 +327,7 @@ class PlainTerminal:
         self._stream_name = None
         self._stream_fragments.clear()
 
-    def _render_stream(self, name: str, text: str, *, label: str = "") -> None:
+    def _render_stream(self, name: str, text: str) -> None:
         if not text:
             return
         role = "stderr" if name == "stderr" else "stdout"
@@ -337,36 +335,10 @@ class PlainTerminal:
             self._finish_stream()
             self._panel_blank(role)
             self._panel_line(FormattedText([
-                ("class:stream-prompt", f"{role} [{self._cell_number or '?'}]{label}:")
+                ("class:stream-prompt", f"{role} [{self._cell_number or '?'}]:")
             ]), role)
             self._stream_name = role
         self._stream_fragments.append(sanitize(text))
-
-    def _display_stream(
-        self, name: str, text: str, execution_id: str | None, *, provisional: bool = False,
-    ) -> None:
-        key = (execution_id, name) if execution_id is not None else None
-        if provisional:
-            if key is not None:
-                self._live_previews[key] = text
-                self._previewed_streams.add(key)
-            self._render_stream(name, text, label=" (live preview)")
-            self._finish_stream()  # Make the small preview visible before the cell ends.
-            return
-        if key is not None and key in self._live_previews:
-            remaining = self._live_previews.pop(key)
-            if remaining.startswith(text):
-                remaining = remaining[len(text):]
-                if remaining:
-                    self._live_previews[key] = remaining
-                return
-            if text.startswith(remaining):
-                text = text[len(remaining):]
-            # A final output-reference notice intentionally differs from the
-            # provisional preview; it must still be displayed.
-        self._render_stream(
-            name, text, label=" (continued)" if key in self._previewed_streams else "",
-        )
 
     def _render_say(self, text: str) -> None:
         self._finish_stream()
@@ -428,13 +400,6 @@ class PlainTerminal:
                 return
             if phase == "cell_complete":
                 self._finish_stream()
-                if execution_id is not None:
-                    for key in tuple(self._live_previews):
-                        if key[0] == execution_id:
-                            self._live_previews.pop(key)
-                    self._previewed_streams = {
-                        key for key in self._previewed_streams if key[0] != execution_id
-                    }
                 status = data.get("status")
                 if status not in ("success", "error"):
                     self._write(f"Cell {sanitize(status)}.")
@@ -448,11 +413,11 @@ class PlainTerminal:
             if name not in ("stdout", "stderr"):
                 name = "stdout"
             text = data.get("text", "") if hasattr(data, "get") else ""
-            if isinstance(text, str) and text:
-                self._display_stream(
-                    name, text, execution_id,
-                    provisional=bool(getattr(metadata, "get", lambda _key: None)("provisional")),
-                )
+            # A preview cannot be replaced on an ordinary scrolling terminal.
+            # Render only the completed, authoritative stream once.
+            if (isinstance(text, str) and text
+                    and not getattr(metadata, "get", lambda _key: None)("provisional")):
+                self._render_stream(name, text)
         elif kind in ("display", "execute_result", "update"):
             bundle = data if hasattr(data, "get") else {}
             fallback = bundle.get("text/plain")
@@ -549,7 +514,7 @@ class PlainTerminal:
             def flush_stream() -> None:
                 nonlocal pending_stream, pending_text
                 if pending_stream is not None and pending_text:
-                    self._display_stream(pending_stream, "".join(pending_text), execution_id)
+                    self._render_stream(pending_stream, "".join(pending_text))
                 pending_stream, pending_text = None, []
 
             for event in ordered_events:
@@ -634,7 +599,7 @@ class PlainTerminal:
                 if not live_output:
                     for name, content in (("stdout", result.stdout), ("stderr", result.stderr)):
                         if content:
-                            self._display_stream(name, content, execution_id)
+                            self._render_stream(name, content)
                 if ordered_events:
                     show_ordered_events(ordered_events)
             self._finish_stream()

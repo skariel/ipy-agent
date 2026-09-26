@@ -136,7 +136,7 @@ def test_main_branch_prompt_toolbar_and_markdown_panels_without_trusting_escapes
     assert "stdout [?]:" in "".join(rendered)
 
 
-def test_early_stream_preview_is_not_printed_twice_on_completed_cell():
+def test_provisional_stream_is_hidden_and_completed_output_appears_once():
     origin = Origin("session", "request", "terminal", 0, execution_id="exec-1")
     output = Output()
     terminal = PlainTerminal(CoordinatorStub(), output=output)
@@ -144,15 +144,16 @@ def test_early_stream_preview_is_not_printed_twice_on_completed_cell():
         origin, 1, "stream", {"name": "stdout", "text": "early line\n"},
         metadata={"provisional": True},
     ))
-    assert "early line" in output.text
+    assert output.text == ""
     terminal._show_live_event(OutputEvent(
         origin, 2, "stream", {"name": "stdout", "text": "early line\nlater line\n"},
     ))
     terminal._show_live_event(OutputEvent(origin, 3, "progress", {"phase": "cell_complete", "status": "success"}))
     assert output.text.count("early line") == 1
     assert output.text.count("later line") == 1
-    assert "stdout [?] (live preview):" in output.text
-    assert "stdout [?] (continued):" in output.text
+    assert output.text.count("stdout [?]:") == 1
+    assert "live preview" not in output.text
+    assert "continued" not in output.text
 
 
 def test_sanitize_removes_terminal_control_and_spoofing_characters():

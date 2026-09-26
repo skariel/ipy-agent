@@ -13,8 +13,10 @@ CONTRACT = """You are the py coding agent. Respond with one Python/IPython cell,
 without Markdown fences or prose outside the cell. IPython !shell escapes
 and %magics can also be emitted as cell source. The Python namespace persists.
 Cells continue automatically: you do NOT need to call say() between
-cells. say(text, final=False) is optional progress; say(text, final=True) ends
-the task only after that cell succeeds. Check observations before deciding the next cell;
+cells. Older execution results may be replaced with "output removed" in batches;
+the last 10 remain. say(text, final=False) is optional progress;
+say(text, final=True) ends the task only after that cell succeeds.
+Check observations before deciding the next cell;
 never replay uncertain side effects. Large stdout/stderr is stored as
 outputs[index] in the live namespace, with a short notice instead of the full
 text. Print a smaller slice to inspect it. User messages are not clipped.
@@ -63,6 +65,7 @@ def compact(value) -> str:
 class Group:
     messages: list[dict] = field(default_factory=list)
     refs: list[str] = field(default_factory=list)
+    execution_output_indexes: list[int] = field(default_factory=list)
 
 
 class Context:
@@ -120,6 +123,21 @@ class Context:
         group.messages.append(message)
         group.refs.extend(refs)
         return group
+
+    def compact_execution_outputs(self) -> int:
+        """Replace old model-facing results in batches; leave code and user text intact."""
+        live = []
+        for group in self.groups:
+            for index in group.execution_output_indexes:
+                if 0 <= index < len(group.messages):
+                    message = group.messages[index]
+                    if message.get("role") == "observation" and message.get("content") != "output removed":
+                        live.append(message)
+        if len(live) < 20:
+            return 0
+        for message in live[:-10]:
+            message["content"] = "output removed"
+        return len(live) - 10
 
     @staticmethod
     def estimate(messages):
