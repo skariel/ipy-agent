@@ -3,9 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PY_AGENT_BIN="${PY_AGENT_BIN:-${UV_TOOL_BIN_DIR:-$HOME/.local/bin}/py}"
-WORKSPACE="${WORKSPACE:-$ROOT}"
-MODEL="${MODEL:-openai-codex/gpt-5.6-sol}"
-NETWORK="${NETWORK:-proxy}"
 
 if [[ ! -x "$PY_AGENT_BIN" ]]; then
     echo "error: py-agent is not installed at $PY_AGENT_BIN" >&2
@@ -13,8 +10,46 @@ if [[ ! -x "$PY_AGENT_BIN" ]]; then
     exit 1
 fi
 
-exec "$PY_AGENT_BIN" \
-    --workspace "$WORKSPACE" \
-    --model "$MODEL" \
-    --network "$NETWORK" \
-    "$@"
+# Kernel management has its own parser and requires an explicit provider or
+# selected configuration when starting; do not prepend terminal options.
+case "${1:-}" in
+    kernel|kernels|attach) exec "$PY_AGENT_BIN" "$@" ;;
+esac
+
+# An explicitly requested legacy session retains its own model/workspace flags;
+# do not smuggle the new provider default into that CLI.
+for argument in "$@"; do
+    if [[ "$argument" == --legacy ]]; then
+        exec "$PY_AGENT_BIN" "$@"
+    fi
+done
+
+arguments=()
+has_provider=false
+has_model=false
+has_config=false
+for argument in "$@"; do
+    case "$argument" in
+        --provider|--provider=*) has_provider=true ;;
+        --model|--model=*) has_model=true ;;
+        --config|--config=*) has_config=true ;;
+    esac
+done
+
+# No implicit paid provider request. Override through CLI flags or the explicit
+# PROVIDER and MODEL environment variables; the CLI validates combinations.
+if [[ "$has_provider" == false ]]; then
+    if [[ -n "${PROVIDER:-}" ]]; then
+        arguments+=(--provider "$PROVIDER")
+    elif [[ "$has_config" == false ]]; then
+        arguments+=(--provider fake)
+    fi
+fi
+if [[ "$has_model" == false && -n "${MODEL:-}" ]]; then
+    arguments+=(--model "$MODEL")
+fi
+
+if [[ -n "${WORKSPACE:-}" ]]; then
+    cd -- "$WORKSPACE"
+fi
+exec "$PY_AGENT_BIN" "${arguments[@]}" "$@"

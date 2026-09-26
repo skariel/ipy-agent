@@ -2,7 +2,8 @@
   "network": {
     "allowedDomains": [
       "pypi.org",
-      "files.pythonhosted.org"
+      "files.pythonhosted.org",
+      "chatgpt.com"
     ]
   }
 }

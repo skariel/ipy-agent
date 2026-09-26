@@ -28,7 +28,8 @@ from .plugins import Contributions, PluginManifest, Service, hookimpl
 # approval claims that are false for the default local executor.
 _PRODUCTION_CONTRACT = """You are the py coding agent. Respond with Python code only. Emit one complete
 Python/IPython cell per response; it executes in a persistent local namespace
-shared with direct terminal cells. Python, shell escapes and subprocesses run
+shared with direct terminal cells. Do not wrap the cell in Markdown code fences
+or add prose outside the cell. Python, shell escapes and subprocesses run
 with the current user's permissions. There is no mandatory sandbox, permission
 broker, credential isolation or filesystem approval service. A separate worker
 process is not a security boundary. Do not claim that code is sandboxed or
@@ -194,7 +195,7 @@ class ProductionContextAdapter:
         observation: Mapping[str, object] | None = None,
         phase: str | None = None,
     ) -> None:
-        """Append only the source actually dispatched and its packed evidence."""
+        """Append generated source and evidence (execution or rejected syntax check)."""
         if not isinstance(request_id, str) or not request_id or not isinstance(assistant_text, str):
             raise TypeError("A context response requires a request identity and text")
         if phase not in (None, "commentary", "final_answer"):

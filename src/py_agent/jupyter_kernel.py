@@ -21,7 +21,7 @@ from typing import Any
 from .contracts import (
     CompletenessResult, CompletionResult, ExecutorCapabilityError,
     InputReply, InputRequest, InputUnavailableError,
-    InspectionResult, MAX_INPUT_VALUE_CHARS, OutputEvent,
+    InspectionResult, MAX_INPUT_VALUE_CHARS, OutputEvent, ProgressCallback,
 )
 
 try:
@@ -274,6 +274,7 @@ class _CoordinatorKernelMethods:
         *,
         allow_stdin: bool,
         input_handler,
+        on_progress: ProgressCallback | None = None,
     ) -> object:
         submit = self.coordinator.submit
         kwargs = {}
@@ -281,6 +282,8 @@ class _CoordinatorKernelMethods:
             kwargs["allow_stdin"] = allow_stdin
         if self._supports_keyword(submit, "input_handler"):
             kwargs["input_handler"] = input_handler if allow_stdin else None
+        if on_progress is not None and self._supports_keyword(submit, "on_progress"):
+            kwargs["on_progress"] = on_progress
         return await submit(frontend_id, code, **kwargs)
 
     async def _stdin_exchange(
@@ -434,6 +437,55 @@ class _CoordinatorKernelMethods:
         except asyncio.TimeoutError:
             raise InputUnavailableError("Jupyter stdin reply timed out") from None
 
+    @staticmethod
+    def _event_key(event: object) -> tuple[str | None, int | None]:
+        origin = getattr(event, "origin", None)
+        return (
+            getattr(origin, "request_id", None),
+            getattr(event, "sequence", None),
+        )
+
+    @staticmethod
+    def _message_not_already_delivered(
+        message: str,
+        delivered_events: tuple[object, ...],
+        status_events: tuple[object, ...] = (),
+    ) -> str:
+        say_texts = []
+        step_limit_texts = []
+        for event in delivered_events:
+            data = getattr(event, "data", {})
+            metadata = getattr(event, "metadata", {})
+            if (getattr(event, "kind", None) in ("display", "execute_result", "update")
+                    and getattr(metadata, "get", lambda _key: None)("py_agent_source") == "say"):
+                value = data.get("text/plain") if isinstance(data, Mapping) else None
+                if isinstance(value, str):
+                    say_texts.append(value)
+            if (getattr(event, "kind", None) == "progress"
+                    and isinstance(data, Mapping) and data.get("phase") == "step_limit"):
+                value = data.get("text")
+                if isinstance(value, str):
+                    step_limit_texts.append(value)
+        for event in status_events:
+            data = getattr(event, "data", {})
+            if (getattr(event, "kind", None) == "progress"
+                    and isinstance(data, Mapping) and data.get("phase") == "step_limit"):
+                value = data.get("text")
+                if isinstance(value, str):
+                    step_limit_texts.append(value)
+        if say_texts:
+            prefix = "\n".join(say_texts)
+            if message == prefix:
+                message = ""
+            elif message.startswith(prefix + "\n"):
+                message = message[len(prefix) + 1:]
+        for text in step_limit_texts:
+            if message == text:
+                message = ""
+            elif message.endswith("\n" + text):
+                message = message[:-(len(text) + 1)]
+        return message
+
     async def do_execute(
         self,
         code: str,
@@ -489,6 +541,19 @@ class _CoordinatorKernelMethods:
 
             self._active_execution = True
             self._interrupt_requested = False
+            delivered_progress_events: list[OutputEvent] = []
+            event_error_published = False
+
+            async def on_progress(event: OutputEvent) -> None:
+                nonlocal event_error_published
+                self.publish_output_event(
+                    event, parent=parent, silent=silent,
+                    execution_count=self.execution_count,
+                )
+                delivered_progress_events.append(event)
+                if event.kind == "error":
+                    event_error_published = True
+
             try:
                 if code.strip():
                     # Route exactly as the terminal does: ordinary text asks
@@ -504,6 +569,7 @@ class _CoordinatorKernelMethods:
                     submission = await self._submit_with_input(
                         self._frontend_id(parent), code,
                         allow_stdin=allow_stdin, input_handler=input_handler,
+                        on_progress=on_progress,
                     )
                 else:
                     submission = None
@@ -541,9 +607,17 @@ class _CoordinatorKernelMethods:
             message = getattr(submission, "message", "") if submission is not None else ""
             raw_events = getattr(submission, "events", ()) if submission is not None else ()
             events = tuple(raw_events) if isinstance(raw_events, (tuple, list)) else ()
-            has_event_flow = bool(events)
-            event_error_published = False
+            if isinstance(message, str):
+                message = self._message_not_already_delivered(
+                    message, tuple(delivered_progress_events), status_events=events,
+                )
+            has_event_flow = bool(events or delivered_progress_events)
+            delivered_keys = {
+                self._event_key(event) for event in delivered_progress_events
+            }
             for event in events:
+                if self._event_key(event) in delivered_keys:
+                    continue
                 metadata = getattr(event, "metadata", {})
                 if getattr(metadata, "get", lambda _key: None)("py_agent_source") == "say":
                     continue  # say() retains its existing text-message presentation.
@@ -768,8 +842,9 @@ class _CoordinatorKernelMethods:
                              silent=silent, parent=parent)
         elif event.kind in ("display", "execute_result", "update"):
             if metadata.get("py_agent_source") == "say":
+                text = str(data.get("text/plain", ""))
                 self._send_iopub("stream", {
-                    "name": "stdout", "text": data.get("text/plain", ""),
+                    "name": "stdout", "text": text + ("" if text.endswith("\n") else "\n"),
                 }, silent=silent, parent=parent)
                 return
             message_type = {
@@ -795,7 +870,8 @@ class _CoordinatorKernelMethods:
                                                       default_name=data.get("ename", "AgentExecutionError")),
                              silent=silent, parent=parent)
         elif event.kind == "progress":
-            self._send_iopub("stream", {"name": "stdout", "text": data.get("text", "")},
+            text = str(data.get("text", ""))
+            self._send_iopub("stream", {"name": "stdout", "text": text + ("" if text.endswith("\n") else "\n")},
                              silent=silent, parent=parent)
 
     def do_interrupt(self) -> dict[str, str]:

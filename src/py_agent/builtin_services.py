@@ -1,6 +1,10 @@
 """Minimal built-in services used to exercise the public plugin boundary."""
 from __future__ import annotations
 
+import ast
+import re
+import tokenize
+
 from .contracts import AgentDecision, ModelRequest, ModelResponse, RoutedAction, UserAction
 from .local_executor import LocalExecutor
 from .plugins import Contributions, PluginManifest, Service, hookimpl
@@ -52,7 +56,32 @@ class FakeProvider:
         return ModelResponse(text=f"say({text!r}, final=True)")
 
 
+_SINGLE_CODE_FENCE = re.compile(
+    r"\A[ \t]*```(?:python|py|ipython)?[ \t]*\r?\n"
+    r"(?P<source>.*?)\r?\n```[ \t]*\Z",
+    re.DOTALL | re.IGNORECASE,
+)
+_FENCE_LINE = re.compile(r"(?m)^[ \t]*```")
+
+
 class BasicInterpreter:
+    def check_syntax(self, source: str) -> str | None:
+        """Compile the IPython-transformed cell without running it.
+
+        This is only a syntax check: magics, imports, functions, names and
+        filesystem effects can still fail when the cell actually runs.
+        """
+        from IPython.core.inputtransformer2 import TransformerManager
+
+        try:
+            transformed = TransformerManager().transform_cell(source)
+            compile(transformed, "<agent-cell>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        except SyntaxError as exc:
+            return f"{type(exc).__name__}: {exc.msg} (line {exc.lineno or 1})"
+        except tokenize.TokenError as exc:
+            return f"TokenError: {str(exc)[:300]}"
+        return None
+
     def interpret(self, response: ModelResponse) -> AgentDecision:
         if not isinstance(response, ModelResponse):
             return AgentDecision("reject", reason="Invalid provider response")
@@ -60,7 +89,17 @@ class BasicInterpreter:
             return AgentDecision("reject", reason=response.rejection_reason or "Incomplete provider response")
         if not isinstance(response.text, str) or not response.text.strip():
             return AgentDecision("reject", reason="Empty provider response")
-        return AgentDecision("execute", source=response.text)
+        source = response.text.strip()
+        fenced = _SINGLE_CODE_FENCE.fullmatch(source)
+        if fenced is not None:
+            source = fenced.group("source")
+        elif _FENCE_LINE.search(source):
+            return AgentDecision(
+                "reject", reason="Provider returned mixed or malformed Markdown; no cell was executed",
+            )
+        if not source.strip():
+            return AgentDecision("reject", reason="Provider returned an empty code cell")
+        return AgentDecision("execute", source=source)
 
 
 class BuiltinPlugin:

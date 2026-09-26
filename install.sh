@@ -3,22 +3,16 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ "$(uname -s)" != "Linux" ]]; then
-    echo "error: py-agent currently requires Linux" >&2
+if ! command -v uv >/dev/null 2>&1; then
+    echo "error: uv is required to install py-agent" >&2
     exit 1
 fi
 
-missing=()
-for command in uv srt bwrap socat rg; do
-    command -v "$command" >/dev/null 2>&1 || missing+=("$command")
-done
-if ((${#missing[@]})); then
-    echo "error: missing required commands: ${missing[*]}" >&2
-    echo "Install uv, srt, bubblewrap, socat, and ripgrep, then retry." >&2
-    exit 1
-fi
-
+# Install a private, non-editable copy. The default local executor does not
+# require srt, bubblewrap, socat, or any other isolation runtime.
 echo "Installing py-agent from $ROOT"
 uv tool install --force --reinstall --link-mode copy "$ROOT"
 echo
-echo "Installed. Start it with: $ROOT/run.sh"
+echo "Installed. Start the deterministic fake provider with: $ROOT/run.sh"
+echo "For a real model: PROVIDER=codex MODEL=openai-codex/MODEL $ROOT/run.sh"
+echo "Execution is unrestricted by default; use your own isolation wrapper if needed."

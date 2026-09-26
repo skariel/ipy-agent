@@ -30,6 +30,64 @@ class UserAction:
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
+MAX_QUEUED_ACTION_CHARS = 65_536
+MAX_FRONTEND_ID_CHARS = 128
+
+
+class QueueFullError(RuntimeError):
+    """The coordinator's bounded pending-action queue has no free slots."""
+
+
+@dataclass(frozen=True)
+class QueueOutcome:
+    """Terminal result for one accepted queued action.
+
+    ``submission`` is a coordinator Submission for independently dispatched
+    work. A ``steered`` outcome has no submission: its text was committed as
+    user context in the active agent turn.
+    """
+
+    origin: Origin
+    status: Literal["steered", "completed", "failed", "interrupted", "closed"]
+    submission: Submission | None = field(default=None, repr=False, compare=False)
+    error: str | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.origin, Origin):
+            raise TypeError("QueueOutcome origin must be an Origin")
+        if self.status not in {"steered", "completed", "failed", "interrupted", "closed"}:
+            raise ValueError("QueueOutcome status is unsupported")
+        if self.error is not None and not isinstance(self.error, str):
+            raise TypeError("QueueOutcome error must be text or None")
+        if self.status == "completed":
+            if not isinstance(self.submission, Submission):
+                raise TypeError("Completed QueueOutcome requires a Submission")
+            if self.submission.action.origin != self.origin:
+                raise ValueError("QueueOutcome submission origin must match its request")
+        elif self.submission is not None:
+            raise ValueError("Only completed QueueOutcome records may carry a Submission")
+
+
+@dataclass(frozen=True)
+class QueueTicket:
+    """Stable identity and completion handle returned by ``Coordinator.enqueue``."""
+
+    origin: Origin
+    kind: Literal["ask", "execute", "command"]
+    position: int
+    completion: Awaitable[QueueOutcome] = field(repr=False, compare=False)
+
+    def __post_init__(self):
+        if not isinstance(self.origin, Origin):
+            raise TypeError("QueueTicket origin must be an Origin")
+        if self.kind not in {"ask", "execute", "command"}:
+            raise ValueError("QueueTicket kind is unsupported")
+        if type(self.position) is not int or self.position < 1:
+            raise ValueError("QueueTicket position must be positive")
+        if not hasattr(self.completion, "__await__"):
+            raise TypeError("QueueTicket completion must be awaitable")
+
+
 @dataclass(frozen=True)
 class RoutedAction:
     origin: Origin
@@ -257,6 +315,13 @@ class OutputEvent:
         object.__setattr__(self, "metadata", _freeze_json_mapping(self.metadata, "OutputEvent metadata"))
 
 
+# Async request-local sink for immutable progress and output events. The
+# coordinator awaits each callback before advancing, providing bounded
+# backpressure. Events describe stage boundaries and completed-cell output only;
+# they do not expose model reasoning or claim to stream generated text.
+ProgressCallback = Callable[[OutputEvent], Awaitable[None]]
+
+
 @dataclass(frozen=True)
 class ContextSnapshot:
     epoch: int
@@ -351,6 +416,26 @@ class ModelResponse:
     def __post_init__(self):
         object.__setattr__(self, "usage", MappingProxyType(deepcopy(dict(self.usage))))
         object.__setattr__(self, "adapter_metadata", MappingProxyType(deepcopy(dict(self.adapter_metadata))))
+
+
+@dataclass(frozen=True)
+class Submission:
+    """Frontend-neutral result of one coordinator submission."""
+
+    action: RoutedAction
+    result: ExecutionResult | None = None
+    message: str = ""
+    execution: ExecutionRequest | None = None
+    response: ModelResponse | None = None
+    say_outputs: tuple[SayOutput, ...] = ()
+    executions: tuple[tuple[ExecutionRequest, ExecutionResult], ...] = ()
+    events: tuple[OutputEvent, ...] = ()
+
+    def __post_init__(self):
+        events = tuple(self.events)
+        if any(not isinstance(event, OutputEvent) for event in events):
+            raise TypeError("Submission events must contain OutputEvent records")
+        object.__setattr__(self, "events", events)
 
 
 @dataclass(frozen=True)

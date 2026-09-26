@@ -5,12 +5,18 @@ build-backend = "hatchling.build"
 [project]
 name = "py-agent"
 version = "0.1.0"
-description = "Persistent sandboxed IPython agent with agent-owned memory"
+description = "Plugin-driven coding agent with a persistent local IPython workspace"
 requires-python = ">=3.12,<3.15"
-dependencies = ["ipython==9.10.0", "prompt-toolkit==3.0.52", "litelm[anthropic]==0.5.2", "httpx==0.28.1"]
+dependencies = ["ipython==9.10.0", "prompt-toolkit==3.0.52", "litelm[anthropic]==0.5.2", "httpx==0.28.1", "pluggy==1.6.0"]
+
+[project.optional-dependencies]
+jupyter = ["ipykernel>=6.29,<8", "jupyter-client>=8,<9"]
 
 [project.scripts]
 py = "py_agent.cli:main"
+
+[project.entry-points."ipy_agent.plugins"]
+isolated-executor = "py_agent.isolated_executor:plugin"
 
 [dependency-groups]
 dev = [
@@ -135,7 +141,7 @@ preview = true
 quote-style = "double"
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/scripts", "/README.md", "/PLAN.md", "/IPYTHON_AGENT_PLAN.md", "/pyproject.toml", "/uv.lock"]
+include = ["/src", "/tests", "/scripts", "/examples", "/README.md", "/ARCHITECTURE_PLAN.md", "/ARCHITECTURE_STATUS.md", "/PLUGIN_API.md", "/pyproject.toml", "/uv.lock"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/py_agent"]

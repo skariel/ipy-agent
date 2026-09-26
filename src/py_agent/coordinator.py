@@ -7,6 +7,7 @@ import json
 import math
 import re
 import shlex
+from collections import deque
 from dataclasses import dataclass, replace
 from enum import Enum
 from types import MappingProxyType
@@ -29,10 +30,17 @@ from .contracts import (
     InspectionResult,
     ModelRequest,
     ModelResponse,
+    MAX_FRONTEND_ID_CHARS,
+    MAX_QUEUED_ACTION_CHARS,
     Origin,
     OutputEvent,
+    ProgressCallback,
+    QueueFullError,
+    QueueOutcome,
+    QueueTicket,
     RoutedAction,
     SayOutput,
+    Submission,
     UserAction,
 )
 from .plugins import PluginError, PluginRuntime
@@ -48,6 +56,7 @@ from .session_journal import (
 )
 
 
+MAX_PENDING_ACTIONS = 32
 HISTORY_DEFAULT_LIMIT = 10
 HISTORY_MAX_ITEMS = 20
 HISTORY_MAX_PAGE_CHARS = 4_000
@@ -124,22 +133,15 @@ class State(str, Enum):
     CLOSED = "closed"
 
 
-@dataclass(frozen=True)
-class Submission:
+@dataclass
+class _QueuedAction:
     action: RoutedAction
-    result: ExecutionResult | None = None
-    message: str = ""
-    execution: ExecutionRequest | None = None
-    response: ModelResponse | None = None
-    say_outputs: tuple[SayOutput, ...] = ()
-    executions: tuple[tuple[ExecutionRequest, ExecutionResult], ...] = ()
-    events: tuple[OutputEvent, ...] = ()
-
-    def __post_init__(self):
-        events = tuple(self.events)
-        if any(not isinstance(event, OutputEvent) for event in events):
-            raise TypeError("Submission events must contain OutputEvent records")
-        object.__setattr__(self, "events", events)
+    text: str
+    config: ConfigSnapshot | None
+    allow_stdin: bool
+    input_handler: InputHandler | None
+    on_progress: ProgressCallback | None
+    completion: asyncio.Future[QueueOutcome]
 
 
 class Coordinator:
@@ -225,6 +227,8 @@ class Coordinator:
         # snapshot; none of these changes replaces selected long-lived services.
         self._context: list[tuple[str, str]] = []
         self._context_epoch = 0
+        self._context_overlay: list[tuple[int, str]] = []
+        self._context_overlay_epoch: int | None = None
         self._restart_config = creation_config
         self._epoch_config = self._restart_config
         self._epoch_config_epoch = self._read_context_epoch()
@@ -269,6 +273,9 @@ class Coordinator:
         self.state = State.NEW
 
         self._lock = asyncio.Lock()
+        self._queue_lock = asyncio.Lock()
+        self._pending_actions: deque[_QueuedAction] = deque()
+        self._queue_worker: asyncio.Task | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._close_task: asyncio.Task | None = None
         self._executor_close_attempted = False
@@ -445,9 +452,14 @@ class Coordinator:
             # The initial epoch could not be inspected; treat the first observed
             # value as a baseline rather than an unverified epoch transition.
             self._epoch_config_epoch = epoch
+            if self._context_overlay_epoch is not None and self._context_overlay_epoch != epoch:
+                self._context_overlay.clear()
+                self._context_overlay_epoch = epoch
         elif epoch > self._epoch_config_epoch:
             self._epoch_config = self._current_config() if config is None else config
             self._epoch_config_epoch = epoch
+            self._context_overlay.clear()
+            self._context_overlay_epoch = epoch
 
     def _plugin_config(
         self,
@@ -605,7 +617,8 @@ class Coordinator:
         """Complete direct input in the selected executor's persistent namespace."""
         self._check_query_cursor(code, cursor_pos)
         async with self._lock:
-            if self.state is not State.IDLE:
+            if (self.state is not State.IDLE or self._queue_worker is not None
+                    or self._pending_actions):
                 raise RuntimeError("Session busy or unavailable")
             task = asyncio.current_task()
             self._active_task = task
@@ -637,7 +650,8 @@ class Coordinator:
         if type(detail_level) is not int or detail_level not in (0, 1):
             raise ValueError("Inspection detail level must be 0 or 1")
         async with self._lock:
-            if self.state is not State.IDLE:
+            if (self.state is not State.IDLE or self._queue_worker is not None
+                    or self._pending_actions):
                 raise RuntimeError("Session busy or unavailable")
             task = asyncio.current_task()
             self._active_task = task
@@ -688,7 +702,8 @@ class Coordinator:
         if not isinstance(code, str):
             return CompletenessResult("invalid")
         async with self._lock:
-            if self.state is not State.IDLE:
+            if (self.state is not State.IDLE or self._queue_worker is not None
+                    or self._pending_actions):
                 raise RuntimeError("Session busy or unavailable")
             task = asyncio.current_task()
             self._active_task = task
@@ -718,63 +733,133 @@ class Coordinator:
     def _visible_says(cls, result: ExecutionResult) -> tuple[str, ...]:
         return tuple(cls._say_text(output.content) for output in cls._visible_say_outputs(result))
 
-    async def _publish_output(self, request: ExecutionRequest, result: ExecutionResult) -> tuple[OutputEvent, ...]:
+    def _new_output_event(
+        self,
+        origin: Origin,
+        kind: str,
+        data: dict[str, object],
+        *,
+        display_id: str | None = None,
+        metadata: dict[str, object] | None = None,
+        author: str | None = None,
+    ) -> OutputEvent:
+        self._event_sequence += 1
+        return OutputEvent(
+            origin, self._event_sequence, kind, data, display_id, metadata or {}, author,
+        )
+
+    async def _dispatch_output_event(
+        self,
+        event: OutputEvent,
+        *,
+        on_progress: ProgressCallback | None,
+        operation_id: str,
+        expected_state: State,
+    ) -> None:
+        """Deliver one event serially and reject delivery after request invalidation."""
+        if not self._operation_is_current(operation_id, expected_state):
+            raise asyncio.CancelledError
+        for registration in self._observer_registrations:
+            observer = self.output_observers[registration.qualified_name]
+            try:
+                delivered = observer.observe(event)
+                if not inspect.isawaitable(delivered):
+                    raise TypeError(f"Observer {registration.qualified_name} must be async")
+                await delivered
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if registration.critical:
+                    raise
+                self.best_effort_observer_failures += 1
+            if not self._operation_is_current(operation_id, expected_state):
+                raise asyncio.CancelledError
+        if on_progress is not None:
+            delivered = on_progress(event)
+            if not inspect.isawaitable(delivered):
+                raise TypeError("Request progress callback must be async")
+            await delivered
+            if not self._operation_is_current(operation_id, expected_state):
+                raise asyncio.CancelledError
+
+    async def _emit_progress(
+        self,
+        origin: Origin,
+        data: dict[str, object],
+        *,
+        on_progress: ProgressCallback | None,
+        operation_id: str,
+        expected_state: State,
+        author: str = "agent",
+    ) -> OutputEvent:
+        event = self._new_output_event(
+            origin, "progress", data, author=author,
+        )
+        await self._dispatch_output_event(
+            event, on_progress=on_progress, operation_id=operation_id,
+            expected_state=expected_state,
+        )
+        return event
+
+    async def _publish_output(
+        self,
+        request: ExecutionRequest,
+        result: ExecutionResult,
+        *,
+        on_progress: ProgressCallback | None,
+        operation_id: str,
+    ) -> tuple[OutputEvent, ...]:
         origin = request.origin
         events: list[OutputEvent] = []
 
-        def append(kind: str, data: dict[str, object], *, display_id: str | None = None,
-                   metadata: dict[str, object] | None = None) -> None:
-            self._event_sequence += 1
-            events.append(OutputEvent(
-                origin, self._event_sequence, kind, data, display_id,
-                metadata or {}, request.author,
-            ))
+        async def append(
+            kind: str,
+            data: dict[str, object],
+            *,
+            display_id: str | None = None,
+            metadata: dict[str, object] | None = None,
+        ) -> None:
+            event = self._new_output_event(
+                origin, kind, data, display_id=display_id, metadata=metadata,
+                author=request.author,
+            )
+            events.append(event)
+            await self._dispatch_output_event(
+                event, on_progress=on_progress, operation_id=operation_id,
+                expected_state=State.EXECUTING,
+            )
 
-        if result.output_events:
-            for output in result.output_events:
-                if output.kind == "stream":
-                    data = dict(output.data)
-                    data["author"] = request.author
-                    append("stream", data)
-                else:
-                    append(
-                        output.kind, dict(output.data), display_id=output.display_id,
-                        metadata=dict(output.metadata),
-                    )
-        else:
-            for stream, text in (("stdout", result.stdout), ("stderr", result.stderr)):
-                if text:
-                    append("stream", {"name": stream, "text": text, "author": request.author})
+        delivered_streams = set()
+        for output in result.output_events:
+            if output.kind == "stream":
+                data = dict(output.data)
+                data["author"] = request.author
+                delivered_streams.add(data.get("name"))
+                await append("stream", data)
+            else:
+                await append(
+                    output.kind, dict(output.data), display_id=output.display_id,
+                    metadata=dict(output.metadata),
+                )
+        for stream, text in (("stdout", result.stdout), ("stderr", result.stderr)):
+            if text and stream not in delivered_streams:
+                await append("stream", {"name": stream, "text": text, "author": request.author})
 
         for output in result.say_outputs:
             if output.final and result.status != "success":
                 continue  # Staged finals are not user-visible until successful completion.
-            append(
+            await append(
                 "display", {"text/plain": self._say_text(output.content)},
                 metadata={"py_agent_source": "say", "final": output.final},
             )
         if result.error or result.status not in ("success", "error"):
-            append("error", {
+            await append("error", {
                 "ename": "ExecutionError", "evalue": result.error or result.status,
             })
         elif result.status == "error":
-            append("error", {
+            await append("error", {
                 "ename": "ExecutionError", "evalue": result.error or "Execution failed",
             })
-        for event in events:
-            for registration in self._observer_registrations:
-                observer = self.output_observers[registration.qualified_name]
-                try:
-                    delivered = observer.observe(event)
-                    if not inspect.isawaitable(delivered):
-                        raise TypeError(f"Observer {registration.qualified_name} must be async")
-                    await delivered
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    if registration.critical:
-                        raise
-                    self.best_effort_observer_failures += 1
         return tuple(events)
 
     def _model_options(self, snapshot: ConfigSnapshot | None) -> dict[str, str]:
@@ -797,6 +882,23 @@ class Coordinator:
                 snapshot = prepare(text, request_id)
                 if not isinstance(snapshot, ContextSnapshot):
                     raise TypeError("Context service must return a ContextSnapshot")
+                overlay = tuple(
+                    ("user", message) for epoch, message in self._context_overlay
+                    if epoch == snapshot.epoch
+                ) if self._context_overlay_epoch == snapshot.epoch else ()
+                if overlay:
+                    insertion = (
+                        len(snapshot.messages) - 1
+                        if snapshot.messages and snapshot.messages[-1] == ("user", text)
+                        else len(snapshot.messages)
+                    )
+                    messages = list(snapshot.messages)
+                    phases = list(snapshot.message_phases)
+                    messages[insertion:insertion] = overlay
+                    phases[insertion:insertion] = [None] * len(overlay)
+                    snapshot = replace(
+                        snapshot, messages=tuple(messages), message_phases=tuple(phases),
+                    )
                 return snapshot
             # The v1 ContextService protocol exposes reset policy and usage
             # accounting but not mutation methods. Keep a minimal compatible
@@ -813,8 +915,45 @@ class Coordinator:
             value = snapshot()
             if not isinstance(value, ContextSnapshot):
                 raise TypeError("Context service snapshot() must return ContextSnapshot")
+            if self._context_overlay and self._context_overlay_epoch == value.epoch:
+                additions = tuple(
+                    ("user", text) for epoch, text in self._context_overlay if epoch == value.epoch
+                )
+                value = replace(
+                    value,
+                    messages=(*value.messages, *additions),
+                    message_phases=(*value.message_phases, *((None,) * len(additions))),
+                )
             return value
         return ContextSnapshot(self._context_epoch, tuple(self._context))
+
+    def _append_steering_context(self, text: str, request_id: str) -> None:
+        """Append steering after the completed cell's observation, never mid-request."""
+        if self.context_service is None:
+            self._context.append(("user", text))
+            return
+        add = getattr(self.context_service, "add", None)
+        if callable(add):
+            result = add("user", text, refs=(request_id,))
+            if inspect.isawaitable(result):
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+                raise TypeError("Context service add() must be synchronous")
+            if callable(getattr(self.context_service, "snapshot", None)):
+                return
+            self._context.append(("user", text))
+            return
+        if not callable(getattr(self.context_service, "snapshot", None)):
+            self._context.append(("user", text))
+            return
+        epoch = self._read_context_epoch()
+        if epoch is None:
+            epoch = self._context_epoch
+        if self._context_overlay_epoch != epoch:
+            self._context_overlay.clear()
+            self._context_overlay_epoch = epoch
+        self._context_overlay.append((epoch, text))
 
     @staticmethod
     def _agent_protocol_context(snapshot: ContextSnapshot) -> ContextSnapshot:
@@ -1138,6 +1277,160 @@ class Coordinator:
                 raise
             self.state = State.IDLE
 
+    @staticmethod
+    def _validate_routed_action(routed: object, origin: Origin) -> RoutedAction:
+        if not isinstance(routed, RoutedAction):
+            raise TypeError("Router must return a RoutedAction")
+        if routed.origin != origin:
+            raise ValueError("Router changed request origin")
+        if routed.kind not in ("ask", "execute", "command"):
+            raise ValueError(f"Router returned unknown action kind: {routed.kind!r}")
+        if not isinstance(routed.source, str) or not routed.source.strip():
+            raise ValueError("Router returned an empty or invalid source")
+        if len(routed.source) > MAX_QUEUED_ACTION_CHARS:
+            raise ValueError("Routed action exceeds the queued-action size limit")
+        if routed.language is not None and not isinstance(routed.language, str):
+            raise TypeError("Routed action language must be text or None")
+        return routed
+
+    @property
+    def pending_action_count(self) -> int:
+        """Number of accepted actions not yet dispatched or applied as steering."""
+        return len(self._pending_actions)
+
+    @property
+    def queue_active(self) -> bool:
+        """Whether a queue item is pending or the serial queue worker is draining."""
+        return bool(self._pending_actions) or self._queue_worker is not None
+
+    async def enqueue(
+        self,
+        frontend_id: str,
+        text: str,
+        *,
+        allow_stdin: bool = False,
+        input_handler: InputHandler | None = None,
+        on_progress: ProgressCallback | None = None,
+    ) -> QueueTicket:
+        """Accept bounded FIFO work without cancelling the active provider or cell.
+
+        Leading English asks may be committed as steering at a safe cell boundary.
+        Direct cells and slash commands remain deferred until the active turn ends;
+        an English ask behind one cannot overtake it.
+        """
+        if self.state in (State.NEW, State.STOPPING, State.FAILED, State.CLOSED):
+            raise RuntimeError("Session unavailable for queued actions")
+        if (not isinstance(frontend_id, str) or not frontend_id
+                or len(frontend_id) > MAX_FRONTEND_ID_CHARS or "\x00" in frontend_id):
+            raise ValueError("Frontend ID must be nonempty bounded text without NUL")
+        if not isinstance(text, str):
+            raise TypeError("Queued submission text must be text")
+        if len(text) > MAX_QUEUED_ACTION_CHARS:
+            raise ValueError("Queued submission exceeds the text size limit")
+        if type(allow_stdin) is not bool:
+            raise TypeError("allow_stdin must be a boolean")
+        if input_handler is not None and not callable(input_handler):
+            raise TypeError("input_handler must be callable or None")
+        if on_progress is not None and not callable(on_progress):
+            raise TypeError("on_progress must be callable or None")
+
+        config = self._current_config()
+        revision = config.revision if config is not None else self.config_revision
+        origin = Origin(self.session_id, uuid4().hex, frontend_id, revision)
+        routed = self._validate_routed_action(self.router.route(UserAction(origin, text)), origin)
+        loop = asyncio.get_running_loop()
+        completion: asyncio.Future[QueueOutcome] = loop.create_future()
+        async with self._queue_lock:
+            if self.state in (State.STOPPING, State.FAILED, State.CLOSED):
+                raise RuntimeError("Session unavailable for queued actions")
+            if len(self._pending_actions) >= MAX_PENDING_ACTIONS:
+                raise QueueFullError(
+                    f"Pending action queue is full ({MAX_PENDING_ACTIONS}); no action was accepted"
+                )
+            item = _QueuedAction(
+                routed, text, config, allow_stdin, input_handler, on_progress, completion,
+            )
+            self._pending_actions.append(item)
+            ticket = QueueTicket(
+                routed.origin, routed.kind, len(self._pending_actions), asyncio.shield(completion),
+            )
+        self._start_queue_worker_if_idle()
+        return ticket
+
+    def _start_queue_worker_if_idle(self) -> None:
+        if (self._queue_worker is None and self._pending_actions
+                and self.state is State.IDLE and not self._lock.locked()):
+            worker = asyncio.create_task(
+                self._drain_queue(), name="py-agent-queued-actions",
+            )
+            self._queue_worker = worker
+            # A task cancelled before its coroutine starts never enters the
+            # drainer's finally block. Always release the worker slot.
+            worker.add_done_callback(self._queue_worker_finished)
+
+    def _queue_worker_finished(self, worker: asyncio.Task) -> None:
+        if self._queue_worker is worker:
+            self._queue_worker = None
+        self._start_queue_worker_if_idle()
+
+    @staticmethod
+    def _complete_queue_item(item: _QueuedAction, outcome: QueueOutcome) -> None:
+        if not item.completion.done():
+            item.completion.set_result(outcome)
+
+    async def _fail_pending_actions(self, status: str, error: str) -> None:
+        async with self._queue_lock:
+            pending = tuple(self._pending_actions)
+            self._pending_actions.clear()
+        for item in pending:
+            self._complete_queue_item(item, QueueOutcome(item.action.origin, status, error=error))
+
+    async def _drain_queue(self) -> None:
+        current = asyncio.current_task()
+        try:
+            while True:
+                async with self._queue_lock:
+                    if not self._pending_actions:
+                        return
+                    if self.state is not State.IDLE or self._lock.locked():
+                        return
+                    item = self._pending_actions.popleft()
+                try:
+                    submission = await self.submit(
+                        item.action.origin.frontend_id, item.text, _queued_action=item,
+                    )
+                except asyncio.CancelledError:
+                    self._complete_queue_item(
+                        item, QueueOutcome(item.action.origin, "interrupted", error="Queued action was cancelled"),
+                    )
+                    await self._fail_pending_actions(
+                        "interrupted", "Queue processing was cancelled; pending actions were not dispatched",
+                    )
+                    return
+                except Exception as exc:
+                    self._complete_queue_item(
+                        item, QueueOutcome(item.action.origin, "failed", error=str(exc)),
+                    )
+                    if self.state in (State.FAILED, State.STOPPING, State.CLOSED):
+                        await self._fail_pending_actions("interrupted", "Session is unavailable")
+                        return
+                else:
+                    self._complete_queue_item(
+                        item, QueueOutcome(item.action.origin, "completed", submission=submission),
+                    )
+        finally:
+            if self._queue_worker is current:
+                self._queue_worker = None
+            self._start_queue_worker_if_idle()
+
+    async def _consume_queued_steering(self) -> tuple[_QueuedAction, ...]:
+        """Reserve leading English asks for the next request, without mutating context yet."""
+        async with self._queue_lock:
+            selected = []
+            while self._pending_actions and self._pending_actions[0].action.kind == "ask":
+                selected.append(self._pending_actions.popleft())
+        return tuple(selected)
+
     async def submit(
         self,
         frontend_id: str,
@@ -1145,29 +1438,42 @@ class Coordinator:
         *,
         allow_stdin: bool = False,
         input_handler: InputHandler | None = None,
+        on_progress: ProgressCallback | None = None,
+        _queued_action: _QueuedAction | None = None,
     ) -> Submission:
-        if self.state is not State.IDLE or self._lock.locked():
-            raise RuntimeError("Session busy or unavailable")
+        if ((self.state is not State.IDLE or self._lock.locked() or self._queue_worker is not None
+             or self._pending_actions) and _queued_action is None):
+            raise RuntimeError("Session busy, queued work pending, or unavailable")
         async with self._lock:
-            if self.state is not State.IDLE:
-                raise RuntimeError("Session busy or unavailable")
+            if (self.state is not State.IDLE
+                    or ((_queued_action is None) and (self._queue_worker is not None or self._pending_actions))):
+                raise RuntimeError("Session busy, queued work pending, or unavailable")
+            if _queued_action is not None:
+                allow_stdin = _queued_action.allow_stdin
+                input_handler = _queued_action.input_handler
+                on_progress = _queued_action.on_progress
             if not isinstance(frontend_id, str) or not isinstance(text, str):
                 raise TypeError("Frontend ID and submission text must be text")
             if type(allow_stdin) is not bool:
                 raise TypeError("allow_stdin must be a boolean")
             if input_handler is not None and not callable(input_handler):
                 raise TypeError("input_handler must be callable or None")
+            if on_progress is not None and not callable(on_progress):
+                raise TypeError("on_progress must be callable or None")
 
             task = asyncio.current_task()
             operation_id = uuid4().hex
             self._active_task = task
             self._active_operation_id = operation_id
-            config = self._current_config()
+            config = _queued_action.config if _queued_action is not None else self._current_config()
             self._capture_history_sensitive_config(config)
             self._observe_context_epoch(self._read_context_epoch(), config=config)
             revision = config.revision if config is not None else self.config_revision
             self.config_revision = revision
-            origin = Origin(self.session_id, uuid4().hex, frontend_id, revision)
+            origin = (
+                _queued_action.action.origin if _queued_action is not None
+                else Origin(self.session_id, uuid4().hex, frontend_id, revision)
+            )
 
             def execution_input_handler(execution_origin: Origin) -> InputHandler | None:
                 if not allow_stdin or input_handler is None:
@@ -1212,20 +1518,13 @@ class Coordinator:
                 return dispatch_input
 
             context_pending = False
+            steering_awaiting_dispatch: list[_QueuedAction] = []
+            steering_commit_started = False
             try:
-                routed = self.router.route(UserAction(origin, text))
-                if not isinstance(routed, RoutedAction):
-                    raise TypeError("Router must return a RoutedAction")
-                if routed.origin != origin:
-                    raise ValueError("Router changed request origin")
-                if routed.kind not in ("ask", "execute", "command"):
-                    raise ValueError(f"Router returned unknown action kind: {routed.kind!r}")
-                if not isinstance(routed.source, str):
-                    raise TypeError("Routed action source must be text")
-                if not routed.source.strip():
-                    raise ValueError("Router returned an empty source")
-                if routed.language is not None and not isinstance(routed.language, str):
-                    raise TypeError("Routed action language must be text or None")
+                routed = (
+                    _queued_action.action if _queued_action is not None
+                    else self._validate_routed_action(self.router.route(UserAction(origin, text)), origin)
+                )
 
                 if routed.kind == "command":
                     self.state = State.COMMAND
@@ -1264,8 +1563,33 @@ class Coordinator:
                             origin.session_id, origin.request_id, origin.frontend_id,
                             origin.config_revision, generation_id,
                         )
+                        published_events.append(await self._emit_progress(
+                            generation_origin,
+                            {
+                                "phase": "generation_start", "step": step,
+                                "text": f"Agent: requesting a response (step {step}).",
+                            },
+                            on_progress=on_progress, operation_id=operation_id,
+                            expected_state=State.GENERATING,
+                        ))
+                        # Freeze the next request only after taking steering queued
+                        # before context assembly. Later arrivals wait for the
+                        # following cell; no stage or validator is bypassed.
+                        if step > 1:
+                            steering_awaiting_dispatch.extend(await self._consume_queued_steering())
                         snapshot = initial_context if step == 1 else self._latest_context()
                         self._observe_context_epoch(snapshot.epoch)
+                        if steering_awaiting_dispatch:
+                            additions = tuple(
+                                ("user", item.action.source) for item in steering_awaiting_dispatch
+                            )
+                            snapshot = replace(
+                                snapshot,
+                                messages=(*snapshot.messages, *additions),
+                                message_phases=(
+                                    *snapshot.message_phases, *((None,) * len(additions))
+                                ),
+                            )
                         cell_config = self._current_config()
                         epoch_config = self._epoch_config
                         context = await self._run_context_transforms(
@@ -1281,9 +1605,21 @@ class Coordinator:
                             raise asyncio.CancelledError
                         # This is the final post-transform request actually dispatched to
                         # the provider. Persist it before any provider-side effect.
+                        # Commit only after transforms/validation have succeeded. If
+                        # cancelled earlier, no steering leaks into future context.
+                        for steering_item in steering_awaiting_dispatch:
+                            steering_commit_started = True
+                            self._append_steering_context(
+                                steering_item.action.source, steering_item.action.origin.request_id,
+                            )
                         self._active_model_request = model_request
                         self._active_provider_usage_recorded = False
                         self._journal_record("record_model_request", model_request)
+                        for steering_item in steering_awaiting_dispatch:
+                            self._complete_queue_item(
+                                steering_item, QueueOutcome(steering_item.action.origin, "steered"),
+                            )
+                        steering_awaiting_dispatch.clear()
                         generation = asyncio.create_task(
                             self.provider.generate(model_request),
                             name=f"py-agent-generation-{generation_id}",
@@ -1346,6 +1682,30 @@ class Coordinator:
                                 events=tuple(published_events),
                             )
 
+                        check_syntax = getattr(self.interpreter, "check_syntax", None)
+                        if callable(check_syntax):
+                            syntax_error = check_syntax(decision.source)
+                            if inspect.isawaitable(syntax_error) or (
+                                syntax_error is not None and not isinstance(syntax_error, str)
+                            ):
+                                raise TypeError("Interpreter syntax check must return text or None synchronously")
+                            if syntax_error is not None:
+                                if not syntax_error:
+                                    raise ValueError("Interpreter returned an empty syntax diagnostic")
+                                if not self._operation_is_current(operation_id, State.GENERATING):
+                                    raise asyncio.CancelledError
+                                # This is a model-visible correction, not an
+                                # execution or user-visible cell failure. Never
+                                # dispatch malformed source to the executor.
+                                self._commit_context(
+                                    origin.request_id, routed.source, decision.source,
+                                    {"preflight": {"executed": False, "syntax_error": syntax_error}},
+                                    phase=response.phase, include_user=not context_committed,
+                                )
+                                context_committed = True
+                                context_pending = False
+                                continue
+
                         self.state = State.EXECUTING
                         execution_origin = Origin(
                             origin.session_id, origin.request_id, origin.frontend_id,
@@ -1356,11 +1716,33 @@ class Coordinator:
                             allow_stdin=allow_stdin,
                             input_handler=execution_input_handler(execution_origin),
                         )
+                        published_events.append(await self._emit_progress(
+                            execution_origin,
+                            {
+                                "phase": "execution_start", "step": step, "author": "agent",
+                                "text": f"Agent: executing cell (step {step}).",
+                            },
+                            on_progress=on_progress, operation_id=operation_id,
+                            expected_state=State.EXECUTING,
+                        ))
                         result = await self._execute_dispatched(execution_request)
 
                         if not self._operation_is_current(operation_id, State.EXECUTING):
                             raise asyncio.CancelledError
-                        published_events.extend(await self._publish_output(execution_request, result))
+                        published_events.extend(await self._publish_output(
+                            execution_request, result, on_progress=on_progress,
+                            operation_id=operation_id,
+                        ))
+                        published_events.append(await self._emit_progress(
+                            execution_origin,
+                            {
+                                "phase": "cell_complete", "step": step,
+                                "status": result.status,
+                                "text": f"Agent cell {step} completed with status {result.status}.",
+                            },
+                            on_progress=on_progress, operation_id=operation_id,
+                            expected_state=State.EXECUTING,
+                        ))
                         if not self._operation_is_current(operation_id, State.EXECUTING):
                             raise asyncio.CancelledError
                         visible_outputs.extend(self._visible_say_outputs(result))
@@ -1397,11 +1779,22 @@ class Coordinator:
                                 events=tuple(published_events),
                             )
 
-                    self._set_state_unless_stopping(State.IDLE)
-                    visible_messages.append(
+                    self._set_state_unless_stopping(State.GENERATING)
+                    step_limit_message = (
                         f"Agent paused after {self.max_agent_steps} execution steps without a successful "
                         "say(final=True); submit another request to continue."
                     )
+                    published_events.append(await self._emit_progress(
+                        generation_origin,
+                        {
+                            "phase": "step_limit", "status": "paused",
+                            "step_limit": self.max_agent_steps, "text": step_limit_message,
+                        },
+                        on_progress=on_progress, operation_id=operation_id,
+                        expected_state=State.GENERATING,
+                    ))
+                    self._set_state_unless_stopping(State.IDLE)
+                    visible_messages.append(step_limit_message)
                     return Submission(
                         routed, result=last_result, message="\n".join(visible_messages),
                         execution=last_execution, response=last_response,
@@ -1425,10 +1818,29 @@ class Coordinator:
                     allow_stdin=allow_stdin,
                     input_handler=execution_input_handler(execution_origin),
                 )
+                published_events = [await self._emit_progress(
+                    execution_origin,
+                    {"phase": "execution_start", "author": author,
+                     "text": "Executing user cell."},
+                    on_progress=on_progress, operation_id=operation_id,
+                    expected_state=State.EXECUTING, author=author,
+                )]
                 result = await self._execute_dispatched(execution_request)
                 if not self._operation_is_current(operation_id, State.EXECUTING):
                     raise asyncio.CancelledError
-                published_events = await self._publish_output(execution_request, result)
+                published_events.extend(await self._publish_output(
+                    execution_request, result, on_progress=on_progress,
+                    operation_id=operation_id,
+                ))
+                published_events.append(await self._emit_progress(
+                    execution_origin,
+                    {
+                        "phase": "cell_complete", "step": 1, "status": result.status,
+                        "text": f"User cell completed with status {result.status}.",
+                    },
+                    on_progress=on_progress, operation_id=operation_id,
+                    expected_state=State.EXECUTING, author=author,
+                ))
                 if not self._operation_is_current(operation_id, State.EXECUTING):
                     raise asyncio.CancelledError
                 self._set_state_unless_stopping(
@@ -1441,6 +1853,14 @@ class Coordinator:
                     events=published_events,
                 )
             except asyncio.CancelledError:
+                for steering_item in steering_awaiting_dispatch:
+                    self._complete_queue_item(
+                        steering_item,
+                        QueueOutcome(
+                            steering_item.action.origin, "interrupted",
+                            error="Steering was cancelled before provider dispatch",
+                        ),
+                    )
                 if context_pending:
                     try:
                         self._abandon_context(origin.request_id)
@@ -1452,7 +1872,19 @@ class Coordinator:
                     # Execution/commands may already have side effects; never replay them.
                     self._set_state_unless_stopping(State.FAILED)
                 raise
-            except Exception:
+            except Exception as exc:
+                for steering_item in steering_awaiting_dispatch:
+                    self._complete_queue_item(
+                        steering_item,
+                        QueueOutcome(
+                            steering_item.action.origin, "failed",
+                            error=(
+                                "Steering failed before provider dispatch"
+                                + ("; context may contain partial steering" if steering_commit_started else "")
+                                + ": " + str(exc)
+                            ),
+                        ),
+                    )
                 if context_pending:
                     try:
                         self._abandon_context(origin.request_id)
@@ -1468,6 +1900,9 @@ class Coordinator:
                     self._active_task = None
                 if self._active_operation_id == operation_id:
                     self._active_operation_id = None
+                if self.state in (State.FAILED, State.STOPPING, State.CLOSED):
+                    await self._fail_pending_actions("interrupted", "Session is unavailable")
+                asyncio.get_running_loop().call_soon(self._start_queue_worker_if_idle)
 
     async def _dispatch_command(self, source: str, config: ConfigSnapshot | None) -> str:
         parts = source.split(None, 1)
@@ -1680,12 +2115,19 @@ class Coordinator:
         return "\n".join(lines)
 
     async def interrupt(self) -> None:
-        if self.state in (State.STOPPING, State.CLOSED, State.NEW, State.IDLE, State.FAILED):
+        if self.state in (State.STOPPING, State.CLOSED, State.NEW, State.FAILED):
+            return
+        if self.state is State.IDLE:
+            await self._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
+            worker = self._queue_worker
+            if worker is not None and worker is not asyncio.current_task():
+                worker.cancel()
             return
         if self.state is State.GENERATING:
             # Invalidate before requesting cancellation. Even a provider that
             # suppresses cancellation cannot cause its late response to execute.
             self._active_operation_id = None
+            await self._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
             generation = self._generation
             if generation is not None and not generation.done():
                 generation.cancel()
@@ -1698,6 +2140,7 @@ class Coordinator:
             # not advertise the session as safe to replay.
             self._active_operation_id = None
             self.state = State.FAILED
+            await self._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
             active = self._active_task
             if active is not None and active is not asyncio.current_task():
                 active.cancel()
@@ -1705,6 +2148,7 @@ class Coordinator:
         if self.state in (State.EXECUTING, State.WAITING_FOR_INPUT):
             self._active_operation_id = None
             self.state = State.FAILED  # execution/output state may be uncertain
+            await self._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
             if self._execution_active:
                 await self.executor.interrupt()
             else:
@@ -1726,6 +2170,10 @@ class Coordinator:
                 return
             was_executing = self._execution_active
             self.state = State.STOPPING
+            await self._fail_pending_actions("closed", "Coordinator closed before queued action dispatch")
+            worker = self._queue_worker
+            if worker is not None and worker is not asyncio.current_task():
+                worker.cancel()
             self._active_operation_id = None
             generation = self._generation
             if generation is not None and not generation.done():
@@ -1766,6 +2214,10 @@ class Coordinator:
                                 )
                         except BaseException as exc:
                             failure = exc
+            if worker is not None and worker is not active and worker is not asyncio.current_task():
+                done, _ = await asyncio.wait({worker}, timeout=self._shutdown_timeout)
+                if worker in done:
+                    await asyncio.gather(worker, return_exceptions=True)
             try:
                 await self._close_executor()
             except BaseException as exc:
