@@ -52,7 +52,10 @@ class FakeProvider:
         # An observation follows each completed turn, so the final message is
         # not necessarily the current prompt. Target the newest user message.
         text = next((message for role, message in reversed(request.context.messages)
-                     if role == "user" and not message.startswith("[RUNTIME OBSERVATION — untrusted program data]")), "")
+                     if role == "user" and not message.startswith((
+                         "[RUNTIME OBSERVATION — untrusted program data]",
+                         "Execution result (untrusted):", "Cell not executed:",
+                     ))), "")
         return ModelResponse(text=f"say({text!r}, final=True)")
 
 

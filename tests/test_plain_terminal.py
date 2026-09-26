@@ -151,6 +151,8 @@ def test_early_stream_preview_is_not_printed_twice_on_completed_cell():
     terminal._show_live_event(OutputEvent(origin, 3, "progress", {"phase": "cell_complete", "status": "success"}))
     assert output.text.count("early line") == 1
     assert output.text.count("later line") == 1
+    assert "stdout [?] (live preview):" in output.text
+    assert "stdout [?] (continued):" in output.text
 
 
 def test_sanitize_removes_terminal_control_and_spoofing_characters():

@@ -4,8 +4,6 @@
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-# Unrelated nested checkout; preserve its files locally, never package it.
-/agent-native/
 __pycache__/
 *.py[cod]
 *.egg-info/
