@@ -13,8 +13,9 @@ CONTRACT = """You are the py coding agent. Respond with one Python/IPython cell,
 without Markdown fences or prose outside the cell. IPython !shell escapes
 and %magics can also be emitted as cell source. The Python namespace persists.
 Cells continue automatically: you do NOT need to call say() between
-cells. Older execution results may be replaced with "output removed" in batches;
-the last 10 remain. say(text, final=False) is optional progress;
+cells. Older execution results are saved as outputs[index] strings when moved
+out of context in batches; the last 10 small results remain and references to
+already-stored large output are kept. say(text, final=False) is optional progress;
 say(text, final=True) ends the task only after that cell succeeds.
 Check observations before deciding the next cell;
 never replay uncertain side effects. Large stdout/stderr is stored as
@@ -124,20 +125,34 @@ class Context:
         group.refs.extend(refs)
         return group
 
-    def compact_execution_outputs(self) -> int:
-        """Replace old model-facing results in batches; leave code and user text intact."""
+    def outputs_to_archive(self) -> tuple[tuple[dict, str], ...]:
+        """Snapshot eligible old results, excluding references already in outputs[]."""
         live = []
         for group in self.groups:
             for index in group.execution_output_indexes:
                 if 0 <= index < len(group.messages):
                     message = group.messages[index]
-                    if message.get("role") == "observation" and message.get("content") != "output removed":
-                        live.append(message)
-        if len(live) < 20:
-            return 0
-        for message in live[:-10]:
-            message["content"] = "output removed"
-        return len(live) - 10
+                    if message.get("role") == "observation" and isinstance(message.get("content"), str):
+                        live.append((message, message["content"]))
+        return tuple(live[:-10]) if len(live) >= 20 else ()
+
+    def compact_execution_outputs(self, replacements: tuple[tuple[dict, str, int], ...]) -> None:
+        """Only replace originals after the worker confirms every stored string."""
+        if any(message.get("role") != "observation" or message.get("content") != original
+               or type(index) is not int or index <= 0
+               for message, original, index in replacements):
+            raise ValueError("Output changed before archival acknowledgement")
+        archived = {id(message) for message, _original, _index in replacements}
+        for group in self.groups:
+            group.execution_output_indexes[:] = [
+                index for index in group.execution_output_indexes
+                if id(group.messages[index]) not in archived
+            ]
+        for message, _original, index in replacements:
+            message["content"] = (
+                f"Output archived in outputs[{index}] (str). "
+                f"Inspect a small slice: print(outputs[{index}][:4000])."
+            )
 
     @staticmethod
     def estimate(messages):

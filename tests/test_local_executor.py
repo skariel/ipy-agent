@@ -155,6 +155,7 @@ async def test_large_stdout_is_replaced_by_persistent_output_reference():
         ))
         assert sum(len(event.data["text"]) for event in previews) <= 512
         assert result.status == "success"
+        assert result.output_reference == 1
         assert "outputs[1]" in result.stdout
         assert "Print a smaller slice" in result.stdout
         assert "x" * 100 not in result.stdout
@@ -163,6 +164,11 @@ async def test_large_stdout_is_replaced_by_persistent_output_reference():
         assert excerpt.status == "success"
         assert "x" * 12 in excerpt.stdout
         assert "outputs[1]" not in excerpt.stdout
+        indexes = await executor.store_outputs(("old observation", "another old observation"))
+        assert indexes == (2, 3)
+        archived = await executor.execute(request("print(outputs[2], outputs[3])", author="agent"))
+        assert "old observation another old observation" in archived.stdout
+        assert archived.output_reference is None
     finally:
         await executor.close()
 

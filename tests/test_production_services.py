@@ -178,8 +178,16 @@ def test_context_adapter_preserves_phases_and_delegates_usage_and_reset_policy()
     assert not adapter.needs_reset()
 
 
-def test_execution_outputs_compact_at_20_then_each_10_without_touching_code_or_preflight():
+@pytest.mark.asyncio
+async def test_execution_outputs_archive_at_20_then_each_10_without_touching_code_or_preflight():
     adapter = ProductionContextAdapter(limits=Limits())
+    saved: dict[int, str] = {}
+
+    async def store(texts: tuple[str, ...]) -> tuple[int, ...]:
+        indexes = tuple(range(len(saved) + 1, len(saved) + len(texts) + 1))
+        saved.update(zip(indexes, texts, strict=True))
+        return indexes
+
     adapter.prepare_request("real user task", "request-1")
     adapter.commit_response(
         "request-1", "bad python", observation={"preflight": {"executed": False, "error": "syntax"}},
@@ -188,10 +196,13 @@ def test_execution_outputs_compact_at_20_then_each_10_without_touching_code_or_p
         adapter.commit_response("request-1", f"cell_{number}()", observation={"output": f"result {number}"})
     before = adapter.provider_messages(adapter.snapshot())
     assert "result 1" in str(before)
-    assert "output removed" not in str(before)
+    assert await adapter.archive_execution_outputs(store) == 0
     adapter.commit_response("request-1", "cell_20()", observation={"output": "result 20"})
+    assert "result 1" in str(adapter.provider_messages(adapter.snapshot()))
+    assert await adapter.archive_execution_outputs(store) == 10
     after = adapter.provider_messages(adapter.snapshot())
-    assert sum(message["content"] == "output removed" for message in after) == 10
+    assert saved[1] == "result 1" and saved[10] == "result 10"
+    assert sum("Output archived in outputs[" in message["content"] for message in after) == 10
     assert "result 1" not in str(after) and "result 10" not in str(after)
     assert "result 11" in str(after) and "result 20" in str(after)
     assert "result 1" in str(before)  # already-dispatched snapshots are immutable
@@ -199,13 +210,49 @@ def test_execution_outputs_compact_at_20_then_each_10_without_touching_code_or_p
     assert "Cell not executed: syntax" in str(after)
     for number in range(21, 30):
         adapter.commit_response("request-1", f"cell_{number}()", observation={"output": f"result {number}"})
-    assert sum(message["content"] == "output removed"
-               for message in adapter.provider_messages(adapter.snapshot())) == 10
+    assert await adapter.archive_execution_outputs(store) == 0
     adapter.commit_response("request-1", "cell_30()", observation={"output": "result 30"})
+    assert await adapter.archive_execution_outputs(store) == 10
     final = adapter.provider_messages(adapter.snapshot())
-    assert sum(message["content"] == "output removed" for message in final) == 20
+    assert len(saved) == 20 and saved[11] == "result 11" and saved[20] == "result 20"
+    assert sum("Output archived in outputs[" in message["content"] for message in final) == 20
     assert "result 20" not in str(final)
     assert "result 21" in str(final) and "result 30" in str(final)
+
+
+@pytest.mark.asyncio
+async def test_large_output_reference_is_not_archived_again_and_failed_storage_keeps_text():
+    adapter = ProductionContextAdapter(limits=Limits())
+    adapter.prepare_request("inspect", "r1")
+    adapter.commit_response("r1", "large()", observation={
+        "output": "Output exceeded 8000 characters. Saved as outputs[1].",
+        "_stored_output_index": 1,
+    })
+    for number in range(1, 20):
+        adapter.commit_response("r1", f"cell_{number}()", observation={"output": f"item {number}"})
+
+    async def fail(_texts):
+        raise RuntimeError("worker unavailable")
+
+    assert await adapter.archive_execution_outputs(fail) == 0  # 19 eligible results
+    adapter.commit_response("r1", "cell_20()", observation={"output": "item 20"})
+    with pytest.raises(RuntimeError, match="worker unavailable"):
+        await adapter.archive_execution_outputs(fail)
+    current = str(adapter.provider_messages(adapter.snapshot()))
+    assert "item 1" in current and "item 20" in current
+    assert "outputs[1]" in current  # Already-spooled text is never re-archived.
+    assert "_stored_output_index" not in current
+    saved = {}
+
+    async def store(texts):
+        saved.update(zip(range(2, 2 + len(texts)), texts, strict=True))
+        return tuple(saved)
+
+    assert await adapter.archive_execution_outputs(store) == 10
+    after = str(adapter.provider_messages(adapter.snapshot()))
+    assert "outputs[1]" in after and "outputs[2]" in after
+    assert all("Output exceeded" not in text for text in saved.values())
+    assert await adapter.archive_execution_outputs(store) == 0
 
 
 def test_default_model_messages_contain_only_plain_execution_feedback():

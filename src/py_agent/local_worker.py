@@ -344,6 +344,15 @@ def _validate_request(frame: dict[str, Any]) -> tuple[Any, ...] | None:
         return "execute", execution_id, author, source, origin
 
     kind = frame.get("type")
+    if kind == "store_outputs":
+        if set(frame) != {"type", "version", "request_id", "texts"}:
+            raise ProtocolError("Invalid output storage request fields")
+        request_id, texts = frame["request_id"], frame["texts"]
+        if (not _is_id(request_id) or not isinstance(texts, list)
+                or not 1 <= len(texts) <= 10
+                or any(not isinstance(text, str) or len(text) > 8_000 for text in texts)):
+            raise ProtocolError("Invalid output storage request")
+        return "store_outputs", request_id, texts
     if kind == "complete":
         expected = {"type", "version", "request_id", "code", "cursor_pos"}
     elif kind == "inspect":
@@ -1151,8 +1160,22 @@ def _make_say(execution_id: str, author: str, origin: dict[str, Any], stdout, st
     return say, deactivate, lambda: final_requested
 
 
+def _store_output(shell: Any, text: str) -> int:
+    global _NEXT_OUTPUT_INDEX
+    outputs = shell.user_ns.get("outputs")
+    if type(outputs) is not dict:
+        outputs = {}
+        shell.user_ns["outputs"] = outputs
+    while _NEXT_OUTPUT_INDEX in outputs:
+        _NEXT_OUTPUT_INDEX += 1
+    index = _NEXT_OUTPUT_INDEX
+    outputs[index] = text
+    _NEXT_OUTPUT_INDEX += 1
+    return index
+
+
 def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: dict[str, Any]) -> None:
-    global _ACTIVE_INPUT_FUNCTIONS, _NEXT_OUTPUT_INDEX
+    global _ACTIVE_INPUT_FUNCTIONS
     null_in, null_out, null_err = _NULL_STREAMS
     stdout = _OutputWriter("stdout", execution_id, author, origin)
     stderr = _OutputWriter("stderr", execution_id, author, origin)
@@ -1335,20 +1358,12 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
         # interleaved stream timing. Do not retain unbounded subprocess output.
         retained = (stdout_text + stderr_text)[:MAX_STORED_OUTPUT_CHARS]
         omitted = original_chars - len(retained)
-        outputs = shell.user_ns.get("outputs")
-        if type(outputs) is not dict:
-            outputs = {}
-            shell.user_ns["outputs"] = outputs
-        while _NEXT_OUTPUT_INDEX in outputs:
-            _NEXT_OUTPUT_INDEX += 1
         output_reference = {
-            "index": _NEXT_OUTPUT_INDEX,
+            "index": _store_output(shell, retained),
             "original_chars": original_chars,
             "retained_chars": len(retained),
             "omitted_chars": omitted,
         }
-        outputs[_NEXT_OUTPUT_INDEX] = retained
-        _NEXT_OUTPUT_INDEX += 1
 
     _send({
         "type": "result",
@@ -1396,6 +1411,11 @@ def main() -> None:
             if kind == "execute":
                 _, execution_id, author, source, origin = request
                 _run_cell(shell, execution_id, author, source, origin)
+            elif kind == "store_outputs":
+                _, request_id, texts = request
+                indexes = [_store_output(shell, _redact_text(text)) for text in texts]
+                _send({"type": "outputs_stored", "version": PROTOCOL_VERSION,
+                       "request_id": request_id, "indexes": indexes})
             elif kind == "complete":
                 _, request_id, code, cursor_pos = request
                 _complete(shell, request_id, code, cursor_pos)

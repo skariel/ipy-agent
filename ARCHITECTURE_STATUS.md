@@ -40,8 +40,10 @@ namespace. The default terminal also has built-in `/help`, `/status`, `/interrup
 
 `LocalExecutor` replaces stdout/stderr exceeding 8000 characters with a notice
 and retains up to 1 Mi characters in the persistent `outputs[index]` namespace
-for small follow-up slices. Other model-facing observations and model responses
-also have 8000-character bounds; user input is not clipped. The executor has
+for small follow-up slices. At 20 small execution results, older results are
+stored in that namespace and replaced with short references in model context;
+large-output references are exempt. Other model-facing observations and model
+responses also have 8000-character bounds; user input is not clipped. The executor has
 worker startup/interrupt timeouts, but no normal cell execution deadline. Correlated
 `input()`/`getpass()` requests require a capable owning frontend. A worker failure or interrupt can discard in-memory Python state;
 partial side effects are not rolled back or replayed. An explicit `--journal PATH`

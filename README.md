@@ -88,9 +88,12 @@ observations exceeding 8,000 characters are omitted with a smaller-slice
 instruction. Model-facing execution feedback is plain text, without internal
 session/request/execution IDs; it remains a separately labeled, untrusted
 message so command output cannot masquerade as the user's request. Once 20
-execution results remain in the model context, the oldest 10 become `output
-removed`; the latest 10 stay intact. This repeats every 10 new results and
-does not change user requests, executed source, or the optional journal. User
+small execution results accumulate, the oldest 10 are stored as persistent
+`outputs[index]` strings and replaced in model context with short references;
+the latest 10 stay intact. References to already-spooled large outputs are never
+archived a second time. If the selected executor cannot confirm storage, the
+original results remain in context. This does not change user requests, executed
+source, or the optional journal. User
 messages are not clipped. Model responses over 8,000 characters are
 rejected without execution and the model is asked for a smaller cell. Generated
 cells cannot publish more than 8,000 characters of `say()` content; direct user

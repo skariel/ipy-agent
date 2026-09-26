@@ -270,8 +270,14 @@ class ExecutionResult:
     # True only when a say(final=True) was received and its cell succeeded.
     final: bool = False
     output_events: tuple[ExecutionOutput, ...] = ()
+    # Worker-owned outputs[index] for a stream already spooled before compaction.
+    output_reference: int | None = None
 
     def __post_init__(self):
+        if self.output_reference is not None and (
+            type(self.output_reference) is not int or self.output_reference < 1
+        ):
+            raise ValueError("ExecutionResult output_reference must be a positive integer")
         if type(self.final) is not bool:
             raise TypeError("ExecutionResult final must be a boolean")
         outputs = tuple(self.say_outputs)

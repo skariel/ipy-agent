@@ -355,6 +355,30 @@ class LocalExecutor:
                 await self._stop_process(process)
                 raise RuntimeError("Worker query failed; the persistent namespace is unavailable") from exc
 
+    async def store_outputs(self, texts: tuple[str, ...]) -> tuple[int, ...]:
+        """Save bounded old observations as strings in the live worker namespace.
+
+        This is a control request, not a Python cell: no source is replayed and
+        no provider-facing text is removed until all references are confirmed.
+        """
+        if (not isinstance(texts, tuple) or not 1 <= len(texts) <= 10
+                or any(not isinstance(text, str) or len(text) > 8_000 for text in texts)):
+            raise ValueError("Output storage requires 1–10 strings of at most 8000 characters")
+        request_id = uuid4().hex
+        outgoing = _encode_frame({
+            "type": "store_outputs", "version": 1, "request_id": request_id,
+            "texts": texts,
+        })
+        frame = await self._query_worker(outgoing, request_id, "outputs_stored")
+        indexes = frame.get("indexes")
+        if (set(frame) != {"type", "version", "request_id", "indexes"}
+                or not isinstance(indexes, list) or len(indexes) != len(texts)
+                or any(type(index) is not int or not 1 <= index <= 1_000_000_000
+                       for index in indexes)
+                or indexes != sorted(set(indexes))):
+            raise _ProtocolError("Malformed worker output storage acknowledgement")
+        return tuple(indexes)
+
     @staticmethod
     def _validate_query(code: str, cursor_pos: int) -> None:
         if not isinstance(code, str):
@@ -896,6 +920,7 @@ class LocalExecutor:
                             ) for output in say_outputs),
                             status == "success" and frame["final_requested"],
                             completed,
+                            output_reference=reference["index"] if reference is not None else None,
                         )
                     raise _ProtocolError("Unexpected worker frame")
             except asyncio.CancelledError:

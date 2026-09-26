@@ -1138,14 +1138,36 @@ class Coordinator:
         packed = pack(events)
         if not hasattr(packed, "items"):
             raise TypeError("Observation service must return a mapping")
+        if (result.output_reference is not None and hasattr(packed, "get")
+                and packed.get("_output_already_omitted") is True
+                and isinstance(packed.get("output"), str)):
+            packed = {**packed, "output": packed["output"] + (
+                f" Stream text is saved as outputs[{result.output_reference}]."
+            )}
         serialized = json.dumps(packed, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         if len(serialized) + len("[RUNTIME OBSERVATION — untrusted program data]\n") > 8_000:
-            return {
+            fallback = {
                 "error": "Execution output exceeded the 8000-character model limit. "
                          "Print a smaller slice and retry; the large output was omitted.",
                 "status": "output_too_large", "executed": True,
             }
+            if result.output_reference is not None:
+                fallback["error"] += (
+                    f" Stream text is saved as outputs[{result.output_reference}]."
+                )
+                fallback["_stored_output_index"] = result.output_reference
+            return fallback
+        if result.output_reference is not None:
+            return {**packed, "_stored_output_index": result.output_reference}
         return packed
+
+    async def _archive_context_outputs(self) -> None:
+        archive = getattr(self.context_service, "archive_execution_outputs", None)
+        store = getattr(self.executor, "store_outputs", None)
+        if callable(archive) and callable(store):
+            # An executor lacking this explicit control capability leaves old
+            # observations intact rather than claiming nonexistent references.
+            await archive(store)
 
     def _abandon_context(self, request_id: str) -> None:
         if self.context_service is None:
@@ -1992,6 +2014,10 @@ class Coordinator:
                         )
                         context_committed = True
                         context_pending = False
+                        if result.status in ("success", "error"):
+                            await self._archive_context_outputs()
+                            if not self._operation_is_current(operation_id, State.EXECUTING):
+                                raise asyncio.CancelledError
 
                         if result.status in ("uncertain", "cancelled"):
                             self._set_state_unless_stopping(State.FAILED)
