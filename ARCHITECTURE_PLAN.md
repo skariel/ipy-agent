@@ -52,7 +52,7 @@ The core does not implement provider wire formats, context eviction policy, IPyt
 | Response interpretation | Extract executable Python, validate completion, preserve reasoning separately |
 | Context | Append-only epochs, explicit reset, live namespace inventory, memories conventions |
 | Execution | Local persistent IPython worker |
-| Optional execution | Existing sandbox integration, later remote/container implementations |
+| Optional execution | Explicit wrapper-backed worker; future remote/container implementations |
 | Observations | Model-facing output reduction, spill references and execution feedback |
 | Persistence | Journal and history repositories |
 | Accounting | Provider-reported usage and cache statistics |
@@ -230,7 +230,7 @@ Journals can contain private prompts and code even when credential fields are re
 
 ### Phase 0 — Public contracts and architectural skeleton
 
-- Inventory current dataflow in supervisor.py, context.py, provider adapters, worker.py, terminal.py and supporting modules.
+- Inventory current dataflow in coordinator.py, context.py, provider adapters, local_worker.py, plain_terminal.py and supporting modules.
 - Define records, service protocols, capabilities, error types and ownership rules.
 - Implement plugin discovery/activation and registration validation.
 - Implement the typed config registry and resolution model.
@@ -262,7 +262,7 @@ Acceptance: normal coding workflow operates entirely through public contracts; p
 - Wire `/config` and `/plugins` into the shared command registry.
 - Replace identified policy constants with schema-owned defaults.
 - Implement provenance, revisions, validation, save/reload and restart behavior.
-- Package existing sandbox integration as optional execution/policy plugins; remove mandatory sandbox checks from default installation/launch.
+- Support optional explicit isolated executors without adding mandatory sandbox checks to installation/launch.
 - Document unrestricted execution, external wrappers and isolated-operation limitations prominently.
 
 Acceptance: users can inspect and modify supported settings; configuration failure is atomic; optional isolation selection never silently downgrades; ordinary installation does not require isolation dependencies.

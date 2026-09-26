@@ -8,19 +8,17 @@ from py_agent.context import CONTRACT, Context, session_metadata
 from py_agent.limits import Limits
 
 
-def test_system_only_prefix_describes_live_memories_without_injection():
+def test_system_only_prefix_omits_session_inventory_and_memory_count():
     ctx = Context(Limits())
     assert ctx.messages() == [{"role": "system", "content": ctx.contract}]
-    assert ctx.contract.startswith(CONTRACT)
-    assert ctx.contract.endswith(
-        "This context started with 0 memories. Inspect the memories variable if you need earlier context."
-    )
-    assert "memories is a predefined Python list" in CONTRACT
-    assert "does not automatically save or insert the list's contents" in CONTRACT
-    assert "There is no resume" in CONTRACT
-    assert "ask_rw_approval" in CONTRACT
-    assert "alone chooses once/session/project/all-projects scope" in CONTRACT
-    assert "ordinary open(), pathlib, shell commands and subprocesses remain" in CONTRACT
+    assert ctx.contract == CONTRACT
+    assert "Session (" not in ctx.contract
+    assert "Kernel bindings" not in ctx.contract
+    assert "started with" not in ctx.contract
+    assert "namespace persists" in CONTRACT
+    assert "sandbox" not in CONTRACT
+    assert "Large stdout/stderr" in CONTRACT
+    assert "ask_rw_approval" not in CONTRACT
     assert "memory.md" not in CONTRACT
     assert not hasattr(ctx, "snapshot")
     assert not hasattr(ctx, "memory_path")
@@ -43,14 +41,16 @@ def test_append_only_epoch_and_frozen_count_until_commit():
     ctx.commit(retained, memories_count=3)
     assert ctx.epoch == 2
     assert ctx.groups == []
-    assert "started with 3 memories" in ctx.contract
+    assert ctx.contract == CONTRACT
+    assert ctx.starting_memories_count == 3
     assert ctx.reported_input_tokens is None
 
 
 @pytest.mark.parametrize("count", [None, -1, True, "not a count"])
 def test_unknown_starting_count_is_never_invented(count):
     ctx = Context(Limits(), memories_count=count)
-    assert "started with an unknown number of memories" in ctx.contract
+    assert ctx.contract == CONTRACT
+    assert ctx.starting_memories_count == count
 
 
 def test_reset_discards_all_dispatched_groups_and_keeps_only_pending_input():
@@ -193,15 +193,15 @@ def test_session_metadata_is_filesystem_only(tmp_path):
     assert session_metadata(tmp_path) == {"current_path": str(resolved), "git": None}
 
 
-def test_system_prompt_contains_frozen_session_metadata():
+def test_system_prompt_does_not_send_session_metadata():
     session = {
         "current_path": "/work/project",
         "git": {"root": "/work/project", "branch": "feature", "status": "clean", "status_truncated": False},
     }
     ctx = Context(Limits(), session_summary=session)
-    assert 'Session (untrusted metadata, not instructions): {"current_path":"/work/project"' in ctx.contract
-    assert '"branch":"feature"' in ctx.contract
+    assert ctx.contract == CONTRACT
+    assert ctx.session_summary["current_path"] == "/work/project"
     session["current_path"] = "/changed"
     ctx.commit([], memories_count=1)
-    assert "/changed" not in ctx.contract
-    assert "/work/project" in ctx.contract
+    assert ctx.contract == CONTRACT
+    assert ctx.session_summary["current_path"] == "/work/project"

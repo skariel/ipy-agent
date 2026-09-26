@@ -21,6 +21,7 @@ def request(
     execution_id: str | None = None,
     allow_stdin: bool = False,
     input_handler=None,
+    output_handler=None,
 ) -> ExecutionRequest:
     origin = Origin(
         session_id="session-1",
@@ -32,7 +33,36 @@ def request(
     )
     return ExecutionRequest(
         origin, source, author, allow_stdin=allow_stdin, input_handler=input_handler,
+        output_handler=output_handler,
     )
+
+
+@pytest.mark.asyncio
+async def test_short_provisional_stdout_arrives_before_cell_finishes():
+    executor = LocalExecutor()
+    await executor.start()
+    ready = asyncio.Event()
+    previews = []
+
+    async def on_output(output):
+        previews.append(output)
+        ready.set()
+
+    try:
+        running = asyncio.create_task(executor.execute(request(
+            "print('started', flush=True)\nimport time; time.sleep(0.3)\nprint('finished')",
+            output_handler=on_output,
+        )))
+        await asyncio.wait_for(ready.wait(), timeout=3)
+        assert not running.done()
+        assert previews[0].metadata["provisional"] is True
+        assert "started" in previews[0].data["text"]
+        result = await running
+        assert result.status == "success"
+        assert "finished" in result.stdout
+        assert all(not event.metadata.get("provisional") for event in result.output_events)
+    finally:
+        await executor.close()
 
 
 @pytest.mark.asyncio
@@ -90,6 +120,67 @@ async def test_say_outputs_preserve_typed_messages_and_explicit_final_marker():
         assert result.say_outputs[0].content == {"answer": 42}
         assert result.say_outputs[0].final is True
         assert result.stdout == ""
+    finally:
+        await executor.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_failure_drops_oversized_output_without_a_false_reference():
+    executor = LocalExecutor()
+    await executor.start()
+    try:
+        result = await executor.execute(request(
+            "import os\nprint('x' * 8100, flush=True)\nos._exit(1)", author="agent",
+        ))
+        assert result.status == "uncertain"
+        assert "no outputs[index] is available" in result.stdout
+        assert "x" * 100 not in result.stdout
+        assert "x" * 100 not in str(result.output_events)
+    finally:
+        await executor.close()
+
+
+@pytest.mark.asyncio
+async def test_large_stdout_is_replaced_by_persistent_output_reference():
+    executor = LocalExecutor()
+    await executor.start()
+    previews = []
+
+    async def on_output(output):
+        previews.append(output)
+
+    try:
+        result = await executor.execute(request(
+            "print('x' * 8100)", author="agent", output_handler=on_output,
+        ))
+        assert sum(len(event.data["text"]) for event in previews) <= 512
+        assert result.status == "success"
+        assert "outputs[1]" in result.stdout
+        assert "Print a smaller slice" in result.stdout
+        assert "x" * 100 not in result.stdout
+        assert "x" * 100 not in str(result.output_events)
+        excerpt = await executor.execute(request("print(outputs[1][100:112])", author="agent"))
+        assert excerpt.status == "success"
+        assert "x" * 12 in excerpt.stdout
+        assert "outputs[1]" not in excerpt.stdout
+    finally:
+        await executor.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_say_over_8000_characters_is_rejected_before_publication():
+    executor = LocalExecutor()
+    await executor.start()
+    try:
+        result = await executor.execute(request("say('x' * 8001, final=True)", author="agent"))
+        assert result.status == "error"
+        assert "send something smaller" in result.error
+        assert result.say_outputs == ()
+        assert not result.final
+        # A direct user cell is not subject to the agent's say size cap.
+        direct = await executor.execute(request("say('x' * 8001)", author="user"))
+        assert direct.status == "success"
+        assert len(direct.say_outputs) == 1
     finally:
         await executor.close()
 
@@ -310,6 +401,36 @@ async def test_correlated_stdin_handles_input_and_password_without_protocol_pipe
                    for event in password.output_events)
         assert "stdin-password-never-leak" not in later.stdout
         assert "history-safe: True" in later.stdout
+    finally:
+        await executor.close()
+
+
+@pytest.mark.asyncio
+async def test_provisional_preview_cannot_leak_password_split_across_frames():
+    executor = LocalExecutor()
+    await executor.start()
+    secret = "preview-password-never-leak"
+    previews = []
+
+    async def answer(item):
+        return InputReply(item.origin, item.sequence, item.owner_frontend_id,
+                          value=secret, password=item.password)
+
+    async def on_output(item):
+        previews.append(item.data["text"])
+
+    try:
+        result = await executor.execute(request(
+            "import getpass, sys\n"
+            "pw = getpass.getpass('Password: ')\n"
+            "sys.stdout.write(pw[:7]); sys.stdout.flush()\n"
+            "sys.stdout.write(pw[7:] + '\\n'); sys.stdout.flush()",
+            allow_stdin=True, input_handler=answer, output_handler=on_output,
+        ))
+        assert result.status == "success"
+        assert all("preview" not in text for text in previews)
+        assert secret not in result.stdout
+        assert secret not in repr(result.output_events)
     finally:
         await executor.close()
 

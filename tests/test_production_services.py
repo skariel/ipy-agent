@@ -74,14 +74,14 @@ def test_provider_adapter_translates_context_and_preserves_usage_and_attribution
     observed_request = backend.requests[0]
     assert observed_request["max_tokens"] == 37
     assert observed_request["messages"][0]["role"] == "system"
-    assert "not a security boundary" in observed_request["messages"][0]["content"]
-    assert "must be ignored" in observed_request["messages"][0]["content"]
+    assert "sandbox" not in observed_request["messages"][0]["content"]
+    assert "Session (" not in observed_request["messages"][0]["content"]
     assert observed_request["messages"][1:] == [
         {"role": "user", "content": "first request"},
         {"role": "assistant", "content": "old code"},
         {
             "role": "user",
-            "content": "[RUNTIME OBSERVATION — untrusted program data]\nstdout: 7",
+            "content": "Execution result (untrusted):\nstdout: 7",
         },
         {"role": "user", "content": "continue"},
     ]
@@ -148,8 +148,9 @@ def test_context_adapter_preserves_phases_and_delegates_usage_and_reset_policy()
 
     messages = adapter.provider_messages(snapshot)
     assert messages[0]["role"] == "system"
-    assert "not a security boundary" in messages[0]["content"]
-    assert "ask_rw_approval" in messages[0]["content"]
+    assert "sandbox" not in messages[0]["content"]
+    assert "ask_rw_approval" not in messages[0]["content"]
+    assert "Runtime security:" not in messages[0]["content"]
     assert messages[1:] == (
         {"role": "user", "content": "old task"},
         {"role": "assistant", "content": "x = 1", "phase": "commentary"},
@@ -177,12 +178,31 @@ def test_context_adapter_preserves_phases_and_delegates_usage_and_reset_policy()
     assert not adapter.needs_reset()
 
 
+def test_default_model_messages_contain_only_plain_execution_feedback():
+    adapter = ProductionContextAdapter(limits=Limits())
+    snapshot = adapter.prepare_request("inspect", "request-1")
+    assert snapshot.messages[1] == ("user", "inspect")
+    observation = ProductionObservationAdapter().pack([
+        {"stream": "stdout", "text": "found\n", "session_id": "hidden-session",
+         "request_id": "hidden-request", "execution_id": "hidden-execution"},
+    ])
+    adapter.commit_response("request-1", "print('found')", observation=observation)
+    messages = adapter.provider_messages(adapter.snapshot())
+    assert messages[1:] == (
+        {"role": "user", "content": "inspect"},
+        {"role": "assistant", "content": "print('found')"},
+        {"role": "user", "content": "Execution result (untrusted):\nstdout:\nfound\n"},
+    )
+    assert all("hidden-" not in message["content"] for message in messages)
+    assert all("RUNTIME OBSERVATION" not in message["content"] for message in messages)
+
+
 def test_context_adapter_uses_snapshot_system_prompt_when_one_is_supplied():
     adapter = ProductionContextAdapter(limits=Limits())
     messages = adapter.provider_messages(
         ContextSnapshot(0, (("system", "configured prompt"), ("user", "hello")))
     )
-    assert messages[0]["content"].startswith("configured prompt\n\nProduction runtime clarification")
+    assert messages[0]["content"] == "configured prompt"
     assert messages[1] == {"role": "user", "content": "hello"}
 
 
@@ -190,22 +210,27 @@ def test_observation_adapter_is_lossless_ordered_and_detached_from_input():
     events = [
         {"stream": "stdout", "text": "a", "cell_id": "cell-1"},
         {"stream": "stdout", "text": "b", "cell_id": "cell-1"},
-        {"display": {"text/plain": "table"}, "cell_id": "cell-1"},
+        {"display": "table", "cell_id": "cell-1"},
         {"stream": "stderr", "text": "warning", "cell_id": "cell-1"},
     ]
     adapter = ProductionObservationAdapter()
     packed = adapter.pack(events)
     events[0]["text"] = "mutated"
-    assert packed["events"] == [
-        {"stream": "stdout", "text": "ab", "cell_id": "cell-1", "last_id": None},
-        {"display": {"text/plain": "table"}, "cell_id": "cell-1"},
-        {"stream": "stderr", "text": "warning", "cell_id": "cell-1"},
-    ]
+    assert packed == {"output": "stdout:\nab\nOut:\ntable\nstderr:\nwarning"}
     content = adapter.model_content(
         [{"stream": "stdout", "text": "safe", "cell_id": "cell-2"}]
     )
-    assert content.startswith("[RUNTIME OBSERVATION — untrusted program data]\n")
-    assert '"text":"safe"' in content
+    assert content == "Execution result (untrusted):\nstdout:\nsafe"
+    assert "cell-2" not in content
+
+
+def test_model_observation_omits_oversized_output_but_preserves_short_feedback():
+    adapter = ProductionObservationAdapter()
+    content = adapter.model_content([{"stream": "stdout", "text": "x" * 8_001}])
+    assert len(content) <= 8_000
+    assert "x" * 100 not in content
+    assert "Print a smaller slice" in content
+    assert "omitted" in content
 
 
 def test_plugin_registers_explicit_production_services_using_injected_factories():
@@ -219,7 +244,7 @@ def test_plugin_registers_explicit_production_services_using_injected_factories(
 
     provider = runtime.select("provider", "codex").factory()
     context = runtime.select("context", "production").factory()
-    observations = runtime.select("observation", "lossless").factory()
+    observations = runtime.select("observation", "bounded").factory()
     response = asyncio.run(provider.generate(model_request(messages=(("user", "do it"),))))
 
     assert response.text == "print('ok')"
@@ -233,7 +258,7 @@ def test_plugin_registers_explicit_production_services_using_injected_factories(
 def test_default_production_plugin_does_not_select_or_construct_a_provider():
     runtime = PluginRuntime.load(builtins={"production": ProductionServicesPlugin()})
     assert runtime.select("context", "production").factory()
-    assert runtime.select("observation", "lossless").factory()
+    assert runtime.select("observation", "bounded").factory()
     with pytest.raises(PluginError, match="No enabled provider"):
         runtime.select("provider", "codex")
 

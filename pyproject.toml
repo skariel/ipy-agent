@@ -33,12 +33,12 @@ link-mode = "copy"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-markers = ["sandbox: requires functioning Linux srt isolation", "live: explicitly authorized paid provider calls"]
+markers = ["live: explicitly authorized paid provider calls"]
 
 
 [tool.mypy]
 python_version = "3.12"
-files = ["src", "scripts"]
+files = ["src"]
 strict = false
 strict_bytes = false
 local_partial_types = false
@@ -141,7 +141,7 @@ preview = true
 quote-style = "double"
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/scripts", "/examples", "/README.md", "/ARCHITECTURE_PLAN.md", "/ARCHITECTURE_STATUS.md", "/PLUGIN_API.md", "/pyproject.toml", "/uv.lock"]
+include = ["/src", "/tests", "/examples", "/README.md", "/ARCHITECTURE_PLAN.md", "/ARCHITECTURE_STATUS.md", "/PLUGIN_API.md", "/pyproject.toml", "/uv.lock"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/py_agent"]

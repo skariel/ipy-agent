@@ -27,6 +27,8 @@ from py_agent.contracts import (
 )
 from py_agent.coordinator import MAX_PENDING_ACTIONS, Coordinator, State, Submission
 from py_agent.local_executor import LocalExecutor
+from py_agent.provider import ProviderError
+from py_agent.production_services import ProductionContextAdapter
 from py_agent import plain_terminal
 from py_agent.plugins import Contributions, PluginManifest, PluginRuntime, TransformContribution, hookimpl
 from py_agent.session_journal import JournalError, NoPersistenceJournal, SQLiteSessionJournal
@@ -332,7 +334,7 @@ def test_model_observation_projects_ordered_sanitized_bounded_rich_output():
                 "text/plain": "safe\x1b]52;c;terminal-secret\x07 fallback",
             }),
             ExecutionOutput("execute_result", {"image/png": image_payload}),
-            ExecutionOutput("display", {"text/plain": "x" * 9_000}),
+            ExecutionOutput("display", {"text/plain": "x" * 2_000}),
             ExecutionOutput("stream", {"name": "stderr", "text": "after"}),
         ),
     )
@@ -348,7 +350,6 @@ def test_model_observation_projects_ordered_sanitized_bounded_rich_output():
     assert events[1]["display"] == "safe fallback"
     assert events[2]["display"] == "[rich output omitted; available MIME types: image/png]"
     assert len(events[3]["display"]) <= 8_000
-    assert "truncated" in events[3]["display"]
     assert all(
         event["execution_id"] == origin.execution_id
         and event["generation_id"] == origin.generation_id
@@ -359,6 +360,10 @@ def test_model_observation_projects_ordered_sanitized_bounded_rich_output():
     assert image_payload not in serialized
     assert "terminal-secret" not in serialized
     assert "\x1b" not in serialized
+    too_large = ExecutionResult(origin, "success", stdout="x" * 9_000)
+    rejected = coordinator._packed_observation(request, too_large)
+    assert rejected["status"] == "output_too_large"
+    assert "x" * 100 not in json.dumps(rejected)
     foreign_origin = Origin(
         "other-session", "request", "terminal", 4, "generation", "other-execution",
     )
@@ -531,9 +536,9 @@ async def test_progress_stream_keeps_step_limit_and_error_status():
         submission = await coordinator.submit("status-client", "continue", on_progress=collect)
         limit = next(event for event in delivered if event.data.get("phase") == "step_limit")
         assert limit.data["status"] == "paused"
-        assert "paused after 1 execution steps" in limit.data["text"]
+        assert "paused after 1 agent steps" in limit.data["text"]
         assert limit in submission.events
-        assert "paused after 1 execution steps" in submission.message
+        assert "paused after 1 agent steps" in submission.message
 
         class ErrorExecutor(CaptureExecutor):
             async def execute(self, request):
@@ -816,6 +821,250 @@ def test_cli_journal_flag_is_optional_and_forwarded_to_jupyter_kernel():
 
 
 @pytest.mark.asyncio
+async def test_transient_provider_failure_retries_without_reexecuting_cells():
+    class FlakyProvider:
+        model = "offline/flaky"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def generate(self, _request):
+            self.calls += 1
+            if self.calls < 3:
+                raise ProviderError("temporary outage", kind="provider")
+            return ModelResponse("say('done', final=True)", provider_id="offline", model=self.model)
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(runtime, router="default", provider="fake",
+                              interpreter="basic", executor="local")
+    provider, executor = FlakyProvider(), CaptureExecutor()
+    coordinator.provider, coordinator.executor = provider, executor
+    await coordinator.start()
+    try:
+        submission = await coordinator.submit("terminal", "finish")
+        assert provider.calls == 3
+        assert len(executor.requests) == 1
+        assert submission.result.final
+        assert [event.data.get("phase") for event in submission.events].count("provider_retry") == 2
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_authentication_provider_failure_is_not_retried():
+    class AuthFailure:
+        model = "offline/auth"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def generate(self, _request):
+            self.calls += 1
+            raise ProviderError("authentication rejected", kind="authentication")
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(runtime, router="default", provider="fake",
+                              interpreter="basic", executor="local")
+    provider, executor = AuthFailure(), CaptureExecutor()
+    coordinator.provider, coordinator.executor = provider, executor
+    await coordinator.start()
+    try:
+        with pytest.raises(ProviderError, match="authentication rejected"):
+            await coordinator.submit("terminal", "finish")
+        assert provider.calls == 1
+        assert not executor.requests
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_default_agent_loop_continues_past_sixteen_cells_until_final():
+    class RepeatingProvider:
+        model = "offline/long-task"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def generate(self, _request):
+            self.calls += 1
+            return ModelResponse("pass", provider_id="offline", model=self.model)
+
+    class EventuallyFinalExecutor(CaptureExecutor):
+        async def execute(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 17:
+                return ExecutionResult(request.origin, "success", final=True,
+                                       say_outputs=(SayOutput("done", final=True),))
+            return ExecutionResult(request.origin, "success")
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(runtime, router="default", provider="fake",
+                              interpreter="basic", executor="local")
+    provider, executor = RepeatingProvider(), EventuallyFinalExecutor()
+    coordinator.provider, coordinator.executor = provider, executor
+    assert coordinator.max_agent_steps == 0
+    await coordinator.start()
+    try:
+        submission = await coordinator.submit("terminal", "finish the long investigation")
+        assert submission.result.final
+        assert len(submission.executions) == provider.calls == 17
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_unlimited_agent_loop_still_bounds_consecutive_invalid_model_cells():
+    class MalformedProvider:
+        model = "offline/malformed"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def generate(self, _request):
+            self.calls += 1
+            return ModelResponse("Prose\n```python\npass\n```", provider_id="offline", model=self.model)
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(runtime, router="default", provider="fake",
+                              interpreter="basic", executor="local")
+    provider, executor = MalformedProvider(), CaptureExecutor()
+    coordinator.provider, coordinator.executor = provider, executor
+    await coordinator.start()
+    try:
+        submission = await coordinator.submit("terminal", "find a bug")
+        assert provider.calls == 3
+        assert not executor.requests
+        assert "3 consecutive invalid" in submission.message
+        assert coordinator.state is State.IDLE
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_long_agent_task_resets_reported_full_context_without_losing_active_request():
+    from py_agent.limits import Limits
+    from py_agent.production_services import ProductionContextAdapter
+
+    class ReportingProvider:
+        model = "offline/reset"
+
+        def __init__(self):
+            self.requests = []
+
+        async def generate(self, request):
+            self.requests.append(request)
+            return ModelResponse("pass", usage={"normalized": {"input_tokens": 96}},
+                                 provider_id="offline", model=self.model)
+
+    class FinalOnSecondCell(CaptureExecutor):
+        async def execute(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 2:
+                return ExecutionResult(request.origin, "success", final=True,
+                                       say_outputs=(SayOutput("done", final=True),))
+            return ExecutionResult(request.origin, "success")
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(
+        runtime, router="default", provider="fake", interpreter="basic", executor="local",
+        context=ProductionContextAdapter(limits=Limits(input_tokens=100)),
+    )
+    provider, executor = ReportingProvider(), FinalOnSecondCell()
+    coordinator.provider, coordinator.executor = provider, executor
+    await coordinator.start()
+    try:
+        submission = await coordinator.submit("terminal", "find the bug")
+        assert submission.result.final
+        assert [request.context.epoch for request in provider.requests] == [1, 2]
+        assert ("user", "find the bug") in provider.requests[1].context.messages
+        assert not any(role == "assistant" and text == "pass"
+                       for role, text in provider.requests[1].context.messages)
+    finally:
+        await coordinator.close()
+
+
+def test_agent_protocol_is_not_repeated_in_default_system_prompt():
+    original = ProductionContextAdapter().snapshot()
+    default = Coordinator._agent_protocol_context(original)
+    assert default.messages == original.messages
+    assert "another cell without calling say()" in default.messages[0][1]
+
+    custom = ContextSnapshot(1, (("system", "Write one Python cell."),), (None,))
+    corrected = Coordinator._agent_protocol_context(custom)
+    assert corrected.messages[0][1].count("Autonomous multi-cell protocol:") == 1
+
+
+@pytest.mark.asyncio
+async def test_toolbar_cache_summary_uses_complete_weighted_reports():
+    class UsageProvider:
+        model = "offline/cache"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def generate(self, _request):
+            self.calls += 1
+            usage = (
+                {"input_tokens": 100, "cache_read_tokens": 50, "cache_write_tokens": 20}
+                if self.calls == 1 else
+                {"input_tokens": 300, "cache_read_tokens": 270, "cache_write_tokens": 10}
+            )
+            return ModelResponse("pass", usage={"normalized": usage}, provider_id="offline", model=self.model)
+
+    class TwoCellExecutor(CaptureExecutor):
+        async def execute(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return ExecutionResult(request.origin, "success")
+            return ExecutionResult(request.origin, "success", final=True,
+                                   say_outputs=(SayOutput("complete", final=True),))
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(runtime, router="default", provider="fake",
+                              interpreter="basic", executor="local")
+    coordinator.provider, coordinator.executor = UsageProvider(), TwoCellExecutor()
+    await coordinator.start()
+    try:
+        await coordinator.submit("terminal", "calculate cache")
+        assert coordinator.cache_summary == ("80", "320", "30")
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_agent_response_is_rejected_with_model_only_retry():
+    class RepairingProvider:
+        model = "offline/size-repair"
+
+        def __init__(self):
+            self.requests = []
+
+        async def generate(self, request):
+            self.requests.append(request)
+            source = "#" + "x" * 8_000 if len(self.requests) == 1 else "say('done', final=True)"
+            return ModelResponse(source, provider_id="offline", model=self.model)
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(
+        runtime, router="default", provider="fake", interpreter="basic", executor="local",
+    )
+    provider, executor = RepairingProvider(), CaptureExecutor()
+    coordinator.provider, coordinator.executor = provider, executor
+    await coordinator.start()
+    try:
+        submission = await coordinator.submit("terminal", "handle this")
+        assert submission.result.final
+        assert len(provider.requests) == 2
+        assert [item.source for item in executor.requests] == ["say('done', final=True)"]
+        feedback = "\n".join(content for _, content in provider.requests[1].context.messages)
+        assert "Try sending a smaller Python cell" in feedback
+        assert "x" * 100 not in feedback
+        assert not any(event.kind == "error" for event in submission.events)
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
 async def test_agent_syntax_error_is_returned_to_model_without_executing_or_displaying_it():
     class RepairingProvider:
         model = "offline/repair"
@@ -845,6 +1094,44 @@ async def test_agent_syntax_error_is_returned_to_model_without_executing_or_disp
             for role, content in provider.requests[1].context.messages if role == "observation"
         )
         assert not any(event.kind == "error" for event in submission.events)
+        assert submission.message == "complete"
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_mixed_markdown_response_is_corrected_without_executing_rejected_text():
+    class RepairingProvider:
+        model = "offline/format-repair"
+
+        def __init__(self):
+            self.requests = []
+
+        async def generate(self, request):
+            self.requests.append(request)
+            source = (
+                "Here is the answer:\n```python\nprint('DO_NOT_EXECUTE')\n```"
+                if len(self.requests) == 1 else "say('repaired', final=True)"
+            )
+            return ModelResponse(source, provider_id="offline", model=self.model)
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(
+        runtime, router="default", provider="fake", interpreter="basic", executor="local",
+    )
+    provider, executor = RepairingProvider(), CaptureExecutor()
+    coordinator.provider, coordinator.executor = provider, executor
+    await coordinator.start()
+    try:
+        submission = await coordinator.submit("terminal", "complete the task")
+        assert submission.result.final
+        assert len(provider.requests) == 2
+        assert [request.source for request in executor.requests] == ["say('repaired', final=True)"]
+        next_messages = provider.requests[1].context.messages
+        assert any("invalid format" in text for _, text in next_messages)
+        assert not any("DO_NOT_EXECUTE" in text for _, text in next_messages)
+        assert any(event.kind == "progress" and event.data.get("phase") == "format_retry"
+                   for event in submission.events)
         assert submission.message == "complete"
     finally:
         await coordinator.close()

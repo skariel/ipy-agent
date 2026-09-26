@@ -1,8 +1,4 @@
-"""Lossless observation packing; display spooling belongs to the worker.
-
-Adjacent stdout/stderr pipe fragments are coalesced without dropping text or
-clipping JSON. There is no second byte-based output budget in the supervisor.
-"""
+"""Coalesce adjacent stream fragments before the model-facing size check."""
 
 from __future__ import annotations
 

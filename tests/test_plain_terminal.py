@@ -97,6 +97,62 @@ async def until(predicate):
     await asyncio.wait_for(poll(), 3)
 
 
+def test_output_panels_do_not_prepend_a_plain_blank_line():
+    for render in (
+        lambda terminal: (terminal._render_stream("stdout", "out\n"), terminal._finish_stream()),
+        lambda terminal: (terminal._render_stream("stderr", "err\n"), terminal._finish_stream()),
+        lambda terminal: terminal._render_say("message"),
+        lambda terminal: terminal._render_display("Out", "result"),
+    ):
+        output = Output()
+        terminal = PlainTerminal(CoordinatorStub(), output=output)
+        render(terminal)
+        assert output.text and not output.text.startswith("\n")
+
+
+def test_main_branch_prompt_toolbar_and_markdown_panels_without_trusting_escapes():
+    from py_agent.terminal_markdown import markdown_fragments
+
+    coordinator, output = CoordinatorStub(), Output()
+    coordinator.model = "fake/deterministic"
+    terminal = PlainTerminal(coordinator, output=output)
+    assert "In [1]: " in str(terminal._prompt_message())
+    assert "IDLE | fake/deterministic" in str(terminal._toolbar())
+    terminal._render_say("# Heading\n- **bold** and `code`\n\x1b]52;c;secret\x07")
+    assert "Heading" in output.text
+    assert "• bold and code" in output.text
+    assert "secret" not in output.text
+    assert "\x1b" not in output.text
+    assert any(text == "bold" and style == "class:md-bold"
+               for style, text in markdown_fragments("**bold**"))
+
+    colored = PlainTerminal(coordinator, output=output)
+    colored.no_color = False
+    rendered = []
+    colored._write_raw = rendered.append
+    colored._render_stream("stdout", "hello\n")
+    colored._finish_stream()
+    assert "\x1b[48;2;40;50;40m" in "".join(rendered)
+    assert "stdout [?]:" in "".join(rendered)
+
+
+def test_early_stream_preview_is_not_printed_twice_on_completed_cell():
+    origin = Origin("session", "request", "terminal", 0, execution_id="exec-1")
+    output = Output()
+    terminal = PlainTerminal(CoordinatorStub(), output=output)
+    terminal._show_live_event(OutputEvent(
+        origin, 1, "stream", {"name": "stdout", "text": "early line\n"},
+        metadata={"provisional": True},
+    ))
+    assert "early line" in output.text
+    terminal._show_live_event(OutputEvent(
+        origin, 2, "stream", {"name": "stdout", "text": "early line\nlater line\n"},
+    ))
+    terminal._show_live_event(OutputEvent(origin, 3, "progress", {"phase": "cell_complete", "status": "success"}))
+    assert output.text.count("early line") == 1
+    assert output.text.count("later line") == 1
+
+
 def test_sanitize_removes_terminal_control_and_spoofing_characters():
     assert sanitize("safe\x1b]52;c;SECRET\x07\x1b[2J\u202e text") == "safe text"
     assert sanitize("a\r\nb\rc\x00") == "a\nb\nc"
@@ -362,7 +418,7 @@ async def test_terminal_renders_live_progress_once_without_identifier_spam():
         await until(lambda: terminal.session.app.is_running)
         pipe.send_text("do it\r")
         await asyncio.wait_for(started.wait(), timeout=3)
-        assert "Agent working…" in output.text
+        assert "Agent working…" not in output.text  # state lives in the toolbar
         assert "hello" not in output.text
         pipe.send_text("/quit\r")
         release.set()
@@ -370,7 +426,7 @@ async def test_terminal_renders_live_progress_once_without_identifier_spam():
 
     assert output.text.count("hello") == 1
     assert output.text.count("cell output") == 1
-    assert "Running agent cell 1…" in output.text
+    assert "Running agent cell 1…" not in output.text
     assert "Agent: executing cell (step 1)." not in output.text
     assert "request-long-id" not in output.text
     assert "execution-long-id" not in output.text

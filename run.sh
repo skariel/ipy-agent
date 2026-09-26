@@ -16,14 +16,6 @@ case "${1:-}" in
     kernel|kernels|attach) exec "$PY_AGENT_BIN" "$@" ;;
 esac
 
-# An explicitly requested legacy session retains its own model/workspace flags;
-# do not smuggle the new provider default into that CLI.
-for argument in "$@"; do
-    if [[ "$argument" == --legacy ]]; then
-        exec "$PY_AGENT_BIN" "$@"
-    fi
-done
-
 arguments=()
 has_provider=false
 has_model=false

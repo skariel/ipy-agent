@@ -27,6 +27,8 @@ from typing import Any
 
 MAX_FRAME = 1_048_576
 MAX_OUTPUT_FRAME_CHARS = 8_192
+MAX_VISIBLE_OUTPUT_CHARS = 8_000
+MAX_STORED_OUTPUT_CHARS = 1_048_576
 MAX_ERROR_CHARS = 8_192
 MAX_SAY_CHARS = MAX_FRAME
 MAX_SAY_MESSAGES = 1_024
@@ -60,6 +62,7 @@ _SEND_LOCK = threading.Lock()
 _PASSWORD_SECRETS: list[str] = []
 _PASSWORD_SECRET_CHARS = 0
 _ACTIVE_INPUT_FUNCTIONS: tuple[Any, Any] | None = None
+_NEXT_OUTPUT_INDEX = 1
 
 
 def _dispatch_input(prompt: Any = "") -> str:
@@ -88,7 +91,8 @@ def _stdlib_getpass_dispatch(
     if kwargs:
         name = next(iter(kwargs))
         raise TypeError(f"Unexpected getpass argument: {name}")
-    return __py_agent_dispatch_getpass(prompt, stream, echo_char=echo_char)
+    # Resolved in the getpass module namespace after code transplantation.
+    return __py_agent_dispatch_getpass(prompt, stream, echo_char=echo_char)  # noqa: F821
 
 
 def _secure_getpass_variants() -> None:
@@ -636,6 +640,9 @@ class _OutputWriter(io.TextIOBase):
         self.origin = origin
         self._pending = ""
         self._lock = threading.Lock()
+        self._captured: list[str] = []
+        self._captured_chars = 0
+        self._omitted_chars = 0
         self._binary = _OutputBytesWriter(self)
 
     @property
@@ -664,6 +671,12 @@ class _OutputWriter(io.TextIOBase):
             for start in range(0, length, MAX_OUTPUT_FRAME_CHARS):
                 chunk = text[start : start + MAX_OUTPUT_FRAME_CHARS]
                 safe = chunk.encode("utf-8", errors="replace").decode("utf-8")
+                remaining = max(0, MAX_STORED_OUTPUT_CHARS - self._captured_chars)
+                kept = safe[:remaining]
+                if kept:
+                    self._captured.append(kept)
+                    self._captured_chars += len(kept)
+                self._omitted_chars += len(safe) - len(kept)
                 offset = 0
                 if self._pending:
                     needed = MAX_OUTPUT_FRAME_CHARS - len(self._pending)
@@ -676,11 +689,18 @@ class _OutputWriter(io.TextIOBase):
                     self._emit(safe[offset : offset + MAX_OUTPUT_FRAME_CHARS])
                     offset += MAX_OUTPUT_FRAME_CHARS
                 self._pending += safe[offset:]
+                if "\n" in self._pending:
+                    self._emit(self._pending)
+                    self._pending = ""
         return length
 
     def flush(self) -> None:
         self._binary._flush_decoder()
         self._flush_text()
+
+    def captured(self) -> tuple[str, int, int]:
+        with self._lock:
+            return "".join(self._captured), self._captured_chars, self._omitted_chars
 
     def _flush_text(self) -> None:
         with self._lock:
@@ -1098,6 +1118,8 @@ def _make_say(execution_id: str, author: str, origin: dict[str, Any], stdout, st
         except (TypeError, ValueError, RecursionError) as exc:
             raise TypeError("say() content must be finite JSON data") from exc
         cost = len(encoded)
+        if author == "agent" and emitted_chars + cost > 8_000:
+            raise ValueError("say() output exceeds the 8000-character cell limit; send something smaller")
         if emitted_count >= MAX_SAY_MESSAGES:
             raise ValueError("say() emitted too many messages in one cell")
         if emitted_chars + cost > MAX_SAY_CHARS:
@@ -1130,7 +1152,7 @@ def _make_say(execution_id: str, author: str, origin: dict[str, Any], stdout, st
 
 
 def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: dict[str, Any]) -> None:
-    global _ACTIVE_INPUT_FUNCTIONS
+    global _ACTIVE_INPUT_FUNCTIONS, _NEXT_OUTPUT_INDEX
     null_in, null_out, null_err = _NULL_STREAMS
     stdout = _OutputWriter("stdout", execution_id, author, origin)
     stderr = _OutputWriter("stderr", execution_id, author, origin)
@@ -1302,6 +1324,32 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
             builtins.input = _dispatch_input
             _secure_getpass_variants()
 
+    stdout_text, stdout_chars, stdout_omitted = stdout.captured()
+    stderr_text, stderr_chars, stderr_omitted = stderr.captured()
+    output_reference = None
+    original_chars = stdout_chars + stdout_omitted + stderr_chars + stderr_omitted
+    if original_chars > MAX_VISIBLE_OUTPUT_CHARS:
+        # Model and terminal receive only the reference. Keep bounded text in
+        # the persistent Python namespace so the agent can inspect small slices.
+        # stdout then stderr when both exist; this is text, not a replay of
+        # interleaved stream timing. Do not retain unbounded subprocess output.
+        retained = (stdout_text + stderr_text)[:MAX_STORED_OUTPUT_CHARS]
+        omitted = original_chars - len(retained)
+        outputs = shell.user_ns.get("outputs")
+        if type(outputs) is not dict:
+            outputs = {}
+            shell.user_ns["outputs"] = outputs
+        while _NEXT_OUTPUT_INDEX in outputs:
+            _NEXT_OUTPUT_INDEX += 1
+        output_reference = {
+            "index": _NEXT_OUTPUT_INDEX,
+            "original_chars": original_chars,
+            "retained_chars": len(retained),
+            "omitted_chars": omitted,
+        }
+        outputs[_NEXT_OUTPUT_INDEX] = retained
+        _NEXT_OUTPUT_INDEX += 1
+
     _send({
         "type": "result",
         "version": PROTOCOL_VERSION,
@@ -1311,6 +1359,7 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
         "status": status,
         "error": error,
         "final_requested": final_requested(),
+        "output_reference": output_reference,
     })
 
 
@@ -1330,7 +1379,7 @@ def main() -> None:
     config.InteractiveShell.colors = "nocolor"
     shell = InteractiveShell.instance(
         config=config,
-        user_ns={"say": lambda text, final=False: print(text), "memories": []},
+        user_ns={"say": lambda text, final=False: print(text), "memories": [], "outputs": {}},
     )
     _install_noninteractive_system(shell)
     _send({"type": "ready", "version": PROTOCOL_VERSION})

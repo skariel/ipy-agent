@@ -163,6 +163,40 @@ def _completion(raw: dict) -> Completion:
     return Completion(text, reason, usage, reasoning, raw, rejection)
 
 
+def _litelm_failure_kind(exc: Exception) -> str:
+    """Retry only failures with a recognizable transient provider category."""
+    status = getattr(exc, "status_code", None)
+    if type(status) is not int:
+        status = getattr(exc, "status", None)
+    if type(status) is int:
+        if status in (401, 403):
+            return "authentication"
+        if status == 429:
+            return "rate_limit"
+        if status == 408:
+            return "timeout"
+        if status == 413:
+            return "overflow"
+        if 500 <= status < 600:
+            return "provider"
+        if 400 <= status < 500:
+            return "request"
+    name = type(exc).__name__
+    if name == "ContextWindowExceededError":
+        return "overflow"
+    if name in {"AuthenticationError", "PermissionDeniedError", "InvalidRequestError", "BadRequestError"}:
+        return "authentication" if name in {"AuthenticationError", "PermissionDeniedError"} else "request"
+    if name in {"RateLimitError", "RateLimitException"}:
+        return "rate_limit"
+    if name in {"TimeoutError", "APITimeoutError", "ReadTimeout", "ConnectTimeout"}:
+        return "timeout"
+    if name in {"APIConnectionError", "ConnectionError", "TransportError"}:
+        return "transport"
+    if name in {"ServiceUnavailableError", "InternalServerError"}:
+        return "provider"
+    return "internal"
+
+
 class LitelmProvider:
     """API-key client; no pi subscription authentication or server-side history.
 
@@ -201,7 +235,7 @@ class LitelmProvider:
             # Exception strings can contain credential-bearing URLs or headers.
             # Record the category, never deliberately persist their raw content.
             name = type(exc).__name__
-            kind = "overflow" if name == "ContextWindowExceededError" else "provider"
+            kind = _litelm_failure_kind(exc)
             raise ProviderError(f"litelm request failed ({name}); no source accepted", kind=kind) from exc
 
     async def _collect(self, stream: Any) -> Completion:

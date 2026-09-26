@@ -9,9 +9,25 @@ from types import SimpleNamespace
 
 import pytest
 
-from py_agent.provider import Completion, FakeProvider, LitelmProvider, ProviderError, normalize_usage
+from py_agent.provider import (
+    Completion, FakeProvider, LitelmProvider, ProviderError, _litelm_failure_kind, normalize_usage,
+)
 
 MESSAGES = [{"role": "system", "content": "raw Python only"}, {"role": "user", "content": "go"}]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [(400, "request"), (401, "authentication"), (403, "authentication"),
+     (408, "timeout"), (413, "overflow"), (429, "rate_limit"),
+     (500, "provider"), (503, "provider")],
+)
+def test_litelm_retry_classification_is_explicit(status, expected):
+    error = RuntimeError("credentials must never be logged")
+    error.status_code = status
+    assert _litelm_failure_kind(error) == expected
+    assert _litelm_failure_kind(ValueError("local plugin bug")) == "internal"
+
 
 
 def response(content="say('ok', final=True)", *, reason="stop", **message):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from itertools import count
 import json
 import math
 import re
@@ -21,6 +22,7 @@ from .contracts import (
     ContextSnapshot,
     ExecutorCapabilities,
     ExecutorCapabilityError,
+    ExecutionOutput,
     ExecutionRequest,
     ExecutionResult,
     InputHandler,
@@ -65,6 +67,7 @@ HISTORY_MAX_OFFSET = MAX_EVENT_BYTES
 HISTORY_MAX_SENSITIVE_VALUES = 256
 HISTORY_MAX_SENSITIVE_CHARS = 65_536
 HISTORY_MAX_SENSITIVE_VALUE_CHARS = 256
+MAX_AGENT_RESPONSE_CHARS = 8_000
 MODEL_OBSERVATION_MAX_EVENTS = 256
 MODEL_OBSERVATION_MAX_DISPLAY_CHARS = 8_000
 MODEL_OBSERVATION_MAX_MIME_TYPES = 16
@@ -162,10 +165,10 @@ class Coordinator:
         executor_wrappers: tuple[str, ...] = (),
         config_revision: int = 0,
         shutdown_timeout: float = 5.0,
-        max_agent_steps: int = 16,
+        max_agent_steps: int = 0,
     ):
-        if type(max_agent_steps) is not int or max_agent_steps <= 0:
-            raise ValueError("max_agent_steps must be a positive integer")
+        if type(max_agent_steps) is not int or max_agent_steps < 0:
+            raise ValueError("max_agent_steps must be a nonnegative integer (0 means unlimited)")
         if isinstance(shutdown_timeout, bool) or not isinstance(shutdown_timeout, (int, float)):
             raise ValueError("shutdown_timeout must be a finite positive number")
         try:
@@ -283,6 +286,9 @@ class Coordinator:
         self._active_operation_id: str | None = None
         self._active_model_request: ModelRequest | None = None
         self._active_provider_usage_recorded = False
+        self._cache_totals = {"input_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0}
+        self._cache_complete = {name: True for name in self._cache_totals}
+        self._cache_reports = 0
         self._active_execution_request: ExecutionRequest | None = None
         self._active_execution_result_recorded = False
         self._execution_active = False
@@ -957,14 +963,15 @@ class Coordinator:
 
     @staticmethod
     def _agent_protocol_context(snapshot: ContextSnapshot) -> ContextSnapshot:
-        """Correct old advisory-final wording and state this coordinator's loop contract."""
+        """Supply the loop contract only when the selected context omits it."""
         correction = (
-            "Autonomous multi-cell protocol: say(text, final=False) emits a user-visible message. "
-            "A non-final say is progress only. The coordinator runs another provider/execution step "
-            "after every successful non-final cell; finish the task with say(answer, final=True). "
-            "Only a final say from a successfully completed cell completes the task; a final say in a "
-            "failed cell is discarded. Intermediate say messages and execution observations are "
-            "visible on the next step."
+            "Autonomous multi-cell protocol: after each executed cell that does not complete the task, "
+            "its execution observations are fed back and another model/execution turn follows automatically. "
+            "You may run multiple consecutive cells with no say() call at all; say() is NEVER required "
+            "to advance to the next cell. say(text, final=False) is optional user-visible progress, "
+            "not a continuation command. Finish only when the task is actually done with "
+            "say(answer, final=True) in a successful cell. A final say in a failed cell is discarded. "
+            "Never claim that say() is needed between cells."
         )
         messages = []
         phases = list(snapshot.message_phases)
@@ -975,8 +982,15 @@ class Coordinator:
                     "final is\ncurrently advisory only.",
                     "final=True explicitly requests completion, but completion is committed only after success.",
                 )
-            if role == "system" and correction in content:
-                found_protocol = True
+            if role == "system":
+                normalized = " ".join(content.split())
+                if (correction in content
+                        or "another cell without calling say()." in normalized
+                        or "You can run any number of Python cells in sequence without calling say() between them."
+                        in normalized
+                        or "Cells continue automatically: you do NOT need to call say() between cells."
+                        in normalized):
+                    found_protocol = True
             messages.append((role, content))
         if not found_protocol:
             system_index = next((i for i, (role, _) in enumerate(messages) if role == "system"), None)
@@ -1108,16 +1122,29 @@ class Coordinator:
                     + f"[{omitted_events} execution output events omitted]"
                 )
             error = _strip_observation_terminal_controls(result.error or "no error details")
-            return output_text + (
+            feedback = output_text + (
                 f"\nExecution {result.status}: {error}"
                 if result.status != "success" else ""
             )
+            if len(feedback) > 8_000:
+                return (
+                    "Execution output exceeded the 8000-character model limit. "
+                    "Print a smaller slice and retry; the large output was omitted."
+                )
+            return feedback
         pack = getattr(self.observations, "pack", None)
         if not callable(pack):
             raise TypeError("Selected observation service must expose pack")
         packed = pack(events)
         if not hasattr(packed, "items"):
             raise TypeError("Observation service must return a mapping")
+        serialized = json.dumps(packed, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        if len(serialized) + len("[RUNTIME OBSERVATION — untrusted program data]\n") > 8_000:
+            return {
+                "error": "Execution output exceeded the 8000-character model limit. "
+                         "Print a smaller slice and retry; the large output was omitted.",
+                "status": "output_too_large", "executed": True,
+            }
         return packed
 
     def _abandon_context(self, request_id: str) -> None:
@@ -1172,12 +1199,41 @@ class Coordinator:
                 "Durable journal failed; the operation stopped without replay"
             ) from exc
 
+    @property
+    def cache_summary(self) -> tuple[str, str, str]:
+        """Session-weighted cache rate and complete reported read/write totals."""
+        rate = "?"
+        if (self._cache_reports and self._cache_complete["input_tokens"]
+                and self._cache_complete["cache_read_tokens"]
+                and self._cache_totals["input_tokens"] > 0):
+            total = self._cache_totals["input_tokens"]
+            rate = str((self._cache_totals["cache_read_tokens"] * 100 + total // 2) // total)
+        read = str(self._cache_totals["cache_read_tokens"]) if (
+            self._cache_reports and self._cache_complete["cache_read_tokens"]
+        ) else "?"
+        write = str(self._cache_totals["cache_write_tokens"]) if (
+            self._cache_reports and self._cache_complete["cache_write_tokens"]
+        ) else "?"
+        return rate, read, write
+
     def _record_provider_usage(
         self, request: ModelRequest, response: ModelResponse | None, *, outcome: str,
     ) -> None:
         if self._active_model_request is request and self._active_provider_usage_recorded:
             return
         self._journal_record("record_provider_usage", request, response, outcome=outcome)
+        if response is not None:
+            reported = response.usage.get("normalized", response.usage)
+            counters = reported if hasattr(reported, "get") else {}
+            self._cache_reports += 1
+            for name in self._cache_totals:
+                value = counters.get(name)
+                if name == "cache_write_tokens" and (type(value) is not int or value < 0):
+                    value = counters.get("cache_creation_tokens")
+                if type(value) is int and value >= 0:
+                    self._cache_totals[name] += value
+                else:
+                    self._cache_complete[name] = False
         if self._active_model_request is request:
             self._active_provider_usage_recorded = True
 
@@ -1517,6 +1573,31 @@ class Coordinator:
 
                 return dispatch_input
 
+            def execution_output_handler(execution_origin: Origin, author: str):
+                if on_progress is None:
+                    return None
+
+                async def deliver(output: ExecutionOutput) -> None:
+                    if (output.kind != "stream"
+                            or not self._operation_is_current(operation_id, State.EXECUTING)):
+                        raise asyncio.CancelledError
+                    event = self._new_output_event(
+                        execution_origin, "stream",
+                        {**dict(output.data), "author": author},
+                        metadata={"provisional": True}, author=author,
+                    )
+                    # Frontend-only provisional preview: never add it to model
+                    # context, journal, or observer history. The completed cell
+                    # result remains the single authoritative output record.
+                    delivered = on_progress(event)
+                    if not inspect.isawaitable(delivered):
+                        raise TypeError("Request progress callback must be async")
+                    await delivered
+                    if not self._operation_is_current(operation_id, State.EXECUTING):
+                        raise asyncio.CancelledError
+
+                return deliver
+
             context_pending = False
             steering_awaiting_dispatch: list[_QueuedAction] = []
             steering_commit_started = False
@@ -1555,8 +1636,32 @@ class Coordinator:
                     last_result = None
                     last_execution = None
                     last_response = None
+                    invalid_generations = 0
+                    dispatched_steering: list[tuple[str, str]] = []
 
-                    for step in range(1, self.max_agent_steps + 1):
+                    def preflight_exhausted(response: ModelResponse) -> Submission | None:
+                        nonlocal invalid_generations
+                        invalid_generations += 1
+                        # A limitless successful-cell loop must not turn a
+                        # broken format into unbounded paid provider retries.
+                        if invalid_generations <= 2:
+                            return None
+                        self._set_state_unless_stopping(State.IDLE)
+                        visible_messages.append(
+                            "Agent paused after 3 consecutive invalid model responses; "
+                            "no rejected source was executed. Submit a new request to continue."
+                        )
+                        return Submission(
+                            routed, result=last_result, message="\n".join(visible_messages),
+                            execution=last_execution, response=response,
+                            say_outputs=tuple(visible_outputs), executions=tuple(executions),
+                            events=tuple(published_events),
+                        )
+
+                    # Follow the original agent loop by default: only an
+                    # explicitly selected positive limit pauses a long task.
+                    steps = count(1) if self.max_agent_steps == 0 else range(1, self.max_agent_steps + 1)
+                    for step in steps:
                         self.state = State.GENERATING
                         generation_id = uuid4().hex
                         generation_origin = Origin(
@@ -1577,8 +1682,31 @@ class Coordinator:
                         # following cell; no stage or validator is bypassed.
                         if step > 1:
                             steering_awaiting_dispatch.extend(await self._consume_queued_steering())
-                        snapshot = initial_context if step == 1 else self._latest_context()
+                        reset_needed = getattr(self.context_service, "needs_reset", None)
+                        reset_this_step = step > 1 and callable(reset_needed) and reset_needed()
+                        if reset_this_step:
+                            # Reset between model calls even during a long task.
+                            # Reinsert the active user's request so eviction of
+                            # dispatched history does not erase the task itself.
+                            snapshot = self._prepare_context(routed.source, origin.request_id)
+                            context_committed = False
+                            context_pending = callable(getattr(self.context_service, "prepare_request", None))
+                        else:
+                            snapshot = initial_context if step == 1 else self._latest_context()
                         self._observe_context_epoch(snapshot.epoch)
+                        if reset_this_step and dispatched_steering:
+                            # Earlier queued user steering is still active task
+                            # input. Restore its provenance after epoch eviction.
+                            for steering_id, steering_text in dispatched_steering:
+                                self._append_steering_context(steering_text, steering_id)
+                            if callable(getattr(self.context_service, "snapshot", None)):
+                                snapshot = self._latest_context()
+                            else:
+                                snapshot = replace(
+                                    snapshot,
+                                    messages=(*snapshot.messages, *(("user", text) for _, text in dispatched_steering)),
+                                    message_phases=(*snapshot.message_phases, *((None,) * len(dispatched_steering))),
+                                )
                         if steering_awaiting_dispatch:
                             additions = tuple(
                                 ("user", item.action.source) for item in steering_awaiting_dispatch
@@ -1616,27 +1744,63 @@ class Coordinator:
                         self._active_provider_usage_recorded = False
                         self._journal_record("record_model_request", model_request)
                         for steering_item in steering_awaiting_dispatch:
+                            dispatched_steering.append((
+                                steering_item.action.origin.request_id, steering_item.action.source,
+                            ))
                             self._complete_queue_item(
                                 steering_item, QueueOutcome(steering_item.action.origin, "steered"),
                             )
                         steering_awaiting_dispatch.clear()
-                        generation = asyncio.create_task(
-                            self.provider.generate(model_request),
-                            name=f"py-agent-generation-{generation_id}",
-                        )
-                        self._generation = generation
-                        try:
+                        # Only transport/rate-limit failures explicitly classified
+                        # as transient may retry. Never retry credentials, malformed
+                        # responses, plugin validation or code execution. A retry
+                        # sends the same already-journaled request; each failed
+                        # attempt gets its own usage-unknown journal record.
+                        for attempt in range(3):
+                            generation = asyncio.create_task(
+                                self.provider.generate(model_request),
+                                name=f"py-agent-generation-{generation_id}-attempt-{attempt + 1}",
+                            )
+                            self._generation = generation
                             try:
                                 response = await generation
                             except asyncio.CancelledError:
                                 self._record_provider_usage(model_request, None, outcome="cancelled")
                                 raise
-                            except Exception:
+                            except Exception as exc:
+                                kind = getattr(exc, "kind", None)
+                                transient = isinstance(kind, str) and kind in {
+                                    "provider", "rate_limit", "transport", "timeout",
+                                }
+                                if transient and attempt < 2:
+                                    self._journal_record(
+                                        "record_provider_usage", model_request, None, outcome="retry_failed",
+                                    )
+                                    try:
+                                        published_events.append(await self._emit_progress(
+                                            generation_origin,
+                                            {"phase": "provider_retry", "attempt": attempt + 2,
+                                             "text": f"Provider request failed ({kind}); retrying ({attempt + 2}/3)."},
+                                            on_progress=on_progress, operation_id=operation_id,
+                                            expected_state=State.GENERATING,
+                                        ))
+                                        await asyncio.sleep(0.5 * (attempt + 1))
+                                    except asyncio.CancelledError:
+                                        self._record_provider_usage(model_request, None, outcome="cancelled")
+                                        raise
+                                    except Exception:
+                                        self._record_provider_usage(model_request, None, outcome="failed")
+                                        raise
+                                    if not self._operation_is_current(operation_id, State.GENERATING):
+                                        self._record_provider_usage(model_request, None, outcome="cancelled")
+                                        raise asyncio.CancelledError
+                                    continue
                                 self._record_provider_usage(model_request, None, outcome="failed")
                                 raise
-                        finally:
-                            if self._generation is generation:
-                                self._generation = None
+                            finally:
+                                if self._generation is generation:
+                                    self._generation = None
+                            break
 
                         if not isinstance(response, ModelResponse):
                             self._record_provider_usage(model_request, None, outcome="failed")
@@ -1650,6 +1814,22 @@ class Coordinator:
                         record_usage = getattr(self.context_service, "record_response", None)
                         if callable(record_usage):
                             record_usage(response)
+                        if len(response.text) > MAX_AGENT_RESPONSE_CHARS:
+                            self._commit_context(
+                                origin.request_id, routed.source,
+                                "[generated response rejected: exceeds 8000 characters]",
+                                {"preflight": {
+                                    "executed": False,
+                                    "error": "Your response exceeded the 8000-character limit. Try sending a smaller Python cell.",
+                                }},
+                                phase=response.phase, include_user=not context_committed,
+                            )
+                            context_committed = True
+                            context_pending = False
+                            exhausted = preflight_exhausted(response)
+                            if exhausted is not None:
+                                return exhausted
+                            continue
                         decision = self.interpreter.interpret(response)
                         if not isinstance(decision, AgentDecision):
                             raise TypeError("Interpreter must return an AgentDecision")
@@ -1657,6 +1837,56 @@ class Coordinator:
                             raise ValueError(f"Interpreter returned unknown decision: {decision.kind!r}")
                         if not isinstance(decision.source, str) or not isinstance(decision.reason, str):
                             raise TypeError("Decision source and reason must be text")
+                        if type(decision.retryable) is not bool or (decision.retryable and decision.kind != "reject"):
+                            raise ValueError("Only a rejected response may request a format retry")
+                        if decision.kind == "execute" and len(decision.source) > MAX_AGENT_RESPONSE_CHARS:
+                            self._commit_context(
+                                origin.request_id, routed.source,
+                                "[generated cell rejected: exceeds 8000 characters]",
+                                {"preflight": {
+                                    "executed": False,
+                                    "error": "Your Python cell exceeded the 8000-character limit. Try sending a smaller cell.",
+                                }},
+                                phase=response.phase, include_user=not context_committed,
+                            )
+                            context_committed = True
+                            context_pending = False
+                            exhausted = preflight_exhausted(response)
+                            if exhausted is not None:
+                                return exhausted
+                            continue
+
+                        if decision.kind == "reject" and decision.retryable:
+                            if not self._operation_is_current(operation_id, State.GENERATING):
+                                raise asyncio.CancelledError
+                            # Preserve only a short diagnostic, never the rejected
+                            # Markdown. A format correction costs one of the same
+                            # bounded agent steps and cannot dispatch code.
+                            correction = (
+                                "No code was executed. Invalid model response format: "
+                                + (decision.reason[:300] or "invalid cell")
+                                + ". Respond with exactly one complete Python/IPython cell: "
+                                  "no prose outside the cell and no Markdown fences."
+                            )
+                            self._commit_context(
+                                origin.request_id, routed.source,
+                                "[model response rejected: invalid format; not executed]",
+                                {"preflight": {"executed": False, "error": correction}},
+                                phase=response.phase, include_user=not context_committed,
+                            )
+                            context_committed = True
+                            context_pending = False
+                            exhausted = preflight_exhausted(response)
+                            if exhausted is not None:
+                                return exhausted
+                            published_events.append(await self._emit_progress(
+                                generation_origin,
+                                {"phase": "format_retry", "step": step,
+                                 "text": "Model response had invalid format; requesting a Python-only correction."},
+                                on_progress=on_progress, operation_id=operation_id,
+                                expected_state=State.GENERATING,
+                            ))
+                            continue
 
                         if decision.kind != "execute" or not decision.source.strip():
                             if context_pending:
@@ -1704,8 +1934,12 @@ class Coordinator:
                                 )
                                 context_committed = True
                                 context_pending = False
+                                exhausted = preflight_exhausted(response)
+                                if exhausted is not None:
+                                    return exhausted
                                 continue
 
+                        invalid_generations = 0
                         self.state = State.EXECUTING
                         execution_origin = Origin(
                             origin.session_id, origin.request_id, origin.frontend_id,
@@ -1715,6 +1949,7 @@ class Coordinator:
                             execution_origin, decision.source, "agent", "ipython",
                             allow_stdin=allow_stdin,
                             input_handler=execution_input_handler(execution_origin),
+                            output_handler=execution_output_handler(execution_origin, "agent"),
                         )
                         published_events.append(await self._emit_progress(
                             execution_origin,
@@ -1781,7 +2016,7 @@ class Coordinator:
 
                     self._set_state_unless_stopping(State.GENERATING)
                     step_limit_message = (
-                        f"Agent paused after {self.max_agent_steps} execution steps without a successful "
+                        f"Agent paused after {self.max_agent_steps} agent steps without a successful "
                         "say(final=True); submit another request to continue."
                     )
                     published_events.append(await self._emit_progress(
@@ -1817,6 +2052,7 @@ class Coordinator:
                     routed.language if routed.language else "ipython",
                     allow_stdin=allow_stdin,
                     input_handler=execution_input_handler(execution_origin),
+                    output_handler=execution_output_handler(execution_origin, "user"),
                 )
                 published_events = [await self._emit_progress(
                     execution_origin,
@@ -2102,8 +2338,8 @@ class Coordinator:
         total_chars = page.get("total_chars")
         if (not isinstance(content, str) or type(next_offset) is not int
                 or type(total_chars) is not int or next_offset < offset
-                or next_offset > MAX_HISTORY_OFFSET or total_chars < next_offset
-                or total_chars > MAX_HISTORY_OFFSET):
+                or next_offset > HISTORY_MAX_OFFSET or total_chars < next_offset
+                or total_chars > HISTORY_MAX_OFFSET):
             return "History page is unavailable because the journal returned invalid data."
         lines = [
             f"Journal event {tokens[0]} characters {offset}-{next_offset} of {total_chars} "

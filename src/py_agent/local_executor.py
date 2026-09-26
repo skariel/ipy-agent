@@ -40,6 +40,7 @@ MAX_PASSWORD_SECRETS = 128
 MAX_PASSWORD_SECRET_CHARS = 1_048_576
 MAX_COMPLETION_MATCHES = 512
 MAX_COMPLETION_MATCH_CHARS = 2_048
+MAX_INSPECTION_CHARS = 16_384
 
 
 class _ProtocolError(ValueError):
@@ -685,6 +686,8 @@ class LocalExecutor:
             rich_frame_count = 0
             rich_frame_bytes = 0
             input_sequence = 0
+            preview_sent = False
+            preview_buffers = {"stdout": "", "stderr": ""}
 
             def completed_output_events() -> tuple[ExecutionOutput, ...]:
                 truncated_streams = frozenset(
@@ -740,6 +743,29 @@ class LocalExecutor:
                             output_events.append(ExecutionOutput("stream", {
                                 "name": frame["stream"], "text": accepted,
                             }))
+                            if request.output_handler is not None and not preview_sent:
+                                # Show one short, provisional line while the
+                                # cell is still running. Hold any suffix that
+                                # might be a split password; full output is
+                                # redacted and decided only at cell completion.
+                                stream_name = frame["stream"]
+                                preview_buffers[stream_name] = (
+                                    preview_buffers[stream_name] + accepted
+                                )[:512]
+                                pending_preview = preview_buffers[stream_name]
+                                first_line = pending_preview.split("\n", 1)[0]
+                                candidate = (first_line + "\n") if "\n" in pending_preview else pending_preview
+                                longest = max((len(secret) for secret in self._password_secrets), default=0)
+                                if longest:
+                                    candidate = candidate[:max(0, len(candidate) - longest + 1)]
+                                    candidate = _strip_partial_secret_suffix(candidate, self._password_secrets)
+                                candidate = _redact_text(candidate, self._password_secrets)
+                                if candidate:
+                                    await request.output_handler(ExecutionOutput(
+                                        "stream", {"name": frame["stream"], "text": candidate},
+                                        metadata={"provisional": True},
+                                    ))
+                                    preview_sent = True
                         continue
                     if kind == "rich_output":
                         expected_fields = {
@@ -800,7 +826,7 @@ class LocalExecutor:
                     if kind == "result":
                         expected_fields = {
                             "type", "version", "execution_id", "origin", "author", "status", "error",
-                            "final_requested",
+                            "final_requested", "output_reference",
                         }
                         if set(frame) != expected_fields or type(frame["final_requested"]) is not bool:
                             raise _ProtocolError("Malformed worker result frame")
@@ -815,17 +841,61 @@ class LocalExecutor:
                         final_requested = any(output.final for output in say_outputs)
                         if frame["final_requested"] != final_requested:
                             raise _ProtocolError("Worker final marker did not match its say messages")
+                        reference = frame["output_reference"]
+                        if reference is not None:
+                            if (not isinstance(reference, dict)
+                                    or set(reference) != {
+                                        "index", "original_chars", "retained_chars", "omitted_chars",
+                                    }
+                                    or any(type(value) is not int or value < 0 for value in reference.values())
+                                    or not 1 <= reference["index"] <= 1_000_000_000
+                                    or reference["original_chars"] <= 8_000
+                                    or reference["retained_chars"] > 1_048_576
+                                    or reference["original_chars"] != (
+                                        reference["retained_chars"] + reference["omitted_chars"]
+                                    )):
+                                raise _ProtocolError("Malformed worker output reference")
+                            index = reference["index"]
+                            omitted = reference["omitted_chars"]
+                            notice = (
+                                f"Output exceeded 8000 characters and was removed from the transcript. "
+                                f"Saved as outputs[{index}] (str; {reference['retained_chars']} "
+                                f"characters retained"
+                                + (f", {omitted} omitted" if omitted else "")
+                                + f"). Print a smaller slice: print(outputs[{index}][:4000]).\n"
+                            )
+                            safe_events = []
+                            inserted = False
+                            for output in output_events:
+                                if output.kind == "stream":
+                                    if not inserted:
+                                        safe_events.append(ExecutionOutput(
+                                            "stream", {"name": "stdout", "text": notice},
+                                        ))
+                                        inserted = True
+                                else:
+                                    safe_events.append(output)
+                            if not inserted:
+                                safe_events.append(ExecutionOutput(
+                                    "stream", {"name": "stdout", "text": notice},
+                                ))
+                            stdout_result, stderr_result = _redact_text(notice, self._password_secrets), ""
+                            completed = self._safe_output_events(safe_events, truncated_streams=frozenset())
+                        else:
+                            stdout_result = collector.text("stdout", self._password_secrets)
+                            stderr_result = collector.text("stderr", self._password_secrets)
+                            completed = completed_output_events()
                         return ExecutionResult(
                             request.origin,
                             status,
                             _redact_text(error, self._password_secrets) if error is not None else None,
-                            collector.text("stdout", self._password_secrets),
-                            collector.text("stderr", self._password_secrets),
+                            stdout_result,
+                            stderr_result,
                             tuple(SayOutput(
                                 _redact_json(output.content, self._password_secrets), output.final,
                             ) for output in say_outputs),
                             status == "success" and frame["final_requested"],
-                            completed_output_events(),
+                            completed,
                         )
                     raise _ProtocolError("Unexpected worker frame")
             except asyncio.CancelledError:
@@ -833,23 +903,53 @@ class LocalExecutor:
                 # Kill to prevent an unread late result corrupting the next call.
                 await asyncio.shield(self._stop_process(process))
                 raise
-            except (OSError, EOFError, asyncio.IncompleteReadError, TypeError, ValueError, RuntimeError):
+            except Exception:
+                # Includes failure of an optional live-output callback: never
+                # leave an unread worker result to corrupt the next request.
                 await self._stop_process(process)
-                return ExecutionResult(
-                    request.origin,
-                    "uncertain",
-                    "Worker lost or protocol failed during execution; side effects may have occurred",
-                    collector.text("stdout", self._password_secrets),
-                    collector.text("stderr", self._password_secrets),
-                    tuple(SayOutput(
-                        _redact_json(output.content, self._password_secrets), output.final,
-                    ) for output in say_outputs),
-                    output_events=self._safe_output_events(
+                received = collector.retained + sum(collector.discarded.values())
+                if received > 8_000:
+                    # The worker died before it could assign outputs[index].
+                    # Neither the transcript nor journal may expose the raw
+                    # oversized prefix on this uncertain path.
+                    notice = (
+                        "Output exceeded 8000 characters and was removed after worker failure; "
+                        "no outputs[index] is available for this cell.\n"
+                    )
+                    stdout_result, stderr_result = notice, ""
+                    safe_events = []
+                    inserted = False
+                    for output in output_events:
+                        if output.kind == "stream":
+                            if not inserted:
+                                safe_events.append(ExecutionOutput(
+                                    "stream", {"name": "stdout", "text": notice},
+                                ))
+                                inserted = True
+                        else:
+                            safe_events.append(output)
+                    if not inserted:
+                        safe_events.append(ExecutionOutput("stream", {"name": "stdout", "text": notice}))
+                    completed = self._safe_output_events(safe_events, truncated_streams=frozenset())
+                else:
+                    stdout_result = collector.text("stdout", self._password_secrets)
+                    stderr_result = collector.text("stderr", self._password_secrets)
+                    completed = self._safe_output_events(
                         output_events,
                         truncated_streams=frozenset(
                             stream for stream, omitted in collector.discarded.items() if omitted
                         ),
-                    ),
+                    )
+                return ExecutionResult(
+                    request.origin,
+                    "uncertain",
+                    "Worker lost or protocol failed during execution; side effects may have occurred",
+                    stdout_result,
+                    stderr_result,
+                    tuple(SayOutput(
+                        _redact_json(output.content, self._password_secrets), output.final,
+                    ) for output in say_outputs),
+                    output_events=completed,
                 )
             finally:
                 self._active_execution_id = None

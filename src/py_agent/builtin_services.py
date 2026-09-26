@@ -96,6 +96,7 @@ class BasicInterpreter:
         elif _FENCE_LINE.search(source):
             return AgentDecision(
                 "reject", reason="Provider returned mixed or malformed Markdown; no cell was executed",
+                retryable=True,
             )
         if not source.strip():
             return AgentDecision("reject", reason="Provider returned an empty code cell")

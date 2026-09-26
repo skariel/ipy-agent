@@ -591,6 +591,19 @@ async def test_rejection_in_earlier_event_cannot_be_overridden_by_good_final(aut
     assert result.text == ""
 
 
+@pytest.mark.asyncio
+async def test_unknown_stream_event_reports_only_safe_event_type(auth):
+    provider, _, _ = setup([
+        {"type": "response.output_text.annotation.added", "payload": "private-model-text"},
+        done(),
+    ])
+    result = await provider.generate(MESSAGES, max_tokens=30)
+    assert not result.successful
+    assert result.text == ""
+    assert "response.output_text.annotation.added" in result.rejection_reason
+    assert "private-model-text" not in result.rejection_reason
+
+
 @pytest.mark.parametrize("kind", ["response.failed", "response.incomplete", "response.cancelled"])
 async def test_terminal_event_kind_cannot_claim_success_with_completed_status(auth, kind):
     provider, _, _ = setup([done(kind=kind)])
@@ -673,14 +686,21 @@ async def test_invalid_usage_rejected(auth, usage):
         await provider.generate(MESSAGES, max_tokens=30)
 
 
-@pytest.mark.parametrize("status", [301, 302, 307, 401, 403, 429, 500])
-async def test_http_errors_no_redirects_no_body_or_credential_leak(auth, status):
+@pytest.mark.parametrize(
+    ("status", "kind"),
+    [(301, "response_status"), (302, "response_status"), (307, "response_status"),
+     (400, "request"), (401, "authentication"), (403, "authentication"),
+     (408, "timeout"), (413, "overflow"), (429, "rate_limit"),
+     (500, "provider"), (503, "provider")],
+)
+async def test_http_errors_no_redirects_no_body_or_credential_leak(auth, status, kind):
     provider, requests, stream = setup(
         status=status, data=(SECRET + ACCOUNT).encode(), headers={"location": "https://untrusted.invalid/"}
     )
     with pytest.raises(ProviderError) as failure:
         await provider.generate(MESSAGES, max_tokens=30)
     assert str(status) in str(failure.value)
+    assert failure.value.kind == kind
     assert SECRET not in repr(failure.value)
     assert ACCOUNT not in repr(failure.value)
     assert len(requests) == 1
@@ -701,6 +721,7 @@ async def test_transport_failure_is_sanitized_and_stream_closed(auth):
         await provider.generate(MESSAGES, max_tokens=30)
     assert SECRET not in str(failure.value)
     assert "ReadError" in str(failure.value)
+    assert failure.value.kind == "transport"
     assert stream.closed
 
 

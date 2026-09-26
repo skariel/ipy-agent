@@ -31,18 +31,22 @@ permission broker or credential isolation. To isolate execution, users must run
 
 The default TTY path handles one request at a time. An English request iterates
 provider responses and generated cells until a successful `say(..., final=True)`
-or a bounded step limit. Execution results become observations for later steps;
+or interruption; a positive `agent.max_steps` opts into a step limit (default 0,
+unlimited). Execution results become observations for later steps;
 side-effecting cells are never automatically replayed.
 Direct `@` Python, `!` shell escapes, and `%` IPython magics execute in the same
 namespace. The default terminal also has built-in `/help`, `/status`, `/interrupt`,
 `/quit`, `/config`, `/plugins`, and `/history` commands. Batch/JSON mode is not implemented.
 
-`LocalExecutor` retains output up to its configured character bound and has worker
-startup/interrupt timeouts, but no normal cell execution deadline. Correlated
+`LocalExecutor` replaces stdout/stderr exceeding 8000 characters with a notice
+and retains up to 1 Mi characters in the persistent `outputs[index]` namespace
+for small follow-up slices. Other model-facing observations and model responses
+also have 8000-character bounds; user input is not clipped. The executor has
+worker startup/interrupt timeouts, but no normal cell execution deadline. Correlated
 `input()`/`getpass()` requests require a capable owning frontend. A worker failure or interrupt can discard in-memory Python state;
 partial side effects are not rolled back or replayed. An explicit `--journal PATH`
 selects an append-only SQLite journal and bounded `/history`; otherwise a
-no-persistence implementation is selected. Legacy `/usage` and `/trace` remain absent.
+no-persistence implementation is selected. `/usage` and `/trace` are not implemented.
 
 ## Providers: deterministic fake versus production
 
@@ -57,11 +61,18 @@ selected JSON config. There is no implicit production provider/model.
   `openai-codex/...` model; pi owns login/refresh and `--pi-auth` can select the
   auth file.
 
-Production adapters preserve provider response status and reported usage; the
-basic interpreter accepts only a complete, non-rejected response and executes its
-text directly as Python. There is no Markdown-to-code extraction. The CLI makes
-provider calls only after user submission. `--fake-responses` belongs to the
-legacy CLI, not the default coordinator path.
+Production adapters preserve provider response status and reported usage.
+The coordinator retries classified transient provider failures at most twice
+without repeating Python execution; credentials, malformed responses and other
+non-transient errors do not retry. A retry repeats the model request, however:
+providers may bill both attempts if the original response was lost after processing.
+The basic interpreter accepts only a
+complete, non-rejected response, removes a
+single enclosing Python Markdown fence, and compiles the resulting cell before
+execution. Oversized responses and mixed/malformed Markdown are rejected
+without execution and receive bounded model-only format corrections. Other
+provider rejections stop the turn.
+The CLI makes provider calls only after user submission.
 
 The worker still has the current user's process privileges. Provider credentials
 are not a worker sandbox boundary: agent code may inspect the environment and
@@ -73,7 +84,7 @@ capability, but ordinary same-user file access still applies.
 | Area | Implemented now | Not implemented or materially incomplete |
 | --- | --- | --- |
 | Coordinator | Serialized submissions; explicit router/provider/interpreter/executor selection; request/execution identities; cancellation invalidates generation results; executor lifecycle ownership. | The full planned event/dataflow architecture, session attachment lifetime, a fully general middleware pipeline and journal-backed session recovery. |
-| Execution | Persistent local IPython worker, shared direct/agent namespace, framed transport, stdout/stderr capture, bounded retained output, interrupt/cleanup. | Default isolation, execution deadlines/resource quotas, incremental rich-event delivery, rollback/recovery, and automatic resumption. |
+| Execution | Persistent local IPython worker, shared direct/agent namespace, framed transport, stdout/stderr capture, one short provisional within-cell stream preview, bounded retained output, interrupt/cleanup. | Default isolation, execution deadlines/resource quotas, continuous stream/rich-event delivery, rollback/recovery, and automatic resumption. |
 | Context/observations | Production context adapter bridges the existing context policy; observation adapter packs execution output; provider-reported usage is retained. | Rich output observations and host history APIs beyond bounded `/history`. `wait()` is absent. |
 | Commands/frontend | Plain TTY frontend, built-in config/plugins and local help/status/interrupt/quit commands, and explicitly activated plugin command contributions with collision checks. | Batch/JSON frontend, terminal-independent output event subscription, rich terminal/notebook rendering, and general lifecycle hooks. |
 | Configuration | Typed core plus enabled-plugin scalar schemas, defaults, provenance/revisions, validation, config commands, explicit plugin activation from `--plugin` or the selected trusted config file. | Full plan precedence with profiles/environment/project layers, credential backends, and automatic service reconstruction for restart-only changes. |
@@ -138,7 +149,7 @@ selected by qualified IDs through CLI flags or the corresponding config settings
 Unselected stages are excluded from the coordinator runtime. The coordinator
 awaits selected observers sequentially. A general middleware or lifecycle hook is
 absent. Context/observation service selection remains fixed to the built-in
-production/lossless pair in the CLI.
+production/bounded pair in the CLI.
 
 ### Optional Jupyter adapter
 
@@ -174,18 +185,6 @@ Current limitations include:
 
 Treat Jupyter support as experimental and unverified, not a finished notebook integration.
 
-## Legacy sandboxed CLI
-
-`py --legacy` explicitly selects the previous supervisor/terminal implementation;
-it is separate from the coordinator architecture above. That legacy path retains
-SRT/bubblewrap launching, restricted proxy networking, interactive filesystem and
-network permission prompts, protected host storage, its journal/history and richer
-`say`/`wait` behavior. Its isolation is not the default CLI and is not wired as an
-optional executor plugin. The legacy command can still fail closed when SRT or
-nested isolation prerequisites are unavailable; proxy networking is not
-transparent open networking. Legacy-only run options and behavior are documented
-under the clearly labeled legacy sections in [README.md](README.md).
-
 ## Progress against the architecture plan
 
 | Plan phase | Current assessment |
@@ -193,7 +192,7 @@ under the clearly labeled legacy sections in [README.md](README.md).
 | Phase 0 — contracts and skeleton | **Partial.** Typed records, service protocols, plugin registration validation, and scalar config schema/store exist. The complete contract set, general hook model, and integration guarantees are not present. |
 | Phase 1 — working vertical slice | **Implemented in structure.** The default terminal/coordinator/fake-provider/local-executor path exists, with direct and generated code sharing one namespace. This status is based on code review; tests were not run here. |
 | Phase 2 — production behavior | **Partial.** Litelm and Codex production adapters, context policy, observations, and usage accounting are bridged. Optional durable journal/history is wired; rich event flow and complete accounting presentation remain incomplete. |
-| Phase 3 — config and optional isolation | **Partial.** Typed config commands, plugin-schema merging, explicit trusted-config activation, and provenance are present. The opt-in wrapper-backed executor is available through explicit plugin activation; its isolation policy is not verified. The old SRT path remains opt-in and separate. |
+| Phase 3 — config and optional isolation | **Partial.** Typed config commands, plugin-schema merging, explicit trusted-config activation, and provenance are present. The opt-in wrapper-backed executor is available through explicit plugin activation; its isolation policy is not verified. The former SRT path has been removed. |
 | Phase 4 — plugin boundary | **Partial.** External distributions/examples and the API draft exist; the CLI activates explicitly selected entry points and selects services, wrappers, and named stages. Middleware/lifecycle integration and a frozen contract remain gaps. |
 | Phase 5 — Jupyter | **Experimental/incomplete.** Protocol adapter, manager commands, and private session/process helpers exist, the executable entrypoint is present but the managed path remains unverified; several core protocol services are absent. |
 

@@ -176,12 +176,19 @@ class ExecutionRequest:
     language: str = "ipython"
     allow_stdin: bool = False
     input_handler: InputHandler | None = field(default=None, repr=False, compare=False)
+    # Optional, frontend-only early stream preview. The completed result still
+    # owns the authoritative model/journal output and its 8000-character policy.
+    output_handler: Callable[[ExecutionOutput], Awaitable[None]] | None = field(
+        default=None, repr=False, compare=False,
+    )
 
     def __post_init__(self):
         if type(self.allow_stdin) is not bool:
             raise TypeError("ExecutionRequest allow_stdin must be a boolean")
         if self.input_handler is not None and not callable(self.input_handler):
             raise TypeError("ExecutionRequest input_handler must be callable or None")
+        if self.output_handler is not None and not callable(self.output_handler):
+            raise TypeError("ExecutionRequest output_handler must be callable or None")
 
 
 @dataclass(frozen=True)
@@ -443,6 +450,9 @@ class AgentDecision:
     kind: Literal["execute", "finish", "wait", "reject"]
     source: str = ""
     reason: str = ""
+    # A format-only rejection can request another model cell without executing
+    # the rejected text. Provider failures and policy refusals remain terminal.
+    retryable: bool = False
 
 
 @dataclass(frozen=True)

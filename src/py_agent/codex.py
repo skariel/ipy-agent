@@ -367,7 +367,13 @@ class CodexProvider:
                                 f"Codex authentication rejected (HTTP {status}); refresh your login in pi with /login openai-codex",
                                 kind="authentication",
                             )
-                        kind = "rate_limit" if status == 429 else "overflow" if status == 413 else "provider"
+                        kind = (
+                            "rate_limit" if status == 429 else
+                            "timeout" if status == 408 else
+                            "overflow" if status == 413 else
+                            "provider" if 500 <= status < 600 else
+                            "request" if 400 <= status < 500 else "response_status"
+                        )
                         raise ProviderError(f"Codex request failed (HTTP {status}); no source accepted", kind=kind)
                     # Validate actual SSE/JSON data, not just the MIME header:
                     # proxies may omit or relabel a valid streamed response.
@@ -390,10 +396,19 @@ class CodexProvider:
         except ProviderError as exc:
             safe = _redact(str(exc), (credentials.access, credentials.account_id))
             raise ProviderError(safe, kind=exc.kind) from None
-        except Exception as exc:
-            # HTTP exceptions can contain request URLs, headers, and secrets.
+        except httpx.TimeoutException as exc:
             raise ProviderError(
-                f"Codex request failed ({type(exc).__name__}); no source accepted", kind="provider"
+                f"Codex request failed ({type(exc).__name__}); no source accepted", kind="timeout"
+            ) from None
+        except httpx.TransportError as exc:
+            raise ProviderError(
+                f"Codex request failed ({type(exc).__name__}); no source accepted", kind="transport"
+            ) from None
+        except Exception as exc:
+            # Unexpected local errors may indicate a bug, not a transient
+            # service outage. Never retry or expose URL/header details.
+            raise ProviderError(
+                f"Codex request failed ({type(exc).__name__}); no source accepted", kind="internal"
             ) from None
 
     async def _collect(self, response, max_tokens, *, secrets=()):
@@ -449,7 +464,14 @@ class CodexProvider:
                 if not isinstance(event.get(field), str):
                     rejection = rejection or "Unsupported Codex text delta"
             else:
-                rejection = rejection or "Codex error, refusal, tool call or unsupported stream event"
+                # Report only the bounded protocol event *type*, never the SSE
+                # payload (which may contain model text, credentials or data).
+                # Unknown events still invalidate the entire generated cell.
+                safe_kind = (
+                    kind if re.fullmatch(r"response\.[A-Za-z0-9_.-]{1,80}", kind)
+                    else "error" if kind == "error" else "unrecognized"
+                )
+                rejection = rejection or f"Codex rejected unsupported stream event type: {safe_kind}"
         if terminal is None:
             raise ProviderError("Codex stream ended without terminal response; no source accepted", kind="shape")
         usage = _usage(terminal.get("usage"))

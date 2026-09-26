@@ -1,6 +1,6 @@
 """Small prompt-toolkit frontend for the coordinator vertical slice.
 
-This frontend intentionally does not depend on the legacy supervisor terminal.
+This frontend renders coordinator events without owning execution policy.
 It renders bounded coordinator output and only the sanitized ``text/plain``
 fallback from rich MIME events.
 """
@@ -18,20 +18,52 @@ from dataclasses import dataclass
 from typing import Any
 
 from prompt_toolkit import PromptSession, print_formatted_text
+from prompt_toolkit.filters import has_focus, is_searching
+from prompt_toolkit.formatted_text import FormattedText, to_formatted_text
+from prompt_toolkit.formatted_text.utils import fragment_list_width, split_lines
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.styles import Style
 
 from .contracts import (
     InputCancelledError, InputReply, InputRequest, InputUnavailableError,
     OutputEvent, ProgressCallback,
 )
 from .coordinator import Coordinator, State, Submission
+from .terminal_markdown import markdown_fragments
 
 _STRING_ESCAPE = re.compile(r"(?:\x1b[\]PX^_]|[\x90\x98\x9d\x9e\x9f]).*?(?:\x07|\x1b\\|\x9c|$)", re.DOTALL)
 _CSI = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]")
 _ESCAPE = re.compile(r"\x1b[ -/]*[@-~]")
 _TERMINAL_PROMPT_LOCKS = weakref.WeakKeyDictionary()
 _PROMPT_INTERRUPTED = object()
+_SHIFT_ENTER = (Keys.ShiftEscape, Keys.ControlM)
+ANSI_SEQUENCES["\x1b[13;2u"] = _SHIFT_ENTER
+ANSI_SEQUENCES["\x1b[27;2;13~"] = _SHIFT_ENTER
+ANSI_SEQUENCES["\x1b[99;5u"] = (Keys.ControlC,)
+ANSI_SEQUENCES["\x1b[27;5;99~"] = (Keys.ControlC,)
+ANSI_SEQUENCES["\x1b[127;3u"] = (Keys.Escape, Keys.Backspace)
+ANSI_SEQUENCES["\x1b[27;3;127~"] = (Keys.Escape, Keys.Backspace)
+_EXTENDED_KEYS_ON = "\x1b[>4;2m\x1b[>1u"
+_EXTENDED_KEYS_OFF = "\x1b[<u\x1b[>4;0m"
+_COLOR_STYLE = {
+    "user-prompt": "ansigreen bold", "continuation-prompt": "ansigreen bold",
+    "say": "bg:#343541", "stdout": "bg:#283228", "stderr": "bg:#3c2828",
+    "stream-prompt": "ansiblue bold", "output-prompt": "ansired bold",
+    "output-note": "ansiyellow italic", "md-heading": "ansicyan bold",
+    "md-bold": "bold", "md-italic": "italic", "md-code": "ansiyellow",
+    "md-quote": "ansigreen italic",
+}
+_ANSI_BG = {"say": "48;2;52;53;65", "stdout": "48;2;40;50;40", "stderr": "48;2;60;40;40"}
+_ANSI_TEXT = {
+    "md-heading": "36;1", "md-bold": "1", "md-italic": "3",
+    "md-code": "33", "md-quote": "32;3", "output-note": "33;3",
+    "stream-prompt": "34;1", "output-prompt": "31;1",
+}
 
 
 def _prompt_lock_for(coordinator: object) -> asyncio.Lock:
@@ -130,12 +162,22 @@ class PlainTerminal:
         frontend_id: str = "terminal",
         vi: bool = False,
         multiline: bool = False,
+        no_color: bool = False,
     ):
         self.coordinator = coordinator
         self.frontend_id = frontend_id
         self.input = input
         self.output = output
         self.vi = vi
+        self.multiline = multiline
+        self.no_color = no_color or output is not None
+        self._style = Style.from_dict({} if self.no_color else _COLOR_STYLE)
+        self._input_number = 1
+        self._cell_number = 0
+        self._execution_numbers: dict[str, int] = {}
+        self._live_previews: dict[tuple[str, str], str] = {}
+        self._stream_name: str | None = None
+        self._stream_fragments: list[str] = []
         self._prompt_lock = _prompt_lock_for(coordinator)
         self._prompt_active = False
         self._stdin_request: InputRequest | None = None
@@ -156,7 +198,192 @@ class PlainTerminal:
             enable_history_search=True,
             vi_mode=vi,
             multiline=multiline,
+            key_bindings=self._bindings(),
+            bottom_toolbar=self._toolbar,
+            refresh_interval=0.15,
+            style=self._style,
+            color_depth=ColorDepth.DEPTH_1_BIT if self.no_color else ColorDepth.TRUE_COLOR,
         )
+
+    def _bindings(self) -> KeyBindings:
+        bindings = KeyBindings()
+
+        @bindings.add("s-escape", "enter", eager=True)
+        @bindings.add("escape", "enter", eager=True)
+        def submit_multiline(event):
+            event.current_buffer.validate_and_handle()
+
+        @bindings.add("enter", filter=has_focus("DEFAULT_BUFFER") & ~is_searching, eager=True)
+        def smart_enter(event):
+            buffer = event.current_buffer
+            if self._stdin_request is not None:
+                buffer.validate_and_handle()
+                return
+            if self.multiline:
+                if buffer.text.strip() in ("/quit", "/exit"):
+                    buffer.validate_and_handle()
+                else:
+                    buffer.insert_text("\n")
+                return
+            before = buffer.document.current_line_before_cursor
+            stripped = before.rstrip()
+            if stripped.endswith(("\\", ":")):
+                indent = len(before) - len(before.lstrip(" "))
+                if stripped.endswith(":"):
+                    indent += 4
+                buffer.insert_text("\n" + " " * indent)
+            else:
+                buffer.validate_and_handle()
+
+        return bindings
+
+    def _toolbar(self) -> FormattedText:
+        state = getattr(self.coordinator, "state", State.IDLE)
+        phase = getattr(state, "value", str(state)).upper()
+        if phase == "GENERATING":
+            symbol = "|/-\\"[int(time.monotonic() / 0.15) % 4]
+            activity = f"{symbol} Thinking (GENERATING)"
+        elif phase in ("EXECUTING", "WAITING-FOR-INPUT"):
+            activity = "Executing (EXECUTING)" if phase == "EXECUTING" else "Waiting for input"
+        else:
+            activity = phase
+        service = getattr(self.coordinator, "context_service", None)
+        context = getattr(service, "context", None)
+        window = getattr(context, "window_tokens", None)
+        tokens = getattr(service, "reported_input_tokens", None)
+        if type(window) is int and window >= 1000:
+            whole, remainder = divmod(window, 1000)
+            capacity = f"{whole}.{remainder:03d}".rstrip("0").rstrip(".") + "k"
+        else:
+            capacity = str(window) if type(window) is int and window > 0 else "?"
+        percentage = (
+            str((tokens * 100 + window // 2) // window)
+            if type(tokens) is int and tokens >= 0 and type(window) is int and window > 0 else "?"
+        )
+        model = sanitize(getattr(self.coordinator, "model", "?"))
+        cache = getattr(self.coordinator, "cache_summary", ("?", "?", "?"))
+        rate, read, write = cache if isinstance(cache, tuple) and len(cache) == 3 else ("?", "?", "?")
+        text = f"{activity} | {model} | {percentage}%/{capacity} | CH {rate}% r{read} w{write}"
+        return FormattedText([("", text.replace("\n", " ").replace("\t", " "))])
+
+    def _panel_width(self) -> int:
+        try:
+            return max(1, self.session.output.get_size().columns)
+        except (AttributeError, OSError):
+            return 80
+
+    def _panel_line(self, fragments: FormattedText, role: str) -> None:
+        parts = list(to_formatted_text(fragments))
+        if self.no_color:
+            self._write("".join(text for _, text, *_ in parts))
+            return
+        width = self._panel_width()
+        visible = fragment_list_width(parts)
+        padding = width if visible == 0 else (-visible) % width
+        background = _ANSI_BG[role]
+        chunks = [f"\x1b[{background}m"]
+        current = ""
+        for style, text, *_ in parts:
+            style_name = next((name for name in _ANSI_TEXT if f"class:{name}" in style.split()), "")
+            code = _ANSI_TEXT.get(style_name, "")
+            if code != current:
+                chunks.append(f"\x1b[0m\x1b[{background}m")
+                if code:
+                    chunks.append(f"\x1b[{code}m")
+                current = code
+            chunks.append(text)
+        if current:
+            chunks.append(f"\x1b[0m\x1b[{background}m")
+        chunks.extend((" " * padding, "\x1b[0m\n"))
+        self._write_raw("".join(chunks))
+
+    def _write_raw(self, value: str) -> None:
+        if self.output is None:
+            import sys
+
+            sys.stdout.write(value)
+            sys.stdout.flush()
+        else:
+            print_formatted_text(value, end="", output=self.output)
+
+    def _panel_blank(self, role: str) -> None:
+        if not self.no_color:
+            self._panel_line(FormattedText([]), role)
+
+    def _panel(self, content: FormattedText, role: str) -> None:
+        for line in split_lines(content):
+            self._panel_line(FormattedText(line), role)
+
+    def _finish_stream(self) -> None:
+        if self._stream_name is None:
+            return
+        role = self._stream_name
+        text = "".join(self._stream_fragments)
+        lines = text.splitlines()
+        self._panel(FormattedText([("", "\n".join(lines[:5]))]), role)
+        if len(lines) > 5:
+            self._panel_line(FormattedText([("class:output-note", f"… showing 5 of {len(lines)} lines")]), role)
+        self._panel_blank(role)
+        self._write("")
+        self._stream_name = None
+        self._stream_fragments.clear()
+
+    def _render_stream(self, name: str, text: str) -> None:
+        if not text:
+            return
+        role = "stderr" if name == "stderr" else "stdout"
+        if self._stream_name != role:
+            self._finish_stream()
+            self._panel_blank(role)
+            self._panel_line(FormattedText([
+                ("class:stream-prompt", f"{role} [{self._cell_number or '?'}]:")
+            ]), role)
+            self._stream_name = role
+        self._stream_fragments.append(sanitize(text))
+
+    def _display_stream(
+        self, name: str, text: str, execution_id: str | None, *, provisional: bool = False,
+    ) -> None:
+        key = (execution_id, name) if execution_id is not None else None
+        if provisional:
+            if key is not None:
+                self._live_previews[key] = text
+            self._render_stream(name, text)
+            self._finish_stream()  # Make the small preview visible before the cell ends.
+            return
+        if key is not None and key in self._live_previews:
+            remaining = self._live_previews.pop(key)
+            if remaining.startswith(text):
+                remaining = remaining[len(text):]
+                if remaining:
+                    self._live_previews[key] = remaining
+                return
+            if text.startswith(remaining):
+                text = text[len(remaining):]
+            # A final output-reference notice intentionally differs from the
+            # provisional preview; it must still be displayed.
+        self._render_stream(name, text)
+
+    def _render_say(self, text: str) -> None:
+        self._finish_stream()
+        self._panel_blank("say")
+        self._panel(markdown_fragments(sanitize(text)), "say")
+        self._panel_blank("say")
+        self._write("")
+
+    def _render_display(self, label: str, text: str) -> None:
+        self._finish_stream()
+        role = "stdout"
+        lines = sanitize(text).splitlines()
+        self._panel_blank(role)
+        self._panel_line(FormattedText([
+            ("class:output-prompt", f"{label} [{self._cell_number or '?'}]:")
+        ]), role)
+        self._panel(FormattedText([("", "\n".join(lines[:5]))]), role)
+        if len(lines) > 5:
+            self._panel_line(FormattedText([("class:output-note", f"… showing 5 of {len(lines)} lines")]), role)
+        self._panel_blank(role)
+        self._write("")
 
     def _write(self, text: Any, *, end: str = "\n") -> None:
         safe = sanitize(text)
@@ -180,23 +407,31 @@ class PlainTerminal:
         kind = getattr(event, "kind", None)
         data = getattr(event, "data", {})
         metadata = getattr(event, "metadata", {})
+        execution_id = getattr(getattr(event, "origin", None), "execution_id", None)
+        if execution_id in self._execution_numbers:
+            self._cell_number = self._execution_numbers[execution_id]
         if kind == "progress":
             phase = data.get("phase") if hasattr(data, "get") else None
-            # Provider generation has no stdout. Show cell boundaries so a
-            # silent repository inspection does not look like a frozen prompt.
-            if phase in ("generation_start", "execution_start", "cell_complete"):
-                step = data.get("step") if hasattr(data, "get") else None
-                if phase == "generation_start" and step == 1:
-                    self._write("Agent working…")
-                elif phase == "execution_start":
-                    self._write(
-                        f"Running {'your' if getattr(event, 'author', None) == 'user' else 'agent'} cell"
-                        + (f" {step}" if type(step) is int else "") + "…"
-                    )
-                elif phase == "cell_complete":
-                    status = data.get("status")
-                    if status != "success":
-                        self._write(f"Cell {step} {sanitize(status)}.")
+            # The toolbar carries the ordinary generating/executing state.
+            if phase in ("generation_start", "execution_start"):
+                if phase == "execution_start" and execution_id is not None:
+                    if execution_id not in self._execution_numbers:
+                        self._cell_number += 1
+                        self._execution_numbers[execution_id] = self._cell_number
+                        if len(self._execution_numbers) > 128:
+                            self._execution_numbers.pop(next(iter(self._execution_numbers)))
+                self.session.app.invalidate()
+                return
+            if phase == "cell_complete":
+                self._finish_stream()
+                if execution_id is not None:
+                    for key in tuple(self._live_previews):
+                        if key[0] == execution_id:
+                            self._live_previews.pop(key)
+                status = data.get("status")
+                if status not in ("success", "error"):
+                    self._write(f"Cell {sanitize(status)}.")
+                self.session.app.invalidate()
                 return
             text = data.get("text") if hasattr(data, "get") else None
             if isinstance(text, str) and text:
@@ -207,7 +442,10 @@ class PlainTerminal:
                 name = "stdout"
             text = data.get("text", "") if hasattr(data, "get") else ""
             if isinstance(text, str) and text:
-                self._write(f"{name}:\n{text}", end="" if text.endswith("\n") else "\n")
+                self._display_stream(
+                    name, text, execution_id,
+                    provisional=bool(getattr(metadata, "get", lambda _key: None)("provisional")),
+                )
         elif kind in ("display", "execute_result", "update"):
             bundle = data if hasattr(data, "get") else {}
             fallback = bundle.get("text/plain")
@@ -225,11 +463,12 @@ class PlainTerminal:
                     text += ": " + ", ".join(mime_types[:8])
                 text += "]"
             if getattr(metadata, "get", lambda _key: None)("py_agent_source") == "say":
-                self._write(text)
+                self._render_say(text)
             else:
-                label = "display update" if kind == "update" else "display"
-                self._write(f"{label}:\n{text}", end="" if text.endswith("\n") else "\n")
+                label = "display update" if kind == "update" else "Out"
+                self._render_display(label, text)
         elif kind == "error":
+            self._finish_stream()
             message = data.get("evalue", "Execution failed") if hasattr(data, "get") else "Execution failed"
             self._write(f"Cell error: {message}")
 
@@ -287,10 +526,8 @@ class PlainTerminal:
             event for event in delivered_events if self._event_key(event) not in returned_keys
         )
         message = self._message_not_already_delivered(
-            submission.message, delivered_events, status_events=events,
+            submission.message, all_events, status_events=events,
         )
-        if message:
-            self._write(message)
         events = tuple(event for event in events if self._event_key(event) not in delivered_keys)
         events_by_execution = {}
         for event in events:
@@ -305,11 +542,7 @@ class PlainTerminal:
             def flush_stream() -> None:
                 nonlocal pending_stream, pending_text
                 if pending_stream is not None and pending_text:
-                    text = "".join(pending_text)
-                    self._write(
-                        f"{pending_stream}:\n{text}",
-                        end="" if text.endswith("\n") else "\n",
-                    )
+                    self._display_stream(pending_stream, "".join(pending_text), execution_id)
                 pending_stream, pending_text = None, []
 
             for event in ordered_events:
@@ -330,7 +563,10 @@ class PlainTerminal:
                     flush_stream()
                     metadata = getattr(event, "metadata", {})
                     if getattr(metadata, "get", lambda _key: None)("py_agent_source") == "say":
-                        continue  # say() remains rendered through the existing message path.
+                        value = event.data.get("text/plain")
+                        if isinstance(value, str):
+                            self._render_say(value)
+                        continue
                     bundle = getattr(event, "data", {})
                     fallback = bundle.get("text/plain") if hasattr(bundle, "get") else None
                     if isinstance(fallback, str):
@@ -348,10 +584,8 @@ class PlainTerminal:
                         if mime_types:
                             text += ": " + ", ".join(mime_types[:8])
                         text += "]"
-                    label = "display update" if kind == "update" else "display"
-                    self._write(
-                        f"{label}:\n{text}", end="" if text.endswith("\n") else "\n",
-                    )
+                    label = "display update" if kind == "update" else "Out"
+                    self._render_display(label, text)
                 elif kind == "progress":
                     flush_stream()
                     self._show_live_event(event)
@@ -367,12 +601,23 @@ class PlainTerminal:
                 and event.kind == "progress" and event.data.get("phase") == "execution_start"
                 for event in delivered_events
             )
+            if execution_id in self._execution_numbers:
+                self._cell_number = self._execution_numbers[execution_id]
             if execution is not None and not had_live_execution_start:
-                self._write(f"[{execution.author} execution]")
+                if execution_id not in self._execution_numbers:
+                    self._cell_number += 1
+                    if execution_id is not None:
+                        self._execution_numbers[execution_id] = self._cell_number
+                        if len(self._execution_numbers) > 128:
+                            self._execution_numbers.pop(next(iter(self._execution_numbers)))
+                else:
+                    self._cell_number = self._execution_numbers[execution_id]
+                self.session.app.invalidate()
             ordered_events = events_by_execution.get(execution_id, ())
             live_output = any(
                 self._event_key(event) in delivered_keys
                 and getattr(event, "kind", None) == "stream"
+                and not getattr(getattr(event, "metadata", {}), "get", lambda _key: None)("provisional")
                 for event in all_events
                 if getattr(getattr(event, "origin", None), "execution_id", None) == execution_id
             )
@@ -382,10 +627,10 @@ class PlainTerminal:
                 if not live_output:
                     for name, content in (("stdout", result.stdout), ("stderr", result.stderr)):
                         if content:
-                            safe = sanitize(content)
-                            self._write(f"{name}:\n{safe}", end="" if safe.endswith("\n") else "\n")
+                            self._display_stream(name, content, execution_id)
                 if ordered_events:
                     show_ordered_events(ordered_events)
+            self._finish_stream()
             if result.status == "error":
                 live_error = any(
                     self._event_key(event) in delivered_keys and event.kind == "error"
@@ -412,16 +657,16 @@ class PlainTerminal:
         if unattached_events:
             for event in unattached_events:
                 self._show_live_event(event)
+        self._finish_stream()
+        if message:
+            self._write(message)
 
-    def _prompt_message(self) -> str:
+    def _prompt_message(self) -> FormattedText | str:
         request = self._stdin_request
         if request is not None:
             prompt = sanitize(request.prompt)
             return f"Python {'password ' if request.password else ''}input: {prompt} "
-        active = self._active_submission_task is not None and not self._active_submission_task.done()
-        if active or getattr(self.coordinator, "state", State.IDLE) is not State.IDLE:
-            return "py (agent running; submissions queue)> "
-        return "py> "
+        return FormattedText([("class:user-prompt", f"In [{self._input_number}]: ")])
 
     def _partial_prompt_text(self) -> str:
         try:
@@ -450,6 +695,9 @@ class PlainTerminal:
                     try:
                         return await self.session.prompt_async(
                             lambda: self._prompt_message(),
+                            prompt_continuation=lambda width, _line, _wrap: FormattedText([
+                                ("class:continuation-prompt", " " * max(0, width - 5) + "...: ")
+                            ]),
                             is_password=request.password if request is not None else False,
                             default=self._composer_draft if request is None else "",
                         )
@@ -700,10 +948,20 @@ class PlainTerminal:
             # Prompt-toolkit redirects stdout/stderr through run_in_terminal,
             # redraws the active prompt, and preserves its editable buffer.
             # Install after the event loop exists and restore it on detach.
-            with patch_stdout():
-                await self._run_loop()
+            with patch_stdout(raw=not self.no_color):
+                self.session.output.write_raw(_EXTENDED_KEYS_ON)
+                self.session.output.flush()
+                try:
+                    await self._run_loop()
+                finally:
+                    self._finish_stream()
+                    self.session.output.write_raw(_EXTENDED_KEYS_OFF)
+                    self.session.output.flush()
         else:
-            await self._run_loop()
+            try:
+                await self._run_loop()
+            finally:
+                self._finish_stream()
 
     async def _run_loop(self) -> None:
         """Keep one composer available while coordinator work runs in the background."""
@@ -761,6 +1019,7 @@ class PlainTerminal:
             last_interrupt = 0.0
             if not text.strip():
                 continue
+            self._write("")  # Separate submitted input from the next output panel.
             if text.startswith("/"):
                 handled = await self._handle_command(text)
                 if handled is False:
@@ -793,6 +1052,8 @@ class PlainTerminal:
                 else:
                     acknowledgement = f"Queued action (position {ticket.position})."
                 self._write(acknowledgement)
+                self._input_number += 1
+                self.session.app.invalidate()
                 watcher = asyncio.create_task(
                     self._watch_queue_ticket(ticket, delivered),
                     name=f"py-terminal-queued-{ticket.origin.request_id}",
@@ -810,3 +1071,5 @@ class PlainTerminal:
                 except asyncio.CancelledError:
                     pass
             self._start_submission(text)
+            self._input_number += 1
+            self.session.app.invalidate()
