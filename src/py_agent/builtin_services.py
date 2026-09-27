@@ -93,7 +93,9 @@ class BasicInterpreter:
         fenced = _SINGLE_CODE_FENCE.fullmatch(source)
         if fenced is not None:
             source = fenced.group("source")
-        elif _FENCE_LINE.search(source):
+        elif _FENCE_LINE.search(source) and self.check_syntax(source) is not None:
+            # A fence line inside an otherwise valid cell (for example inside a
+            # string literal) is not mixed Markdown and must still execute.
             return AgentDecision(
                 "reject", reason="Provider returned mixed or malformed Markdown; no cell was executed",
                 retryable=True,

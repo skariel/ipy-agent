@@ -49,6 +49,9 @@ def test_response_interpreter_unwraps_one_python_fence_and_rejects_mixed_markdow
         assert interpreter.interpret(ModelResponse(text)).kind == "reject"
     assert interpreter.interpret(ModelResponse("say('2', final=True)")).kind == "execute"
     assert interpreter.check_syntax("```python\npass\n```") is not None
+    embedded = "doc = '''\n```python\npass\n```\n'''\nsay('2', final=True)"
+    assert interpreter.interpret(ModelResponse(embedded)).kind == "execute"
+    assert interpreter.interpret(ModelResponse(embedded)).source == embedded
     assert interpreter.check_syntax("!echo hello") is None
     assert interpreter.check_syntax("await coro()") is None
 
@@ -1683,5 +1686,47 @@ async def test_pending_queue_is_bounded_and_interrupt_fails_closed_without_repla
         assert provider.cancelled
         assert executor.requests == []
         assert coordinator.pending_action_count == 0
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_format_failures_do_not_repeat_the_full_contract():
+    class AlwaysBadProvider:
+        model = "offline/format-loop"
+
+        def __init__(self):
+            self.requests = []
+
+        async def generate(self, request):
+            self.requests.append(request)
+            fence = chr(96) * 3
+            return ModelResponse(
+                "Here is the code:" + "\n" + fence + "python\npass\n" + fence)
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(
+        runtime, router="default", provider="fake", interpreter="basic", executor="local",
+    )
+    provider, executor = AlwaysBadProvider(), CaptureExecutor()
+    coordinator.provider, coordinator.executor = provider, executor
+    await coordinator.start()
+    try:
+        submission = await coordinator.submit("terminal", "complete the task")
+        assert len(provider.requests) == 3
+        assert not executor.requests
+        assert "3 consecutive invalid" in submission.message
+        corrections = [
+            message
+            for request in provider.requests[1:]
+            for role, message in request.context.messages
+            if role == "observation" and "mixed or malformed Markdown" in message
+        ]
+        assert len(corrections) >= 2
+        full = next(c for c in corrections if "ordinary assistant message text" in c)
+        terse = next(c for c in reversed(corrections) if "Still no valid cell" in c)
+        assert terse is not full
+        assert len(terse) < len(full)
+        assert "mixed or malformed Markdown" in terse
     finally:
         await coordinator.close()

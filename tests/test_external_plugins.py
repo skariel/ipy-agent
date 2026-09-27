@@ -66,10 +66,11 @@ def examples():
     }
 
 
-def _runtime(examples, *, builtins=None) -> PluginRuntime:
+def _runtime(examples, *, builtins=None, include=None) -> PluginRuntime:
+    selected = EXAMPLES if include is None else include
     plugins = {
         examples[distribution].PLUGIN_ID: examples[distribution].plugin
-        for distribution in EXAMPLES
+        for distribution in selected
     }
     plugins.update(builtins or {})
     return PluginRuntime.load(builtins=plugins)
@@ -281,7 +282,7 @@ def _execution_request() -> ExecutionRequest:
 @pytest.mark.asyncio
 async def test_coordinator_selects_external_executor_wrapper_and_transforms(examples):
     delegate = _DelegateExecutor()
-    runtime = _runtime(examples, builtins={
+    runtime = _runtime(examples, include=("plugin_command", "plugin_executor"), builtins={
         "builtin": BuiltinPlugin(executor_factory=lambda: delegate),
     })
     store = ConfigStore(runtime.config)
@@ -419,7 +420,7 @@ async def test_coordinator_observer_failure_policy_and_no_execution_replay(examp
             )
 
     delegate = _DelegateExecutor(stdout="done")
-    runtime = _runtime(examples, builtins={
+    runtime = _runtime(examples, include=("plugin_command", "plugin_executor"), builtins={
         "builtin": BuiltinPlugin(executor_factory=lambda: delegate),
         "broken-observer": BrokenObserverPlugin(),
     })

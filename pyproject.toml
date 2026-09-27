@@ -33,6 +33,11 @@ link-mode = "copy"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Hard stops so a hung await can never wedge a run: faulthandler dumps stacks
+# first, then pytest-timeout fails the test instead of blocking forever.
+timeout = 60
+timeout_method = "thread"
+faulthandler_timeout = 50
 markers = ["live: explicitly authorized paid provider calls"]
 
 

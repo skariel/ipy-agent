@@ -2047,13 +2047,24 @@ class Coordinator:
                             # Preserve only a short diagnostic, never the rejected
                             # Markdown. A format correction costs one of the same
                             # bounded agent steps and cannot dispatch code.
-                            correction = (
-                                "No code was executed. Invalid model response format: "
-                                + (decision.reason[:300] or "invalid cell")
-                                + ". No tools or function calls are available. Respond with exactly one "
-                                  "complete Python/IPython cell as ordinary assistant message text: "
-                                  "no tool call, JSON, prose outside the cell, or Markdown fences."
-                            )
+                            detail = decision.reason[:300] or "invalid cell"
+                            if invalid_generations == 0:
+                                correction = (
+                                    "No code was executed. Invalid model response format: "
+                                    + detail
+                                    + ". No tools or function calls are available. Respond with exactly one "
+                                      "complete Python/IPython cell as ordinary assistant message text: "
+                                      "no tool call, JSON, prose outside the cell, or Markdown fences."
+                                )
+                            else:
+                                # The full contract was already sent once; repeating it verbatim only
+                                # pads the next request with the same wall of text.
+                                correction = (
+                                    "Still no valid cell. Invalid model response format: "
+                                    + detail
+                                    + ". Respond with exactly one complete Python/IPython cell and nothing "
+                                      "else: no fences, prose, tool call, JSON, or function call."
+                                )
                             self._commit_context(
                                 origin.request_id, routed.source,
                                 "[model response rejected: invalid format; not executed]",
