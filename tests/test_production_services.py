@@ -61,6 +61,7 @@ def test_provider_adapter_translates_context_and_preserves_usage_and_attribution
     adapter = ProductionProviderAdapter(backend, provider_id="codex", max_tokens=90)
     request = model_request(
         messages=(
+            ("system", "Configured execution contract."),
             ("user", "first request"),
             ("assistant", "old code"),
             ("observation", "stdout: 7"),
@@ -74,8 +75,7 @@ def test_provider_adapter_translates_context_and_preserves_usage_and_attribution
     observed_request = backend.requests[0]
     assert observed_request["max_tokens"] == 37
     assert observed_request["messages"][0]["role"] == "system"
-    assert "sandbox" not in observed_request["messages"][0]["content"]
-    assert "Session (" not in observed_request["messages"][0]["content"]
+    assert observed_request["messages"][0]["content"] == "Configured execution contract."
     assert observed_request["messages"][1:] == [
         {"role": "user", "content": "first request"},
         {"role": "assistant", "content": "old code"},
@@ -210,7 +210,9 @@ async def test_execution_outputs_archive_at_20_then_each_10_without_touching_cod
     assert saved[1] == "result 1" and saved[10] == "result 10"
     assert any(message["content"] == "Output (8 chars) saved in outputs[1]." for message in after)
     assert sum(" chars) saved in outputs[" in message["content"] for message in after) == 10
-    assert "result 1" not in str(after) and "result 10" not in str(after)
+    retained_contents = {message["content"] for message in after}
+    assert all(f"result {number}" not in retained_contents for number in range(1, 11))
+    assert all(f"result {number}" in retained_contents for number in range(11, 21))
     assert "result 11" in str(after) and "result 20" in str(after)
     assert "result 1" in str(before)  # already-dispatched snapshots are immutable
     assert "real user task" in str(after) and "cell_1()" in str(after)

@@ -346,7 +346,18 @@ async def test_large_unicode_output_round_trips_across_multiple_frames():
     try:
         result = await executor.execute(request("print('🙂' * 10_000, end='')"))
         assert result.status == "success"
-        assert result.stdout == "🙂" * 10_000
+        assert result.output_reference is not None
+        assert f"outputs[{result.output_reference}], fully retained" in result.stdout
+        # Retrieve below the spool threshold, still spanning multiple UTF-8 frames.
+        recovered = []
+        for start in (0, 5_000):
+            excerpt = await executor.execute(request(
+                f"print(outputs[{result.output_reference}][{start}:{start + 5_000}], end='')",
+            ))
+            assert excerpt.status == "success"
+            assert excerpt.output_reference is None
+            recovered.append(excerpt.stdout)
+        assert "".join(recovered) == "🙂" * 10_000
     finally:
         await executor.close()
 

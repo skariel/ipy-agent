@@ -239,7 +239,7 @@ async def test_progress_iopub_is_immediate_correlated_and_not_replayed():
     try:
         await asyncio.wait_for(entered.wait(), timeout=3)
         assert [message[0] for message in kernel.sent] == ["execute_input", "stream"]
-        assert kernel.sent[-1][1]["text"] == "Agent: requesting a response (step 1)."
+        assert kernel.sent[-1][1]["text"] == "Agent: requesting a response (step 1).\n"
         release.set()
         reply = await asyncio.wait_for(running, timeout=3)
         assert reply["status"] == "ok"
@@ -495,11 +495,14 @@ async def test_silent_and_store_history_are_independent_protocol_flags():
     kernel = KernelHarness(coordinator)
 
     silent_reply = await kernel.do_execute("x = 1", True, store_history=True)
+    assert kernel.sent == []
     unstored_reply = await kernel.do_execute("x = 2", False, store_history=False)
 
     assert silent_reply["execution_count"] == 0
     assert unstored_reply["execution_count"] == 1
-    assert kernel.sent == []
+    assert [message[0] for message in kernel.sent] == ["execute_input"]
+    assert kernel.sent[0][1] == {"code": "x = 2", "execution_count": 1}
+    assert kernel.sent[0][2]["header"]["msg_id"] == "cell-a"
     history = await kernel.do_history("tail", n=10, raw=True)
     assert history == {"history": []}
     assert len(coordinator.calls) == 2

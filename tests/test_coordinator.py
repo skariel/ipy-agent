@@ -5,6 +5,9 @@ import asyncio
 import json
 from pathlib import Path
 
+from prompt_toolkit.formatted_text import to_plain_text
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 import pytest
 
 from py_agent import cli, plain_terminal
@@ -606,8 +609,6 @@ async def test_terminal_uses_only_sanitized_text_plain_rich_fallback(monkeypatch
         plain_terminal, "print_formatted_text",
         lambda text, **_kwargs: captured.append(text),
     )
-    terminal = plain_terminal.PlainTerminal.__new__(plain_terminal.PlainTerminal)
-    terminal.output = object()
     event = OutputEvent(
         # Rich MIME is never emitted to a terminal; only the plain fallback is considered.
         Origin("session", "request", "terminal", 0),
@@ -620,12 +621,18 @@ async def test_terminal_uses_only_sanitized_text_plain_rich_fallback(monkeypatch
         "events": (event,),
     })()
 
-    await terminal._show_submission(submission)
+    with create_pipe_input() as terminal_input:
+        terminal = plain_terminal.PlainTerminal(
+            object(), input=terminal_input, output=DummyOutput(),
+        )
+        await terminal._show_submission(submission)
 
-    assert "safe" in captured[0]
-    assert "<script>" not in captured[0]
-    assert "secret" not in captured[0]
-    assert "\x1b" not in captured[0]
+    rendered = "".join(to_plain_text(part) for part in captured)
+    assert "safe" in rendered
+    assert "<script>" not in rendered
+    assert "secret" not in rendered
+    assert "\x1b" not in rendered
+    assert "\u202e" not in rendered
 
 
 @pytest.mark.asyncio

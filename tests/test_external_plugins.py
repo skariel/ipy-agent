@@ -26,6 +26,7 @@ from py_agent.contracts import (
     ModelRequest,
     ModelResponse,
     Origin,
+    SayOutput,
 )
 from py_agent.coordinator import Coordinator, State
 from py_agent.plugins import (
@@ -235,12 +236,15 @@ def test_registration_conflicts_dependencies_and_transform_topology(examples):
 class _DelegateExecutor:
     capabilities = ExecutorCapabilities(persistent=True, interrupt=True)
 
-    def __init__(self, *, stdout: str = "delegated", stderr: str = "", block: bool = False):
+    def __init__(
+        self, *, stdout: str = "delegated", stderr: str = "", block: bool = False, final: bool = False,
+    ):
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
         if not block:
             self.release.set()
         self.stdout, self.stderr = stdout, stderr
+        self.final = final
         self.start_calls = 0
         self.execute_calls = 0
         self.interrupt_calls = 0
@@ -253,7 +257,11 @@ class _DelegateExecutor:
         self.execute_calls += 1
         self.entered.set()
         await self.release.wait()
-        return ExecutionResult(request.origin, "success", stdout=self.stdout, stderr=self.stderr)
+        return ExecutionResult(
+            request.origin, "success", stdout=self.stdout, stderr=self.stderr,
+            say_outputs=(SayOutput("done", final=True),) if self.final else (),
+            final=self.final,
+        )
 
     async def interrupt(self):
         self.interrupt_calls += 1
@@ -271,7 +279,7 @@ class _RecordingProvider:
 
     async def generate(self, request: ModelRequest):
         self.requests.append(request)
-        return ModelResponse("pass")
+        return ModelResponse("say('done', final=True)")
 
 
 def _execution_request() -> ExecutionRequest:
@@ -281,7 +289,7 @@ def _execution_request() -> ExecutionRequest:
 
 @pytest.mark.asyncio
 async def test_coordinator_selects_external_executor_wrapper_and_transforms(examples):
-    delegate = _DelegateExecutor()
+    delegate = _DelegateExecutor(final=True)
     runtime = _runtime(examples, include=("plugin_command", "plugin_executor"), builtins={
         "builtin": BuiltinPlugin(executor_factory=lambda: delegate),
     })
@@ -294,6 +302,7 @@ async def test_coordinator_selects_external_executor_wrapper_and_transforms(exam
         interpreter="basic",
         executor="local",
         executor_wrappers=("example-executor-wrapper:audit",),
+        max_agent_steps=2,
         config_store=store,
     )
     provider = _RecordingProvider()
@@ -302,16 +311,20 @@ async def test_coordinator_selects_external_executor_wrapper_and_transforms(exam
     try:
         greeted = await coordinator.submit("terminal", "/greet Ada")
         assert greeted.message == "salut, Ada"
-        await coordinator.submit("terminal", "inspect the transformed request")
+        submission = await coordinator.submit("terminal", "inspect the transformed request")
+        assert submission.result.final
+        assert len(provider.requests) == 1
         request = provider.requests[0]
         assert request.context.messages[0] == ("system", "External example context:")
         assert request.context.transform_trace == ("example-command-context:prefix",)
         assert request.options["example_request_tag"] == "external-example"
         assert request.transform_trace == ("example-command-context:tag",)
         assert coordinator.executor.execution_count == delegate.execute_calls == 1
-        assert delegate.start_calls == delegate.close_calls == 1
+        assert delegate.start_calls == 1
+        assert delegate.close_calls == 0
     finally:
         await coordinator.close()
+    assert delegate.close_calls == 1
 
 
 @pytest.mark.asyncio
@@ -362,20 +375,27 @@ async def test_bounded_observer_backpressures_coordinator_and_events_are_immutab
     await coordinator.start()
     try:
         submission = asyncio.create_task(coordinator.submit("terminal", "@work()"))
+        started = await asyncio.wait_for(observer.receive(), timeout=1)
+        assert started.kind == "progress" and started.data["phase"] == "execution_start"
+        observer.acknowledge()
         first = await asyncio.wait_for(observer.receive(), timeout=1)
         assert first.kind == "stream" and first.data["name"] == "stdout"
         with pytest.raises(TypeError):
             first.data["text"] = "changed"
         await asyncio.sleep(0)
-        assert not submission.done()  # stderr is blocked by the one-slot queue
+        assert not submission.done()  # the one-slot queue still backpressures later events
         observer.acknowledge()
-        await submission
-        second = await observer.receive()
+        second = await asyncio.wait_for(observer.receive(), timeout=1)
         assert second.data["name"] == "stderr"
         assert second.sequence == first.sequence + 1
         assert second.origin.request_id == first.origin.request_id
         observer.acknowledge()
-        await observer.join()
+        completed = await asyncio.wait_for(observer.receive(), timeout=1)
+        assert completed.kind == "progress" and completed.data["phase"] == "cell_complete"
+        assert completed.sequence == second.sequence + 1
+        observer.acknowledge()
+        await asyncio.wait_for(submission, timeout=1)
+        await asyncio.wait_for(observer.join(), timeout=1)
     finally:
         await coordinator.close()
 
@@ -391,7 +411,11 @@ async def test_interrupt_cancels_backpressured_observer_without_replaying_execut
     await coordinator.start()
     try:
         pending = asyncio.create_task(coordinator.submit("terminal", "@side_effect()"))
-        await asyncio.wait_for(observer.receive(), timeout=1)
+        started = await asyncio.wait_for(observer.receive(), timeout=1)
+        assert started.kind == "progress" and started.data["phase"] == "execution_start"
+        observer.acknowledge()
+        first = await asyncio.wait_for(observer.receive(), timeout=1)
+        assert first.kind == "stream" and first.data["name"] == "stdout"
         await asyncio.sleep(0)
         assert not pending.done()
         await coordinator.interrupt()
@@ -408,8 +432,10 @@ async def test_interrupt_cancels_backpressured_observer_without_replaying_execut
 @pytest.mark.parametrize(("critical", "should_fail"), ((True, True), (False, False)))
 async def test_coordinator_observer_failure_policy_and_no_execution_replay(examples, critical, should_fail):
     class BrokenObserver:
-        async def observe(self, _event):
-            raise RuntimeError("observer failed")
+        async def observe(self, event):
+            # Fail on execution output, not the pre-execution progress notification.
+            if event.kind == "stream":
+                raise RuntimeError("observer failed")
 
     class BrokenObserverPlugin:
         @hookimpl
