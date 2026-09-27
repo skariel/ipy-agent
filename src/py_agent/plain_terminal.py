@@ -44,8 +44,12 @@ _PROMPT_INTERRUPTED = object()
 _SHIFT_ENTER = (Keys.ShiftEscape, Keys.ControlM)
 ANSI_SEQUENCES["\x1b[13;2u"] = _SHIFT_ENTER
 ANSI_SEQUENCES["\x1b[27;2;13~"] = _SHIFT_ENTER
-ANSI_SEQUENCES["\x1b[99;5u"] = (Keys.ControlC,)
-ANSI_SEQUENCES["\x1b[27;5;99~"] = (Keys.ControlC,)
+# Extended keyboard protocols report Ctrl-Shift-C separately from Ctrl-C.
+# Treat both as composer cancellation rather than inserting an undecoded CSI
+# suffix into the user's draft. Neither key interrupts coordinator execution.
+for _code, _modifier in ((99, 5), (99, 6), (67, 6)):
+    ANSI_SEQUENCES[f"\x1b[{_code};{_modifier}u"] = (Keys.ControlC,)
+    ANSI_SEQUENCES[f"\x1b[27;{_modifier};{_code}~"] = (Keys.ControlC,)
 ANSI_SEQUENCES["\x1b[127;3u"] = (Keys.Escape, Keys.Backspace)
 ANSI_SEQUENCES["\x1b[27;3;127~"] = (Keys.Escape, Keys.Backspace)
 _EXTENDED_KEYS_ON = "\x1b[>4;2m\x1b[>1u"
@@ -1025,7 +1029,12 @@ class PlainTerminal:
             if callable(enqueue) and self._queue_work_is_active():
                 delivered: list[OutputEvent] = []
 
-                async def on_queued_progress(event: OutputEvent) -> None:
+                async def on_queued_progress(
+                    event: OutputEvent, delivered: list[OutputEvent] = delivered,
+                ) -> None:
+                    # Each queued ticket owns its delivery log. A closure over
+                    # the loop variable would redirect older callbacks to the
+                    # newest ticket and break completion-time deduplication.
                     await self._progress_callback(event, delivered)
 
                 try:

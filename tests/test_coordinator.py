@@ -879,7 +879,8 @@ def test_cli_journal_flag_is_optional_and_forwarded_to_jupyter_kernel():
 
 
 @pytest.mark.asyncio
-async def test_transient_provider_failure_retries_without_reexecuting_cells():
+@pytest.mark.parametrize("kind", ["provider", "transport"])
+async def test_transient_provider_failure_retries_without_reexecuting_cells(kind):
     class FlakyProvider:
         model = "offline/flaky"
 
@@ -889,7 +890,7 @@ async def test_transient_provider_failure_retries_without_reexecuting_cells():
         async def generate(self, _request):
             self.calls += 1
             if self.calls < 3:
-                raise ProviderError("temporary outage", kind="provider")
+                raise ProviderError("temporary outage", kind=kind)
             return ModelResponse("say('done', final=True)", provider_id="offline", model=self.model)
 
     runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
@@ -909,7 +910,8 @@ async def test_transient_provider_failure_retries_without_reexecuting_cells():
 
 
 @pytest.mark.asyncio
-async def test_authentication_provider_failure_is_not_retried():
+@pytest.mark.parametrize("kind", ["authentication", "configuration"])
+async def test_authentication_or_configuration_provider_failure_is_not_retried(kind):
     class AuthFailure:
         model = "offline/auth"
 
@@ -918,7 +920,7 @@ async def test_authentication_provider_failure_is_not_retried():
 
         async def generate(self, _request):
             self.calls += 1
-            raise ProviderError("authentication rejected", kind="authentication")
+            raise ProviderError("authentication rejected", kind=kind)
 
     runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
     coordinator = Coordinator(runtime, router="default", provider="fake",
@@ -1050,7 +1052,7 @@ async def test_long_agent_task_forces_collapse_without_resetting_or_losing_activ
 
 def test_default_system_prompt_is_static_and_custom_context_is_not_rewritten():
     default = ProductionContextAdapter().snapshot()
-    assert "you do NOT need to call say() between cells" in default.messages[0][1]
+    assert "You do not need to call say() between cells" in " ".join(default.messages[0][1].split())
     custom = ContextSnapshot(1, (("system", "Write one Python cell."),), (None,))
     assert ProductionContextAdapter().provider_messages(custom) == (
         {"role": "system", "content": "Write one Python cell."},
@@ -1193,7 +1195,7 @@ async def test_mixed_markdown_response_is_corrected_without_executing_rejected_t
         next_messages = provider.requests[1].context.messages
         assert any("invalid format" in text for _, text in next_messages)
         assert any(
-            "No tools or function calls are available" in text
+            "There is no external tool-call API" in text
             and "ordinary assistant message text" in text
             for _, text in next_messages
         )
@@ -1206,7 +1208,12 @@ async def test_mixed_markdown_response_is_corrected_without_executing_rejected_t
 
 
 @pytest.mark.asyncio
-async def test_queued_english_is_added_after_cell_observation_before_next_model_request():
+@pytest.mark.parametrize("steering", [
+    "Prioritize the failing test first",
+    "/py_agent/production_services.py:74: self.context.contract = _PRODUCTION_CONTRACT\n"
+    "Request failed: Codex request failed (SSLError); no source accepted",
+])
+async def test_queued_english_is_added_after_cell_observation_before_next_model_request(steering):
     class BlockingProvider:
         model = "offline/steering"
 
@@ -1249,7 +1256,7 @@ async def test_queued_english_is_added_after_cell_observation_before_next_model_
     active = asyncio.create_task(coordinator.submit("terminal", "start task"))
     try:
         await asyncio.wait_for(provider.started.wait(), timeout=3)
-        ticket = await coordinator.enqueue("terminal", "Prioritize the failing test first")
+        ticket = await coordinator.enqueue("terminal", steering)
         assert ticket.kind == "ask"
         assert ticket.position == 1
         assert ticket.origin.request_id
@@ -1264,7 +1271,7 @@ async def test_queued_english_is_added_after_cell_observation_before_next_model_
         assert outcome.origin == ticket.origin
         assert len(provider.requests) == 2
         next_messages = provider.requests[1].context.messages
-        assert next_messages[-1] == ("user", "Prioritize the failing test first")
+        assert next_messages[-1] == ("user", steering)
         assert next_messages[-2][0] == "observation"
         assert provider.requests[1].origin.request_id == submission.action.origin.request_id
         assert [request.author for request in executor.requests] == ["agent", "agent"]

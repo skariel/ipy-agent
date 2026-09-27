@@ -16,11 +16,11 @@ def test_system_only_prefix_omits_session_inventory_and_memory_count():
     assert "Kernel bindings" not in ctx.contract
     assert "started with" not in ctx.contract
     assert "namespace persists" in CONTRACT
-    assert "No tools or function calls are available" in CONTRACT
+    assert "There is no external tool-call API" in CONTRACT
     assert "ordinary assistant message" in CONTRACT
-    assert "not as a tool call, JSON, or Markdown" in CONTRACT
+    assert "outside the cell, JSON, or tool calls" in CONTRACT
     assert "sandbox" not in CONTRACT
-    assert "Large stdout/stderr" in CONTRACT
+    assert "Stdout/stderr exceeding 8000 characters" in CONTRACT
     assert "ask_rw_approval" not in CONTRACT
     assert "memory.md" not in CONTRACT
     assert not hasattr(ctx, "snapshot")
@@ -208,3 +208,15 @@ def test_system_prompt_does_not_send_session_metadata():
     ctx.commit([], memories_count=1)
     assert ctx.contract == CONTRACT
     assert ctx.session_summary["current_path"] == "/work/project"
+
+
+def test_prompt_distinguishes_python_calls_from_tool_api_and_completion_from_progress():
+    prompt = " ".join(CONTRACT.split())
+    assert "There is no external tool-call API" in prompt
+    assert "Python function calls, imports, subprocesses" in prompt
+    assert "No tools or function calls are available" not in prompt
+    assert (
+        "Use final=True only when the task is finished or you are awaiting user input, "
+        "not for intermediate progress."
+    ) in prompt
+    assert "Completion is published after the cell succeeds" in prompt

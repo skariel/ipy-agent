@@ -2124,7 +2124,8 @@ class Coordinator:
                                 correction = (
                                     "No code was executed. Invalid model response format: "
                                     + detail
-                                    + ". No tools or function calls are available. Respond with exactly one "
+                                    + ". There is no external tool-call API. Python function calls are available. "
+                                      "Respond with exactly one "
                                       "complete Python/IPython cell as ordinary assistant message text: "
                                       "no tool call, JSON, prose outside the cell, or Markdown fences."
                                 )

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+import ssl
 import sys
+import traceback
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +17,7 @@ from py_agent.provider import (
     LitelmProvider,
     ProviderError,
     _litelm_failure_kind,
+    _ssl_failure_kind,
     normalize_usage,
 )
 
@@ -44,6 +47,50 @@ def test_litelm_retry_classification_is_explicit(status, expected):
     error.status_code = status
     assert _litelm_failure_kind(error) == expected
     assert _litelm_failure_kind(ValueError("local plugin bug")) == "internal"
+
+
+@pytest.mark.parametrize("link", ["__cause__", "__context__"])
+def test_ssl_classification_checks_wrapped_causes_and_handles_cycles(link):
+    outer = type("APIConnectionError", (Exception,), {})("private URL")
+    failure = ssl.SSLError(ssl.SSL_ERROR_SSL, "private detail")
+    failure.reason = "DECRYPTION_FAILED_OR_BAD_RECORD_MAC"
+    setattr(outer, link, failure)
+    setattr(failure, link, outer)
+    assert _litelm_failure_kind(outer) == "transport"
+    failure.__cause__ = ssl.SSLCertVerificationError(1, "private certificate details")
+    assert _litelm_failure_kind(outer) == "configuration"
+
+
+@pytest.mark.parametrize(
+    ("detail", "kind"),
+    [
+        ("[SSL: CERTIFICATE_VERIFY_FAILED]", "configuration"),
+        ("[SSL: WRONG_VERSION_NUMBER]", "configuration"),
+        ("[SSL: UNEXPECTED_EOF_WHILE_READING]", "transport"),
+    ],
+)
+def test_sdk_connection_wrappers_retaining_only_ssl_reason(detail, kind):
+    error = type("APIConnectionError", (Exception,), {})(detail)
+    assert _litelm_failure_kind(error) == kind
+    assert _ssl_failure_kind(ValueError("local error")) is None
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("certificate", [False, True])
+async def test_litelm_ssl_failure_is_classified_and_traceback_sanitized(monkeypatch, wrapped, certificate):
+    secret = "private-credential-do-not-log"
+    error = ssl.SSLCertVerificationError(1, secret) if certificate else ssl.SSLEOFError(8, secret)
+    if wrapped:
+        outer = type("APIConnectionError", (Exception,), {})(secret)
+        outer.__cause__ = error
+        error = outer
+    calls = install(monkeypatch, error)
+    with pytest.raises(ProviderError) as failure:
+        await LitelmProvider("openai/test").generate(MESSAGES)
+    assert failure.value.kind == ("configuration" if certificate else "transport")
+    assert failure.value.raw == {}
+    assert secret not in "".join(traceback.format_exception(failure.value))
+    assert len(calls) == 1
 
 
 def response(content="say('ok', final=True)", *, reason="stop", **message):

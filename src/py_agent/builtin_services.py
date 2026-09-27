@@ -39,7 +39,12 @@ class DefaultRouter:
             command = text[1:]
             if not command.strip():
                 raise ValueError("Empty command")
-            return RoutedAction(action.origin, "command", command)
+            # Only command identifiers use the slash-command route. Pasted
+            # absolute paths/logs must remain user input, including their full
+            # multiline body, rather than disappearing as "Unknown command".
+            name = command.split(None, 1)[0]
+            if re.fullmatch(r"[a-z][a-z0-9_-]*", name):
+                return RoutedAction(action.origin, "command", command)
         return RoutedAction(action.origin, "ask", text)
 
 

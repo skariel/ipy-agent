@@ -14,6 +14,7 @@ import inspect
 import json
 from pathlib import Path
 import re
+import ssl
 from typing import Any, Protocol
 
 
@@ -185,8 +186,49 @@ def _completion(raw: dict) -> Completion:
     return Completion(text, reason, usage, reasoning, raw, rejection)
 
 
+def _ssl_failure_kind(exc: BaseException) -> str | None:
+    """Recognize transient TLS disconnects without retrying trust/config errors.
+
+    SSL errors can escape httpx unwrapped during stream reads, or be wrapped by
+    httpcore/SDK connection errors. Inspect both chains; certificate failures
+    take precedence. Some wrappers retain only OpenSSL's bracketed reason.
+    Never return exception text (it can contain credentials).
+    """
+    pending, seen = [exc], set()
+    kinds = set()
+    while pending and len(seen) < 64:
+        error = pending.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        reason = getattr(error, "reason", None)
+        reasons = set(re.findall(r"\[SSL: ([A-Z0-9_]+)\]", str(error)))
+        if isinstance(reason, str):
+            reasons.add(reason)
+        if isinstance(error, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in reasons:
+            return "configuration"
+        if isinstance(error, ssl.SSLError) or reasons:
+            transient = (
+                isinstance(error, (ssl.SSLEOFError, ssl.SSLZeroReturnError))
+                or getattr(error, "errno", None) in {ssl.SSL_ERROR_EOF, ssl.SSL_ERROR_ZERO_RETURN}
+                or bool(reasons & {
+                    "UNEXPECTED_EOF_WHILE_READING", "DECRYPTION_FAILED_OR_BAD_RECORD_MAC",
+                })
+            )
+            kinds.add("transport" if transient else "configuration")
+        for linked in (error.__cause__, error.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    if "configuration" in kinds:
+        return "configuration"
+    return "transport" if kinds else None
+
+
 def _litelm_failure_kind(exc: Exception) -> str:
     """Retry only failures with a recognizable transient provider category."""
+    tls_kind = _ssl_failure_kind(exc)
+    if tls_kind is not None:
+        return tls_kind
     status = getattr(exc, "status_code", None)
     if type(status) is not int:
         status = getattr(exc, "status", None)
@@ -307,7 +349,7 @@ class LitelmProvider:
             # Record the category, never deliberately persist their raw content.
             name = type(exc).__name__
             kind = _litelm_failure_kind(exc)
-            raise ProviderError(f"litelm request failed ({name}); no source accepted", kind=kind) from exc
+            raise ProviderError(f"litelm request failed ({name}); no source accepted", kind=kind) from None
 
     async def _collect(self, stream: Any) -> Completion:
         if not hasattr(stream, "__aiter__"):

@@ -19,7 +19,7 @@ import uuid
 
 import httpx
 
-from .provider import Completion, ProviderError, _validate_messages
+from .provider import Completion, ProviderError, _ssl_failure_kind, _validate_messages
 
 CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
@@ -406,19 +406,19 @@ class CodexProvider:
         except ProviderError as exc:
             safe = _redact(str(exc), (credentials.access, credentials.account_id))
             raise ProviderError(safe, kind=exc.kind) from None
-        except httpx.TimeoutException as exc:
-            raise ProviderError(
-                f"Codex request failed ({type(exc).__name__}); no source accepted", kind="timeout"
-            ) from None
-        except httpx.TransportError as exc:
-            raise ProviderError(
-                f"Codex request failed ({type(exc).__name__}); no source accepted", kind="transport"
-            ) from None
         except Exception as exc:
-            # Unexpected local errors may indicate a bug, not a transient
-            # service outage. Never retry or expose URL/header details.
+            # Raw SSL failures can escape httpx during stream reads. Classify
+            # them before generic transport wrappers so certificate failures
+            # never become retryable connection errors. Unknown local errors
+            # remain nonretryable; never expose URL/header details.
+            kind = _ssl_failure_kind(exc)
+            if kind is None:
+                kind = (
+                    "timeout" if isinstance(exc, httpx.TimeoutException) else
+                    "transport" if isinstance(exc, httpx.TransportError) else "internal"
+                )
             raise ProviderError(
-                f"Codex request failed ({type(exc).__name__}); no source accepted", kind="internal"
+                f"Codex request failed ({type(exc).__name__}); no source accepted", kind=kind
             ) from None
 
     async def _collect(self, response, max_tokens, *, secrets=()):

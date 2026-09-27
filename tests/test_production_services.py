@@ -278,9 +278,9 @@ def test_default_model_messages_contain_only_plain_execution_feedback():
     adapter = ProductionContextAdapter(limits=Limits())
     snapshot = adapter.prepare_request("inspect", "request-1")
     system_prompt = snapshot.messages[0][1]
-    assert "No tools or function calls are available" in system_prompt
+    assert "There is no external tool-call API" in system_prompt
     assert "ordinary assistant message" in system_prompt
-    assert "not as a tool call, JSON, or Markdown" in system_prompt
+    assert "outside the cell, JSON, or tool calls" in system_prompt
     assert snapshot.messages[1] == ("user", "[context boundary u1]\ninspect")
     observation = ProductionObservationAdapter().pack([
         {"stream": "stdout", "text": "found\n", "session_id": "hidden-session",
@@ -375,3 +375,9 @@ def test_existing_provider_factories_defer_authentication_and_network_to_adapter
     assert isinstance(litelm, LitelmProvider)
     assert litelm.model == "openai/test-model"
     assert litelm.stream is True
+
+
+def test_production_and_default_context_share_system_contract():
+    from py_agent.context import CONTRACT
+
+    assert ProductionContextAdapter().snapshot().messages[0] == ("system", CONTRACT)

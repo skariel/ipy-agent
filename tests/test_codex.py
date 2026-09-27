@@ -6,6 +6,8 @@ import asyncio
 from copy import deepcopy
 import json
 from pathlib import Path
+import ssl
+import traceback
 from types import SimpleNamespace
 
 import httpx
@@ -175,7 +177,7 @@ async def test_real_system_prompt_and_execution_results_are_not_assistant_output
     body = json.loads(requests[0].content)
     assert body["instructions"] == context.contract
     assert body["instructions"].startswith(
-        "You are the py coding agent. Respond with one Python/IPython cell"
+        "You are py, a coding agent working through a persistent Python/IPython environment."
     )
     assert body["reasoning"] == {"effort": "medium"}
     assistant = [item for item in body["input"] if item["role"] == "assistant"]
@@ -723,6 +725,52 @@ async def test_transport_failure_is_sanitized_and_stream_closed(auth):
     assert "ReadError" in str(failure.value)
     assert failure.value.kind == "transport"
     assert stream.closed
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("stage", ["connect", "stream"])
+@pytest.mark.parametrize(
+    ("error_type", "code", "detail", "kind"),
+    [
+        (ssl.SSLEOFError, ssl.SSL_ERROR_EOF, "connection closed", "transport"),
+        (ssl.SSLZeroReturnError, ssl.SSL_ERROR_ZERO_RETURN, "connection closed", "transport"),
+        (ssl.SSLError, ssl.SSL_ERROR_SSL, "[SSL: UNEXPECTED_EOF_WHILE_READING]", "transport"),
+        (ssl.SSLError, ssl.SSL_ERROR_SSL, "[SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC]", "transport"),
+        (ssl.SSLCertVerificationError, ssl.SSL_ERROR_SSL, "untrusted certificate", "configuration"),
+        (ssl.SSLError, ssl.SSL_ERROR_SSL, "[SSL: CERTIFICATE_VERIFY_FAILED]", "configuration"),
+        (ssl.SSLError, ssl.SSL_ERROR_SSL, "[SSL: WRONG_VERSION_NUMBER]", "configuration"),
+        (ssl.SSLError, ssl.SSL_ERROR_SSL, "unknown TLS error", "configuration"),
+        (ValueError, 0, "local bug", "internal"),
+    ],
+)
+async def test_tls_failures_classified_without_accepting_source_or_leaking_secrets(
+    auth, wrapped, stage, error_type, code, detail, kind,
+):
+    error = error_type(code, f"{detail} {SECRET} {ACCOUNT}")
+    if wrapped:
+        outer = httpx.ConnectError(f"private URL {SECRET}")
+        outer.__cause__ = error
+        error = outer
+        if kind == "internal":
+            kind = "transport"  # An ordinary httpx transport wrapper still owns its classification.
+    stream = Bytes([sse([done()])], failure=error)
+    provider, requests, _ = setup(stream=stream)
+    if stage == "connect":
+        def fail(request):
+            requests.append(request)
+            raise error
+
+        provider._transport = httpx.MockTransport(fail)
+    with pytest.raises(ProviderError) as failure:
+        await provider.generate(MESSAGES)
+    assert failure.value.kind == kind
+    assert failure.value.raw == {}
+    assert failure.value.usage_unknown
+    rendered = "".join(traceback.format_exception(failure.value))
+    assert SECRET not in rendered and ACCOUNT not in rendered
+    assert len(requests) == 1  # Retry ownership remains with the coordinator.
+    if stage == "stream":
+        assert stream.closed  # Even a terminal event cannot escape a failed stream.
 
 
 async def test_cancellation_closes_stream_no_completion_returned(auth):

@@ -660,6 +660,62 @@ async def test_terminal_accepts_fifo_queue_input_while_active_without_interrupti
     assert "Queued steering (position 1).\n\n" in output.text.replace("\r\n", "\n")
 
 
+async def test_queued_progress_is_deduplicated_per_ticket_after_multiple_inputs():
+    class QueuingCoordinator:
+        state = State.GENERATING
+
+        def __init__(self):
+            self.queued = []
+
+        async def enqueue(self, frontend_id, text, *, on_progress=None, **_kwargs):
+            origin = Origin("session", f"queued-{len(self.queued)}", frontend_id, 0)
+            completion = asyncio.get_running_loop().create_future()
+            ticket = QueueTicket(origin, "ask", len(self.queued) + 1, completion)
+            self.queued.append((ticket, text, on_progress))
+            return ticket
+
+    coordinator, output = QueuingCoordinator(), Output()
+    with create_pipe_input() as pipe:
+        terminal = PlainTerminal(coordinator, input=pipe, output=output)
+        running = asyncio.create_task(terminal.run())
+        await until(lambda: terminal.session.app.is_running)
+        pipe.send_text("first request\rsecond request\r")
+        await until(lambda: len(coordinator.queued) == 2)
+        for index, (ticket, text, progress) in enumerate(coordinator.queued):
+            event = OutputEvent(ticket.origin, 1, "display", {"text/plain": f"result-{index}"})
+            await progress(event)
+            ticket.completion.set_result(QueueOutcome(
+                ticket.origin, "completed",
+                submission=Submission(RoutedAction(ticket.origin, "ask", text), events=(event,)),
+            ))
+        await until(lambda: not terminal._queued_watchers)
+        coordinator.state = State.IDLE
+        pipe.send_text("/quit\r")
+        await asyncio.wait_for(running, 3)
+
+    assert output.text.count("result-0") == 1
+    assert output.text.count("result-1") == 1
+
+
+async def test_bracketed_multiline_paste_reaches_coordinator_unchanged():
+    coordinator, output = CoordinatorStub(), Output()
+    pasted = (
+        "/py_agent/production_services.py:74: self.context.contract = _PRODUCTION_CONTRACT\n"
+        "Request failed: Codex request failed (SSLError); no source accepted\n"
+        "did you get this message?"
+    )
+    with create_pipe_input() as pipe:
+        terminal = PlainTerminal(coordinator, input=pipe, output=output)
+        running = asyncio.create_task(terminal.run())
+        await until(lambda: terminal.session.app.is_running)
+        pipe.send_text("\x1b[200~" + pasted + "\x1b[201~\r")
+        await until(lambda: bool(coordinator.submissions))
+        pipe.send_text("/quit\r")
+        await asyncio.wait_for(running, 3)
+
+    assert coordinator.submissions == [("terminal", pasted)]
+
+
 async def test_completed_composer_prompt_racing_stdin_is_not_used_as_the_stdin_reply(monkeypatch):
     composer_started, release_composer = asyncio.Event(), asyncio.Event()
     stdin_started = asyncio.Event()

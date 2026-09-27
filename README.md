@@ -61,7 +61,9 @@ only `run.sh` supplies the DeepSeek Flash launcher default.
 Recognized transient provider failures (rate limits, transport/timeouts, and
 server 5xx errors) receive up to two retries before any Python cell executes;
 a lost response can still mean both model attempts were billed. Authentication,
-request, format, and unknown local errors are not retried.
+request, format, and unknown local errors are not retried. Recognized transient
+TLS disconnects are transport failures; certificate verification and unknown TLS
+errors are not retried, and TLS verification is never disabled.
 
 The default frontend requires a TTY; batch/JSON mode is not implemented. While
 an agent request runs, the status bar shows activity, with completed-cell
@@ -74,6 +76,10 @@ English requests, `@` Python,
 `!` shell escapes, `%` IPython magics, and the
 built-in slash commands `/help`, `/status`, `/interrupt`, `/quit`, `/config`,
 `/plugins`, `/model`, `/effort`, `/context`, and `/history` (when a journal is selected).
+Slash commands require an identifier (letters, digits, underscores, or hyphens,
+starting with a lowercase letter). Path-prefixed pastes such as `/src/file.py:42`
+remain English input, including when queued as steering. Use a leading backslash
+(e.g. `\/tmp`) to force English input for a path indistinguishable from a command.
 `/model [MODEL_ID]` and `/effort [PRESET]` apply immediate, session-local overrides;
 they do not change the selected provider or persist configuration. Effort presets are
 `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; DeepSeek maps `minimal`/`low`
