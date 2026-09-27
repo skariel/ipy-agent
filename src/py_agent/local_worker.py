@@ -361,7 +361,7 @@ def _validate_request(frame: dict[str, Any]) -> tuple[Any, ...] | None:
         request_id, texts = frame["request_id"], frame["texts"]
         if (not _is_id(request_id) or not isinstance(texts, list)
                 or not 1 <= len(texts) <= 10
-                or any(not isinstance(text, str) or len(text) > 8_000 for text in texts)):
+                or any(not isinstance(text, str) or len(text) > 16_000 for text in texts)):
             raise ProtocolError("Invalid output storage request")
         return "store_outputs", request_id, texts
     if kind == "complete":
@@ -1253,7 +1253,8 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
     rich_frame_bytes = 0
 
     def emit_rich(kind: str, data: Any = None, metadata: Any = None,
-                  display_id: str | None = None, wait: bool = False) -> bool:
+                  display_id: str | None = None, wait: bool = False,
+                  output_read: dict[str, int] | None = None) -> bool:
         nonlocal rich_frame_count, rich_frame_bytes
         if kind == "clear":
             safe_data, safe_metadata = {"wait": bool(wait)}, {}
@@ -1261,6 +1262,11 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
             safe_data, safe_metadata = _safe_mime_bundle(data, metadata)
             safe_data = _redact_json(safe_data)
             safe_metadata = _redact_json(safe_metadata)
+            if output_read is not None:
+                # These fixed protocol keys and integer offsets are structural,
+                # not user text. Password redaction must not corrupt provenance.
+                safe_data = {"text/plain": data["text/plain"]}  # already redacted and budgeted
+                safe_metadata = {"py_agent_output_read": output_read}
             if not safe_data:
                 return False
         frame = {
@@ -1290,6 +1296,43 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
         rich_frame_count += 1
         rich_frame_bytes += size
         return True
+
+    read_output_active = True
+    read_output_chars = 0
+    read_output_count = 0
+
+    def read_output(index: int, start: int = 0, limit: int = 4000) -> None:
+        """Display a bounded archive excerpt without creating another archive."""
+        nonlocal read_output_chars, read_output_count
+        if not read_output_active:
+            raise RuntimeError("read_output() belongs to a completed cell; use the current helper")
+        if type(index) is not int or not 1 <= index <= 1_000_000_000:
+            raise ValueError("index must be a positive output ID")
+        if type(start) is not int or start < 0:
+            raise ValueError("start must be a nonnegative character offset")
+        if type(limit) is not int or not 1 <= limit <= 4000:
+            raise ValueError("limit must be between 1 and 4000 characters")
+        outputs = shell.user_ns.get("outputs")
+        if type(outputs) is not dict or index not in outputs:
+            raise KeyError(f"No archived outputs[{index}] in this namespace")
+        text = outputs[index]
+        if type(text) is not str:
+            raise TypeError(f"outputs[{index}] is not archived text")
+        total = len(text)
+        start = min(start, total)
+        end = min(start + limit, total)
+        header = f"outputs[{index}] chars {start}:{end} of {total}"
+        rendered = _redact_text(header + "\n" + text[start:end])
+        if read_output_count >= 8 or read_output_chars + len(rendered) > 8000:
+            raise ValueError("read_output() cell budget exceeded after redaction; use a smaller limit or another cell")
+        if not emit_rich("display", {"text/plain": rendered}, output_read={
+            "index": index, "start": start, "end": end, "total": total,
+        }):
+            raise RuntimeError("Unable to emit archive excerpt within output limits")
+        read_output_count += 1
+        read_output_chars += len(rendered)
+
+    shell.user_ns["read_output"] = read_output
 
     def publish(data: Any, metadata: Any = None, source: Any = None, *,
                 transient: Any = None, update: bool = False) -> Any:
@@ -1380,6 +1423,7 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
             displayhook_delegate.write_output_prompt = original_write_output_prompt
             displayhook_delegate.finish_displayhook = original_finish_displayhook
             displayhook_delegate.log_output = original_log_output
+            read_output_active = False
             deactivate_say()
             deactivate_input()
             _ACTIVE_INPUT_FUNCTIONS = None

@@ -97,10 +97,15 @@ completed terminal result, journal and model context. Other frontends may
 consume a provisional executor preview of up to 512 characters; it never enters
 the model context or journal. The worker retains
 up to 1 Mi characters in a
-persistent `outputs[index]` string; inspect it with a smaller slice, e.g.
-`@print(outputs[1][:4000])`. Stream order is stdout then stderr when both exist;
-extra text beyond the storage cap is discarded. Other model-facing execution
-observations exceeding 8,000 characters receive a short omission notice.
+persistent `outputs[index]` string; inspect it with
+`@read_output(1, start=0, limit=4000)`. This displays an excerpt directly with its
+original ID, character range, and retained total. Limits are 1–4,000 characters
+per read, at most 8 reads and 8,000 rendered characters per cell; request further
+pages in another cell. The helper returns `None`; don't print its return value.
+Stream order is stdout then stderr when both exist; extra text beyond the storage
+cap is discarded. Other model-facing execution observations exceeding 8,000 raw
+content characters receive a short omission notice. Formatting labels have a
+separate bounded allowance; JSON escaping doesn't reduce the visible text budget.
 Execution feedback is a separate observation record internally;
 providers that support only system/user/assistant roles receive its plain text
 as a user-role message, without a repeated label or internal IDs. Silent cells
@@ -110,7 +115,16 @@ small execution results accumulate, the oldest 10 are stored as persistent
 `outputs[index]` strings and replaced in model context with short references
 that report the original character count;
 the latest 10 stay intact. References to already-spooled large outputs are never
-archived a second time. If the selected executor cannot confirm storage, the
+archived a second time. `read_output` excerpts age into references to the original
+output ID and range, never another archived copy. In model context these excerpts
+are separate observations following the cell's ordinary output; terminal events
+retain execution order. Ordinary output from the same cell still follows normal
+limits and archival. Password redaction counts toward the read budget; use a
+smaller limit if it expands the excerpt. If a password becomes known later in the
+same cell, final redaction may shorten the displayed excerpt with an explicit note
+while preserving its original reference. Terminal five-line previews are
+display-only and do not shorten model-visible excerpts.
+If the selected executor cannot confirm storage, the
 original results remain in context. This does not change user requests, executed
 source, or the optional journal. User
 messages are not clipped. Model responses over 8,000 characters are

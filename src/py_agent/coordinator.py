@@ -16,6 +16,7 @@ from types import MappingProxyType
 from uuid import uuid4
 
 from .collapse_control import parse_collapse
+from .output_reads import output_read_reference
 from .configuration import ApplyAt, ConfigSnapshot, ConfigStore
 from .context_export import default_export_path, write_context_html
 from .contracts import (
@@ -981,6 +982,39 @@ class Coordinator:
         self._context_overlay.append((epoch, text))
 
     def _packed_observation(self, request: ExecutionRequest, result: ExecutionResult):
+        # Archive reads have their own bounded envelope. Never let unrelated
+        # stdout (including an oversized stream) hide or re-archive an excerpt.
+        reads = []
+        ordinary = []
+        read_chars = 0
+        for output in result.output_events:
+            ref = output_read_reference(output.metadata)
+            text = output.data.get("text/plain")
+            if (output.kind == "display" and ref is not None
+                    and isinstance(text, str) and len(reads) < 8
+                    and read_chars + len(text) <= 8000):
+                read_chars += len(text)
+                reads.append({
+                    "text": _strip_observation_terminal_controls(text),
+                    "reference": (
+                        f"outputs[{ref['index']}] chars {ref['start']}:{ref['end']} "
+                        f"of {ref['total']}; retrieve with "
+                        f"read_output({ref['index']}, start={ref['start']}, "
+                        f"limit={max(1, ref['end'] - ref['start'])})"
+                    ),
+                })
+            else:
+                ordinary.append(output)
+        packed = self._packed_regular_observation(
+            request, replace(result, output_events=tuple(ordinary)),
+        )
+        if not reads:
+            return packed
+        if isinstance(packed, str):
+            return "\n".join([packed, *(read["text"] for read in reads)])
+        return {**packed, "_output_reads": reads}
+
+    def _packed_regular_observation(self, request: ExecutionRequest, result: ExecutionResult):
         if result.origin != request.origin:
             raise RuntimeError("Cannot pack output from a different execution origin")
         events = []
@@ -1120,7 +1154,13 @@ class Coordinator:
                 f" Stream text is saved as outputs[{result.output_reference}]."
             )}
         serialized = json.dumps(packed, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        if len(serialized) > 8_000:
+        # Plain observation text is the actual model content, not its JSON
+        # encoding. Labels and JSON escapes must not consume its raw-text budget.
+        plain_output = set(packed) <= {"output", "_output_already_omitted"} and isinstance(
+            packed.get("output"), str,
+        )
+        oversized = len(packed["output"]) > 16_000 if plain_output else len(serialized) > 8_000
+        if oversized:
             fallback = {
                 "error": f"Observation too long ({len(serialized)} chars); omitted.",
                 "status": "output_too_large", "executed": True,

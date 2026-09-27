@@ -59,6 +59,17 @@ source. A transport failure or cancellation fails the session, since the persist
 namespace may be unavailable. Wrappers must forward this method when their delegate
 supports it, as well as optional `store_outputs` archival; do not advertise unsupported
 capabilities. The example audit wrapper demonstrates this forwarding.
+`store_outputs(texts)` accepts 1–10 strings of up to 16000 characters each (including
+observation formatting) and acknowledges distinct positive archive IDs. Local
+transport splits batches to respect its byte limit even with JSON escapes.
+
+The local `read_output(index, start=0, limit=4000)` helper emits a `display` event
+with `text/plain` and `py_agent_output_read` metadata containing integer `index`,
+`start`, `end`, and `total` (character offsets into retained text). Preserve that
+metadata through wrappers. The coordinator validates bounded excerpts and passes
+them separately from ordinary observations; the production context ages them into
+original-ID/range references without creating another output archive. Normal
+stdout from the same cell is not exempt from output limits.
 
 ## Output observers, failure policy, and backpressure
 

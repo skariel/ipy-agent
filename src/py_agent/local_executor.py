@@ -24,6 +24,7 @@ from .contracts import (
     InputUnavailableError, InspectionResult, MAX_INPUT_PROMPT_CHARS,
     MAX_INPUT_REQUESTS_PER_EXECUTION, MAX_INPUT_VALUE_CHARS, SayOutput,
 )
+from .output_reads import output_read_reference
 
 MAX_FRAME = 1_048_576
 MAX_OUTPUT_CHARS = 1_048_576
@@ -362,8 +363,13 @@ class LocalExecutor:
         no provider-facing text is removed until all references are confirmed.
         """
         if (not isinstance(texts, tuple) or not 1 <= len(texts) <= 10
-                or any(not isinstance(text, str) or len(text) > 8_000 for text in texts)):
-            raise ValueError("Output storage requires 1–10 strings of at most 8000 characters")
+                or any(not isinstance(text, str) or len(text) > 16_000 for text in texts)):
+            raise ValueError("Output storage requires 1–10 strings of at most 16000 characters")
+        # Five maximum-size strings fit even with 12-byte astral JSON escapes.
+        # Context replacement still waits for the entire batch acknowledgement.
+        if len(texts) > 5:
+            first = await self.store_outputs(texts[:5])
+            return first + await self.store_outputs(texts[5:])
         request_id = uuid4().hex
         outgoing = _encode_frame({
             "type": "store_outputs", "version": 1, "request_id": request_id,
@@ -549,6 +555,18 @@ class LocalExecutor:
         ):
             data = _redact_json(event.data, self._password_secrets)
             metadata = _redact_json(event.metadata, self._password_secrets)
+            ref = output_read_reference(event.metadata)
+            original = event.data.get("text/plain")
+            if event.kind == "display" and ref is not None and isinstance(original, str):
+                # A password may have become known *after* the read in this cell.
+                # Keep the helper's original envelope and typed provenance even
+                # when final redaction expands text or matches structural keys.
+                text = _redact_text(original, self._password_secrets)
+                if len(text) > len(original):
+                    note = "\n[Redacted excerpt shortened; retry with a smaller limit.]"
+                    text = (text[:max(0, len(original) - len(note))] + note)[:len(original)]
+                data = {"text/plain": text}
+                metadata = {"py_agent_output_read": ref}
             display_id = _redact_text(event.display_id, self._password_secrets) if event.display_id else None
             result.append(ExecutionOutput(
                 event.kind, data, display_id=display_id, metadata=metadata,
