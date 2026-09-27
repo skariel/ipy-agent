@@ -1,0 +1,14 @@
+# Strict migration gate. Run: uv run mypy --config-file mypy-strict.toml
+# Imported legacy modules are analyzed for types, but their errors belong to
+# the full-repository migration, not this gate.
+[tool.mypy]
+python_version = "3.12"
+strict = true
+follow_imports = "silent"
+files = [
+    "src/py_agent/configuration.py",
+    "src/py_agent/limits.py",
+    "src/py_agent/collapse_control.py",
+    "src/py_agent/context_export.py",
+    "src/py_agent/terminal_markdown.py",
+]

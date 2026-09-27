@@ -302,3 +302,10 @@ after a submission completes; incremental streaming is unavailable. Correlated
 stdin, bounded completion, and static inspection are implemented but not yet
 integration-verified; full history and dynamic completion remain incomplete. See
 [ARCHITECTURE_STATUS.md](ARCHITECTURE_STATUS.md) for details.
+
+## Development quality checks
+
+Run `uv run pytest -q` for the test suite and
+`uv run mypy --config-file mypy-strict.toml` for the migrated strict-typed core.
+Whole-repository strict typing is still in progress; see
+[REFACTORING.md](REFACTORING.md) for scope and next steps.

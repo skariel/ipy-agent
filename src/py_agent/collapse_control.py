@@ -1,4 +1,5 @@
 """Parse reserved context-control cells without executing model-supplied code."""
+
 from __future__ import annotations
 
 import ast
@@ -19,18 +20,28 @@ def parse_collapse(source: str, *, forced: bool = False) -> tuple[str, str, str]
         if forced or re.search(r"\bcollapse\s*\(", source):
             raise ValueError(_FORMAT) from None
         return None
-    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
-             and isinstance(node.func, ast.Name) and node.func.id == "collapse"]
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "collapse"
+    ]
     if not calls:
         if forced:
             raise ValueError("FORCED COLLAPSE MODE: " + _FORMAT)
         return None
-    if (len(tree.body) != 1 or not isinstance(tree.body[0], ast.Expr)
-            or len(calls) != 1 or tree.body[0].value is not calls[0]):
+    if (
+        len(tree.body) != 1
+        or not isinstance(tree.body[0], ast.Expr)
+        or len(calls) != 1
+        or tree.body[0].value is not calls[0]
+    ):
         raise ValueError(_FORMAT)
     call = calls[0]
-    if (call.keywords or len(call.args) != 3
-            or any(not isinstance(arg, ast.Constant) or not isinstance(arg.value, str)
-                   for arg in call.args)):
+    if call.keywords or len(call.args) != 3:
         raise ValueError(_FORMAT)
-    return tuple(arg.value for arg in call.args)
+    values: list[str] = []
+    for arg in call.args:
+        if not isinstance(arg, ast.Constant) or not isinstance(arg.value, str):
+            raise ValueError(_FORMAT)
+        values.append(arg.value)
+    return values[0], values[1], values[2]

@@ -7,14 +7,13 @@ must not reconfigure an already running service. Validators must be side-effect 
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 import json
 import math
 from types import MappingProxyType
-from typing import Callable
-
+from typing import NoReturn, TypeGuard
 
 Scalar = str | int | float | bool | None
 
@@ -27,12 +26,13 @@ def _valid_label(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip()) and value == value.strip() and "\x00" not in value
 
 
-def _is_scalar(value: object) -> bool:
-    return (type(value) in (str, int, float, bool, type(None))
-            and not (type(value) is float and not math.isfinite(value)))
+def _is_scalar(value: object) -> TypeGuard[Scalar]:
+    return type(value) in (str, int, float, bool, type(None)) and not (
+        type(value) is float and not math.isfinite(value)
+    )
 
 
-def _copy_mapping(values, description: str) -> dict:
+def _copy_mapping[K, V](values: Mapping[K, V], description: str) -> dict[K, V]:
     if not isinstance(values, Mapping):
         raise ConfigError(f"{description} must be a mapping")
     try:
@@ -41,7 +41,8 @@ def _copy_mapping(values, description: str) -> dict:
         raise ConfigError(f"{description} must be a stable mapping") from None
 
 
-class ApplyAt(str, Enum):
+# Preserve Enum string formatting used by existing consumers.
+class ApplyAt(str, Enum):  # ruff: ignore[replace-str-enum]
     IMMEDIATE = "immediate"
     REQUEST = "request"
     CELL = "cell"
@@ -62,9 +63,9 @@ class ConfigField:
     choices: tuple[Scalar, ...] = field(default=(), repr=False)
     minimum: int | float | None = None
     maximum: int | float | None = None
-    validator: Callable[[Scalar], None] | None = field(default=None, repr=False, compare=False)
+    validator: Callable[[Scalar], bool | None] | None = field(default=None, repr=False, compare=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not _valid_label(self.name) or not _valid_label(self.owner):
             raise ConfigError("Configuration fields require nonempty, trimmed names and owners")
         if self.value_type not in (str, int, float, bool, type(None)):
@@ -91,8 +92,9 @@ class ConfigField:
         if (self.minimum is not None or self.maximum is not None) and self.value_type not in (int, float):
             raise ConfigError(f"Numeric bounds are not supported for {self.name}")
         for bound in (self.minimum, self.maximum):
-            if bound is not None and (type(bound) not in (int, float)
-                                      or (type(bound) is float and not math.isfinite(bound))):
+            if bound is not None and (
+                type(bound) not in (int, float) or (type(bound) is float and not math.isfinite(bound))
+            ):
                 raise ConfigError(f"Invalid numeric bound for {self.name}")
         if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
             raise ConfigError(f"Reversed bounds for {self.name}")
@@ -111,10 +113,12 @@ class ConfigField:
             raise ConfigError(f"{self.name} requires a finite number")
         if self.choices and value not in self.choices:
             raise ConfigError(f"{self.name} is not an allowed choice")
-        if self.minimum is not None and value < self.minimum:
-            raise ConfigError(f"{self.name} is below its minimum")
-        if self.maximum is not None and value > self.maximum:
-            raise ConfigError(f"{self.name} exceeds its maximum")
+        # Bounds are permitted only for numeric fields, checked at construction.
+        if isinstance(value, (int, float)):
+            if self.minimum is not None and value < self.minimum:
+                raise ConfigError(f"{self.name} is below its minimum")
+            if self.maximum is not None and value > self.maximum:
+                raise ConfigError(f"{self.name} exceeds its maximum")
         if self.validator is not None:
             try:
                 if self.validator(value) is False:
@@ -129,7 +133,7 @@ class ConfigLayer:
     source: str
     values: Mapping[str, Scalar] = field(repr=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not _valid_label(self.source) or self.source in ("default", "session"):
             raise ConfigError("Layer source must be named, trimmed, and cannot be default or session")
         copied = _copy_mapping(self.values, "Configuration layer values")
@@ -146,7 +150,7 @@ class ResolvedValue:
     source: str
     masked_sources: tuple[str, ...] = ()
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not _is_scalar(self.value) or not _valid_label(self.source):
             raise ConfigError("Invalid resolved configuration value or provenance")
         if isinstance(self.masked_sources, (str, bytes)):
@@ -155,8 +159,11 @@ class ResolvedValue:
             sources = tuple(self.masked_sources)
         except TypeError:
             raise ConfigError("Masked provenance must be a sequence of source names") from None
-        if (any(not _valid_label(source) for source in sources)
-                or len(set(sources)) != len(sources) or self.source in sources):
+        if (
+            any(not _valid_label(source) for source in sources)
+            or len(set(sources)) != len(sources)
+            or self.source in sources
+        ):
             raise ConfigError("Invalid masked configuration provenance")
         object.__setattr__(self, "masked_sources", sources)
 
@@ -166,12 +173,11 @@ class ConfigSnapshot:
     revision: int
     entries: Mapping[str, ResolvedValue] = field(repr=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if type(self.revision) is not int or self.revision < 0:
             raise ConfigError("Configuration revision must be a nonnegative integer")
         copied = _copy_mapping(self.entries, "Configuration snapshot entries")
-        if any(not _valid_label(name) or not isinstance(value, ResolvedValue)
-               for name, value in copied.items()):
+        if any(not _valid_label(name) or not isinstance(value, ResolvedValue) for name, value in copied.items()):
             raise ConfigError("Invalid configuration snapshot entry")
         object.__setattr__(self, "entries", MappingProxyType(copied))
 
@@ -185,27 +191,35 @@ class ConfigChange:
     after: ConfigSnapshot
     changed: Mapping[str, ApplyAt]
 
-    def __post_init__(self):
-        if (not isinstance(self.before, ConfigSnapshot) or not isinstance(self.after, ConfigSnapshot)
-                or self.after.revision <= self.before.revision
-                or set(self.before.entries) != set(self.after.entries)):
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.before, ConfigSnapshot)
+            or not isinstance(self.after, ConfigSnapshot)
+            or self.after.revision <= self.before.revision
+            or set(self.before.entries) != set(self.after.entries)
+        ):
             raise ConfigError("A configuration change requires compatible, increasing snapshots")
         copied = _copy_mapping(self.changed, "Changed configuration fields")
-        if any(name not in self.before.entries or name not in self.after.entries
-               or not isinstance(boundary, ApplyAt) for name, boundary in copied.items()):
+        if any(
+            name not in self.before.entries or name not in self.after.entries or not isinstance(boundary, ApplyAt)
+            for name, boundary in copied.items()
+        ):
             raise ConfigError("Invalid changed configuration field")
         object.__setattr__(self, "changed", MappingProxyType(copied))
 
 
 class ConfigRegistry:
-    __slots__ = ("fields", "_sealed")
+    __slots__ = ("_sealed", "fields")
 
-    def __setattr__(self, name, value):
+    fields: Mapping[str, ConfigField]
+    _sealed: bool
+
+    def __setattr__(self, name: str, value: object) -> None:
         if getattr(self, "_sealed", False):
             raise AttributeError("ConfigRegistry is immutable")
         object.__setattr__(self, name, value)
 
-    def __init__(self, fields: Iterable[ConfigField] = ()):
+    def __init__(self, fields: Iterable[ConfigField] = ()) -> None:
         try:
             supplied = tuple(fields)
         except TypeError:
@@ -235,8 +249,9 @@ class ConfigRegistry:
         for name, entry in snapshot.entries.items():
             self.fields[name].validate(entry.value)
 
-    def resolve(self, layers: Iterable[ConfigLayer], overrides: Mapping[str, Scalar],
-                *, revision: int) -> ConfigSnapshot:
+    def resolve(
+        self, layers: Iterable[ConfigLayer], overrides: Mapping[str, Scalar], *, revision: int
+    ) -> ConfigSnapshot:
         if type(revision) is not int or revision < 0:
             raise ConfigError("Configuration revision must be a nonnegative integer")
         try:
@@ -254,20 +269,21 @@ class ConfigRegistry:
             self.validate(layer.values)
             for name, value in layer.values.items():
                 previous = entries[name]
-                entries[name] = ResolvedValue(value, layer.source,
-                                              (*previous.masked_sources, previous.source))
+                entries[name] = ResolvedValue(value, layer.source, (*previous.masked_sources, previous.source))
         for name, value in overrides.items():
             previous = entries[name]
-            entries[name] = ResolvedValue(value, "session",
-                                          (*previous.masked_sources, previous.source))
+            entries[name] = ResolvedValue(value, "session", (*previous.masked_sources, previous.source))
         return ConfigSnapshot(revision, entries)
 
     def display(self, snapshot: ConfigSnapshot) -> dict[str, dict[str, object]]:
         self._validate_snapshot(snapshot)
         return {
-            name: {"value": "<redacted>" if self.fields[name].sensitive else item.value,
-                   "source": item.source, "masked_sources": item.masked_sources,
-                   "apply_at": self.fields[name].apply_at.value}
+            name: {
+                "value": "<redacted>" if self.fields[name].sensitive else item.value,
+                "source": item.source,
+                "masked_sources": item.masked_sources,
+                "apply_at": self.fields[name].apply_at.value,
+            }
             for name, item in snapshot.entries.items()
         }
 
@@ -279,13 +295,13 @@ class ConfigStore:
     Updating settings never starts/stops services or writes a configuration file.
     """
 
-    __slots__ = ("_registry", "_layers", "_overrides", "_snapshot")
+    __slots__ = ("_layers", "_overrides", "_registry", "_snapshot")
 
     @property
     def registry(self) -> ConfigRegistry:
         return self._registry
 
-    def __init__(self, registry: ConfigRegistry, layers: Iterable[ConfigLayer] = ()):
+    def __init__(self, registry: ConfigRegistry, layers: Iterable[ConfigLayer] = ()) -> None:
         if not isinstance(registry, ConfigRegistry):
             raise ConfigError("Expected ConfigRegistry")
         self._registry = registry
@@ -303,10 +319,15 @@ class ConfigStore:
     def _commit(self, layers: tuple[ConfigLayer, ...], overrides: dict[str, Scalar]) -> ConfigChange:
         before = self._snapshot
         after = self.registry.resolve(layers, overrides, revision=before.revision + 1)
-        change = ConfigChange(before, after, {
-            name: self.registry.fields[name].apply_at
-            for name in after.entries if before.entries[name] != after.entries[name]
-        })
+        change = ConfigChange(
+            before,
+            after,
+            {
+                name: self.registry.fields[name].apply_at
+                for name in after.entries
+                if before.entries[name] != after.entries[name]
+            },
+        )
         # Nothing mutates until the complete candidate, provenance and diff validate.
         self._layers, self._overrides, self._snapshot = layers, overrides, after
         return change
@@ -318,8 +339,10 @@ class ConfigStore:
     def set_json(self, name: str, text: str) -> ConfigChange:
         if not isinstance(text, str):
             raise ConfigError("Expected a JSON scalar value")
-        def reject_constant(_value):
+
+        def reject_constant(_value: str) -> NoReturn:
             raise ValueError("Non-standard JSON constant")
+
         try:
             value = json.loads(text, parse_constant=reject_constant)
         except (ValueError, RecursionError):

@@ -98,3 +98,52 @@ def test_sensitive_values_are_hidden_from_representations_and_change_display():
     assert "do-not-print-this" not in repr(store.snapshot)
     assert "do-not-print-this" not in repr(change)
     assert registry.display(store.snapshot)["secret"]["value"] == "<redacted>"
+
+
+@pytest.mark.parametrize(("value_type", "default", "low", "high"), [
+    (int, 2, 0, 4),
+    (float, 2.0, 0.0, 4.0),
+])
+def test_numeric_bounds_are_inclusive_and_rejections_are_atomic(value_type, default, low, high):
+    store = ConfigStore(ConfigRegistry([
+        ConfigField("count", "core", value_type, default, minimum=1, maximum=3),
+    ]))
+    for value in (low, high):
+        before = store.snapshot
+        with pytest.raises(ConfigError):
+            store.set({"count": value})
+        assert store.snapshot is before
+    for value in (value_type(1), value_type(3)):
+        assert store.set({"count": value}).after.get("count") == value
+
+
+@pytest.mark.parametrize("result", [True, None, False])
+def test_validator_return_contract(result):
+    def validate(value):
+        return None if value == 1 else result
+
+    store = ConfigStore(ConfigRegistry([
+        ConfigField("count", "core", int, 1, validator=validate),
+    ]))
+    before = store.snapshot
+    if result is False:
+        with pytest.raises(ConfigError, match="Validation failed"):
+            store.set({"count": 2})
+        assert store.snapshot is before
+    else:
+        assert store.set({"count": 2}).after.get("count") == 2
+
+
+def test_validator_exception_is_redacted_and_does_not_commit():
+    def validate(value):
+        if value != "initial":
+            raise ValueError(f"secret: {value}")
+
+    store = ConfigStore(ConfigRegistry([
+        ConfigField("secret", "core", str, "initial", sensitive=True, validator=validate),
+    ]))
+    before = store.snapshot
+    with pytest.raises(ConfigError, match="^Validation failed for secret$") as exc:
+        store.set({"secret": "private"})
+    assert "private" not in str(exc.value)
+    assert store.snapshot is before
