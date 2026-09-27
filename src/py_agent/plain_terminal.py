@@ -131,8 +131,8 @@ RESERVED_COMMANDS = frozenset({
 
 HELP = """Enter an English request to ask the explicitly selected provider.
 While work runs, the composer remains available: English becomes steering and
-@/!/% cells execute after the current agent cell, before its next model call.
-Slash commands remain deferred. Queue order is preserved; nothing interrupts the cell.
+@/!/% cells and queued slash commands run after the current agent cell, before
+its next model call, in queue order. /interrupt and /quit remain immediate controls.
 @python                execute Python/IPython in the shared local namespace
 !shell                 execute an IPython shell escape in that namespace
 %magic                 execute an IPython magic

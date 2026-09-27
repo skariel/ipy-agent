@@ -505,6 +505,9 @@ class PluginRuntime:
 
         pm = pluggy.PluginManager("ipy_agent")
         pm.add_hookspecs(Hooks)
+        # Declared specs are snapshotted before any plugin registers, so an
+        # unknown hook name is still absent from the manager's hook relay.
+        known_specs = set(vars(pm.hook))
         for name, plugin in sorted(plugins.items()):
             try:
                 registered = pm.register(plugin, name=name)
@@ -516,7 +519,7 @@ class PluginRuntime:
             try:
                 for attribute in dir(plugin):
                     options = pm.parse_hookimpl_opts(plugin, attribute)
-                    if options is not None and not hasattr(pm.hook, attribute):
+                    if options is not None and attribute not in known_specs:
                         raise PluginError(f"Plugin {name} declares unknown hook {attribute}")
             except PluginError:
                 raise

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from py_agent import cli
+from py_agent import cli, plain_terminal
 from py_agent.builtin_services import BasicInterpreter, BuiltinPlugin
 from py_agent.contracts import (
     ContextSnapshot,
@@ -20,17 +20,23 @@ from py_agent.contracts import (
     InputUnavailableError,
     ModelRequest,
     ModelResponse,
-    OutputEvent,
     Origin,
+    OutputEvent,
     QueueFullError,
     SayOutput,
 )
 from py_agent.coordinator import MAX_PENDING_ACTIONS, Coordinator, State, Submission
 from py_agent.local_executor import LocalExecutor
-from py_agent.provider import ProviderError
+from py_agent.plugins import (
+    CommandContribution,
+    Contributions,
+    PluginManifest,
+    PluginRuntime,
+    TransformContribution,
+    hookimpl,
+)
 from py_agent.production_services import ProductionContextAdapter, ProductionObservationAdapter
-from py_agent import plain_terminal
-from py_agent.plugins import Contributions, PluginManifest, PluginRuntime, TransformContribution, hookimpl
+from py_agent.provider import ProviderError
 from py_agent.session_journal import JournalError, NoPersistenceJournal, SQLiteSessionJournal
 
 
@@ -1037,7 +1043,7 @@ async def test_long_agent_task_forces_collapse_without_resetting_or_losing_activ
 
 def test_default_system_prompt_is_static_and_custom_context_is_not_rewritten():
     default = ProductionContextAdapter().snapshot()
-    assert "another cell without calling say()" in default.messages[0][1]
+    assert "you do NOT need to call say() between cells" in default.messages[0][1]
     custom = ContextSnapshot(1, (("system", "Write one Python cell."),), (None,))
     assert ProductionContextAdapter().provider_messages(custom) == (
         {"role": "system", "content": "Write one Python cell."},
@@ -1474,12 +1480,12 @@ async def test_queued_python_shell_magic_run_at_next_cell_boundary_before_model_
 
 
 @pytest.mark.asyncio
-async def test_queued_command_blocks_later_direct_cell_at_agent_boundary():
+async def test_queued_command_and_later_direct_cell_run_at_agent_boundary():
     first_started, release_first = asyncio.Event(), asyncio.Event()
     second_started, release_second = asyncio.Event(), asyncio.Event()
 
     class Provider:
-        model = "offline/command-barrier"
+        model = "offline/command-boundary"
         calls = 0
 
         async def generate(self, _request):
@@ -1515,18 +1521,165 @@ async def test_queued_command_blocks_later_direct_cell_at_agent_boundary():
         direct = await coordinator.enqueue("terminal", "@len(outputs)")
         release_first.set()
         await asyncio.wait_for(second_started.wait(), 3)
-        assert [request.author for request in executor.requests] == ["agent"]
-        assert not direct.completion.done()
-        release_second.set()
-        await asyncio.wait_for(active, 3)
         outcomes = await asyncio.wait_for(asyncio.gather(
             command.completion, direct.completion,
         ), 3)
         assert [outcome.status for outcome in outcomes] == ["completed", "completed"]
-        assert [request.author for request in executor.requests] == ["agent", "agent", "user"]
+        assert outcomes[0].submission.action.origin == command.origin
+        assert outcomes[0].submission.message == "Command service is not configured"
+        assert [request.author for request in executor.requests] == ["agent", "user"]
+        assert not active.done()
+        assert coordinator.state is State.GENERATING
+        release_second.set()
+        await asyncio.wait_for(active, 3)
+        assert [request.author for request in executor.requests] == ["agent", "user", "agent"]
     finally:
         release_first.set()
         release_second.set()
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_model_and_effort_commands_affect_next_generation_in_fifo_order():
+    first_started, release_first = asyncio.Event(), asyncio.Event()
+    second_started, release_second = asyncio.Event(), asyncio.Event()
+
+    class Provider:
+        model = "offline/original"
+
+        def __init__(self):
+            self.requests = []
+
+        def set_model(self, model):
+            self.model = model
+
+        async def generate(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                first_started.set()
+                await release_first.wait()
+            else:
+                second_started.set()
+                await release_second.wait()
+            return ModelResponse("pass")
+
+    class Executor(CaptureExecutor):
+        async def execute(self, request):
+            self.requests.append(request)
+            final = len(self.requests) == 2
+            return ExecutionResult(request.origin, "success", final=final,
+                                   say_outputs=(SayOutput("done", final=True),) if final else ())
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(runtime, router="default", provider="fake",
+                              interpreter="basic", executor="local")
+    provider = Provider()
+    coordinator.provider, coordinator.executor = provider, Executor()
+    coordinator.provider_id = "litelm"
+    coordinator.model = provider.model
+    await coordinator.start()
+    active = asyncio.create_task(coordinator.submit("terminal", "ongoing"))
+    try:
+        await asyncio.wait_for(first_started.wait(), 3)
+        tickets = [await coordinator.enqueue("other-frontend", source) for source in (
+            "/model offline/next", "/model", "/effort high", "continue with new settings",
+        )]
+        assert provider.model == "offline/original"
+        assert not any(ticket.completion.done() for ticket in tickets)
+        release_first.set()
+        await asyncio.wait_for(second_started.wait(), 3)
+        outcomes = await asyncio.wait_for(asyncio.gather(
+            *(ticket.completion for ticket in tickets),
+        ), 3)
+        assert [outcome.status for outcome in outcomes] == ["completed"] * 3 + ["steered"]
+        assert outcomes[1].submission.message == "Model: offline/next (provider: litelm)"
+        assert [outcome.submission.action.origin for outcome in outcomes[:3]] == [
+            ticket.origin for ticket in tickets[:3]
+        ]
+        assert provider.requests[0].model == "offline/original"
+        assert "effort" not in provider.requests[0].options
+        assert provider.requests[1].model == "offline/next"
+        assert provider.requests[1].options["effort"] == "high"
+        assert provider.requests[1].context.messages[-1] == ("user", "continue with new settings")
+        assert provider.requests[1].origin.request_id == provider.requests[0].origin.request_id
+        assert not active.done()
+        release_second.set()
+        await asyncio.wait_for(active, 3)
+    finally:
+        release_first.set()
+        release_second.set()
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_queued_async_command_settles_ticket_without_replay():
+    first_started, release_first = asyncio.Event(), asyncio.Event()
+    command_started = asyncio.Event()
+    command_calls = []
+
+    class Provider:
+        model = "offline/command-cancellation"
+        calls = 0
+
+        async def generate(self, _request):
+            self.calls += 1
+            first_started.set()
+            await release_first.wait()
+            return ModelResponse("pass")
+
+    class Executor(CaptureExecutor):
+        async def execute(self, request):
+            self.requests.append(request)
+            return ExecutionResult(request.origin, "success")
+
+    class Command:
+        async def execute(self, arguments):
+            command_calls.append(arguments)
+            command_started.set()
+            await asyncio.Event().wait()
+
+    class CommandPlugin:
+        @hookimpl
+        def py_agent_register(self):
+            return Contributions(
+                PluginManifest("boundary-command"),
+                commands=(CommandContribution("wait-command", lambda _config: Command()),),
+            )
+
+    runtime = PluginRuntime.load(builtins={
+        "builtin": BuiltinPlugin(), "boundary-command": CommandPlugin(),
+    })
+    coordinator = Coordinator(runtime, router="default", provider="fake",
+                              interpreter="basic", executor="local")
+    provider, executor = Provider(), Executor()
+    coordinator.provider, coordinator.executor = provider, executor
+    await coordinator.start()
+    active = asyncio.create_task(coordinator.submit("terminal", "ongoing"))
+    try:
+        await asyncio.wait_for(first_started.wait(), 3)
+        steering = await coordinator.enqueue("terminal", "reserved steering")
+        command = await coordinator.enqueue("other-frontend", "/wait-command once")
+        direct = await coordinator.enqueue("terminal", "@must_not_run = True")
+        release_first.set()
+        await asyncio.wait_for(command_started.wait(), 3)
+        assert coordinator.state is State.COMMAND
+        assert not active.done()
+        assert not command.completion.done()
+        await coordinator.interrupt()
+        with pytest.raises(asyncio.CancelledError):
+            await active
+        outcomes = await asyncio.wait_for(asyncio.gather(
+            steering.completion, command.completion, direct.completion,
+        ), 3)
+        assert [outcome.status for outcome in outcomes] == ["interrupted"] * 3
+        assert outcomes[1].origin == command.origin
+        assert command_calls == ["once"]
+        assert provider.calls == 1
+        assert [request.author for request in executor.requests] == ["agent"]
+        assert coordinator.pending_action_count == 0
+        assert all(text != "reserved steering" for _, text in coordinator._latest_context().messages)
+    finally:
+        release_first.set()
         await coordinator.close()
 
 

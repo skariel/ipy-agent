@@ -1373,10 +1373,10 @@ class Coordinator:
     ) -> QueueTicket:
         """Accept bounded FIFO work without cancelling the active provider or cell.
 
-        Leading English asks become steering at a safe cell boundary. Direct
-        @/!/% cells run at that boundary before the next model request, without
-        interrupting execution. Slash commands wait for the turn to finish and
-        block later queue items; no item overtakes an earlier one.
+        English asks become steering at a safe cell boundary. Direct @/!/%
+        cells and slash commands run at that boundary before the next model
+        request, without interrupting execution. Queue items are processed in
+        FIFO order; commands do not wait for the whole agent turn to finish.
         """
         if self.state in (State.NEW, State.STOPPING, State.FAILED, State.CLOSED):
             raise RuntimeError("Session unavailable for queued actions")
@@ -1687,19 +1687,63 @@ class Coordinator:
                     if self.state is State.EXECUTING:
                         self.state = previous_state
 
+            async def run_command(action: RoutedAction, command_config: ConfigSnapshot | None) -> Submission:
+                """Dispatch under the current operation without releasing its ownership."""
+                self.state = State.COMMAND
+                self._capture_history_sensitive_config(command_config)
+                message = await self._dispatch_command(action.source, command_config)
+                if not self._operation_is_current(operation_id, State.COMMAND):
+                    raise asyncio.CancelledError
+                if self.config_store is not None:
+                    self.config_revision = self.config_store.snapshot.revision
+                    self._capture_history_sensitive_config(self.config_store.snapshot)
+                if (not self._journal_sensitive_config_ready
+                        and getattr(self.journal, "persisted", None) is True):
+                    message += (
+                        "\nWarning: sensitive configuration exceeds journal redaction limits; "
+                        "further persisted operations will stop safely."
+                    )
+                return Submission(action, message=message)
+
+            async def run_queued_command(item: _QueuedAction) -> None:
+                previous_state = self.state
+                try:
+                    submission = await run_command(item.action, item.config)
+                except asyncio.CancelledError:
+                    # Commands may have side effects. Leave COMMAND set so the
+                    # outer submission fails closed; never replay this item.
+                    self._complete_queue_item(item, QueueOutcome(
+                        item.action.origin, "interrupted",
+                        error="Queued command interrupted; side effects may have occurred",
+                    ))
+                    raise
+                except Exception as exc:
+                    self._complete_queue_item(item, QueueOutcome(
+                        item.action.origin, "failed",
+                        error=f"Queued command failed; side effects may have occurred: {exc}",
+                    ))
+                    raise
+                else:
+                    self.state = previous_state
+                    self._complete_queue_item(item, QueueOutcome(
+                        item.action.origin, "completed", submission=submission,
+                    ))
+
             async def drain_boundary_queue() -> None:
-                # Reserve leading English steering in FIFO order and execute
-                # direct cells before the next provider call. A slash command
-                # at the head remains deferred and blocks everything behind it.
+                # Reserve English steering and run cells/commands in FIFO order
+                # before the next provider call. Bound this drain so newly
+                # arriving actions cannot indefinitely starve generation.
                 async with self._queue_lock:
                     boundary_count = len(self._pending_actions)
                 for _ in range(boundary_count):
                     async with self._queue_lock:
-                        if not self._pending_actions or self._pending_actions[0].action.kind == "command":
+                        if not self._pending_actions:
                             return
                         item = self._pending_actions.popleft()
                     if item.action.kind == "ask":
                         steering_awaiting_dispatch.append(item)
+                    elif item.action.kind == "command":
+                        await run_queued_command(item)
                     else:
                         await run_queued_direct(item)
 
@@ -1710,21 +1754,9 @@ class Coordinator:
                 )
 
                 if routed.kind == "command":
-                    self.state = State.COMMAND
-                    message = await self._dispatch_command(routed.source, config)
-                    if not self._operation_is_current(operation_id, State.COMMAND):
-                        raise asyncio.CancelledError
-                    if self.config_store is not None:
-                        self.config_revision = self.config_store.snapshot.revision
-                        self._capture_history_sensitive_config(self.config_store.snapshot)
-                    if (not self._journal_sensitive_config_ready
-                            and getattr(self.journal, "persisted", None) is True):
-                        message += (
-                            "\nWarning: sensitive configuration exceeds journal redaction limits; "
-                            "further persisted operations will stop safely."
-                        )
+                    submission = await run_command(routed, config)
                     self._set_state_unless_stopping(State.IDLE)
-                    return Submission(routed, message=message)
+                    return submission
 
                 if routed.kind == "ask":
                     context_pending = callable(getattr(self.context_service, "prepare_request", None))

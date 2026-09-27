@@ -268,7 +268,10 @@ def test_pidfd_signal_rejects_a_reused_pid(monkeypatch):
         **(vars(expected) | {"start_ticks": "a-different-process"})
     )
     signaled = []
-    monkeypatch.setattr(kernel_sessions.os, "pidfd_open", lambda *_args: 123)
+    def fake_pidfd_open(*_args):
+        return 123
+
+    monkeypatch.setattr(kernel_sessions.os, "pidfd_open", fake_pidfd_open, raising=False)
     monkeypatch.setattr(signal, "pidfd_send_signal", lambda *args: signaled.append(args), raising=False)
     monkeypatch.setattr(kernel_sessions.os, "close", lambda _fd: None)
     monkeypatch.setattr(kernel_sessions, "_proc_info", lambda _pid, **_kwargs: reused)

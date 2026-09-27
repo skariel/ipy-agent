@@ -175,7 +175,7 @@ async def test_real_system_prompt_and_execution_results_are_not_assistant_output
     body = json.loads(requests[0].content)
     assert body["instructions"] == context.contract
     assert body["instructions"].startswith(
-        "You are the py coding agent. You speak only Python. Always answer with pure Python code and nothing else."
+        "You are the py coding agent. Respond with one Python/IPython cell"
     )
     assert body["reasoning"] == {"effort": "medium"}
     assistant = [item for item in body["input"] if item["role"] == "assistant"]
