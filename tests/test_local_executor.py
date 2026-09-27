@@ -606,6 +606,32 @@ async def test_sigint_interrupt_reports_cancellation_and_preserves_namespace_whe
 
 
 @pytest.mark.asyncio
+async def test_interrupt_that_must_stop_the_worker_reports_an_uncertain_result(tmp_path):
+    executor = LocalExecutor(interrupt_timeout=0.3)
+    await executor.start()
+    armed = tmp_path / "armed"
+    running = asyncio.create_task(executor.execute(request(
+        "import pathlib, signal\n"
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        f"pathlib.Path({str(armed)!r}).write_text('armed')\n"
+        "while True: pass",
+    )))
+    try:
+        for _ in range(300):
+            if armed.exists():
+                break
+            await asyncio.sleep(.01)
+        assert armed.exists()
+        assert executor._active_execution_id is not None
+        await executor.interrupt()
+        result = await asyncio.wait_for(running, timeout=10)
+        assert result.status == "uncertain"
+        assert executor.process is None
+    finally:
+        await executor.close()
+
+
+@pytest.mark.asyncio
 async def test_task_cancellation_never_replays_and_discards_uncertain_worker_state():
     executor = LocalExecutor()
     await executor.start()

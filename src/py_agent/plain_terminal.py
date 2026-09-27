@@ -880,7 +880,10 @@ class PlainTerminal:
             try:
                 submission = await self._submit(text, on_progress=on_progress)
             except asyncio.CancelledError:
-                self._write("Request was cancelled; it will not be replayed.")
+                if getattr(self.coordinator, "state", State.IDLE) is State.FAILED:
+                    self._write("Request was cancelled; the session is not usable and needs a restart.")
+                else:
+                    self._write("Request was cancelled; it will not be replayed. The session is still usable.")
             except Exception as exc:
                 self._write(f"Request failed: {exc}")
             else:
@@ -1013,6 +1016,12 @@ class PlainTerminal:
                     continue
 
             enqueue = getattr(self.coordinator, "enqueue", None)
+            if getattr(self.coordinator, "state", State.IDLE) is State.FAILED:
+                self._write(
+                    "Session is failed and cannot accept new work; "
+                    "use /quit to exit and start a new session."
+                )
+                continue
             if callable(enqueue) and self._queue_work_is_active():
                 delivered: list[OutputEvent] = []
 

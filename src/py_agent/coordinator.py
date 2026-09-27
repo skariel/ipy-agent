@@ -305,6 +305,10 @@ class Coordinator:
         self._active_execution_request: ExecutionRequest | None = None
         self._active_execution_result_recorded = False
         self._execution_active = False
+        # Status of the executor result that belongs to the current dispatch,
+        # cleared before each dispatch. A cancellation that arrives after a
+        # "cancelled" result may keep a session whose namespace survived.
+        self._execution_outcome_status: str | None = None
         self._generation: asyncio.Task | None = None
         # Minimal context fallback for embedders that do not select a context
         # policy. Production CLI sessions select ProductionContextAdapter.
@@ -1248,6 +1252,7 @@ class Coordinator:
         self._journal_record("record_execution_source", request)
         self._active_execution_request = request
         self._active_execution_result_recorded = False
+        self._execution_outcome_status = None
         self._execution_active = True
         try:
             try:
@@ -1268,6 +1273,7 @@ class Coordinator:
             self._record_uncertain_execution(request, f"Executor returned an invalid result: {type(exc).__name__}")
             raise
         self._record_execution_result(request, result)
+        self._execution_outcome_status = result.status
         return result
 
     async def _close_executor(self) -> None:
@@ -2292,7 +2298,13 @@ class Coordinator:
                     self._set_state_unless_stopping(State.IDLE)
                 elif self.state in (State.EXECUTING, State.COMMAND):
                     # Execution/commands may already have side effects; never replay them.
-                    self._set_state_unless_stopping(State.FAILED)
+                    # A user interrupt leaves the session usable only when the
+                    # executor reported that the interrupted cell itself stopped.
+                    if (self.state is State.EXECUTING
+                            and self._execution_outcome_status == "cancelled"):
+                        self._set_state_unless_stopping(State.IDLE)
+                    else:
+                        self._set_state_unless_stopping(State.FAILED)
                 raise
             except Exception as exc:
                 for steering_item in steering_awaiting_dispatch:
@@ -2516,8 +2528,8 @@ class Coordinator:
             return "Effort presets are unavailable for the selected provider."
         self._effort_override = value
         note = (
-            " DeepSeek treats non-none presets as thinking enabled and may not "
-            "distinguish every level."
+            " DeepSeek maps minimal/low to low, medium/high to high, xhigh to max, "
+            "and none disables thinking."
             if self.provider_id == "litelm" and self.model.startswith("deepseek/")
             else ""
         )
@@ -2744,12 +2756,20 @@ class Coordinator:
                 active.cancel()
             return
         if self.state in (State.EXECUTING, State.WAITING_FOR_INPUT):
+            # Invalidate before requesting cancellation so a late executor result
+            # cannot be dispatched even if the executor ignores the interrupt.
             self._active_operation_id = None
-            self.state = State.FAILED  # execution/output state may be uncertain
             await self._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
             if self._execution_active:
+                # Stop the cell and let the cancelled operation choose its own
+                # transition: a "cancelled" result means the executor kept a
+                # usable namespace, anything else fails the session closed.
                 await self.executor.interrupt()
             else:
+                # The cell result is already recorded, but output delivery or
+                # observer acknowledgement was cancelled; keep the fail-closed
+                # transition instead of promising an unchanged session.
+                self.state = State.FAILED
                 active = self._active_task
                 if active is not None and active is not asyncio.current_task():
                     active.cancel()

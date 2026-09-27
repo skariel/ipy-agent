@@ -31,11 +31,13 @@ def test_effort_presets_override_the_next_litelm_request_options():
     assert "provider default" in dispatch(coordinator, "effort")
     changed = dispatch(coordinator, "effort high")
 
-    assert "thinking enabled" in changed
+    assert "xhigh to max" in changed
     assert coordinator._model_options(coordinator.config_store.snapshot)["effort"] == "high"
     assert "Effort: high" in dispatch(coordinator, "effort")
+    assert "none disables thinking" in dispatch(coordinator, "effort none")
+    assert coordinator._model_options(coordinator.config_store.snapshot)["effort"] == "none"
     assert dispatch(coordinator, "effort maximum").startswith("Usage: /effort")
-    assert coordinator._model_options(coordinator.config_store.snapshot)["effort"] == "high"
+    assert coordinator._model_options(coordinator.config_store.snapshot)["effort"] == "none"
 
 
 def test_codex_model_validation_and_configured_effort_are_preserved():

@@ -203,6 +203,36 @@ def test_pi_auth_key_and_effort_are_passed_without_entering_messages(monkeypatch
     assert calls[0]["messages"] == MESSAGES
 
 
+def test_deepseek_effort_presets_map_to_documented_api_levels(monkeypatch):
+    calls = install(monkeypatch, SimpleNamespace(model_dump=lambda: response()))
+    provider = LitelmProvider("deepseek/deepseek-flash")
+
+    for preset, expected in (
+        ("minimal", "low"), ("low", "low"), ("medium", "high"),
+        ("high", "high"), ("xhigh", "max"),
+    ):
+        provider.effort = preset
+        asyncio.run(provider.generate(MESSAGES))
+        assert calls[-1]["reasoning_effort"] == expected
+        assert "extra_body" not in calls[-1]
+
+    provider.effort = "none"
+    asyncio.run(provider.generate(MESSAGES))
+    assert "reasoning_effort" not in calls[-1]
+    assert calls[-1]["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_non_deepseek_effort_is_forwarded_verbatim(monkeypatch):
+    calls = install(monkeypatch, SimpleNamespace(model_dump=lambda: response()))
+    provider = LitelmProvider("openai/gpt-5")
+    provider.effort = "xhigh"
+
+    asyncio.run(provider.generate(MESSAGES))
+
+    assert calls[0]["reasoning_effort"] == "xhigh"
+    assert "extra_body" not in calls[0]
+
+
 def test_live_model_change_resolves_the_new_provider_key(monkeypatch, tmp_path):
     auth = tmp_path / "auth.json"
     auth.write_text(

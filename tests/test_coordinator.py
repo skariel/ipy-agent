@@ -781,6 +781,42 @@ async def test_password_stdin_value_never_enters_journal_or_visible_output(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_interrupt_during_execution_keeps_the_session_and_namespace_usable():
+    executor = LocalExecutor()
+    runtime = PluginRuntime.load(builtins={
+        "builtin": BuiltinPlugin(executor_factory=lambda: executor),
+    })
+    coordinator = Coordinator(
+        runtime, router="default", provider="fake", interpreter="basic", executor="local",
+    )
+    await coordinator.start()
+    running = asyncio.create_task(coordinator.submit(
+        "terminal",
+        "@import time\ninterrupt_kept_namespace = 41\ntime.sleep(30)",
+    ))
+    try:
+        for _ in range(300):
+            if (coordinator.state is State.EXECUTING
+                    and executor._active_execution_id is not None):
+                break
+            await asyncio.sleep(.01)
+        assert coordinator.state is State.EXECUTING
+        assert executor._active_execution_id is not None
+        await coordinator.interrupt()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(running, timeout=10)
+        assert coordinator.state is State.IDLE
+        follow_up = await asyncio.wait_for(
+            coordinator.submit("terminal", "@print(interrupt_kept_namespace + 1)"), timeout=10,
+        )
+        assert follow_up.result.status == "success"
+        assert "42" in follow_up.result.stdout
+        assert coordinator.state is State.IDLE
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
 async def test_journal_failure_prevents_execution_and_fails_session_without_replay(tmp_path):
     journal = journal_for(tmp_path)
     runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})

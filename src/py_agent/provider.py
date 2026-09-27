@@ -221,6 +221,28 @@ def _litelm_failure_kind(exc: Exception) -> str:
 
 _MODEL_ID = re.compile(r"[^\x00-\x20\x7f]{1,512}\Z")
 
+# The shared effort vocabulary is Codex's preset list. DeepSeek accepts only
+# low/high/max and disables thinking through a separate toggle, so translate at
+# the provider boundary instead of teaching the coordinator two vocabularies.
+_DEEPSEEK_EFFORT = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+}
+
+
+def _litelm_effort_options(model: str, effort: str) -> dict[str, object]:
+    """Translate one shared effort preset into provider request options."""
+    if model.split("/", 1)[0] != "deepseek":
+        return {"reasoning_effort": effort}
+    if effort == "none":
+        # DeepSeek documents no "none" effort value; thinking mode is toggled
+        # through the OpenAI-compatible extra body instead.
+        return {"extra_body": {"thinking": {"type": "disabled"}}}
+    return {"reasoning_effort": _DEEPSEEK_EFFORT.get(effort, effort)}
+
 
 class LitelmProvider:
     """API-key client; no pi subscription authentication or server-side history.
@@ -264,7 +286,7 @@ class LitelmProvider:
         if credential is not None:
             kwargs["api_key"] = credential.key
         if self.effort is not None:
-            kwargs["reasoning_effort"] = self.effort
+            kwargs.update(_litelm_effort_options(self.model, self.effort))
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
         if self.api_base is not None:

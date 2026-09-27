@@ -75,7 +75,10 @@ English requests, `@` Python,
 built-in slash commands `/help`, `/status`, `/interrupt`, `/quit`, `/config`,
 `/plugins`, `/model`, `/effort`, `/context`, and `/history` (when a journal is selected).
 `/model [MODEL_ID]` and `/effort [PRESET]` apply immediate, session-local overrides;
-they do not change the selected provider or persist configuration. `/context save [PATH]`
+they do not change the selected provider or persist configuration. Effort presets are
+`none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; DeepSeek maps `minimal`/`low`
+to `low`, `medium`/`high` to `high`, `xhigh` to `max`, and disables thinking for `none`.
+`/context save [PATH]`
 writes a private (mode `0600`), standalone HTML explorer containing the current
 live messages, system prompt, last exact dispatched request, runtime/tool
 metadata, raw context groups, and collapsed archives; it is intentionally unredacted
