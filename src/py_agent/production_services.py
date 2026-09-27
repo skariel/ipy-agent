@@ -31,8 +31,11 @@ from .plugins import Contributions, PluginManifest, Service, hookimpl
 
 # Keep the runtime prompt explicit about unrestricted execution.
 _PRODUCTION_CONTRACT = """You are py, a coding agent. Reply with one Python/IPython cell (<=8000
-characters), no Markdown fences or prose. The Python namespace persists
-across cells. !shell escapes, %magics, imports and subprocesses work.
+characters), no Markdown fences or prose.
+No tools or function calls are available. Return the cell source directly as the
+ordinary assistant message, not as a tool call, JSON, or Markdown.
+The Python namespace persists across cells. !shell escapes, %magics, imports and
+subprocesses work.
 
 say() is how you talk to the user: say(text, final=False) publishes
 progress; say(text, final=True) finishes the task after that cell succeeds.

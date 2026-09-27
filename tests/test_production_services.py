@@ -275,6 +275,10 @@ def test_silent_cells_do_not_inject_a_completed_observation():
 def test_default_model_messages_contain_only_plain_execution_feedback():
     adapter = ProductionContextAdapter(limits=Limits())
     snapshot = adapter.prepare_request("inspect", "request-1")
+    system_prompt = snapshot.messages[0][1]
+    assert "No tools or function calls are available" in system_prompt
+    assert "ordinary assistant message" in system_prompt
+    assert "not as a tool call, JSON, or Markdown" in system_prompt
     assert snapshot.messages[1] == ("user", "[context boundary u1]\ninspect")
     observation = ProductionObservationAdapter().pack([
         {"stream": "stdout", "text": "found\n", "session_id": "hidden-session",

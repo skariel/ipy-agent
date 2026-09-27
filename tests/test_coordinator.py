@@ -1176,6 +1176,11 @@ async def test_mixed_markdown_response_is_corrected_without_executing_rejected_t
         assert [request.source for request in executor.requests] == ["say('repaired', final=True)"]
         next_messages = provider.requests[1].context.messages
         assert any("invalid format" in text for _, text in next_messages)
+        assert any(
+            "No tools or function calls are available" in text
+            and "ordinary assistant message text" in text
+            for _, text in next_messages
+        )
         assert not any("DO_NOT_EXECUTE" in text for _, text in next_messages)
         assert any(event.kind == "progress" and event.data.get("phase") == "format_retry"
                    for event in submission.events)

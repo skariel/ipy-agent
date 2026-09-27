@@ -2050,8 +2050,9 @@ class Coordinator:
                             correction = (
                                 "No code was executed. Invalid model response format: "
                                 + (decision.reason[:300] or "invalid cell")
-                                + ". Respond with exactly one complete Python/IPython cell: "
-                                  "no prose outside the cell and no Markdown fences."
+                                + ". No tools or function calls are available. Respond with exactly one "
+                                  "complete Python/IPython cell as ordinary assistant message text: "
+                                  "no tool call, JSON, prose outside the cell, or Markdown fences."
                             )
                             self._commit_context(
                                 origin.request_id, routed.source,

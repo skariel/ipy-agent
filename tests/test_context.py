@@ -16,6 +16,9 @@ def test_system_only_prefix_omits_session_inventory_and_memory_count():
     assert "Kernel bindings" not in ctx.contract
     assert "started with" not in ctx.contract
     assert "namespace persists" in CONTRACT
+    assert "No tools or function calls are available" in CONTRACT
+    assert "ordinary assistant message" in CONTRACT
+    assert "not as a tool call, JSON, or Markdown" in CONTRACT
     assert "sandbox" not in CONTRACT
     assert "Large stdout/stderr" in CONTRACT
     assert "ask_rw_approval" not in CONTRACT
