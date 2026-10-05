@@ -10,38 +10,59 @@ import asyncio
 import json
 import math
 import os
+from pathlib import Path
 import re
 import signal
 import sys
-from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from .contracts import (
-    CompletionResult, ExecutionOutput, ExecutionRequest, ExecutionResult,
-    ExecutorCapabilities, InputCancelledError, InputReply, InputRequest,
-    InputUnavailableError, InspectionResult, MAX_INPUT_PROMPT_CHARS,
-    MAX_INPUT_REQUESTS_PER_EXECUTION, MAX_INPUT_VALUE_CHARS, SayOutput,
+    MAX_INPUT_PROMPT_CHARS,
+    MAX_INPUT_REQUESTS_PER_EXECUTION,
+    MAX_INPUT_VALUE_CHARS,
+    CompletionResult,
+    ExecutionOutput,
+    ExecutionRequest,
+    ExecutionResult,
+    ExecutorCapabilities,
+    InputCancelledError,
+    InputReply,
+    InputRequest,
+    InputUnavailableError,
+    InspectionResult,
+    SayOutput,
 )
 from .output_reads import output_read_reference
+from .output_safety import (
+    redact_json as _redact_json,
+)
+from .output_safety import (
+    redact_text as _redact_text,
+)
+from .output_safety import (
+    strip_partial_secret_suffix as _strip_partial_secret_suffix,
+)
+from .worker_protocol import (
+    MAX_COMPLETION_MATCH_CHARS,
+    MAX_COMPLETION_MATCHES,
+    MAX_ERROR_CHARS,
+    MAX_FRAME,
+    MAX_INSPECTION_CHARS,
+    MAX_OUTPUT_FRAME_CHARS,
+    MAX_PASSWORD_SECRET_CHARS,
+    MAX_PASSWORD_SECRETS,
+    MAX_QUERY_CHARS,
+    MAX_RICH_OUTPUT_BYTES,
+    MAX_RICH_OUTPUT_FRAMES,
+    MAX_SAY_MESSAGES,
+    PROTOCOL_VERSION,
+)
 
-MAX_FRAME = 1_048_576
 MAX_OUTPUT_CHARS = 1_048_576
 DEFAULT_OUTPUT_CHARS = 262_144
-MAX_OUTPUT_FRAME_CHARS = 8_192
-MAX_ERROR_CHARS = 8_192
 MAX_SAY_CHARS = MAX_FRAME
-MAX_SAY_MESSAGES = 1_024
-MAX_RICH_OUTPUT_FRAMES = 256
-MAX_RICH_OUTPUT_BYTES = 2_097_152
-MAX_QUERY_CHARS = 65_536
 MAX_INPUT_ERROR_CHARS = 8_192
-MAX_PASSWORD_SECRETS = 128
-MAX_PASSWORD_SECRET_CHARS = 1_048_576
-MAX_COMPLETION_MATCHES = 512
-MAX_COMPLETION_MATCH_CHARS = 2_048
-MAX_INSPECTION_CHARS = 16_384
 
 
 class _ProtocolError(ValueError):
@@ -102,42 +123,6 @@ def _encode_frame(message: dict[str, Any]) -> bytes:
     if not 0 < len(payload) <= MAX_FRAME:
         raise ValueError(f"Execution request exceeds the {MAX_FRAME}-byte transport limit")
     return len(payload).to_bytes(4, "big") + payload
-
-
-def _redact_text(text: str, secrets: list[str]) -> str:
-    marker = "[REDACTED]"
-    if any(secret and secret in marker for secret in secrets):
-        marker = ""
-    for secret in sorted(secrets, key=len, reverse=True):
-        if secret:
-            text = text.replace(secret, marker)
-    return text
-
-
-def _redact_json(value: Any, secrets: list[str]) -> Any:
-    if isinstance(value, str):
-        return _redact_text(value, secrets)
-    if isinstance(value, list):
-        return [_redact_json(item, secrets) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_json(item, secrets) for item in value)
-    if isinstance(value, Mapping):
-        return {
-            _redact_text(key, secrets) if isinstance(key, str) else key:
-            _redact_json(item, secrets)
-            for key, item in value.items()
-        }
-    return value
-
-
-def _strip_partial_secret_suffix(text: str, secrets: list[str]) -> str:
-    partial = 0
-    for secret in secrets:
-        for length in range(min(len(secret) - 1, len(text)), 0, -1):
-            if length > partial and text.endswith(secret[:length]):
-                partial = length
-                break
-    return text[:-partial] if partial else text
 
 
 def _redact_stream_fragments(
@@ -341,7 +326,7 @@ class LocalExecutor:
                         continue
                     if (
                         type(frame.get("version")) is not int
-                        or frame.get("version") != 1
+                        or frame.get("version") != PROTOCOL_VERSION
                         or frame.get("type") != expected_type
                         or frame.get("request_id") != request_id
                     ):
@@ -372,7 +357,7 @@ class LocalExecutor:
             return first + await self.store_outputs(texts[5:])
         request_id = uuid4().hex
         outgoing = _encode_frame({
-            "type": "store_outputs", "version": 1, "request_id": request_id,
+            "type": "store_outputs", "version": PROTOCOL_VERSION, "request_id": request_id,
             "texts": texts,
         })
         frame = await self._query_worker(outgoing, request_id, "outputs_stored")
@@ -405,7 +390,7 @@ class LocalExecutor:
                     chunk = text[offset:offset + chunk_chars]
                     final = offset + len(chunk) == len(text)
                     await self._send(process, _encode_frame({
-                        "type": "store_collapsed", "version": 1, "request_id": request_id,
+                        "type": "store_collapsed", "version": PROTOCOL_VERSION, "request_id": request_id,
                         "offset": offset, "text": chunk, "final": final,
                     }))
                     while True:
@@ -416,7 +401,7 @@ class LocalExecutor:
                     value_key = "index" if final else "offset"
                     value = frame.get(value_key)
                     if (set(frame) != {"type", "version", "request_id", value_key}
-                            or type(frame.get("version")) is not int or frame["version"] != 1
+                            or type(frame.get("version")) is not int or frame["version"] != PROTOCOL_VERSION
                             or frame.get("type") != expected_type
                             or frame.get("request_id") != request_id
                             or type(value) is not int
@@ -446,7 +431,7 @@ class LocalExecutor:
         self._validate_query(code, cursor_pos)
         request_id = uuid4().hex
         outgoing = _encode_frame({
-            "type": "complete", "version": 1, "request_id": request_id,
+            "type": "complete", "version": PROTOCOL_VERSION, "request_id": request_id,
             "code": code, "cursor_pos": cursor_pos,
         })
         frame = await self._query_worker(outgoing, request_id, "completion")
@@ -476,7 +461,7 @@ class LocalExecutor:
             raise ValueError("Inspection detail level must be 0 or 1")
         request_id = uuid4().hex
         outgoing = _encode_frame({
-            "type": "inspect", "version": 1, "request_id": request_id,
+            "type": "inspect", "version": PROTOCOL_VERSION, "request_id": request_id,
             "code": code, "cursor_pos": cursor_pos, "detail_level": detail_level,
         })
         frame = await self._query_worker(outgoing, request_id, "inspection")
@@ -524,7 +509,7 @@ class LocalExecutor:
                 set(ready) != {"type", "version"}
                 or ready.get("type") != "ready"
                 or type(ready.get("version")) is not int
-                or ready["version"] != 1
+                or ready["version"] != PROTOCOL_VERSION
             ):
                 raise _ProtocolError("Invalid worker ready frame")
             self._started = True
@@ -589,7 +574,7 @@ class LocalExecutor:
         if (
             set(frame) != expected
             or type(frame.get("version")) is not int
-            or frame["version"] != 1
+            or frame["version"] != PROTOCOL_VERSION
             or frame.get("execution_id") != execution_id
             or frame.get("origin") != origin
             or frame.get("author") != request.author
@@ -604,7 +589,7 @@ class LocalExecutor:
 
         if request.origin.execution_id is None:
             await self._send(process, _encode_frame({
-                "type": "input_error", "version": 1,
+                "type": "input_error", "version": PROTOCOL_VERSION,
                 "execution_id": execution_id, "origin": origin,
                 "author": request.author, "sequence": sequence,
                 "password": frame["password"],
@@ -620,7 +605,7 @@ class LocalExecutor:
 
         async def reply_error(message: str, *, cancelled: bool = False) -> None:
             await self._send(process, _encode_frame({
-                "type": "input_error", "version": 1,
+                "type": "input_error", "version": PROTOCOL_VERSION,
                 "execution_id": execution_id, "origin": origin,
                 "author": request.author, "sequence": sequence,
                 "password": input_request.password,
@@ -724,7 +709,7 @@ class LocalExecutor:
             await reply_error("Password redaction capacity is exhausted; no value was accepted")
             return sequence
         await self._send(process, _encode_frame({
-            "type": "input_reply", "version": 1,
+            "type": "input_reply", "version": PROTOCOL_VERSION,
             "execution_id": execution_id, "origin": origin,
             "author": request.author, "sequence": sequence,
             "password": reply.password, "value": reply.value,
@@ -752,7 +737,7 @@ class LocalExecutor:
             origin = _origin_payload(request)
             outgoing = _encode_frame({
                 "type": "execute",
-                "version": 1,
+                "version": PROTOCOL_VERSION,
                 "execution_id": execution_id,
                 "origin": origin,
                 "author": request.author,
@@ -802,7 +787,7 @@ class LocalExecutor:
                 self._active_done.clear()
                 while True:
                     frame = await self._receive(process)
-                    if frame.get("version") != 1 or type(frame.get("version")) is not int:
+                    if frame.get("version") != PROTOCOL_VERSION or type(frame.get("version")) is not int:
                         raise _ProtocolError("Unsupported worker protocol version")
                     if (
                         frame.get("execution_id") != execution_id

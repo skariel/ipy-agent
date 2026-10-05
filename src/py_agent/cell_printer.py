@@ -12,13 +12,16 @@ class CellPrinter:
     Call like print, with an optional label. Long strings keep their head and
     tail; nonstrings use str(), so conversion itself is not resource bounded.
     The worker creates a fresh instance for each cell and finishes it exactly once.
+    Supply ``redact`` at construction to protect text before bounded retention.
+    Finish-time redaction is an additional pass, not a substitute for that.
     """
 
     BUDGET = 6000
     MAX_CALLS = 32
     ITEM_LIMIT = 1000
 
-    def __init__(self) -> None:
+    def __init__(self, *, redact: Callable[[str], str] = lambda text: text) -> None:
+        self._redact = redact
         self._items: list[tuple[str, str]] = []
         self._skipped = 0
         self._active = True
@@ -47,14 +50,16 @@ class CellPrinter:
         frame = sys._getframe(1)
         location = f"line {frame.f_lineno}"
         del frame
-        name = self._clip(label.replace("\n", " ").replace("\r", " "), 80)
+        name = self._clip(self._redact(label).replace("\n", " ").replace("\r", " "), 80)
         header = f"[preview {len(self._items) + 1}, {location}" + (f", {name}" if name else "") + "]"
+        # Redact before clipping so long passwords cannot become leaked fragments.
         # Bound each conversion's retained text and the join; don't join every
         # argument into an arbitrarily large temporary string.
+        sep = self._redact(sep)
         parts = []
         retained = 0
         for value in values:
-            part = self._clip(str(value), self.ITEM_LIMIT)
+            part = self._clip(self._redact(str(value)), self.ITEM_LIMIT)
             parts.append(part)
             retained += len(part) + min(len(sep), self.ITEM_LIMIT)
             if retained > self.ITEM_LIMIT:

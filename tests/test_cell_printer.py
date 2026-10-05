@@ -1,10 +1,12 @@
 """Fair per-cell previews and real worker integration."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from py_agent.cell_printer import CellPrinter
-from py_agent.contracts import ExecutionRequest, Origin
+from py_agent.contracts import ExecutionRequest, InputReply, Origin
 from py_agent.local_executor import LocalExecutor
 
 
@@ -70,5 +72,40 @@ async def test_worker_previews_flush_on_error_and_reset_per_cell():
         assert "fresh" in result.stdout
         result = await executor.execute(request("saved('stale')"))
         assert result.status == "error"
+    finally:
+        await executor.close()
+
+
+def test_redaction_precedes_value_label_and_separator_clipping():
+    secret = "SENSITIVE-" + "x" * 2000 + "-END"
+    printer = CellPrinter(redact=lambda text: text.replace(secret, "[REDACTED]"))
+    printer(secret, "safe", label=secret, sep=secret)
+    rendered = printer.finish()
+    assert "SENSITIVE" not in rendered
+    assert "-END" not in rendered
+    assert rendered.count("[REDACTED]") == 3
+    assert len(rendered) <= printer.BUDGET
+
+
+@pytest.mark.asyncio
+async def test_worker_redacts_long_password_before_preview_clipping():
+    secret = "SENSITIVE-" + "z" * 2000 + "-END"
+    executor = LocalExecutor()
+    await executor.start()
+
+    async def answer(item):
+        return InputReply(item.origin, item.sequence, item.owner_frontend_id,
+                          value=secret, password=True)
+
+    try:
+        req = replace(request(
+            "import getpass; pw = getpass.getpass()\npreview(pw, label=pw)"
+        ), allow_stdin=True, input_handler=answer)
+        result = await executor.execute(req)
+        assert result.status == "success"
+        assert "SENSITIVE" not in result.stdout
+        assert "-END" not in result.stdout
+        assert result.stdout.count("[REDACTED]") == 2
+        assert len(result.stdout) <= 6000
     finally:
         await executor.close()

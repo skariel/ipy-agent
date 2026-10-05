@@ -1897,3 +1897,61 @@ async def test_repeated_format_failures_do_not_repeat_the_full_contract():
         assert "mixed or malformed Markdown" in terse
     finally:
         await coordinator.close()
+
+
+def test_coordinator_components_own_state_without_duplicate_facade_storage():
+    first = cli._build_coordinator("fake")
+    second = cli._build_coordinator("fake")
+
+    for owner in (first._conversation, first._frontend, first._lifecycle,
+                  first._journal, first._observations):
+        assert owner.coordinator is first
+    assert "_context" not in vars(first)
+    assert "_pending_actions" not in vars(first)
+    assert "_event_sequence" not in vars(first)
+    assert "state" not in vars(first)
+
+    first._context.append(("user", "isolated"))
+    assert first._conversation._context == [("user", "isolated")]
+    assert second._context == []
+    first._context = [("assistant", "replacement")]
+    assert first._conversation._context == [("assistant", "replacement")]
+
+    first.state = State.IDLE
+    assert first._lifecycle.state is State.IDLE
+    first._lifecycle.state = State.NEW
+    assert first.state is State.NEW
+    first.best_effort_observer_failures = 3
+    assert first._frontend.best_effort_observer_failures == 3
+    assert second.best_effort_observer_failures == 0
+    assert first._lock is first._lifecycle._lock
+    assert first._lock is not second._lock
+    assert "_cache_totals" not in vars(first)
+    first._cache_totals["input_tokens"] = 100
+    first._cache_totals["cache_read_tokens"] = 25
+    first._cache_totals["cache_write_tokens"] = 10
+    first._cache_reports = 1
+    assert first._journal.cache_summary == ("25", "25", "10")
+    assert first.cache_summary == first._journal.cache_summary
+    assert second.cache_summary == ("?", "?", "?")
+
+
+@pytest.mark.asyncio
+async def test_coordinator_components_preserve_public_lifecycle_and_dispatch():
+    coordinator = cli._build_coordinator("fake")
+    executor = CaptureExecutor()
+    coordinator.executor = executor
+    await coordinator.start()
+    try:
+        assert coordinator.state is State.IDLE
+        assert coordinator._lifecycle.state is State.IDLE
+        submission = await coordinator.submit("terminal", "@value = 42")
+        assert submission.execution.source == "value = 42"
+        assert executor.requests[0].source == "value = 42"
+        assert coordinator.state is State.IDLE
+        assert not coordinator.queue_active
+        assert coordinator.pending_action_count == 0
+    finally:
+        await coordinator.close()
+    assert coordinator._lifecycle.state is State.CLOSED
+    assert executor.closed == 1

@@ -8,12 +8,14 @@ from __future__ import annotations
 import base64
 import builtins
 import codecs
+from collections.abc import Mapping
 import getpass as _getpass
+import inspect as _inspect
 import io
 import json
 import keyword
-import math
 import locale
+import math
 import os
 import re
 import select
@@ -21,40 +23,42 @@ import subprocess
 import sys
 import threading
 import types
-import inspect as _inspect
-from collections.abc import Mapping
 from typing import Any
 
-MAX_FRAME = 1_048_576
-MAX_OUTPUT_FRAME_CHARS = 8_192
+from .output_safety import redact_json, redact_text, safe_capture
+from .worker_protocol import (
+    MAX_COMPLETION_MATCH_CHARS,
+    MAX_COMPLETION_MATCHES,
+    MAX_ERROR_CHARS,
+    MAX_FRAME,
+    MAX_INSPECTION_CHARS,
+    MAX_OUTPUT_FRAME_CHARS,
+    MAX_PASSWORD_SECRET_CHARS,
+    MAX_PASSWORD_SECRETS,
+    MAX_QUERY_CHARS,
+    MAX_RICH_OUTPUT_BYTES,
+    MAX_RICH_OUTPUT_FRAMES,
+    MAX_SAY_MESSAGES,
+    PROTOCOL_VERSION,
+)
+
 MAX_VISIBLE_OUTPUT_CHARS = 8_000
 MAX_STORED_OUTPUT_CHARS = 1_048_576
-MAX_ERROR_CHARS = 8_192
 MAX_SAY_CHARS = MAX_FRAME
-MAX_SAY_MESSAGES = 1_024
-MAX_RICH_OUTPUT_FRAMES = 256
-MAX_RICH_OUTPUT_BYTES = 2_097_152
 MAX_RICH_FRAME_BYTES = MAX_FRAME - 16_384
 MAX_MIME_VALUE_BYTES = 512_000
 MAX_BINARY_MIME_BYTES = 512_000
 MAX_MIME_DEPTH = 16
 MAX_MIME_ITEMS = 8_192
 MAX_MIME_BUNDLE_ITEMS = 64
-MAX_QUERY_CHARS = 65_536
 MAX_INPUT_PROMPT_CHARS = 8_192
 MAX_INPUT_VALUE_CHARS = 65_536
 MAX_INPUT_REQUESTS_PER_EXECUTION = 64
-MAX_PASSWORD_SECRET_CHARS = 1_048_576
-MAX_PASSWORD_SECRETS = 128
-MAX_COMPLETION_MATCHES = 512
-MAX_COMPLETION_MATCH_CHARS = 2_048
-MAX_INSPECTION_CHARS = 16_384
 _ALLOWED_MIME_TYPES = frozenset({
     "text/plain", "text/html", "text/markdown", "text/latex", "text/csv",
     "application/json", "image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml",
     "application/pdf",
 })
-PROTOCOL_VERSION = 1
 
 _CONTROL_IN: int | None = None
 _CONTROL_OUT: int | None = None
@@ -918,26 +922,11 @@ _RAW_CAPTURE: _RawOutputCapture | None = None
 
 
 def _redact_text(text: str) -> str:
-    marker = "[REDACTED]"
-    if any(secret and secret in marker for secret in _PASSWORD_SECRETS):
-        marker = ""
-    for secret in sorted(_PASSWORD_SECRETS, key=len, reverse=True):
-        if secret:
-            text = text.replace(secret, marker)
-    return text
+    return redact_text(text, _PASSWORD_SECRETS)
 
 
 def _redact_json(value: Any) -> Any:
-    if isinstance(value, str):
-        return _redact_text(value)
-    if isinstance(value, list):
-        return [_redact_json(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_json(item) for item in value)
-    if isinstance(value, Mapping):
-        return {_redact_text(key) if isinstance(key, str) else key: _redact_json(item)
-                for key, item in value.items()}
-    return value
+    return redact_json(value, _PASSWORD_SECRETS)
 
 
 def _error_text(error: BaseException) -> str:
@@ -1180,7 +1169,7 @@ def _store_output(shell: Any, text: str) -> int:
     while _NEXT_OUTPUT_INDEX in outputs:
         _NEXT_OUTPUT_INDEX += 1
     index = _NEXT_OUTPUT_INDEX
-    outputs[index] = text
+    outputs[index] = _redact_text(text)[:MAX_STORED_OUTPUT_CHARS]
     _NEXT_OUTPUT_INDEX += 1
     return index
 
@@ -1232,7 +1221,7 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
     shell.user_ns["say"] = say
     from py_agent.cell_printer import CellPrinter
 
-    cell_printer = CellPrinter()
+    cell_printer = CellPrinter(redact=_redact_text)
     shell.user_ns["preview"] = cell_printer
     sys.stdin = sys.__stdin__ = null_in
     sys.stdout = sys.__stdout__ = stdout
@@ -1322,11 +1311,14 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
         text = outputs[index]
         if type(text) is not str:
             raise TypeError(f"outputs[{index}] is not archived text")
+        # Redact the whole value before slicing, including archives created
+        # before a password was learned (or assigned directly by a cell).
+        text = _redact_text(text)
         total = len(text)
         start = min(start, total)
         end = min(start + limit, total)
         header = f"outputs[{index}] chars {start}:{end} of {total}"
-        excerpt = _redact_text(text[start:end])
+        excerpt = text[start:end]
         rendered = _redact_text(header) + "\n" + excerpt
         if read_output_count >= 8 or read_output_chars + len(excerpt) > 8000:
             raise ValueError("read_output() cell budget exceeded after redaction; use a smaller limit or another cell")
@@ -1451,7 +1443,10 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
         # the persistent Python namespace so the agent can inspect small slices.
         # stdout then stderr when both exist; this is text, not a replay of
         # interleaved stream timing. Do not retain unbounded subprocess output.
-        retained = (stdout_text + stderr_text)[:MAX_STORED_OUTPUT_CHARS]
+        retained = (
+            safe_capture(stdout_text, _PASSWORD_SECRETS, truncated=bool(stdout_omitted))
+            + safe_capture(stderr_text, _PASSWORD_SECRETS, truncated=bool(stderr_omitted))
+        )[:MAX_STORED_OUTPUT_CHARS]
         omitted = original_chars - len(retained)
         output_reference = {
             "index": _store_output(shell, retained),

@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 from py_agent.contracts import ExecutionOutput, ExecutionRequest, ExecutionResult, InputReply, Origin
-from py_agent.coordinator import Coordinator
+from py_agent.coordinator_observations import ModelObservations
 from py_agent.local_executor import LocalExecutor
 from py_agent.production_services import ProductionContextAdapter, ProductionObservationAdapter
 
@@ -16,9 +17,9 @@ def request(source):
 
 
 def pack(req, result):
-    coordinator = Coordinator.__new__(Coordinator)
-    coordinator.observations = ProductionObservationAdapter()
-    return coordinator._packed_observation(req, result)
+    services = SimpleNamespace(observations=ProductionObservationAdapter())
+    renderer = ModelObservations(services)
+    return renderer._packed_observation(req, result)
 
 
 def contents(adapter):
@@ -199,16 +200,18 @@ async def test_read_budget_after_password_redaction_and_password_learned_after_r
         assert "Redacted excerpt shortened" in read["text"]
         assert "outputs[1] chars 0:4000 of 4000" in read["reference"]
 
-        # Once known, expansion is checked before any excerpt is emitted.
-        over = await executor.execute(request("read_output(1)"))
-        assert over.status == "error" and "budget exceeded after redaction" in over.error
-        assert not any(event.kind == "display" for event in over.output_events)
+        # Once known, redact the entire archive before applying excerpt bounds.
+        bounded = await executor.execute(request("read_output(1)"))
+        assert bounded.status == "success"
+        display, = bounded.output_events
+        assert len(display.data["text/plain"].split("\n", 1)[1]) == 4000
+        assert "zz" not in display.data["text/plain"]
         small_req = request("read_output(1, limit=100)")
         small = await executor.execute(small_req)
         assert small.status == "success"
         read, = pack(small_req, small)["_output_reads"]
         assert "zz" not in read["text"] and "[REDACTED]" in read["text"]
-        assert "chars 0:100 of 4000" in read["reference"]
+        assert "chars 0:100 of 20000" in read["reference"]
     finally:
         await executor.close()
 
@@ -264,5 +267,45 @@ async def test_two_full_excerpts_fit_budget_excluding_headers():
             "read_output(1); read_output(1, start=4000); read_output(1, limit=1)"
         ))
         assert over.status == "error"
+    finally:
+        await executor.close()
+
+
+@pytest.mark.asyncio
+async def test_password_is_redacted_before_preview_archive_and_partial_reads():
+    secret = "SENSITIVE-" + "q" * 2000 + "-END"
+    executor = LocalExecutor()
+    await executor.start()
+
+    async def answer(item):
+        return InputReply(item.origin, item.sequence, item.owner_frontend_id,
+                          value=secret, password=True)
+
+    try:
+        req = replace(request(
+            "import getpass; pw = getpass.getpass()\n"
+            "preview(pw, label=pw)\nprint('a' * 9000 + pw, end='')"
+        ), allow_stdin=True, input_handler=answer)
+        result = await executor.execute(req)
+        assert result.status == "success"
+        assert result.output_reference == 1
+        check = await executor.execute(request(
+            "assert pw not in outputs[1]\n"
+            "assert 'SENSITIVE' not in outputs[1]\n"
+            "assert '[REDACTED]' in outputs[1]\n"
+            "read_output(1, start=9000, limit=3)"
+        ))
+        assert check.status == "success"
+        assert "SENSITIVE" not in repr(check.output_events)
+
+        # Also defend archives populated directly, including passwords learned
+        # after storage: redacting only the selected prefix would leak it.
+        read = await executor.execute(request(
+            "outputs[2] = pw\nread_output(2, limit=4)"
+        ))
+        assert read.status == "success"
+        display, = read.output_events
+        assert display.data["text/plain"].endswith("\n[RED")
+        assert "of 10" in display.data["text/plain"]
     finally:
         await executor.close()

@@ -26,6 +26,15 @@ The Python namespace persists across cells. Each cell executes and its result
 returns to you automatically; emit another cell when needed. You do not need
 to call say() between cells.
 
+Cells execute in IPython: a final expression is automatically displayed unless
+its value is None. Assignments and other non-expression statements do not display
+a value. End a final expression with a semicolon (;) to suppress its automatic
+display unless you intentionally want the result shown. For example, sorted(items);
+computes the sorted list without displaying it, and large_result; suppresses a potentially
+large representation. The semicolon does not suppress print(), preview(), say(),
+or output produced while evaluating the expression. Prefer preview(large_result)
+for bounded inspection rather than leaving a large value as the final expression.
+
 ## Working in Python
 
 Think of each interaction as a small program. Python is your one language for
@@ -51,6 +60,32 @@ subsequent cell with say(..., final=True). Retain, inspect, interpret, then
 communicate. Do not infer success merely because a command ran or produced no
 output. Do not rerun side-effecting code just to recover a result already retained
 in the namespace.
+
+## Task-specific helpers
+
+Build small task-specific helpers when they reduce repeated work or make
+verification clearer. Keep results structured, retain originals in variables,
+and expose failures rather than hiding them. Useful helpers might filter test
+failures, inspect numbered source excerpts, or check project-specific invariants.
+Define these yourself when needed; they are not additional built-in functions.
+
+For example, after collecting subprocess results in a list:
+def show_failures(results):
+    failures = [r for r in results if r.returncode != 0]
+    for i, result in enumerate(failures):
+        preview(result.stdout, label=f"failure {i + 1}: stdout")
+        preview(result.stderr, label=f"failure {i + 1}: stderr")
+    return failures
+
+failed_runs = show_failures(test_runs)
+
+Define or collect test_runs before using this example. Inspect the returned
+execution feedback before communicating a conclusion. Keep helpers focused;
+do not build a framework for a one-off task. Reuse host helpers for output
+budgeting, archives, communication, and context management rather than
+reimplementing their control or safety behavior. Resolve per-cell helpers such
+as preview and say by their current global names; do not retain old instances
+in default arguments, closures, or variables for later cells.
 
 ## Communicating
 
@@ -410,7 +445,7 @@ class Context:
             if index is None:
                 message["content"] = f"[Excerpt: {message.pop('output_read_reference')}.]"
             else:
-                message["content"] = f"Output ({len(_original)} chars) saved in outputs[{index}]."
+                message["content"] = f"Output aged out ({len(_original)} chars); saved in outputs[{index}]."
 
     @staticmethod
     def estimate(messages):

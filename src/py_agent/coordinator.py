@@ -1,26 +1,19 @@
-"""Frontend-independent serialized coordinator with explicit service selection."""
+"""Serialized orchestration over explicit coordinator state owners."""
 from __future__ import annotations
 
 import asyncio
-from collections import deque
-from dataclasses import dataclass, replace
-from enum import Enum
+from dataclasses import replace
 import inspect
 from itertools import count
 import json
 import math
-from pathlib import Path
-import re
 import shlex
 from types import MappingProxyType
 from uuid import uuid4
 
 from .collapse_control import parse_collapse
-from .output_reads import output_read_reference
 from .configuration import ApplyAt, ConfigSnapshot, ConfigStore
-from .context_export import default_export_path, write_context_html
 from .contracts import (
-    MAX_FRONTEND_ID_CHARS,
     MAX_QUEUED_ACTION_CHARS,
     AgentDecision,
     CompletenessResult,
@@ -30,7 +23,6 @@ from .contracts import (
     ExecutionRequest,
     ExecutionResult,
     ExecutorCapabilities,
-    ExecutorCapabilityError,
     InputHandler,
     InputReply,
     InputRequest,
@@ -41,7 +33,6 @@ from .contracts import (
     Origin,
     OutputEvent,
     ProgressCallback,
-    QueueFullError,
     QueueOutcome,
     QueueTicket,
     RoutedAction,
@@ -49,110 +40,26 @@ from .contracts import (
     Submission,
     UserAction,
 )
+from .coordinator_conversation import ConversationState
+from .coordinator_frontend import FrontendRouting
+from .coordinator_journal import JournalPolicy
+from .coordinator_lifecycle import ExecutionLifecycle
+from .coordinator_observations import ModelObservations
+from .coordinator_support import (
+    _COORDINATOR_COMMANDS,
+    _EFFORT_PRESETS,
+    _EFFORT_USAGE,
+    _MODEL_USAGE,
+    HISTORY_MAX_ITEMS,
+    MAX_AGENT_RESPONSE_CHARS,
+    State,
+    _QueuedAction,
+)
+from .coordinator_support import (
+    MAX_PENDING_ACTIONS as MAX_PENDING_ACTIONS,
+)
 from .plugins import PluginError, PluginRuntime
-from .session_journal import (
-    MAX_EVENT_BYTES,
-    MAX_HISTORY_PAGE_CHARS,
-    MAX_HISTORY_SEARCH_BYTES,
-    MAX_HISTORY_SEARCH_QUERY_CHARS,
-    MAX_HISTORY_SEARCH_SCAN,
-    JournalError,
-    JournalService,
-    NoPersistenceJournal,
-)
-
-MAX_PENDING_ACTIONS = 32
-HISTORY_DEFAULT_LIMIT = 10
-HISTORY_MAX_ITEMS = 20
-HISTORY_MAX_PAGE_CHARS = 4_000
-HISTORY_MAX_COMMAND_CHARS = 1_024
-HISTORY_MAX_OFFSET = MAX_EVENT_BYTES
-HISTORY_MAX_SENSITIVE_VALUES = 256
-HISTORY_MAX_SENSITIVE_CHARS = 65_536
-HISTORY_MAX_SENSITIVE_VALUE_CHARS = 256
-MAX_AGENT_RESPONSE_CHARS = 8_000
-MODEL_OBSERVATION_MAX_EVENTS = 256
-MODEL_OBSERVATION_MAX_DISPLAY_CHARS = 8_000
-MODEL_OBSERVATION_MAX_MIME_TYPES = 16
-_OBSERVATION_MIME_TYPE = re.compile(r"[A-Za-z0-9!#$&^_.+-]{1,64}/[A-Za-z0-9!#$&^_.+-]{1,64}\Z")
-_TERMINAL_ESCAPE = re.compile(
-    r"(?:"
-    r"\x1b\].*?(?:\x07|\x1b\\|\x9c)|\x9d.*?(?:\x07|\x1b\\|\x9c)|"
-    r"\x1b[P^_X].*?(?:\x1b\\|\x9c)|[\x90\x98\x9e\x9f].*?\x9c|"
-    r"\x1b\[[0-?]*[ -/]*[@-~]|\x9b[0-?]*[ -/]*[@-~]|\x1b[@-_]"
-    r")",
-    re.DOTALL,
-)
-_TERMINAL_INCOMPLETE_ESCAPE = re.compile(
-    r"(?:\x1b\].*|\x9d.*|\x1b[P^_X].*|[\x90\x98\x9e\x9f].*|"
-    r"\x1b\[[0-?]*[ -/]*|\x9b[0-?]*[ -/]*)\Z",
-    re.DOTALL,
-)
-_HISTORY_USAGE = (
-    "Usage: /history [recent [COUNT]] | /history search [--limit COUNT] "
-    "[--kind KIND] QUERY | /history page EVENT_ID [OFFSET [CHARS]]"
-)
-_CONTEXT_USAGE = "Usage: /context save [PATH]"
-_MODEL_USAGE = "Usage: /model [MODEL_ID]"
-_EFFORT_PRESETS = ("none", "minimal", "low", "medium", "high", "xhigh")
-_EFFORT_USAGE = "Usage: /effort [none|minimal|low|medium|high|xhigh]"
-_COORDINATOR_COMMANDS = frozenset({"history", "context", "model", "effort"})
-
-
-def _strip_observation_terminal_controls(text: str) -> str:
-    safe = _TERMINAL_ESCAPE.sub("", text)
-    safe = _TERMINAL_INCOMPLETE_ESCAPE.sub("", safe)
-    return re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", safe)
-
-
-def _bounded_plain_fallback(
-    text: str, limit: int = MODEL_OBSERVATION_MAX_DISPLAY_CHARS,
-) -> str:
-    """Keep bounded plain text, stripping terminal control sequences."""
-    truncated = len(text) > limit
-    safe = _strip_observation_terminal_controls(text[:limit])
-    if truncated:
-        marker = "\n[plain-text fallback truncated]"
-        if limit <= len(marker):
-            return marker[:limit]
-        safe = safe[:limit - len(marker)] + marker
-    return safe
-
-
-def _observation_mime_types(data: object) -> tuple[list[str], bool]:
-    if not hasattr(data, "keys"):
-        return [], False
-    mime_types = []
-    for name in data:
-        if not isinstance(name, str) or _OBSERVATION_MIME_TYPE.fullmatch(name) is None:
-            continue
-        if len(mime_types) >= MODEL_OBSERVATION_MAX_MIME_TYPES:
-            return mime_types, True
-        mime_types.append(name)
-    return mime_types, False
-
-
-class State(str, Enum):
-    NEW = "new"
-    IDLE = "idle"
-    GENERATING = "generating"
-    EXECUTING = "executing"
-    WAITING_FOR_INPUT = "waiting-for-input"
-    COMMAND = "command"
-    STOPPING = "stopping"
-    FAILED = "failed"
-    CLOSED = "closed"
-
-
-@dataclass
-class _QueuedAction:
-    action: RoutedAction
-    text: str
-    config: ConfigSnapshot | None
-    allow_stdin: bool
-    input_handler: InputHandler | None
-    on_progress: ProgressCallback | None
-    completion: asyncio.Future[QueueOutcome]
+from .session_journal import JournalService, NoPersistenceJournal
 
 
 class Coordinator:
@@ -175,6 +82,11 @@ class Coordinator:
         shutdown_timeout: float = 5.0,
         max_agent_steps: int = 0,
     ):
+        self._conversation = ConversationState(self)
+        self._frontend = FrontendRouting(self)
+        self._observations = ModelObservations(self)
+        self._journal = JournalPolicy(self)
+        self._lifecycle = ExecutionLifecycle(self)
         if type(max_agent_steps) is not int or max_agent_steps < 0:
             raise ValueError("max_agent_steps must be a nonnegative integer (0 means unlimited)")
         if isinstance(shutdown_timeout, bool) or not isinstance(shutdown_timeout, (int, float)):
@@ -240,13 +152,9 @@ class Coordinator:
         # Runtime factories are created at different application boundaries.
         # Keep restart and epoch snapshots separate from each request's desired
         # snapshot; none of these changes replaces selected long-lived services.
-        self._context: list[tuple[str, str]] = []
-        self._context_epoch = 0
-        self._context_overlay: list[tuple[int, str]] = []
-        self._context_overlay_epoch: int | None = None
         self._restart_config = creation_config
-        self._epoch_config = self._restart_config
-        self._epoch_config_epoch = self._read_context_epoch()
+        self._conversation._epoch_config = self._restart_config
+        self._conversation._epoch_config_epoch = self._read_context_epoch()
         self._observer_registrations = runtime.observers
         output_observers = {}
         observer_config = self._restart_config
@@ -261,8 +169,6 @@ class Coordinator:
                 raise TypeError(f"Observer {registration.qualified_name} must expose observe(event)")
             output_observers[registration.qualified_name] = observer
         self.output_observers = MappingProxyType(output_observers)
-        self._event_sequence = 0
-        self.best_effort_observer_failures = 0
         self.provider_id = provider
         self.model = model or getattr(self.provider, "model", provider)
         self._effort_override: str | None = None
@@ -277,42 +183,10 @@ class Coordinator:
         )
         if type(getattr(self.journal, "persisted", None)) is not bool:
             raise TypeError("Selected journal must declare whether it persists records")
-        self._history_sensitive_values: set[str] = set()
-        self._history_sensitive_chars = 0
-        self._history_content_hidden = False
-        self._journal_sensitive_config_ready = True
         self._capture_history_sensitive_config(creation_config)
-        self._journal_started = False
-        self._journal_closed = False
-        self._journal_failed = False
         self._shutdown_timeout = shutdown_timeout
         self.max_agent_steps = max_agent_steps
-        self.state = State.NEW
 
-        self._lock = asyncio.Lock()
-        self._queue_lock = asyncio.Lock()
-        self._pending_actions: deque[_QueuedAction] = deque()
-        self._queue_worker: asyncio.Task | None = None
-        self._lifecycle_lock = asyncio.Lock()
-        self._close_task: asyncio.Task | None = None
-        self._executor_close_attempted = False
-        self._active_task: asyncio.Task | None = None
-        self._active_operation_id: str | None = None
-        self._active_model_request: ModelRequest | None = None
-        self._active_provider_usage_recorded = False
-        self._cache_totals = {"input_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0}
-        self._cache_complete = {name: True for name in self._cache_totals}
-        self._cache_reports = 0
-        self._active_execution_request: ExecutionRequest | None = None
-        self._active_execution_result_recorded = False
-        self._execution_active = False
-        # Status of the executor result that belongs to the current dispatch,
-        # cleared before each dispatch. A cancellation that arrives after a
-        # "cancelled" result may keep a session whose namespace survived.
-        self._execution_outcome_status: str | None = None
-        self._generation: asyncio.Task | None = None
-        # Minimal context fallback for embedders that do not select a context
-        # policy. Production CLI sessions select ProductionContextAdapter.
         self._require_methods(self.router, "route")
         self._require_methods(self.provider, "generate")
         self._require_methods(self.interpreter, "interpret")
@@ -337,20 +211,14 @@ class Coordinator:
             raise TypeError(f"Selected service is missing callable methods: {', '.join(missing)}")
 
     def _set_state_unless_stopping(self, state: State) -> None:
-        if self.state not in (State.STOPPING, State.CLOSED):
-            self.state = state
+        return self._lifecycle._set_state_unless_stopping(state)
 
     def _commit_fallback_context(self, user_text: str, assistant_text: str,
                                  observation: str | None = None, *, include_user: bool = True) -> None:
-        if include_user:
-            self._context.append(("user", user_text))
-        self._context.append(("assistant", assistant_text))
-        if observation is not None:
-            self._context.append(("observation", observation[:8000]))
-        self._context_epoch += 1
+        return self._conversation._commit_fallback_context(user_text, assistant_text, observation, include_user=include_user)
 
     def _operation_is_current(self, operation_id: str, state: State) -> bool:
-        return self._active_operation_id == operation_id and self.state is state
+        return self._lifecycle._operation_is_current(operation_id, state)
 
     def _current_config(self) -> ConfigSnapshot | None:
         if self.config_store is None:
@@ -361,129 +229,24 @@ class Coordinator:
         return snapshot
 
     def _capture_history_sensitive_config(self, snapshot: ConfigSnapshot | None) -> None:
-        """Retain bounded sensitive values and install write-time journal redaction."""
-        if snapshot is None or self.config_store is None:
-            return
-        for name, field in self.config_store.registry.fields.items():
-            if not field.sensitive:
-                continue
-            entry = snapshot.entries.get(name)
-            if entry is None or entry.value is None or entry.value == "":
-                continue
-            value = entry.value
-            if not isinstance(value, str):
-                self._history_content_hidden = True
-                if getattr(self.journal, "persisted", None) is True:
-                    self._journal_sensitive_config_ready = False
-                continue
-            if len(value) < 4 or len(value) > HISTORY_MAX_SENSITIVE_VALUE_CHARS:
-                self._history_content_hidden = True
-            if value in self._history_sensitive_values:
-                continue
-            if (len(self._history_sensitive_values) >= HISTORY_MAX_SENSITIVE_VALUES
-                    or self._history_sensitive_chars + len(value) > HISTORY_MAX_SENSITIVE_CHARS):
-                self._history_content_hidden = True
-                self._journal_sensitive_config_ready = False
-                continue
-            self._history_sensitive_values.add(value)
-            self._history_sensitive_chars += len(value)
-        if getattr(self.journal, "persisted", None) is True:
-            try:
-                self.journal.set_sensitive_values(tuple(sorted(self._history_sensitive_values)))
-            except Exception:
-                self._journal_sensitive_config_ready = False
+        return self._conversation._capture_history_sensitive_config(snapshot)
 
     def _history_patterns(self) -> tuple[str, ...]:
-        patterns = set()
-        for value in self._history_sensitive_values:
-            patterns.add(value)
-            escaped = json.dumps(value, ensure_ascii=False)[1:-1]
-            if escaped:
-                patterns.add(escaped)
-        return tuple(sorted(patterns, key=len, reverse=True))
+        return self._conversation._history_patterns()
 
     def _redact_history_text(self, text: str, *, preserve_offsets: bool = False) -> str:
-        if self._history_content_hidden:
-            return "[history content hidden to protect sensitive configuration]"
-        if self._history_sensitive_values and not preserve_offsets:
-            # recent/search API excerpts may cut through a sensitive value. The
-            # paged read path uses overlap-aware masking; short excerpts are
-            # omitted whenever config-derived secret values are in scope.
-            return "[history excerpt hidden to protect sensitive configuration]"
-        patterns = self._history_patterns()
-        if not patterns:
-            return text
-        matcher = re.compile("|".join(re.escape(pattern) for pattern in patterns), re.IGNORECASE)
-        return matcher.sub(
-            lambda match: ("█" * len(match.group(0))) if preserve_offsets else "[REDACTED]",
-            text,
-        )
+        return self._conversation._redact_history_text(text, preserve_offsets=preserve_offsets)
 
     def _read_history_page(self, event_id: str, offset: int, limit: int) -> dict[str, object]:
-        page = self.journal.read(self.session_id, event_id, offset=offset, limit=limit)
-        content = page.get("content")
-        if not isinstance(content, str):
-            raise JournalError("Journal returned an invalid history page")
-        if self._history_content_hidden:
-            page["content"] = self._redact_history_text(content)
-            return page
-        patterns = self._history_patterns()
-        if not patterns or not content:
-            page["content"] = content
-            return page
-        overlap = max(map(len, patterns)) - 1
-        start = max(0, offset - overlap)
-        page_chars = len(content)
-        extended_limit = min(
-            MAX_HISTORY_PAGE_CHARS,
-            (offset - start) + page_chars + overlap,
-        )
-        extended = self.journal.read(
-            self.session_id, event_id, offset=start, limit=extended_limit,
-        )
-        surrounding = extended.get("content")
-        if not isinstance(surrounding, str):
-            raise JournalError("Journal returned an invalid history page")
-        masked = self._redact_history_text(surrounding, preserve_offsets=True)
-        page_start = offset - start
-        page["content"] = masked[page_start:page_start + page_chars]
-        return page
+        return self._conversation._read_history_page(event_id, offset, limit)
 
     def _read_context_epoch(self) -> int | None:
-        """Read the context epoch when the selected context service exposes it."""
-        if self.context_service is None:
-            return self._context_epoch
-        epoch = getattr(self.context_service, "epoch", None)
-        if type(epoch) is int and epoch >= 0:
-            return epoch
-        snapshot = getattr(self.context_service, "snapshot", None)
-        if callable(snapshot):
-            try:
-                value = snapshot()
-            except Exception:
-                return None
-            if isinstance(value, ContextSnapshot):
-                return value.epoch
-        return None
+        return self._conversation._read_context_epoch()
 
     def _observe_context_epoch(
         self, epoch: int | None, *, config: ConfigSnapshot | None = None,
     ) -> None:
-        """Latch EPOCH settings only after the context reports a newer epoch."""
-        if type(epoch) is not int or epoch < 0:
-            return
-        if self._epoch_config_epoch is None:
-            # The initial epoch could not be inspected; treat the first observed
-            # value as a baseline rather than an unverified epoch transition.
-            self._epoch_config_epoch = epoch
-            if self._context_overlay_epoch is not None and self._context_overlay_epoch != epoch:
-                self._context_overlay.clear()
-                self._context_overlay_epoch = epoch
-        elif epoch > self._epoch_config_epoch:
-            self._epoch_config = self._current_config() if config is None else config
-            self._epoch_config_epoch = epoch
-            self._context_overlay.clear()
-            self._context_overlay_epoch = epoch
+        return self._conversation._observe_context_epoch(epoch, config=config)
 
     def _plugin_config(
         self,
@@ -598,31 +361,7 @@ class Coordinator:
             raise TypeError("Execution final marker must be a boolean")
 
     def _route_query(self, code: str) -> RoutedAction:
-        """Apply the configured input router without dispatching an execution."""
-        config = self._current_config()
-        revision = config.revision if config is not None else self.config_revision
-        origin = Origin(self.session_id, uuid4().hex, "inspection", revision)
-        if not code:
-            return RoutedAction(origin, "ask", "")
-        try:
-            routed = self.router.route(UserAction(origin, code))
-        except ValueError:
-            # Prefix-only editor buffers are valid completion/completeness
-            # requests even though they are not executable submissions yet.
-            if code.startswith("@") and not code[1:].strip():
-                return RoutedAction(origin, "execute", code[1:], "ipython")
-            if code.startswith("!") and not code[1:].strip():
-                return RoutedAction(origin, "execute", code, "ipython")
-            if code.startswith("%") and not code[1:].strip():
-                return RoutedAction(origin, "execute", code, "ipython")
-            if code.startswith("/") and not code[1:].strip():
-                return RoutedAction(origin, "command", code[1:])
-            raise
-        if not isinstance(routed, RoutedAction) or routed.origin != origin:
-            raise TypeError("Router returned an invalid query action")
-        if routed.kind not in ("ask", "execute", "command") or not isinstance(routed.source, str):
-            raise TypeError("Router returned an invalid query action")
-        return routed
+        return self._frontend._route_query(code)
 
     @staticmethod
     def _query_prefix_offset(code: str, routed: RoutedAction) -> int:
@@ -638,65 +377,10 @@ class Coordinator:
             raise ValueError("Query cursor position is outside the source")
 
     async def complete(self, code: str, cursor_pos: int) -> CompletionResult:
-        """Complete direct input in the selected executor's persistent namespace."""
-        self._check_query_cursor(code, cursor_pos)
-        async with self._lock:
-            if (self.state is not State.IDLE or self._queue_worker is not None
-                    or self._pending_actions):
-                raise RuntimeError("Session busy or unavailable")
-            task = asyncio.current_task()
-            self._active_task = task
-            try:
-                routed = self._route_query(code)
-                if routed.kind != "execute":
-                    return CompletionResult((), cursor_pos, cursor_pos)
-                offset = self._query_prefix_offset(code, routed)
-                if offset and cursor_pos == 0:
-                    return CompletionResult((), 0, 0)
-                capabilities = self.executor.capabilities
-                method = getattr(self.executor, "complete", None)
-                if not capabilities.completion or not callable(method):
-                    raise ExecutorCapabilityError("completion")
-                result = await method(routed.source, cursor_pos - offset)
-                if not isinstance(result, CompletionResult):
-                    raise TypeError("Executor completion must return CompletionResult")
-                start, end = result.cursor_start + offset, result.cursor_end + offset
-                if end > len(code) or start > end:
-                    raise ValueError("Executor returned an invalid completion cursor range")
-                return CompletionResult(result.matches, start, end, result.metadata)
-            finally:
-                if self._active_task is task:
-                    self._active_task = None
+        return await self._frontend.complete(code, cursor_pos)
 
     async def inspect(self, code: str, cursor_pos: int, detail_level: int = 0) -> InspectionResult:
-        """Inspect a direct-input name in the selected worker without evaluating code."""
-        self._check_query_cursor(code, cursor_pos)
-        if type(detail_level) is not int or detail_level not in (0, 1):
-            raise ValueError("Inspection detail level must be 0 or 1")
-        async with self._lock:
-            if (self.state is not State.IDLE or self._queue_worker is not None
-                    or self._pending_actions):
-                raise RuntimeError("Session busy or unavailable")
-            task = asyncio.current_task()
-            self._active_task = task
-            try:
-                routed = self._route_query(code)
-                if routed.kind != "execute":
-                    return InspectionResult(False)
-                offset = self._query_prefix_offset(code, routed)
-                if offset and cursor_pos == 0:
-                    return InspectionResult(False)
-                capabilities = self.executor.capabilities
-                method = getattr(self.executor, "inspect", None)
-                if not capabilities.inspection or not callable(method):
-                    raise ExecutorCapabilityError("inspection")
-                result = await method(routed.source, cursor_pos - offset, detail_level)
-                if not isinstance(result, InspectionResult):
-                    raise TypeError("Executor inspection must return InspectionResult")
-                return result
-            finally:
-                if self._active_task is task:
-                    self._active_task = None
+        return await self._frontend.inspect(code, cursor_pos, detail_level)
 
     @staticmethod
     def _parse_completeness(source: str) -> CompletenessResult:
@@ -722,23 +406,7 @@ class Coordinator:
             return CompletenessResult("invalid")
 
     async def is_complete(self, code: str) -> CompletenessResult:
-        """Check routed input completeness without executing it or using the worker."""
-        if not isinstance(code, str):
-            return CompletenessResult("invalid")
-        async with self._lock:
-            if (self.state is not State.IDLE or self._queue_worker is not None
-                    or self._pending_actions):
-                raise RuntimeError("Session busy or unavailable")
-            task = asyncio.current_task()
-            self._active_task = task
-            try:
-                routed = self._route_query(code)
-                if routed.kind != "execute":
-                    return CompletenessResult("complete")
-                return self._parse_completeness(routed.source)
-            finally:
-                if self._active_task is task:
-                    self._active_task = None
+        return await self._frontend.is_complete(code)
 
     @staticmethod
     def _say_text(content: object) -> str:
@@ -767,10 +435,7 @@ class Coordinator:
         metadata: dict[str, object] | None = None,
         author: str | None = None,
     ) -> OutputEvent:
-        self._event_sequence += 1
-        return OutputEvent(
-            origin, self._event_sequence, kind, data, display_id, metadata or {}, author,
-        )
+        return self._frontend._new_output_event(origin, kind, data, display_id=display_id, metadata=metadata, author=author)
 
     async def _dispatch_output_event(
         self,
@@ -780,31 +445,7 @@ class Coordinator:
         operation_id: str,
         expected_state: State,
     ) -> None:
-        """Deliver one event serially and reject delivery after request invalidation."""
-        if not self._operation_is_current(operation_id, expected_state):
-            raise asyncio.CancelledError
-        for registration in self._observer_registrations:
-            observer = self.output_observers[registration.qualified_name]
-            try:
-                delivered = observer.observe(event)
-                if not inspect.isawaitable(delivered):
-                    raise TypeError(f"Observer {registration.qualified_name} must be async")
-                await delivered
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                if registration.critical:
-                    raise
-                self.best_effort_observer_failures += 1
-            if not self._operation_is_current(operation_id, expected_state):
-                raise asyncio.CancelledError
-        if on_progress is not None:
-            delivered = on_progress(event)
-            if not inspect.isawaitable(delivered):
-                raise TypeError("Request progress callback must be async")
-            await delivered
-            if not self._operation_is_current(operation_id, expected_state):
-                raise asyncio.CancelledError
+        return await self._frontend._dispatch_output_event(event, on_progress=on_progress, operation_id=operation_id, expected_state=expected_state)
 
     async def _emit_progress(
         self,
@@ -816,14 +457,7 @@ class Coordinator:
         expected_state: State,
         author: str = "agent",
     ) -> OutputEvent:
-        event = self._new_output_event(
-            origin, "progress", data, author=author,
-        )
-        await self._dispatch_output_event(
-            event, on_progress=on_progress, operation_id=operation_id,
-            expected_state=expected_state,
-        )
-        return event
+        return await self._frontend._emit_progress(origin, data, on_progress=on_progress, operation_id=operation_id, expected_state=expected_state, author=author)
 
     async def _publish_output(
         self,
@@ -833,58 +467,7 @@ class Coordinator:
         on_progress: ProgressCallback | None,
         operation_id: str,
     ) -> tuple[OutputEvent, ...]:
-        origin = request.origin
-        events: list[OutputEvent] = []
-
-        async def append(
-            kind: str,
-            data: dict[str, object],
-            *,
-            display_id: str | None = None,
-            metadata: dict[str, object] | None = None,
-        ) -> None:
-            event = self._new_output_event(
-                origin, kind, data, display_id=display_id, metadata=metadata,
-                author=request.author,
-            )
-            events.append(event)
-            await self._dispatch_output_event(
-                event, on_progress=on_progress, operation_id=operation_id,
-                expected_state=State.EXECUTING,
-            )
-
-        delivered_streams = set()
-        for output in result.output_events:
-            if output.kind == "stream":
-                data = dict(output.data)
-                data["author"] = request.author
-                delivered_streams.add(data.get("name"))
-                await append("stream", data)
-            else:
-                await append(
-                    output.kind, dict(output.data), display_id=output.display_id,
-                    metadata=dict(output.metadata),
-                )
-        for stream, text in (("stdout", result.stdout), ("stderr", result.stderr)):
-            if text and stream not in delivered_streams:
-                await append("stream", {"name": stream, "text": text, "author": request.author})
-
-        for output in result.say_outputs:
-            if output.final and result.status != "success":
-                continue  # Staged finals are not user-visible until successful completion.
-            await append(
-                "display", {"text/plain": self._say_text(output.content)},
-                metadata={"py_agent_source": "say", "final": output.final},
-            )
-        if result.error or result.status not in ("success", "error"):
-            await append("error", {
-                "ename": "ExecutionError", "evalue": result.error or result.status,
-            })
-        elif result.status == "error":
-            await append("error", {
-                "ename": "ExecutionError", "evalue": result.error or "Execution failed",
-            })
-        return tuple(events)
+        return await self._frontend._publish_output(request, result, on_progress=on_progress, operation_id=operation_id)
 
     def _model_options(self, snapshot: ConfigSnapshot | None) -> dict[str, str]:
         options: dict[str, str] = {}
@@ -902,479 +485,61 @@ class Coordinator:
         return options
 
     def _prepare_context(self, text: str, request_id: str) -> ContextSnapshot:
-        if self.context_service is not None:
-            prepare = getattr(self.context_service, "prepare_request", None)
-            if callable(prepare):
-                snapshot = prepare(text, request_id)
-                if not isinstance(snapshot, ContextSnapshot):
-                    raise TypeError("Context service must return a ContextSnapshot")
-                overlay = tuple(
-                    ("user", message) for epoch, message in self._context_overlay
-                    if epoch == snapshot.epoch
-                ) if self._context_overlay_epoch == snapshot.epoch else ()
-                if overlay:
-                    insertion = (
-                        len(snapshot.messages) - 1
-                        if snapshot.messages and snapshot.messages[-1] == ("user", text)
-                        else len(snapshot.messages)
-                    )
-                    messages = list(snapshot.messages)
-                    phases = list(snapshot.message_phases)
-                    messages[insertion:insertion] = overlay
-                    phases[insertion:insertion] = [None] * len(overlay)
-                    snapshot = replace(
-                        snapshot, messages=tuple(messages), message_phases=tuple(phases),
-                    )
-                return snapshot
-            # The v1 ContextService protocol exposes reset policy and usage
-            # accounting but not mutation methods. Keep a minimal compatible
-            # append-only snapshot until a service supplies the richer adapter.
-            needs_reset = getattr(self.context_service, "needs_reset", None)
-            if callable(needs_reset) and needs_reset():
-                self._context.clear()
-                self._context_epoch += 1
-        return ContextSnapshot(self._context_epoch, (*self._context, ("user", text)))
+        return self._conversation._prepare_context(text, request_id)
 
     def _latest_context(self) -> ContextSnapshot:
-        snapshot = getattr(self.context_service, "snapshot", None) if self.context_service is not None else None
-        if callable(snapshot):
-            value = snapshot()
-            if not isinstance(value, ContextSnapshot):
-                raise TypeError("Context service snapshot() must return ContextSnapshot")
-            if self._context_overlay and self._context_overlay_epoch == value.epoch:
-                additions = tuple(
-                    ("user", text) for epoch, text in self._context_overlay if epoch == value.epoch
-                )
-                value = replace(
-                    value,
-                    messages=(*value.messages, *additions),
-                    message_phases=(*value.message_phases, *((None,) * len(additions))),
-                )
-            return value
-        return ContextSnapshot(self._context_epoch, tuple(self._context))
+        return self._conversation._latest_context()
 
     def _append_steering_context(self, text: str, request_id: str) -> None:
-        """Append steering after the completed cell's observation, never mid-request."""
-        if self.context_service is None:
-            self._context.append(("user", text))
-            return
-        add = getattr(self.context_service, "add", None)
-        if callable(add):
-            result = add("user", text, refs=(request_id,))
-            if inspect.isawaitable(result):
-                close = getattr(result, "close", None)
-                if callable(close):
-                    close()
-                raise TypeError("Context service add() must be synchronous")
-            if callable(getattr(self.context_service, "snapshot", None)):
-                return
-            self._context.append(("user", text))
-            return
-        if not callable(getattr(self.context_service, "snapshot", None)):
-            self._context.append(("user", text))
-            return
-        epoch = self._read_context_epoch()
-        if epoch is None:
-            epoch = self._context_epoch
-        if self._context_overlay_epoch != epoch:
-            self._context_overlay.clear()
-            self._context_overlay_epoch = epoch
-        self._context_overlay.append((epoch, text))
+        return self._conversation._append_steering_context(text, request_id)
 
     def _packed_observation(self, request: ExecutionRequest, result: ExecutionResult):
         # Archive reads have their own bounded envelope. Never let unrelated
         # stdout (including an oversized stream) hide or re-archive an excerpt.
-        reads = []
-        ordinary = []
-        read_chars = 0
-        for output in result.output_events:
-            ref = output_read_reference(output.metadata)
-            text = output.data.get("text/plain")
-            if (output.kind == "display" and ref is not None
-                    and isinstance(text, str) and len(reads) < 8
-                    and read_chars + len(text) <= 8000):
-                read_chars += len(text)
-                reads.append({
-                    "text": _strip_observation_terminal_controls(text),
-                    "reference": (
-                        f"outputs[{ref['index']}] chars {ref['start']}:{ref['end']} "
-                        f"of {ref['total']}; retrieve with "
-                        f"read_output({ref['index']}, start={ref['start']}, "
-                        f"limit={max(1, ref['end'] - ref['start'])})"
-                    ),
-                })
-            else:
-                ordinary.append(output)
-        packed = self._packed_regular_observation(
-            request, replace(result, output_events=tuple(ordinary)),
-        )
-        if not reads:
-            return packed
-        if isinstance(packed, str):
-            return "\n".join([packed, *(read["text"] for read in reads)])
-        return {**packed, "_output_reads": reads}
+        return self._observations._packed_observation(request, result)
 
     def _packed_regular_observation(self, request: ExecutionRequest, result: ExecutionResult):
-        if result.origin != request.origin:
-            raise RuntimeError("Cannot pack output from a different execution origin")
-        events = []
-        omitted_events = 0
-        event_index = 0
-        display_chars_remaining = MODEL_OBSERVATION_MAX_DISPLAY_CHARS
-        origin = request.origin
-        common = {
-            "session_id": origin.session_id,
-            "request_id": origin.request_id,
-            "frontend_id": origin.frontend_id,
-            "config_revision": origin.config_revision,
-            "generation_id": origin.generation_id,
-            "execution_id": origin.execution_id,
-            "author": request.author,
-        }
-
-        def append_event(data: dict[str, object]) -> None:
-            nonlocal event_index, omitted_events
-            if len(events) < MODEL_OBSERVATION_MAX_EVENTS:
-                events.append({"event_index": event_index, **data, **common})
-            else:
-                omitted_events += 1
-            event_index += 1
-
-        if result.output_events:
-            seen_streams = set()
-            for output in result.output_events:
-                if output.kind == "stream":
-                    name, text = output.data.get("name"), output.data.get("text")
-                    if name in ("stdout", "stderr") and isinstance(text, str) and text:
-                        seen_streams.add(name)
-                        append_event({
-                            "stream": name,
-                            "text": _strip_observation_terminal_controls(text),
-                        })
-                elif output.kind in ("display", "execute_result", "update"):
-                    mime_types, mime_types_truncated = _observation_mime_types(output.data)
-                    fallback = output.data.get("text/plain")
-                    if isinstance(fallback, str) and display_chars_remaining:
-                        display = _bounded_plain_fallback(fallback, display_chars_remaining)
-                        display_chars_remaining -= len(display)
-                    else:
-                        display = ""
-                    if not display:
-                        summary = ", ".join(mime_types) or "no safe MIME types"
-                        if mime_types_truncated:
-                            summary += ", additional MIME types omitted"
-                        display = f"[rich output omitted; available MIME types: {summary}]"
-                    append_event({
-                        "display": display,
-                        "output_kind": output.kind,
-                        "mime_types": mime_types,
-                        "mime_types_truncated": mime_types_truncated,
-                    })
-                elif output.kind == "clear":
-                    clear_event = {"clear": True, "output_kind": "clear"}
-                    wait = output.data.get("wait")
-                    if type(wait) is bool:
-                        clear_event["wait"] = wait
-                    append_event(clear_event)
-            for stream, text in (("stdout", result.stdout), ("stderr", result.stderr)):
-                if text and stream not in seen_streams:
-                    append_event({
-                        "stream": stream,
-                        "text": _strip_observation_terminal_controls(text),
-                    })
-        else:
-            for stream, text in (("stdout", result.stdout), ("stderr", result.stderr)):
-                if text:
-                    append_event({
-                        "stream": stream,
-                        "text": _strip_observation_terminal_controls(text),
-                    })
-
-        for output in result.say_outputs:
-            content = output.content
-            if isinstance(content, str):
-                content = _strip_observation_terminal_controls(content)
-            append_event({"say": content, "final": output.final})
-        if result.status != "success":
-            append_event({
-                "error": _strip_observation_terminal_controls(
-                    result.error or f"Execution {result.status}"
-                ),
-                "status": result.status,
-            })
-        if omitted_events:
-            events.append({
-                "event_index": event_index,
-                "omitted_events": omitted_events,
-                **common,
-            })
-
-        if self.observations is None:
-            observed = [
-                event.get("text", event.get("display", ""))
-                for event in events
-                if "stream" in event or "display" in event
-            ]
-            observed = [text for text in observed if isinstance(text, str) and text]
-            if result.output_events:
-                output_text = "\n".join(observed)
-            else:
-                output_text = "".join(
-                    event["text"] for event in events if "stream" in event
-                )
-            says = "\n".join(
-                _strip_observation_terminal_controls(self._say_text(output.content))
-                for output in result.say_outputs
-            )
-            if says:
-                output_text += ("\n" if output_text else "") + says
-            if omitted_events:
-                output_text += (
-                    ("\n" if output_text else "")
-                    + f"[{omitted_events} execution output events omitted]"
-                )
-            error = _strip_observation_terminal_controls(result.error or "no error details")
-            feedback = output_text + (
-                f"\nExecution {result.status}: {error}"
-                if result.status != "success" else ""
-            )
-            if len(feedback) > 8_000:
-                return f"Output too long ({len(feedback)} chars); omitted."
-            return feedback
-        pack = getattr(self.observations, "pack", None)
-        if not callable(pack):
-            raise TypeError("Selected observation service must expose pack")
-        packed = pack(events)
-        if not hasattr(packed, "items"):
-            raise TypeError("Observation service must return a mapping")
-        if (result.output_reference is not None and hasattr(packed, "get")
-                and packed.get("_output_already_omitted") is True
-                and isinstance(packed.get("output"), str)):
-            packed = {**packed, "output": packed["output"] + (
-                f" Stream text is saved as outputs[{result.output_reference}]."
-            )}
-        serialized = json.dumps(packed, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        # Plain observation text is the actual model content, not its JSON
-        # encoding. Labels and JSON escapes must not consume its raw-text budget.
-        plain_output = set(packed) <= {"output", "_output_already_omitted"} and isinstance(
-            packed.get("output"), str,
-        )
-        oversized = len(packed["output"]) > 16_000 if plain_output else len(serialized) > 8_000
-        if oversized:
-            fallback = {
-                "error": f"Observation too long ({len(serialized)} chars); omitted.",
-                "status": "output_too_large", "executed": True,
-            }
-            if result.output_reference is not None:
-                fallback["error"] += (
-                    f" Stream text is saved as outputs[{result.output_reference}]."
-                )
-                fallback["_stored_output_index"] = result.output_reference
-            return fallback
-        if result.output_reference is not None:
-            return {**packed, "_stored_output_index": result.output_reference}
-        return packed
+        return self._observations._packed_regular_observation(request, result)
 
     async def _archive_context_outputs(self) -> None:
-        archive = getattr(self.context_service, "archive_execution_outputs", None)
-        store = getattr(self.executor, "store_outputs", None)
-        if callable(archive) and callable(store):
-            # An executor lacking this explicit control capability leaves old
-            # observations intact rather than claiming nonexistent references.
-            await archive(store)
+        return await self._conversation._archive_context_outputs()
 
     def _abandon_context(self, request_id: str) -> None:
-        if self.context_service is None:
-            return
-        abandon = getattr(self.context_service, "abandon_request", None)
-        if callable(abandon):
-            abandon(request_id)
+        return self._conversation._abandon_context(request_id)
 
     def _commit_context(self, request_id: str, user_text: str, assistant_text: str,
                         observation=None, phase: str | None = None, *, include_user: bool = True) -> None:
-        if self.context_service is None:
-            text = None
-            if observation is not None:
-                if isinstance(observation, str):
-                    text = observation
-                else:
-                    text = json.dumps(observation, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-            self._commit_fallback_context(user_text, assistant_text, text, include_user=include_user)
-            return
-        commit = getattr(self.context_service, "commit_response", None)
-        if callable(commit):
-            commit(request_id, assistant_text, observation=observation, phase=phase)
-            if callable(getattr(self.context_service, "snapshot", None)):
-                return
-        text = observation if isinstance(observation, str) else (
-            json.dumps(observation, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-            if observation is not None else None
-        )
-        self._commit_fallback_context(user_text, assistant_text, text, include_user=include_user)
+        return self._conversation._commit_context(request_id, user_text, assistant_text, observation, phase, include_user=include_user)
 
     def _journal_record(self, method: str, *args, **kwargs) -> None:
-        if not self._journal_sensitive_config_ready:
-            self._journal_failed = True
-            self._set_state_unless_stopping(State.FAILED)
-            raise JournalError(
-                "Sensitive configuration exceeds journal redaction limits; operation stopped without replay"
-            )
-        if self._journal_failed:
-            raise JournalError("Durable journal failed; the session is fail-closed and will not replay work")
-        try:
-            result = getattr(self.journal, method)(*args, **kwargs)
-            if inspect.isawaitable(result):
-                close = getattr(result, "close", None)
-                if callable(close):
-                    close()
-                raise TypeError("Coordinator journal methods must commit synchronously")
-        except Exception as exc:
-            self._journal_failed = True
-            self._set_state_unless_stopping(State.FAILED)
-            raise JournalError(
-                "Durable journal failed; the operation stopped without replay"
-            ) from exc
+        return self._journal._journal_record(method, *args, **kwargs)
 
     @property
     def cache_summary(self) -> tuple[str, str, str]:
-        """Session-weighted cache rate and complete reported read/write totals."""
-        rate = "?"
-        if (self._cache_reports and self._cache_complete["input_tokens"]
-                and self._cache_complete["cache_read_tokens"]
-                and self._cache_totals["input_tokens"] > 0):
-            total = self._cache_totals["input_tokens"]
-            rate = str((self._cache_totals["cache_read_tokens"] * 100 + total // 2) // total)
-        read = str(self._cache_totals["cache_read_tokens"]) if (
-            self._cache_reports and self._cache_complete["cache_read_tokens"]
-        ) else "?"
-        write = str(self._cache_totals["cache_write_tokens"]) if (
-            self._cache_reports and self._cache_complete["cache_write_tokens"]
-        ) else "?"
-        return rate, read, write
+        return self._journal.cache_summary
 
     def _record_provider_usage(
         self, request: ModelRequest, response: ModelResponse | None, *, outcome: str,
     ) -> None:
-        if self._active_model_request is request and self._active_provider_usage_recorded:
-            return
-        self._journal_record("record_provider_usage", request, response, outcome=outcome)
-        if response is not None:
-            reported = response.usage.get("normalized", response.usage)
-            counters = reported if hasattr(reported, "get") else {}
-            self._cache_reports += 1
-            for name in self._cache_totals:
-                value = counters.get(name)
-                if name == "cache_write_tokens" and (type(value) is not int or value < 0):
-                    value = counters.get("cache_creation_tokens")
-                if type(value) is int and value >= 0:
-                    self._cache_totals[name] += value
-                else:
-                    self._cache_complete[name] = False
-        if self._active_model_request is request:
-            self._active_provider_usage_recorded = True
+        return self._journal._record_provider_usage(request, response, outcome=outcome)
 
     def _record_execution_result(self, request: ExecutionRequest, result: ExecutionResult) -> None:
-        if self._active_execution_request is request and self._active_execution_result_recorded:
-            return
-        self._journal_record("record_execution_result", request, result)
-        if self._active_execution_request is request:
-            self._active_execution_result_recorded = True
+        return self._lifecycle._record_execution_result(request, result)
 
     def _record_uncertain_execution(self, request: ExecutionRequest, reason: str) -> None:
-        if self._active_execution_request is request and self._active_execution_result_recorded:
-            return
-        self._journal_record("record_uncertain_execution", request, reason)
-        if self._active_execution_request is request:
-            self._active_execution_result_recorded = True
+        return self._lifecycle._record_uncertain_execution(request, reason)
 
     async def _execute_dispatched(self, request: ExecutionRequest) -> ExecutionResult:
-        """Commit source before dispatch and result before publishing its output."""
-        self._journal_record("record_execution_source", request)
-        self._active_execution_request = request
-        self._active_execution_result_recorded = False
-        self._execution_outcome_status = None
-        self._execution_active = True
-        try:
-            try:
-                result = await self.executor.execute(request)
-            except asyncio.CancelledError:
-                self._record_uncertain_execution(
-                    request, "Executor call was cancelled; side effects may have occurred",
-                )
-                raise
-            except Exception as exc:
-                self._record_uncertain_execution(request, f"Executor raised {type(exc).__name__}")
-                raise
-        finally:
-            self._execution_active = False
-        try:
-            self._validate_execution_result(request, result)
-        except Exception as exc:
-            self._record_uncertain_execution(request, f"Executor returned an invalid result: {type(exc).__name__}")
-            raise
-        self._record_execution_result(request, result)
-        self._execution_outcome_status = result.status
-        return result
+        return await self._lifecycle._execute_dispatched(request)
 
     async def _close_executor(self) -> None:
-        if self._executor_close_attempted:
-            return
-        self._executor_close_attempted = True
-        await self.executor.close()
+        return await self._lifecycle._close_executor()
 
     def _close_journal(self, state: str) -> None:
-        if self._journal_closed:
-            return
-        failure = None
-        try:
-            if self._journal_started and not self._journal_failed:
-                self._journal_record("end", self.session_id, self.config_revision, state)
-        except BaseException as exc:
-            failure = exc
-        try:
-            self.journal.close()
-        except BaseException as exc:
-            if failure is None:
-                failure = exc
-            elif hasattr(failure, "add_note"):
-                failure.add_note(f"Journal close also failed: {type(exc).__name__}")
-        finally:
-            self._journal_closed = True
-        if failure is not None:
-            raise failure
+        return self._lifecycle._close_journal(state)
 
     async def start(self) -> None:
-        async with self._lifecycle_lock:
-            if self.state is not State.NEW:
-                raise RuntimeError("Coordinator cannot start unless it is new")
-            try:
-                config = self._current_config()
-                if config is not None:
-                    self.config_revision = config.revision
-                self._journal_record(
-                    "start", self.session_id, self.config_revision, self.provider_id, self.model,
-                )
-                self._journal_started = True
-                if (callable(getattr(self.context_service, "collapse", None))
-                        and not callable(getattr(self.executor, "store_collapsed", None))):
-                    raise ExecutorCapabilityError(
-                        "store_collapsed archival required by the selected context service"
-                    )
-                await self.executor.start()
-            except BaseException:
-                self.state = State.FAILED
-                try:
-                    await self._close_executor()
-                except BaseException:
-                    # Preserve startup failure; close() remains safe to call.
-                    pass
-                try:
-                    self._close_journal(State.FAILED.value)
-                except BaseException:
-                    # Preserve startup failure; the journal has still been closed.
-                    pass
-                raise
-            self.state = State.IDLE
+        return await self._lifecycle.start()
 
     @staticmethod
     def _validate_routed_action(routed: object, origin: Origin) -> RoutedAction:
@@ -1394,13 +559,11 @@ class Coordinator:
 
     @property
     def pending_action_count(self) -> int:
-        """Number of accepted actions not yet dispatched or applied as steering."""
-        return len(self._pending_actions)
+        return self._lifecycle.pending_action_count
 
     @property
     def queue_active(self) -> bool:
-        """Whether a queue item is pending or the serial queue worker is draining."""
-        return bool(self._pending_actions) or self._queue_worker is not None
+        return self._lifecycle.queue_active
 
     async def enqueue(
         self,
@@ -1411,67 +574,13 @@ class Coordinator:
         input_handler: InputHandler | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> QueueTicket:
-        """Accept bounded FIFO work without cancelling the active provider or cell.
-
-        English asks become steering at a safe cell boundary. Direct @/!/%
-        cells and slash commands run at that boundary before the next model
-        request, without interrupting execution. Queue items are processed in
-        FIFO order; commands do not wait for the whole agent turn to finish.
-        """
-        if self.state in (State.NEW, State.STOPPING, State.FAILED, State.CLOSED):
-            raise RuntimeError("Session unavailable for queued actions")
-        if (not isinstance(frontend_id, str) or not frontend_id
-                or len(frontend_id) > MAX_FRONTEND_ID_CHARS or "\x00" in frontend_id):
-            raise ValueError("Frontend ID must be nonempty bounded text without NUL")
-        if not isinstance(text, str):
-            raise TypeError("Queued submission text must be text")
-        if len(text) > MAX_QUEUED_ACTION_CHARS:
-            raise ValueError("Queued submission exceeds the text size limit")
-        if type(allow_stdin) is not bool:
-            raise TypeError("allow_stdin must be a boolean")
-        if input_handler is not None and not callable(input_handler):
-            raise TypeError("input_handler must be callable or None")
-        if on_progress is not None and not callable(on_progress):
-            raise TypeError("on_progress must be callable or None")
-
-        config = self._current_config()
-        revision = config.revision if config is not None else self.config_revision
-        origin = Origin(self.session_id, uuid4().hex, frontend_id, revision)
-        routed = self._validate_routed_action(self.router.route(UserAction(origin, text)), origin)
-        loop = asyncio.get_running_loop()
-        completion: asyncio.Future[QueueOutcome] = loop.create_future()
-        async with self._queue_lock:
-            if self.state in (State.STOPPING, State.FAILED, State.CLOSED):
-                raise RuntimeError("Session unavailable for queued actions")
-            if len(self._pending_actions) >= MAX_PENDING_ACTIONS:
-                raise QueueFullError(
-                    f"Pending action queue is full ({MAX_PENDING_ACTIONS}); no action was accepted"
-                )
-            item = _QueuedAction(
-                routed, text, config, allow_stdin, input_handler, on_progress, completion,
-            )
-            self._pending_actions.append(item)
-            ticket = QueueTicket(
-                routed.origin, routed.kind, len(self._pending_actions), asyncio.shield(completion),
-            )
-        self._start_queue_worker_if_idle()
-        return ticket
+        return await self._lifecycle.enqueue(frontend_id, text, allow_stdin=allow_stdin, input_handler=input_handler, on_progress=on_progress)
 
     def _start_queue_worker_if_idle(self) -> None:
-        if (self._queue_worker is None and self._pending_actions
-                and self.state is State.IDLE and not self._lock.locked()):
-            worker = asyncio.create_task(
-                self._drain_queue(), name="py-agent-queued-actions",
-            )
-            self._queue_worker = worker
-            # A task cancelled before its coroutine starts never enters the
-            # drainer's finally block. Always release the worker slot.
-            worker.add_done_callback(self._queue_worker_finished)
+        return self._lifecycle._start_queue_worker_if_idle()
 
     def _queue_worker_finished(self, worker: asyncio.Task) -> None:
-        if self._queue_worker is worker:
-            self._queue_worker = None
-        self._start_queue_worker_if_idle()
+        return self._lifecycle._queue_worker_finished(worker)
 
     @staticmethod
     def _complete_queue_item(item: _QueuedAction, outcome: QueueOutcome) -> None:
@@ -1479,49 +588,10 @@ class Coordinator:
             item.completion.set_result(outcome)
 
     async def _fail_pending_actions(self, status: str, error: str) -> None:
-        async with self._queue_lock:
-            pending = tuple(self._pending_actions)
-            self._pending_actions.clear()
-        for item in pending:
-            self._complete_queue_item(item, QueueOutcome(item.action.origin, status, error=error))
+        return await self._lifecycle._fail_pending_actions(status, error)
 
     async def _drain_queue(self) -> None:
-        current = asyncio.current_task()
-        try:
-            while True:
-                async with self._queue_lock:
-                    if not self._pending_actions:
-                        return
-                    if self.state is not State.IDLE or self._lock.locked():
-                        return
-                    item = self._pending_actions.popleft()
-                try:
-                    submission = await self.submit(
-                        item.action.origin.frontend_id, item.text, _queued_action=item,
-                    )
-                except asyncio.CancelledError:
-                    self._complete_queue_item(
-                        item, QueueOutcome(item.action.origin, "interrupted", error="Queued action was cancelled"),
-                    )
-                    await self._fail_pending_actions(
-                        "interrupted", "Queue processing was cancelled; pending actions were not dispatched",
-                    )
-                    return
-                except Exception as exc:
-                    self._complete_queue_item(
-                        item, QueueOutcome(item.action.origin, "failed", error=str(exc)),
-                    )
-                    if self.state in (State.FAILED, State.STOPPING, State.CLOSED):
-                        await self._fail_pending_actions("interrupted", "Session is unavailable")
-                        return
-                else:
-                    self._complete_queue_item(
-                        item, QueueOutcome(item.action.origin, "completed", submission=submission),
-                    )
-        finally:
-            if self._queue_worker is current:
-                self._queue_worker = None
-            self._start_queue_worker_if_idle()
+        return await self._lifecycle._drain_queue()
 
     async def submit(
         self,
@@ -1533,12 +603,12 @@ class Coordinator:
         on_progress: ProgressCallback | None = None,
         _queued_action: _QueuedAction | None = None,
     ) -> Submission:
-        if ((self.state is not State.IDLE or self._lock.locked() or self._queue_worker is not None
-             or self._pending_actions) and _queued_action is None):
+        if ((self._lifecycle.state is not State.IDLE or self._lifecycle._lock.locked() or self._lifecycle._queue_worker is not None
+             or self._lifecycle._pending_actions) and _queued_action is None):
             raise RuntimeError("Session busy, queued work pending, or unavailable")
-        async with self._lock:
-            if (self.state is not State.IDLE
-                    or ((_queued_action is None) and (self._queue_worker is not None or self._pending_actions))):
+        async with self._lifecycle._lock:
+            if (self._lifecycle.state is not State.IDLE
+                    or ((_queued_action is None) and (self._lifecycle._queue_worker is not None or self._lifecycle._pending_actions))):
                 raise RuntimeError("Session busy, queued work pending, or unavailable")
             if _queued_action is not None:
                 allow_stdin = _queued_action.allow_stdin
@@ -1555,8 +625,8 @@ class Coordinator:
 
             task = asyncio.current_task()
             operation_id = uuid4().hex
-            self._active_task = task
-            self._active_operation_id = operation_id
+            self._lifecycle._active_task = task
+            self._lifecycle._active_operation_id = operation_id
             config = _queued_action.config if _queued_action is not None else self._current_config()
             self._capture_history_sensitive_config(config)
             self._observe_context_epoch(self._read_context_epoch(), config=config)
@@ -1585,12 +655,12 @@ class Coordinator:
                             "Interactive input request does not belong to this execution frontend",
                         )
                     if (
-                        self._active_execution_request is None
-                        or self._active_execution_request.origin != execution_origin
-                        or self.state is not State.EXECUTING
+                        self._lifecycle._active_execution_request is None
+                        or self._lifecycle._active_execution_request.origin != execution_origin
+                        or self._lifecycle.state is not State.EXECUTING
                     ):
                         raise InputUnavailableError("Interactive input execution is no longer active")
-                    self.state = State.WAITING_FOR_INPUT
+                    self._lifecycle.state = State.WAITING_FOR_INPUT
                     try:
                         response = handler(input_request)
                         if not inspect.isawaitable(response):
@@ -1608,8 +678,8 @@ class Coordinator:
                             )
                         return reply
                     finally:
-                        if self.state is State.WAITING_FOR_INPUT:
-                            self.state = State.EXECUTING
+                        if self._lifecycle.state is State.WAITING_FOR_INPUT:
+                            self._lifecycle.state = State.EXECUTING
 
                 return dispatch_input
 
@@ -1666,8 +736,8 @@ class Coordinator:
                         execution_origin, "user", progress=item.on_progress,
                     ),
                 )
-                previous_state = self.state
-                self.state = State.EXECUTING
+                previous_state = self._lifecycle.state
+                self._lifecycle.state = State.EXECUTING
                 events: list[OutputEvent] = []
                 dispatched = False
                 try:
@@ -1724,12 +794,12 @@ class Coordinator:
                     ))
                     raise
                 finally:
-                    if self.state is State.EXECUTING:
-                        self.state = previous_state
+                    if self._lifecycle.state is State.EXECUTING:
+                        self._lifecycle.state = previous_state
 
             async def run_command(action: RoutedAction, command_config: ConfigSnapshot | None) -> Submission:
                 """Dispatch under the current operation without releasing its ownership."""
-                self.state = State.COMMAND
+                self._lifecycle.state = State.COMMAND
                 self._capture_history_sensitive_config(command_config)
                 message = await self._dispatch_command(action.source, command_config)
                 if not self._operation_is_current(operation_id, State.COMMAND):
@@ -1737,7 +807,7 @@ class Coordinator:
                 if self.config_store is not None:
                     self.config_revision = self.config_store.snapshot.revision
                     self._capture_history_sensitive_config(self.config_store.snapshot)
-                if (not self._journal_sensitive_config_ready
+                if (not self._conversation._journal_sensitive_config_ready
                         and getattr(self.journal, "persisted", None) is True):
                     message += (
                         "\nWarning: sensitive configuration exceeds journal redaction limits; "
@@ -1746,7 +816,7 @@ class Coordinator:
                 return Submission(action, message=message)
 
             async def run_queued_command(item: _QueuedAction) -> None:
-                previous_state = self.state
+                previous_state = self._lifecycle.state
                 try:
                     submission = await run_command(item.action, item.config)
                 except asyncio.CancelledError:
@@ -1764,7 +834,7 @@ class Coordinator:
                     ))
                     raise
                 else:
-                    self.state = previous_state
+                    self._lifecycle.state = previous_state
                     self._complete_queue_item(item, QueueOutcome(
                         item.action.origin, "completed", submission=submission,
                     ))
@@ -1773,13 +843,13 @@ class Coordinator:
                 # Reserve English steering and run cells/commands in FIFO order
                 # before the next provider call. Bound this drain so newly
                 # arriving actions cannot indefinitely starve generation.
-                async with self._queue_lock:
-                    boundary_count = len(self._pending_actions)
+                async with self._lifecycle._queue_lock:
+                    boundary_count = len(self._lifecycle._pending_actions)
                 for _ in range(boundary_count):
-                    async with self._queue_lock:
-                        if not self._pending_actions:
+                    async with self._lifecycle._queue_lock:
+                        if not self._lifecycle._pending_actions:
                             return
-                        item = self._pending_actions.popleft()
+                        item = self._lifecycle._pending_actions.popleft()
                     if item.action.kind == "ask":
                         steering_awaiting_dispatch.append(item)
                     elif item.action.kind == "command":
@@ -1838,11 +908,11 @@ class Coordinator:
                     for step in steps:
                         if step > 1:
                             await drain_boundary_queue()
-                            if self._active_operation_id != operation_id or self.state in (
+                            if self._lifecycle._active_operation_id != operation_id or self._lifecycle.state in (
                                 State.FAILED, State.STOPPING, State.CLOSED,
                             ):
                                 raise asyncio.CancelledError
-                        self.state = State.GENERATING
+                        self._lifecycle.state = State.GENERATING
                         generation_id = uuid4().hex
                         generation_origin = Origin(
                             origin.session_id, origin.request_id, origin.frontend_id,
@@ -1904,7 +974,7 @@ class Coordinator:
                                 ),
                             )
                         cell_config = self._current_config()
-                        epoch_config = self._epoch_config
+                        epoch_config = self._conversation._epoch_config
                         context = await self._run_context_transforms(
                             snapshot, config, cell_config, epoch_config,
                         )
@@ -1925,8 +995,8 @@ class Coordinator:
                             self._append_steering_context(
                                 steering_item.action.source, steering_item.action.origin.request_id,
                             )
-                        self._active_model_request = model_request
-                        self._active_provider_usage_recorded = False
+                        self._lifecycle._active_model_request = model_request
+                        self._lifecycle._active_provider_usage_recorded = False
                         self._journal_record("record_model_request", model_request)
                         for steering_item in steering_awaiting_dispatch:
                             dispatched_steering.append((
@@ -1946,7 +1016,7 @@ class Coordinator:
                                 self.provider.generate(model_request),
                                 name=f"py-agent-generation-{generation_id}-attempt-{attempt + 1}",
                             )
-                            self._generation = generation
+                            self._lifecycle._generation = generation
                             try:
                                 response = await generation
                             except asyncio.CancelledError:
@@ -1962,8 +1032,8 @@ class Coordinator:
                                     recovery_context = recover()
                                     forced_collapse = True
                                     model_request = replace(model_request, context=recovery_context)
-                                    self._active_model_request = model_request
-                                    self._active_provider_usage_recorded = False
+                                    self._lifecycle._active_model_request = model_request
+                                    self._lifecycle._active_provider_usage_recorded = False
                                     self._journal_record("record_model_request", model_request)
                                     continue
                                 transient = isinstance(kind, str) and kind in {
@@ -1995,8 +1065,8 @@ class Coordinator:
                                 self._record_provider_usage(model_request, None, outcome="failed")
                                 raise
                             finally:
-                                if self._generation is generation:
-                                    self._generation = None
+                                if self._lifecycle._generation is generation:
+                                    self._lifecycle._generation = None
                             break
 
                         if not isinstance(response, ModelResponse):
@@ -2064,7 +1134,7 @@ class Coordinator:
                                     try:
                                         receipt = await collapse(*collapse_args, store_archive)
                                     except (ValueError, TypeError) as exc:
-                                        if self.state is State.FAILED:
+                                        if self._lifecycle.state is State.FAILED:
                                             raise
                                         collapse_error = str(exc)[:500]
                             if collapse_error is not None:
@@ -2222,7 +1292,7 @@ class Coordinator:
                                 continue
 
                         invalid_generations = 0
-                        self.state = State.EXECUTING
+                        self._lifecycle.state = State.EXECUTING
                         execution_origin = Origin(
                             origin.session_id, origin.request_id, origin.frontend_id,
                             origin.config_revision, generation_id, uuid4().hex,
@@ -2329,9 +1399,9 @@ class Coordinator:
                 # Direct execution bypasses provider and agent policy exactly once.
                 generation_id = None
                 author = "user"
-                if self._active_operation_id != operation_id or self.state is not State.IDLE:
+                if self._lifecycle._active_operation_id != operation_id or self._lifecycle.state is not State.IDLE:
                     raise asyncio.CancelledError
-                self.state = State.EXECUTING
+                self._lifecycle.state = State.EXECUTING
                 execution_origin = Origin(
                     origin.session_id, origin.request_id, origin.frontend_id,
                     origin.config_revision, None, uuid4().hex,
@@ -2391,14 +1461,14 @@ class Coordinator:
                         self._abandon_context(origin.request_id)
                     except Exception:
                         pass
-                if self.state is State.GENERATING:
+                if self._lifecycle.state is State.GENERATING:
                     self._set_state_unless_stopping(State.IDLE)
-                elif self.state in (State.EXECUTING, State.COMMAND):
+                elif self._lifecycle.state in (State.EXECUTING, State.COMMAND):
                     # Execution/commands may already have side effects; never replay them.
                     # A user interrupt leaves the session usable only when the
                     # executor reported that the interrupted cell itself stopped.
-                    if (self.state is State.EXECUTING
-                            and self._execution_outcome_status == "cancelled"):
+                    if (self._lifecycle.state is State.EXECUTING
+                            and self._lifecycle._execution_outcome_status == "cancelled"):
                         self._set_state_unless_stopping(State.IDLE)
                     else:
                         self._set_state_unless_stopping(State.FAILED)
@@ -2421,17 +1491,17 @@ class Coordinator:
                         self._abandon_context(origin.request_id)
                     except Exception:
                         pass
-                if self.state is State.GENERATING:
+                if self._lifecycle.state is State.GENERATING:
                     self._set_state_unless_stopping(State.IDLE)
-                elif self.state in (State.EXECUTING, State.COMMAND):
+                elif self._lifecycle.state in (State.EXECUTING, State.COMMAND):
                     self._set_state_unless_stopping(State.FAILED)
                 raise
             finally:
-                if self._active_task is task:
-                    self._active_task = None
-                if self._active_operation_id == operation_id:
-                    self._active_operation_id = None
-                if self.state in (State.FAILED, State.STOPPING, State.CLOSED):
+                if self._lifecycle._active_task is task:
+                    self._lifecycle._active_task = None
+                if self._lifecycle._active_operation_id == operation_id:
+                    self._lifecycle._active_operation_id = None
+                if self._lifecycle.state in (State.FAILED, State.STOPPING, State.CLOSED):
                     await self._fail_pending_actions("interrupted", "Session is unavailable")
                 asyncio.get_running_loop().call_soon(self._start_queue_worker_if_idle)
 
@@ -2458,7 +1528,7 @@ class Coordinator:
                 cell_config = self._current_config()
                 command = self._sync_factory(
                     registration.create, self._plugin_config(
-                        registration.plugin_id, config, cell_config, self._epoch_config, cell_config,
+                        registration.plugin_id, config, cell_config, self._conversation._epoch_config, cell_config,
                     ),
                 )
                 execute = getattr(command, "execute", None)
@@ -2483,103 +1553,7 @@ class Coordinator:
         return message
 
     def _context_export_payload(self) -> dict[str, object]:
-        """Capture current context plus the exact most recent provider request."""
-        snapshot = self._latest_context()
-
-        def snapshot_data(value: ContextSnapshot) -> dict[str, object]:
-            return {
-                "epoch": value.epoch,
-                "messages": [
-                    {"role": role, "content": content, "phase": phase}
-                    for (role, content), phase in zip(
-                        value.messages, value.message_phases, strict=True,
-                    )
-                ],
-                "transform_trace": list(value.transform_trace),
-            }
-
-        request = self._active_model_request
-        request_data = None
-        if request is not None:
-            request_data = {
-                "origin": vars(request.origin),
-                "model": request.model,
-                "options": dict(request.options),
-                "transform_trace": list(request.transform_trace),
-                "context": snapshot_data(request.context),
-            }
-
-        context = getattr(self.context_service, "context", None)
-        raw_groups = []
-        for group in getattr(context, "groups", ()):
-            raw_groups.append({
-                "messages": [dict(message) for message in getattr(group, "messages", ())],
-                "refs": list(getattr(group, "refs", ())),
-                "execution_output_indexes": list(
-                    getattr(group, "execution_output_indexes", ()),
-                ),
-            })
-        archives = []
-        for index, raw in sorted(getattr(context, "collapsed", {}).items()):
-            try:
-                content = json.loads(raw)
-            except (TypeError, ValueError):
-                content = raw
-            archives.append({"index": index, "content": content})
-
-        capabilities = getattr(self.executor, "capabilities", None)
-        capability_data = vars(capabilities) if isinstance(capabilities, ExecutorCapabilities) else None
-        core_commands = getattr(self.command_registry, "commands", {})
-        return {
-            "export": {
-                "format": "py-context-html-v1",
-                "session_id": self.session_id,
-                "provider_id": self.provider_id,
-                "model": self.model,
-                "config_revision": self.config_revision,
-                "effort_override": self._effort_override,
-                "warning": "Contains sensitive, unredacted session context.",
-            },
-            "current_context": snapshot_data(snapshot),
-            "last_model_request": request_data,
-            "runtime": {
-                "services": {
-                    "router": type(self.router).__name__,
-                    "provider": type(self.provider).__name__,
-                    "interpreter": type(self.interpreter).__name__,
-                    "executor": type(self.executor).__name__,
-                    "context": type(self.context_service).__name__
-                    if self.context_service is not None else None,
-                    "observations": type(self.observations).__name__
-                    if self.observations is not None else None,
-                },
-                "executor_capabilities": capability_data,
-                "commands": sorted(
-                    set(core_commands) | set(self.external_commands) | _COORDINATOR_COMMANDS
-                ),
-                "context_transforms": [
-                    item.qualified_name for item in self._plugin_runtime.transforms["context"]
-                ],
-                "model_request_transforms": [
-                    item.qualified_name
-                    for item in self._plugin_runtime.transforms["model-request"]
-                ],
-                "model_tools": {
-                    "registered": [],
-                    "note": (
-                        "This agent does not send structured tool definitions to the model; "
-                        "Python/IPython execution is specified by the system prompt, and its "
-                        "observations are included in the messages above."
-                    ),
-                },
-            },
-            "raw_context": {
-                "groups": raw_groups,
-                "reported_input_tokens": getattr(context, "reported_input_tokens", None),
-                "window_tokens": getattr(context, "window_tokens", None),
-            },
-            "collapsed_archives": archives,
-        }
+        return self._conversation._context_export_payload()
 
     def _model_command(self, arguments: str) -> str:
         if not isinstance(arguments, str) or len(arguments) > 512:
@@ -2633,56 +1607,10 @@ class Coordinator:
         return f"Effort changed for this session: {value}.{note}"
 
     def _context_command(self, arguments: str) -> str:
-        if not isinstance(arguments, str) or len(arguments) > 4096:
-            return _CONTEXT_USAGE
-        try:
-            tokens = shlex.split(arguments, posix=True)
-        except ValueError:
-            return _CONTEXT_USAGE
-        if tokens and tokens[0] != "save":
-            return _CONTEXT_USAGE
-        if len(tokens) > 2:
-            return _CONTEXT_USAGE
-        path = default_export_path(self.session_id) if len(tokens) < 2 else Path(tokens[1])
-        try:
-            saved = write_context_html(path, self._context_export_payload())
-        except FileExistsError:
-            return f"Context export refused to overwrite existing file: {path}"
-        except OSError as exc:
-            return f"Context export failed: {exc}"
-        return f"Saved private context explorer to {saved} (file mode 0600)."
+        return self._conversation._context_command(arguments)
 
     def _history_command(self, arguments: str) -> str:
-        if getattr(self.journal, "persisted", None) is False:
-            return (
-                "History persistence is disabled: this session selected the explicit "
-                "no-persistence journal. No history is stored or replayed."
-            )
-        if getattr(self.journal, "persisted", None) is not True:
-            return "History viewing is unavailable for the selected journal service."
-        if any(not callable(getattr(self.journal, name, None)) for name in ("recent", "search", "read")):
-            return "History viewing is unavailable for the selected journal service."
-        if not isinstance(arguments, str) or len(arguments) > HISTORY_MAX_COMMAND_CHARS:
-            return _HISTORY_USAGE
-        try:
-            tokens = shlex.split(arguments, posix=True)
-        except ValueError:
-            return _HISTORY_USAGE
-        operation = tokens[0] if tokens else "recent"
-        if operation == "recent":
-            values = tokens[1:]
-            count = self._history_count(values, default=HISTORY_DEFAULT_LIMIT)
-            if count is None:
-                return _HISTORY_USAGE
-            return self._history_recent(count)
-        if operation.isdecimal() and len(tokens) == 1:
-            count = self._history_count(tokens, default=HISTORY_DEFAULT_LIMIT)
-            return self._history_recent(count) if count is not None else _HISTORY_USAGE
-        if operation == "search":
-            return self._history_search(tokens[1:])
-        if operation in {"page", "read"}:
-            return self._history_page(tokens[1:])
-        return _HISTORY_USAGE
+        return self._conversation._history_command(arguments)
 
     @staticmethod
     def _history_count(values: list[str], *, default: int) -> int | None:
@@ -2701,251 +1629,334 @@ class Coordinator:
         return number if number <= maximum else None
 
     def _history_recent(self, count: int) -> str:
-        try:
-            entries = self.journal.recent(self.session_id, limit=count)
-        except Exception:
-            return "History is unavailable because the journal could not be read."
-        if not entries:
-            return "No history entries are recorded for this session. History is read-only; nothing is replayed."
-        lines = ["Recent journal events (newest first; read-only, never replayed):"]
-        for entry in entries[:count]:
-            if not isinstance(entry, dict):
-                continue
-            event_id = entry.get("id")
-            kind = entry.get("kind")
-            request_id = entry.get("request_id")
-            excerpt = entry.get("excerpt")
-            if not isinstance(event_id, str) or not isinstance(kind, str) or not isinstance(excerpt, str):
-                continue
-            safe_excerpt = self._redact_history_text(excerpt[:240])
-            safe_id = event_id[:128]
-            safe_kind = kind[:100]
-            request = f" request={request_id[:128]}" if isinstance(request_id, str) else ""
-            lines.append(f"{safe_id} {safe_kind}{request}: {safe_excerpt}")
-        if len(lines) == 1:
-            return "No readable history entries are available. History is read-only; nothing is replayed."
-        return "\n".join(lines)
+        return self._conversation._history_recent(count)
 
     def _history_search(self, tokens: list[str]) -> str:
-        count = HISTORY_DEFAULT_LIMIT
-        kind = None
-        query_tokens = []
-        index = 0
-        while index < len(tokens):
-            token = tokens[index]
-            if token == "--limit" and not query_tokens and index + 1 < len(tokens):
-                parsed = self._history_count([tokens[index + 1]], default=HISTORY_DEFAULT_LIMIT)
-                if parsed is None:
-                    return _HISTORY_USAGE
-                count = parsed
-                index += 2
-                continue
-            if token == "--kind" and not query_tokens and index + 1 < len(tokens):
-                kind = tokens[index + 1]
-                if not kind or len(kind) > 100 or "\x00" in kind:
-                    return _HISTORY_USAGE
-                index += 2
-                continue
-            if token.startswith("--") and not query_tokens:
-                return _HISTORY_USAGE
-            query_tokens.append(token)
-            index += 1
-        query = " ".join(query_tokens)
-        if not query or len(query) > MAX_HISTORY_SEARCH_QUERY_CHARS:
-            return _HISTORY_USAGE
-        try:
-            entries = self.journal.search(
-                self.session_id, query, kind=kind, limit=count,
-                scan_limit=MAX_HISTORY_SEARCH_SCAN,
-            )
-        except Exception:
-            return "History search is unavailable; check the query and journal."
-        lines = [
-            f"History search (at most {MAX_HISTORY_SEARCH_SCAN} events / "
-            f"{MAX_HISTORY_SEARCH_BYTES} bytes checked; read-only, never replayed):"
-        ]
-        for entry in entries[:count]:
-            if not isinstance(entry, dict):
-                continue
-            event_id = entry.get("id")
-            event_kind = entry.get("kind")
-            excerpt = entry.get("excerpt")
-            if not isinstance(event_id, str) or not isinstance(event_kind, str) or not isinstance(excerpt, str):
-                continue
-            request_id = entry.get("request_id")
-            request = f" request={request_id[:128]}" if isinstance(request_id, str) else ""
-            offset = entry.get("offset")
-            location = (
-                f" around={offset}"
-                if type(offset) is int and 0 <= offset <= HISTORY_MAX_OFFSET else ""
-            )
-            safe_excerpt = self._redact_history_text(excerpt[:400])
-            lines.append(
-                f"{event_id[:128]} {event_kind[:100]}{request}{location}: {safe_excerpt}"
-            )
-        if len(lines) == 1:
-            lines.append("No matches.")
-        return "\n".join(lines)
+        return self._conversation._history_search(tokens)
 
     def _history_page(self, tokens: list[str]) -> str:
-        if not 1 <= len(tokens) <= 3 or re.fullmatch(r"e[0-9]{12}", tokens[0]) is None:
-            return _HISTORY_USAGE
-        offset = self._history_integer(
-            tokens[1], maximum=HISTORY_MAX_OFFSET,
-        ) if len(tokens) >= 2 else 0
-        limit = self._history_integer(
-            tokens[2], maximum=HISTORY_MAX_PAGE_CHARS,
-        ) if len(tokens) >= 3 else min(2_000, HISTORY_MAX_PAGE_CHARS)
-        if offset is None or limit is None or limit < 1:
-            return _HISTORY_USAGE
-        try:
-            page = self._read_history_page(tokens[0], offset, limit)
-        except KeyError:
-            return "No history event matches that ID in this session."
-        except Exception:
-            return "History page is unavailable because the journal could not be read."
-        content = page.get("content")
-        next_offset = page.get("next_offset")
-        total_chars = page.get("total_chars")
-        if (not isinstance(content, str) or type(next_offset) is not int
-                or type(total_chars) is not int or next_offset < offset
-                or next_offset > HISTORY_MAX_OFFSET or total_chars < next_offset
-                or total_chars > HISTORY_MAX_OFFSET):
-            return "History page is unavailable because the journal returned invalid data."
-        lines = [
-            f"Journal event {tokens[0]} characters {offset}-{next_offset} of {total_chars} "
-            "(read-only; history is never replayed):",
-            content,
-        ]
-        if page.get("truncated") is True:
-            lines.append(f"Next page: /history page {tokens[0]} {next_offset} {limit}")
-        return "\n".join(lines)
+        return self._conversation._history_page(tokens)
 
     async def interrupt(self) -> None:
-        if self.state in (State.STOPPING, State.CLOSED, State.NEW, State.FAILED):
-            return
-        if self.state is State.IDLE:
-            await self._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
-            worker = self._queue_worker
-            if worker is not None and worker is not asyncio.current_task():
-                worker.cancel()
-            return
-        if self.state is State.GENERATING:
-            # Invalidate before requesting cancellation. Even a provider that
-            # suppresses cancellation cannot cause its late response to execute.
-            self._active_operation_id = None
-            await self._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
-            generation = self._generation
-            if generation is not None and not generation.done():
-                generation.cancel()
-            elif self._active_task is not None and self._active_task is not asyncio.current_task():
-                # Async transforms run before a provider task exists.
-                self._active_task.cancel()
-            return
-        if self.state is State.COMMAND:
-            # Commands may have external side effects too; cancel once and do
-            # not advertise the session as safe to replay.
-            self._active_operation_id = None
-            self.state = State.FAILED
-            await self._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
-            active = self._active_task
-            if active is not None and active is not asyncio.current_task():
-                active.cancel()
-            return
-        if self.state in (State.EXECUTING, State.WAITING_FOR_INPUT):
-            # Invalidate before requesting cancellation so a late executor result
-            # cannot be dispatched even if the executor ignores the interrupt.
-            self._active_operation_id = None
-            await self._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
-            if self._execution_active:
-                # Stop the cell and let the cancelled operation choose its own
-                # transition: a "cancelled" result means the executor kept a
-                # usable namespace, anything else fails the session closed.
-                await self.executor.interrupt()
-            else:
-                # The cell result is already recorded, but output delivery or
-                # observer acknowledgement was cancelled; keep the fail-closed
-                # transition instead of promising an unchanged session.
-                self.state = State.FAILED
-                active = self._active_task
-                if active is not None and active is not asyncio.current_task():
-                    active.cancel()
+        return await self._lifecycle.interrupt()
 
     async def close(self) -> None:
-        task = asyncio.current_task()
-        if task is self._active_task:
-            raise RuntimeError("Cannot close a coordinator from an active submission")
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close_impl(), name="py-agent-coordinator-close")
-        await asyncio.shield(self._close_task)
+        return await self._lifecycle.close()
 
     async def _close_impl(self) -> None:
-        async with self._lifecycle_lock:
-            if self.state is State.CLOSED:
-                return
-            was_executing = self._execution_active
-            self.state = State.STOPPING
-            await self._fail_pending_actions("closed", "Coordinator closed before queued action dispatch")
-            worker = self._queue_worker
-            if worker is not None and worker is not asyncio.current_task():
-                worker.cancel()
-            self._active_operation_id = None
-            generation = self._generation
-            if generation is not None and not generation.done():
-                generation.cancel()
-            active = self._active_task
-            failure = None
-            if active is not None and active is not asyncio.current_task():
-                active.cancel()
-                # Give cancellation a bounded chance to unwind. A provider may
-                # suppress cancellation; its invalidated result cannot dispatch.
-                done, _ = await asyncio.wait({active}, timeout=self._shutdown_timeout)
-                if active in done:
-                    await asyncio.gather(active, return_exceptions=True)
-                else:
-                    if was_executing:
-                        try:
-                            await self.executor.interrupt()
-                        except BaseException:
-                            pass
-                    done, _ = await asyncio.wait({active}, timeout=min(self._shutdown_timeout, 1.0))
-                    if active in done:
-                        await asyncio.gather(active, return_exceptions=True)
-                    elif not self._journal_failed:
-                        # The operation is now explicitly marked as uncertain or
-                        # cancelled before its journal is closed. Late completions
-                        # cannot overwrite that terminal evidence or be replayed.
-                        try:
-                            if (self._active_execution_request is not None
-                                    and not self._active_execution_result_recorded):
-                                self._record_uncertain_execution(
-                                    self._active_execution_request,
-                                    "Coordinator shutdown timed out; execution outcome may be uncertain",
-                                )
-                            if (self._active_model_request is not None
-                                    and not self._active_provider_usage_recorded):
-                                self._record_provider_usage(
-                                    self._active_model_request, None, outcome="cancelled",
-                                )
-                        except BaseException as exc:
-                            failure = exc
-            if worker is not None and worker is not active and worker is not asyncio.current_task():
-                done, _ = await asyncio.wait({worker}, timeout=self._shutdown_timeout)
-                if worker in done:
-                    await asyncio.gather(worker, return_exceptions=True)
-            try:
-                await self._close_executor()
-            except BaseException as exc:
-                if failure is None:
-                    failure = exc
-            try:
-                self._close_journal(State.STOPPING.value)
-            except BaseException as exc:
-                if failure is None:
-                    failure = exc
-                elif hasattr(failure, "add_note"):
-                    failure.add_note(f"Journal shutdown also failed: {type(exc).__name__}")
-            finally:
-                self.state = State.CLOSED
-            if failure is not None:
-                raise failure
+        return await self._lifecycle._close_impl()
+
+    @property
+    def _context(self):
+        """Compatibility view; mutable state is owned by conversation."""
+        return self._conversation._context
+
+    @_context.setter
+    def _context(self, value):
+        self._conversation._context = value
+
+    @property
+    def _context_epoch(self):
+        """Compatibility view; mutable state is owned by conversation."""
+        return self._conversation._context_epoch
+
+    @_context_epoch.setter
+    def _context_epoch(self, value):
+        self._conversation._context_epoch = value
+
+    @property
+    def _context_overlay(self):
+        """Compatibility view; mutable state is owned by conversation."""
+        return self._conversation._context_overlay
+
+    @_context_overlay.setter
+    def _context_overlay(self, value):
+        self._conversation._context_overlay = value
+
+    @property
+    def _context_overlay_epoch(self):
+        """Compatibility view; mutable state is owned by conversation."""
+        return self._conversation._context_overlay_epoch
+
+    @_context_overlay_epoch.setter
+    def _context_overlay_epoch(self, value):
+        self._conversation._context_overlay_epoch = value
+
+    @property
+    def _history_sensitive_values(self):
+        """Compatibility view; mutable state is owned by conversation."""
+        return self._conversation._history_sensitive_values
+
+    @_history_sensitive_values.setter
+    def _history_sensitive_values(self, value):
+        self._conversation._history_sensitive_values = value
+
+    @property
+    def _history_sensitive_chars(self):
+        """Compatibility view; mutable state is owned by conversation."""
+        return self._conversation._history_sensitive_chars
+
+    @_history_sensitive_chars.setter
+    def _history_sensitive_chars(self, value):
+        self._conversation._history_sensitive_chars = value
+
+    @property
+    def _history_content_hidden(self):
+        """Compatibility view; mutable state is owned by conversation."""
+        return self._conversation._history_content_hidden
+
+    @_history_content_hidden.setter
+    def _history_content_hidden(self, value):
+        self._conversation._history_content_hidden = value
+
+    @property
+    def _journal_sensitive_config_ready(self):
+        """Compatibility view; mutable state is owned by conversation."""
+        return self._conversation._journal_sensitive_config_ready
+
+    @_journal_sensitive_config_ready.setter
+    def _journal_sensitive_config_ready(self, value):
+        self._conversation._journal_sensitive_config_ready = value
+
+    @property
+    def _epoch_config(self):
+        """Compatibility view; mutable state is owned by conversation."""
+        return self._conversation._epoch_config
+
+    @_epoch_config.setter
+    def _epoch_config(self, value):
+        self._conversation._epoch_config = value
+
+    @property
+    def _epoch_config_epoch(self):
+        """Compatibility view; mutable state is owned by conversation."""
+        return self._conversation._epoch_config_epoch
+
+    @_epoch_config_epoch.setter
+    def _epoch_config_epoch(self, value):
+        self._conversation._epoch_config_epoch = value
+
+    @property
+    def _event_sequence(self):
+        """Compatibility view; mutable state is owned by frontend."""
+        return self._frontend._event_sequence
+
+    @_event_sequence.setter
+    def _event_sequence(self, value):
+        self._frontend._event_sequence = value
+
+    @property
+    def best_effort_observer_failures(self):
+        """Compatibility view; mutable state is owned by frontend."""
+        return self._frontend.best_effort_observer_failures
+
+    @best_effort_observer_failures.setter
+    def best_effort_observer_failures(self, value):
+        self._frontend.best_effort_observer_failures = value
+
+    @property
+    def state(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle.state
+
+    @state.setter
+    def state(self, value):
+        self._lifecycle.state = value
+
+    @property
+    def _lock(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._lock
+
+    @_lock.setter
+    def _lock(self, value):
+        self._lifecycle._lock = value
+
+    @property
+    def _queue_lock(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._queue_lock
+
+    @_queue_lock.setter
+    def _queue_lock(self, value):
+        self._lifecycle._queue_lock = value
+
+    @property
+    def _pending_actions(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._pending_actions
+
+    @_pending_actions.setter
+    def _pending_actions(self, value):
+        self._lifecycle._pending_actions = value
+
+    @property
+    def _queue_worker(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._queue_worker
+
+    @_queue_worker.setter
+    def _queue_worker(self, value):
+        self._lifecycle._queue_worker = value
+
+    @property
+    def _lifecycle_lock(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._lifecycle_lock
+
+    @_lifecycle_lock.setter
+    def _lifecycle_lock(self, value):
+        self._lifecycle._lifecycle_lock = value
+
+    @property
+    def _close_task(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._close_task
+
+    @_close_task.setter
+    def _close_task(self, value):
+        self._lifecycle._close_task = value
+
+    @property
+    def _executor_close_attempted(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._executor_close_attempted
+
+    @_executor_close_attempted.setter
+    def _executor_close_attempted(self, value):
+        self._lifecycle._executor_close_attempted = value
+
+    @property
+    def _active_task(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._active_task
+
+    @_active_task.setter
+    def _active_task(self, value):
+        self._lifecycle._active_task = value
+
+    @property
+    def _active_operation_id(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._active_operation_id
+
+    @_active_operation_id.setter
+    def _active_operation_id(self, value):
+        self._lifecycle._active_operation_id = value
+
+    @property
+    def _active_model_request(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._active_model_request
+
+    @_active_model_request.setter
+    def _active_model_request(self, value):
+        self._lifecycle._active_model_request = value
+
+    @property
+    def _active_provider_usage_recorded(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._active_provider_usage_recorded
+
+    @_active_provider_usage_recorded.setter
+    def _active_provider_usage_recorded(self, value):
+        self._lifecycle._active_provider_usage_recorded = value
+
+    @property
+    def _active_execution_request(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._active_execution_request
+
+    @_active_execution_request.setter
+    def _active_execution_request(self, value):
+        self._lifecycle._active_execution_request = value
+
+    @property
+    def _active_execution_result_recorded(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._active_execution_result_recorded
+
+    @_active_execution_result_recorded.setter
+    def _active_execution_result_recorded(self, value):
+        self._lifecycle._active_execution_result_recorded = value
+
+    @property
+    def _execution_active(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._execution_active
+
+    @_execution_active.setter
+    def _execution_active(self, value):
+        self._lifecycle._execution_active = value
+
+    @property
+    def _execution_outcome_status(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._execution_outcome_status
+
+    @_execution_outcome_status.setter
+    def _execution_outcome_status(self, value):
+        self._lifecycle._execution_outcome_status = value
+
+    @property
+    def _generation(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._generation
+
+    @_generation.setter
+    def _generation(self, value):
+        self._lifecycle._generation = value
+
+    @property
+    def _journal_started(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._journal_started
+
+    @_journal_started.setter
+    def _journal_started(self, value):
+        self._lifecycle._journal_started = value
+
+    @property
+    def _journal_closed(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._journal_closed
+
+    @_journal_closed.setter
+    def _journal_closed(self, value):
+        self._lifecycle._journal_closed = value
+
+    @property
+    def _journal_failed(self):
+        """Compatibility view; mutable state is owned by lifecycle."""
+        return self._lifecycle._journal_failed
+
+    @_journal_failed.setter
+    def _journal_failed(self, value):
+        self._lifecycle._journal_failed = value
+
+    @property
+    def _cache_totals(self):
+        """Compatibility view of journal accounting state."""
+        return self._journal._cache_totals
+
+    @_cache_totals.setter
+    def _cache_totals(self, value):
+        self._journal._cache_totals = value
+
+    @property
+    def _cache_complete(self):
+        """Compatibility view of journal accounting state."""
+        return self._journal._cache_complete
+
+    @_cache_complete.setter
+    def _cache_complete(self, value):
+        self._journal._cache_complete = value
+
+    @property
+    def _cache_reports(self):
+        """Compatibility view of journal accounting state."""
+        return self._journal._cache_reports
+
+    @_cache_reports.setter
+    def _cache_reports(self, value):
+        self._journal._cache_reports = value

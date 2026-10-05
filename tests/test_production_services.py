@@ -208,8 +208,8 @@ async def test_execution_outputs_archive_at_20_then_each_10_without_touching_cod
     assert await adapter.archive_execution_outputs(store) == 10
     after = adapter.provider_messages(adapter.snapshot())
     assert saved[1] == "result 1" and saved[10] == "result 10"
-    assert any(message["content"] == "Output (8 chars) saved in outputs[1]." for message in after)
-    assert sum(" chars) saved in outputs[" in message["content"] for message in after) == 10
+    assert any(message["content"] == "Output aged out (8 chars); saved in outputs[1]." for message in after)
+    assert sum(" chars); saved in outputs[" in message["content"] for message in after) == 10
     retained_contents = {message["content"] for message in after}
     assert all(f"result {number}" not in retained_contents for number in range(1, 11))
     assert all(f"result {number}" in retained_contents for number in range(11, 21))
@@ -224,7 +224,7 @@ async def test_execution_outputs_archive_at_20_then_each_10_without_touching_cod
     assert await adapter.archive_execution_outputs(store) == 10
     final = adapter.provider_messages(adapter.snapshot())
     assert len(saved) == 20 and saved[11] == "result 11" and saved[20] == "result 20"
-    assert sum(" chars) saved in outputs[" in message["content"] for message in final) == 20
+    assert sum(" chars); saved in outputs[" in message["content"] for message in final) == 20
     assert "result 20" not in str(final)
     assert "result 21" in str(final) and "result 30" in str(final)
 
