@@ -493,3 +493,63 @@ async def test_real_archive_cancellation_stops_worker_and_coordinator_without_hi
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await coordinator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_forced", [False, True])
+async def test_overflow_recovery_archives_history_without_executing_code(already_forced):
+    from py_agent.provider import ProviderError
+    import ast
+
+    def script(step, request):
+        if step == 1:
+            raise ProviderError("too large", kind="overflow")
+        if step == 2:
+            text = joined(request)
+            assert len(text) < 1500
+            assert "overflow recovery" in text
+            source = text.split("standalone Python cell, with no other code or text:\n")[-1]
+            assert ast.parse(source).body
+            return source
+        assert step == 3
+        assert "history was archived, not summarized" in joined(request)
+        return "say('done', final=True)"
+
+    coordinator, provider, executor, context = make_coordinator(script)
+    await coordinator.start()
+    try:
+        if already_forced:
+            context._force_collapse = True
+        original = "Large user request " * 2000
+        result = await coordinator.submit("terminal", original)
+        assert result.result.final
+        assert len(provider.requests) == 3
+        assert [r.source for r in executor.requests] == ["say('done', final=True)"]
+        assert original in executor.archives[1]
+        assert not context.force_collapse
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_overflow_recovery_rejects_normal_code_and_retries_small_prompt():
+    from py_agent.provider import ProviderError
+
+    def script(step, request):
+        if step == 1:
+            raise ProviderError("too large", kind="overflow")
+        assert len(joined(request)) < 1500 if step < 4 else True
+        if step == 2:
+            return "print('must not run')"
+        if step == 3:
+            return joined(request).split("standalone Python cell, with no other code or text:\n")[-1]
+        return "say('done', final=True)"
+
+    coordinator, provider, executor, context = make_coordinator(script)
+    await coordinator.start()
+    try:
+        result = await coordinator.submit("terminal", "large request " * 2000)
+        assert result.result.final
+        assert [r.source for r in executor.requests] == ["say('done', final=True)"]
+    finally:
+        await coordinator.close()

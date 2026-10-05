@@ -105,10 +105,10 @@ async def test_worker_read_validation_budget_and_stale_helper():
             result = await executor.execute(request(source))
             assert result.status == "error", source
             assert not any(event.kind == "display" for event in result.output_events), source
-        req = request("read_output(1); read_output(1)")
+        req = request("read_output(1); read_output(1); read_output(1, limit=1)")
         result = await executor.execute(req)
         assert result.status == "error" and "cell budget exceeded" in result.error
-        assert sum(event.kind == "display" for event in result.output_events) == 1
+        assert sum(event.kind == "display" for event in result.output_events) == 2
         assert len(pack(req, result)["_output_reads"]) == 1
         eof = await executor.execute(request("read_output(2, start=100)"))
         assert eof.output_events[0].data["text/plain"] == "outputs[2] chars 0:0 of 0\n"
@@ -245,5 +245,24 @@ async def test_maximum_formatted_archive_batch_fits_transport_with_astral_escape
         result = await executor.execute(request("read_output(10, start=15990)"))
         assert result.status == "success"
         assert result.output_events[0].data["text/plain"] == "outputs[10] chars 15990:16000 of 16000\n" + "😀" * 10
+    finally:
+        await executor.close()
+
+
+@pytest.mark.asyncio
+async def test_two_full_excerpts_fit_budget_excluding_headers():
+    executor = LocalExecutor()
+    await executor.start()
+    try:
+        await executor.execute(request("outputs[1] = 'x' * 12000"))
+        result = await executor.execute(request(
+            "read_output(1, limit=4000); read_output(1, start=4000, limit=4000)"
+        ))
+        assert result.status == "success"
+        assert len([e for e in result.output_events if e.kind == "display"]) == 2
+        over = await executor.execute(request(
+            "read_output(1); read_output(1, start=4000); read_output(1, limit=1)"
+        ))
+        assert over.status == "error"
     finally:
         await executor.close()

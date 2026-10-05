@@ -28,23 +28,23 @@ for argument in "$@"; do
     esac
 done
 
-# The installed launcher defaults to DeepSeek Flash through litelm. A provider
-# flag, PROVIDER/MODEL, or an explicitly selected config always takes precedence.
+# The installed launcher defaults to Codex GPT-6.1-Sol (medium effort is the
+# CLI default). Flags, PROVIDER/MODEL, or a selected config take precedence.
 selected_provider=""
 if [[ "$has_provider" == false ]]; then
     if [[ -n "${PROVIDER:-}" ]]; then
         selected_provider="$PROVIDER"
         arguments+=(--provider "$selected_provider")
     elif [[ "$has_config" == false ]]; then
-        selected_provider="litelm"
+        selected_provider="codex"
         arguments+=(--provider "$selected_provider")
     fi
 fi
 if [[ "$has_model" == false ]]; then
     if [[ -n "${MODEL:-}" ]]; then
         arguments+=(--model "$MODEL")
-    elif [[ "$has_config" == false && "$has_provider" == false && "$selected_provider" == "litelm" ]]; then
-        arguments+=(--model "deepseek/deepseek-flash")
+    elif [[ "$has_config" == false && "$has_provider" == false && "$selected_provider" == "codex" ]]; then
+        arguments+=(--model "openai-codex/gpt-6.1-sol")
     fi
 fi
 

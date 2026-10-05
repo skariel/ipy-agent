@@ -28,7 +28,7 @@ For an installed, non-editable tool copy, use the repository scripts:
 
 ```sh
 ./install.sh
-./run.sh                              # litelm + deepseek/deepseek-flash
+./run.sh                              # codex + gpt-6.1-sol, medium effort
 PROVIDER=fake ./run.sh                # deterministic local wiring; no model calls
 PROVIDER=codex MODEL=openai-codex/YOUR_MODEL ./run.sh
 ./run.sh --config /path/to/trusted-settings.json  # uses that file's provider
@@ -36,7 +36,8 @@ PROVIDER=codex MODEL=openai-codex/YOUR_MODEL ./run.sh
 
 `run.sh` forwards extra `py` arguments and starts in your current directory,
 or in `WORKSPACE` when set. With no provider, model, or config selection it defaults
-to `litelm` with `deepseek/deepseek-flash`; requests occur only after submitting
+to `codex` with `openai-codex/gpt-6.1-sol` and medium reasoning effort; requests
+occur only after submitting
 English input. Use `PROVIDER=fake` for the no-network fixture. Installing/running
 this way requires no sandbox tools. The installed copy must
 be reinstalled after source changes.
@@ -57,7 +58,7 @@ normal provider environment remains available. Command-backed `!…` keys and OA
 entries are not executed by this adapter. Codex uses Pi subscription credentials
 (login/refresh remain Pi's responsibility). A provider request is made only after submitting an
 English request. The `py` CLI itself still requires an explicit provider/model;
-only `run.sh` supplies the DeepSeek Flash launcher default.
+only `run.sh` supplies the Codex GPT-6.1-Sol launcher default.
 Recognized transient provider failures (rate limits, transport/timeouts, and
 server 5xx errors) receive up to two retries before any Python cell executes;
 a lost response can still mean both model attempts were billed. Authentication,
@@ -140,6 +141,21 @@ cells are not subject to that `say()` cap. These limits
 do not restrict side effects from successfully dispatched code. Execution has
 no application deadline. Interrupting or losing the
 worker may lose the live namespace, and side effects are not rolled back or replayed.
+
+### Bounded diagnostic previews
+
+Use `preview(value, label="name")` instead of `print` for several large results
+in one cell. A fresh callable `CellPrinter` buffers up to 32 calls and shows a
+head/tail excerpt of each at cell end, with its call number and source line.
+All excerpts share a 6,000-character budget, including labels; excess calls are
+counted but omitted. Keep original values in variables: these previews are lossy,
+not archives. The budget does not cover ordinary prints, tracebacks, or subprocess
+output, and converting nonstring objects with `str()` is not resource bounded.
+
+```python
+preview(test_run.stdout, label="test stdout")
+preview(test_run.stderr, label="test stderr")
+```
 
 ### Context collapse
 

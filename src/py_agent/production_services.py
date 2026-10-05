@@ -50,6 +50,7 @@ class ProductionContextAdapter:
         self._completed_cells = 0
         self._marker_pending = False
         self._force_collapse = False
+        self._overflow_recovery = False
         for group in self.context.groups:
             if group.messages and group.messages[0].get("role") == "user":
                 self._identify_user(group)
@@ -96,11 +97,44 @@ class ProductionContextAdapter:
         if self._reminder_pending:
             self._reminded_at = self._responses
 
+    def recover_overflow(self) -> ContextSnapshot:
+        """Offer a small collapse-only request without evicting live history.
+
+        The recovery summary is an index, not an invented summary of unseen
+        history. The agent must consult the resulting archive before proceeding.
+        """
+        if self._overflow_recovery:
+            raise ValueError("Context overflow persisted during collapse recovery")
+        boundaries = [
+            message for group in self.context.groups for message in group.messages
+            if message.get("boundary_id")
+        ]
+        if not boundaries:
+            raise ValueError("Context overflow has no history to archive")
+        start = boundaries[0]["boundary_id"]
+        marker = self.context.add_marker()
+        end = marker.messages[0]["boundary_id"]
+        self._force_collapse = True
+        self._overflow_recovery = True
+        summary = (
+            "Context overflow recovery: history was archived, not summarized. "
+            "Before continuing, inspect the originals in the collapsed archive "
+            "referenced above to recover the latest user request, constraints, "
+            "and execution state. Do not guess missing details or replay side effects."
+        )
+        source = f"collapse({start!r}, {end!r}, {summary!r})"
+        self._overflow_snapshot = ContextSnapshot(self.context.epoch, (
+            ("system", "Context overflow recovery. Output exactly the following "
+             "standalone Python cell, with no other code or text:\n" + source),
+        ))
+        return self._overflow_snapshot
+
     async def collapse(
         self, start_id: str, end_id: str, summary: str,
         store: Callable[[str], Awaitable[int]],
     ) -> str:
         receipt = await self.context.collapse(start_id, end_id, summary, store)
+        self._overflow_recovery = False
         self._force_collapse = False
         self._reminder_pending = False
         return receipt
@@ -161,6 +195,8 @@ class ProductionContextAdapter:
         return self.context.observation(content, refs, group)
 
     def snapshot(self) -> ContextSnapshot:
+        if self._overflow_recovery:
+            return self._overflow_snapshot
         messages = self.context.messages()
         if self._force_collapse:
             messages.append({"role": "system", "content": COLLAPSE_FORCED})

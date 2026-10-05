@@ -1230,6 +1230,10 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
     )
     _ACTIVE_INPUT_FUNCTIONS = (input_fn, getpass_fn)
     shell.user_ns["say"] = say
+    from py_agent.cell_printer import CellPrinter
+
+    cell_printer = CellPrinter()
+    shell.user_ns["preview"] = cell_printer
     sys.stdin = sys.__stdin__ = null_in
     sys.stdout = sys.__stdout__ = stdout
     sys.stderr = sys.__stderr__ = stderr
@@ -1322,15 +1326,16 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
         start = min(start, total)
         end = min(start + limit, total)
         header = f"outputs[{index}] chars {start}:{end} of {total}"
-        rendered = _redact_text(header + "\n" + text[start:end])
-        if read_output_count >= 8 or read_output_chars + len(rendered) > 8000:
+        excerpt = _redact_text(text[start:end])
+        rendered = _redact_text(header) + "\n" + excerpt
+        if read_output_count >= 8 or read_output_chars + len(excerpt) > 8000:
             raise ValueError("read_output() cell budget exceeded after redaction; use a smaller limit or another cell")
         if not emit_rich("display", {"text/plain": rendered}, output_read={
             "index": index, "start": start, "end": end, "total": total,
         }):
             raise RuntimeError("Unable to emit archive excerpt within output limits")
         read_output_count += 1
-        read_output_chars += len(rendered)
+        read_output_chars += len(excerpt)
 
     shell.user_ns["read_output"] = read_output
 
@@ -1410,6 +1415,9 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
         error = _error_text(exc)
     finally:
         try:
+            preview_text = cell_printer.finish(_redact_text)
+            if preview_text:
+                stdout.write(preview_text)
             stdout.flush()
             stderr.flush()
             if _RAW_CAPTURE is not None:

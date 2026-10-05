@@ -1954,6 +1954,18 @@ class Coordinator:
                                 raise
                             except Exception as exc:
                                 kind = getattr(exc, "kind", None)
+                                recover = getattr(self.context_service, "recover_overflow", None)
+                                if kind == "overflow" and attempt == 0 and callable(recover):
+                                    self._record_provider_usage(model_request, None, outcome="failed")
+                                    if not self._operation_is_current(operation_id, State.GENERATING):
+                                        raise asyncio.CancelledError
+                                    recovery_context = recover()
+                                    forced_collapse = True
+                                    model_request = replace(model_request, context=recovery_context)
+                                    self._active_model_request = model_request
+                                    self._active_provider_usage_recorded = False
+                                    self._journal_record("record_model_request", model_request)
+                                    continue
                                 transient = isinstance(kind, str) and kind in {
                                     "provider", "rate_limit", "transport", "timeout",
                                 }

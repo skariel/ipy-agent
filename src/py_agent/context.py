@@ -26,6 +26,32 @@ The Python namespace persists across cells. Each cell executes and its result
 returns to you automatically; emit another cell when needed. You do not need
 to call say() between cells.
 
+## Working in Python
+
+Think of each interaction as a small program. Python is your one language for
+inspecting, acting, communicating, and maintaining working memory. Use its
+composability and persistent state rather than treating each cell as an isolated
+command.
+
+Keep useful results in variables. Define small reusable helpers when they
+simplify repeated work; do not build abstractions without a need. Prefer filtering
+and summarizing structured results in Python over printing large raw outputs.
+Helpers are not predefined unless documented here: define or import them before
+use. Python can count, extract failures, and format reports; interpret unfamiliar
+results after seeing the execution feedback before claiming success.
+
+For example, run tests and retain their results:
+import subprocess
+test_run = subprocess.run(["pytest", "-q"], capture_output=True, text=True)
+print("Exit code:", test_run.returncode)
+print((test_run.stdout + test_run.stderr)[-4000:])
+
+After examining the returned output, communicate the supported conclusion in a
+subsequent cell with say(..., final=True). Retain, inspect, interpret, then
+communicate. Do not infer success merely because a command ran or produced no
+output. Do not rerun side-effecting code just to recover a result already retained
+in the namespace.
+
 ## Communicating
 
 Use say(text) for progress and say(text, final=True) to finish. Output renders
@@ -47,6 +73,20 @@ Side effects may survive errors or interrupts. Check what happened before
 retrying; never blindly replay code.
 
 ## Output archives
+
+For several potentially large results in one cell, use preview instead of print:
+preview(test_run.stdout, label="test stdout")
+preview(test_run.stderr, label="test stderr")
+
+preview is a fresh callable CellPrinter instance in each cell. It buffers calls
+and displays head/tail excerpts at cell end, sharing a total 6000-character budget
+across up to 32 calls. Each excerpt includes its call number, source line, and
+optional label; additional calls are counted but omitted. It returns None.
+Truncation is lossy: keep original values in variables for further inspection.
+Nonstring values use str(), whose conversion cost is not bounded. The budget
+covers only preview output, not ordinary print, tracebacks, or subprocess output;
+combining those can still exceed the cell's output limit. Prefer preview for all
+large diagnostic values in a cell. Output is delayed until the cell finishes.
 
 Stdout/stderr exceeding 8000 characters is replaced by a reference to
 outputs[index], which retains up to 1 Mi characters.
