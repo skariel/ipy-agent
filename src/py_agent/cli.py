@@ -68,7 +68,7 @@ def default_parser() -> argparse.ArgumentParser:
         prog="py",
         description="Persistent local IPython agent. The default executor is unrestricted.",
         epilog=(
-            "Select a provider explicitly with --provider or in the JSON --config file. "
+            "Select a model with --model PROVIDER/MODEL; its adapter is inferred. "
             "The fake provider is deterministic and is not a language model. "
             "No SRT/bwrap sandbox is required or implied; execution is unrestricted."
         ),
@@ -76,7 +76,7 @@ def default_parser() -> argparse.ArgumentParser:
     result.add_argument("--version", action="version", version="py-agent 0.1.0")
     result.add_argument(
         "--provider", default=None,
-        help="Explicit provider service ID; built-in production providers also require --model",
+        help="Optional adapter override or plugin/fake service ID",
     )
     result.add_argument("--plugin", action="append", default=None, metavar="ID",
                         help="Explicitly activate an installed third-party plugin (repeatable)")
@@ -98,7 +98,7 @@ def default_parser() -> argparse.ArgumentParser:
         "--stream", action=argparse.BooleanOptionalAction, default=None,
         help="Buffer a complete litelm stream before interpreting it",
     )
-    result.add_argument("--effort", choices=CODEX_EFFORTS, help="Codex reasoning effort")
+    result.add_argument("--effort", choices=CODEX_EFFORTS, help="Reasoning effort preset")
     result.add_argument(
         "--pi-auth", type=Path,
         help="Pi auth.json path for built-in Codex and API-key providers",
@@ -460,7 +460,12 @@ def _prepare_configuration(args: argparse.Namespace) -> _CliConfiguration:
     provider = snapshot.get("provider.id")
     model = snapshot.get("model.name")
     if not provider:
-        raise ValueError("Select --provider ID or set provider.id in the explicitly selected JSON config")
+        if not model:
+            raise ValueError("Select --model PROVIDER/MODEL (or --provider for a plugin/fake service)")
+        from .model_catalog import adapter_for_model
+        provider = adapter_for_model(model)
+        store.set({"provider.id": provider})
+        snapshot = store.snapshot
     # Resolve every selected service before constructing any of them. There is
     # no provider/executor/router fallback on an unknown or disabled ID.
     runtime.select("provider", provider)
@@ -497,8 +502,8 @@ def _prepare_configuration(args: argparse.Namespace) -> _CliConfiguration:
         raise ValueError("provider.api_base is supported only by the litelm provider")
     if provider != "litelm" and stream:
         raise ValueError("provider.stream is supported only by the litelm provider")
-    if provider != "codex" and snapshot.entries["model.effort"].source != "default":
-        raise ValueError("model.effort is supported only by the Codex provider")
+    if provider not in {"codex", "litelm"} and snapshot.entries["model.effort"].source != "default":
+        raise ValueError("model.effort requires a production provider")
     if provider == "fake" and snapshot.get("model.max_tokens"):
         raise ValueError("model.max_tokens is not supported by the fake provider")
     if provider == "codex" and snapshot.get("model.max_tokens"):

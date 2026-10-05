@@ -47,8 +47,8 @@ model**; use it for a local wiring/demo path only. Production providers are expl
 and require a model:
 
 ```sh
-uv run --locked py --provider litelm --model openai/YOUR_MODEL
-uv run --locked py --provider codex --model openai-codex/YOUR_MODEL
+uv run --locked py --model openai/YOUR_MODEL
+uv run --locked py --model openai-codex/YOUR_MODEL
 ```
 
 The litelm adapter reads matching static API-key entries from Pi's private
@@ -57,7 +57,7 @@ the selected model provider's key to litelm. If no matching entry exists, litelm
 normal provider environment remains available. Command-backed `!…` keys and OAuth
 entries are not executed by this adapter. Codex uses Pi subscription credentials
 (login/refresh remain Pi's responsibility). A provider request is made only after submitting an
-English request. The `py` CLI itself still requires an explicit provider/model;
+English request. The `py` CLI itself requires an explicit model (or a plugin/fake provider);
 only `run.sh` supplies the Codex GPT-6.1-Sol launcher default.
 Recognized transient provider failures (rate limits, transport/timeouts, and
 server 5xx errors) receive up to two retries before any Python cell executes;
@@ -81,6 +81,18 @@ Slash commands require an identifier (letters, digits, underscores, or hyphens,
 starting with a lowercase letter). Path-prefixed pastes such as `/src/file.py:42`
 remain English input, including when queued as steering. Use a leading backslash
 (e.g. `\/tmp`) to force English input for a path indistinguishable from a command.
+`/model` lists catalog models backed by environment API keys or pi credentials.
+Account entitlement is not checked; arbitrary explicit `PROVIDER/MODEL` IDs can
+also be selected. `--model` infers the adapter; `--provider` remains an optional
+override for plugins and testing. `/model PROVIDER/MODEL` can switch between
+API-key and Codex transports within a session, preserving the auth-file path and
+session effort override. Endpoint/stream/token-cap settings must be cleared before
+switching transports. The bundled catalog is a snapshot, not live discovery.
+
+Authentication remains owned by pi: use pi's `/login` and `/logout` (and token
+refresh), or set provider API-key environment variables. py reads pi's auth file
+on each request; it does not yet implement its own OAuth login/refresh.
+
 `/model [MODEL_ID]` and `/effort [PRESET]` apply immediate, session-local overrides;
 they do not change the selected provider or persist configuration. Effort presets are
 `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; DeepSeek maps `minimal`/`low`

@@ -146,7 +146,7 @@ its next model call, in queue order. /interrupt and /quit remain immediate contr
 /history search QUERY   search recent journal events
 /history page ID [OFFSET [CHARS]]  read one bounded event page; never replays code
 /context save [PATH]   save a private, standalone HTML context explorer
-/model [MODEL_ID]       show or change the active model for this session
+/model [MODEL_ID]       list credential-backed models or switch model/adapter
 /effort [PRESET]        show or change reasoning effort for this session
 Enabled plugins may add slash commands.
 /help                  show this help

@@ -186,7 +186,7 @@ def test_default_cli_is_coordinator_first_and_requires_explicit_provider():
     assert args.provider is None
     assert "--network" not in help_text
     assert "not a language model" in help_text
-    with pytest.raises(ValueError, match="Select --provider"):
+    with pytest.raises(ValueError, match="Select --model"):
         cli._initial_config(args)
     custom = cli.parser().parse_args(["--provider", "third-party"])
     with pytest.raises(PluginError, match="No enabled provider"):

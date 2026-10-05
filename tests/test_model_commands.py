@@ -43,9 +43,12 @@ def test_effort_presets_override_the_next_litelm_request_options():
 def test_codex_model_validation_and_configured_effort_are_preserved():
     coordinator = cli._build_coordinator("codex", model="openai-codex/one", effort="medium")
 
-    rejected = dispatch(coordinator, "model deepseek/deepseek-flash")
-    assert "not changed" in rejected
-    assert coordinator.model == "openai-codex/one"
+    changed = dispatch(coordinator, "model deepseek/deepseek-flash")
+    assert "Model changed" in changed
+    assert coordinator.model == "deepseek/deepseek-flash"
+    assert coordinator.provider_id == "litelm"
+    assert "Model changed" in dispatch(coordinator, "model openai-codex/one")
+    assert coordinator.provider_id == "codex"
     assert coordinator._model_options(coordinator.config_store.snapshot)["effort"] == "medium"
     assert "openai-codex/one -> openai-codex/two" in dispatch(
         coordinator,
@@ -82,3 +85,55 @@ def test_fake_provider_reports_live_controls_as_unavailable():
 
     assert "unavailable" in dispatch(coordinator, "model anything")
     assert "unavailable" in dispatch(coordinator, "effort low")
+
+
+def test_adapter_is_inferred_from_model():
+    for model, adapter in [
+        ("deepseek/deepseek-flash", "litelm"),
+        ("openai-codex/gpt-5.4", "codex"),
+    ]:
+        args = cli.parser().parse_args(["--model", model, "--effort", "high"])
+        configured = cli._prepare_configuration(args)
+        assert configured.provider == adapter
+
+
+def test_model_list_filters_credentials(monkeypatch, tmp_path):
+    from py_agent.model_catalog import available_models, MODELS
+    from litelm._providers import PROVIDERS
+    for _, env in PROVIDERS.values():
+        if env:
+            monkeypatch.delenv(env, raising=False)
+    auth = tmp_path / "auth.json"
+    assert available_models(auth) == ()
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only")
+    assert available_models(auth) == tuple("deepseek/" + m for m in MODELS["deepseek"])
+    coordinator = cli._build_coordinator("litelm", model="deepseek/deepseek-flash", auth_file=auth)
+    listing = dispatch(coordinator, "model")
+    assert "Available models" in listing
+    assert "deepseek/deepseek-flash" in listing
+    assert "test-only" not in listing
+
+
+def test_cross_adapter_switch_preserves_effort_and_auth(tmp_path):
+    coordinator = cli._build_coordinator(
+        "litelm", model="deepseek/deepseek-flash", auth_file=tmp_path / "auth.json"
+    )
+    dispatch(coordinator, "effort high")
+    assert "Model changed" in dispatch(coordinator, "model openai-codex/gpt-5.4")
+    assert coordinator.provider.adapter.auth_file == tmp_path / "auth.json"
+    assert coordinator._model_options(coordinator.config_store.snapshot)["effort"] == "high"
+    assert "Usage:" in dispatch(coordinator, "model bad model")
+    assert coordinator.model == "openai-codex/gpt-5.4"
+    dispatch(coordinator, "model deepseek/deepseek-flash")
+    assert coordinator.provider_id == "litelm"
+    assert coordinator._model_options(coordinator.config_store.snapshot)["effort"] == "high"
+
+
+def test_litelm_configured_effort(monkeypatch):
+    from py_agent.configuration import ConfigLayer, ConfigStore
+    store = ConfigStore(cli._core_config_registry(), (
+        ConfigLayer("test", {"model.effort": "high"}),
+    ))
+    coordinator = cli._build_coordinator("litelm", model="deepseek/deepseek-flash", config_store=store)
+    assert coordinator._model_options(store.snapshot)["effort"] == "high"
+    assert "Effort: high" in dispatch(coordinator, "effort")

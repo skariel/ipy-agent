@@ -377,14 +377,32 @@ class ProductionProviderAdapter:
         self.model = model if isinstance(model, str) else "unknown"
 
     def set_model(self, model: str) -> None:
-        setter = getattr(self.adapter, "set_model", None)
-        if not callable(setter):
-            raise ValueError("Selected provider does not support live model changes")
-        setter(model)
-        selected = getattr(self.adapter, "model", None)
-        if not isinstance(selected, str) or not selected:
-            raise TypeError("Provider model setter returned invalid state")
-        self.model = selected
+        from .model_catalog import adapter_for_model
+        from .provider import LitelmProvider
+        from .codex import CodexProvider
+
+        if isinstance(self.adapter, (LitelmProvider, CodexProvider)):
+            selected_id = adapter_for_model(model)
+            current_id = "codex" if isinstance(self.adapter, CodexProvider) else "litelm"
+            if selected_id != current_id:
+                if self.configured_max_tokens or getattr(self.adapter, "api_base", None) or getattr(self.adapter, "stream", False):
+                    raise ValueError("Clear adapter-specific endpoint/stream/token settings before switching transports")
+                auth_file = self.adapter.auth_file
+                candidate = (
+                    CodexProvider(model, auth_file=auth_file)
+                    if selected_id == "codex"
+                    else LitelmProvider(model, auth_file=auth_file)
+                )
+                self.adapter = candidate
+                self.provider_id = selected_id
+            else:
+                self.adapter.set_model(model)
+        else:
+            setter = getattr(self.adapter, "set_model", None)
+            if not callable(setter):
+                raise ValueError("Selected provider does not support live model changes")
+            setter(model)
+        self.model = self.adapter.model
 
     def _max_tokens(self, request: ModelRequest) -> int | None:
         option = request.options.get("max_tokens")

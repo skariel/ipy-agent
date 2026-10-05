@@ -781,5 +781,5 @@ def test_kernel_start_does_not_assume_provider_or_model():
 
     args = cli._management_parser().parse_args(["kernel", "start"])
     assert args.provider is None
-    with pytest.raises(ValueError, match="Select --provider"):
+    with pytest.raises(ValueError, match="Select --model"):
         cli._initial_config(args)

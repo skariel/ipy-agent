@@ -478,9 +478,9 @@ class Coordinator:
                 options["max_tokens"] = str(max_tokens.value)
         if self._effort_override is not None and self.provider_id in {"litelm", "codex"}:
             options["effort"] = self._effort_override
-        elif snapshot is not None and self.provider_id == "codex":
+        elif snapshot is not None and self.provider_id in {"codex", "litelm"}:
             effort = snapshot.entries.get("model.effort")
-            if effort is not None and isinstance(effort.value, str):
+            if effort is not None and isinstance(effort.value, str) and (self.provider_id == "codex" or effort.source != "default"):
                 options["effort"] = effort.value
         return options
 
@@ -1563,7 +1563,21 @@ class Coordinator:
         except ValueError:
             return _MODEL_USAGE
         if not tokens:
-            return f"Model: {self.model} (provider: {self.provider_id})"
+            from .model_catalog import available_models
+            from .provider import ProviderError
+            current = f"Model: {self.model} (provider: {self.provider_id})"
+            if self.provider_id not in {"litelm", "codex"}:
+                return current + "\nLive model changes are unavailable for the selected provider."
+            if not hasattr(self.provider, "adapter"):
+                return current
+            try:
+                models = available_models(getattr(self.provider.adapter, "auth_file", None))
+            except ProviderError as exc:
+                return current + f"\nCannot list available models: {exc}"
+            return current + "\nAvailable models (configured credentials; account access may vary):\n" + (
+                "\n".join(models) if models else
+                "None. Set a provider API key or login in pi (/login), then retry."
+            )
         if len(tokens) != 1:
             return _MODEL_USAGE
         setter = getattr(self.provider, "set_model", None)
@@ -1578,12 +1592,16 @@ class Coordinator:
         except (TypeError, ValueError) as exc:
             return f"Model was not changed: {exc}"
         self.model = selected
+        if self.provider_id in {"litelm", "codex"}:
+            self.provider_id = getattr(self.provider, "provider_id", None) or self.provider_id
         return f"Model changed for this session: {previous} -> {selected}"
 
     def _configured_effort(self, config: ConfigSnapshot | None) -> str | None:
-        if self.provider_id != "codex" or config is None:
+        if self.provider_id not in {"codex", "litelm"} or config is None:
             return None
         entry = config.entries.get("model.effort")
+        if self.provider_id == "litelm" and entry is not None and entry.source == "default":
+            return None
         return entry.value if entry is not None and isinstance(entry.value, str) else None
 
     def _effort_command(self, arguments: str, config: ConfigSnapshot | None) -> str:
