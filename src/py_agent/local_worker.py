@@ -226,6 +226,18 @@ def _safe_mime_bundle(data: Any, metadata: Any = None) -> tuple[dict[str, Any], 
                 or not _allowed_mime_type(mime_type)):
             continue
         try:
+            from .images import RASTER_MIMES, normalize
+            if mime_type in RASTER_MIMES:
+                try:
+                    image = normalize(mime_type, value)
+                    mime_type = image.mime_type
+                    value = base64.b64encode(image.data).decode("ascii")
+                except (ValueError, TypeError):
+                    safe_data["text/plain"] = (
+                        str(safe_data.get("text/plain", ""))[:1024] +
+                        "\n[Image rejected: invalid raster or size/pixel limit exceeded.]"
+                    )
+                    continue
             if mime_type.startswith("image/") and isinstance(value, (bytes, bytearray, memoryview)):
                 binary_size = value.nbytes if isinstance(value, memoryview) else len(value)
                 if binary_size > MAX_BINARY_MIME_BYTES:
@@ -239,6 +251,8 @@ def _safe_mime_bundle(data: Any, metadata: Any = None) -> tuple[dict[str, Any], 
             trial = dict(safe_data)
             trial[mime_type] = safe_value
             if len(json.dumps(trial, ensure_ascii=True, allow_nan=False, separators=(",", ":"))) > MAX_RICH_FRAME_BYTES - 65_536:
+                if mime_type in {"image/png", "image/jpeg"}:
+                    safe_data["text/plain"] = str(safe_data.get("text/plain", ""))[:1024] + "\n[Image omitted: display frame byte limit.]"
                 continue
             safe_data[mime_type] = safe_value
         except (TypeError, ValueError, OverflowError, RecursionError):
@@ -1488,6 +1502,12 @@ def main() -> None:
         user_ns={"say": lambda text, final=False: print(text), "memories": [], "outputs": {},
                  "collapsed": collapsed.archives},
     )
+    # Headless inline figures need no GUI event loop. Other GUI backends remain
+    # unsupported in this worker; do not silently pretend a GUI was started.
+    def enable_headless_gui(gui=None):
+        if gui not in (None, "inline"):
+            raise NotImplementedError("Use the inline Matplotlib backend in py")
+    shell.enable_gui = enable_headless_gui
     _install_noninteractive_system(shell)
     _send({"type": "ready", "version": PROTOCOL_VERSION})
 

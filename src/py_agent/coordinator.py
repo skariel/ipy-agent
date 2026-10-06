@@ -1011,7 +1011,7 @@ class Coordinator:
                         # responses, plugin validation or code execution. A retry
                         # sends the same already-journaled request; each failed
                         # attempt gets its own usage-unknown journal record.
-                        for attempt in range(3):
+                        for attempt in range(5):
                             generation = asyncio.create_task(
                                 self.provider.generate(model_request),
                                 name=f"py-agent-generation-{generation_id}-attempt-{attempt + 1}",
@@ -1039,7 +1039,12 @@ class Coordinator:
                                 transient = isinstance(kind, str) and kind in {
                                     "provider", "rate_limit", "transport", "timeout",
                                 }
-                                if transient and attempt < 2:
+                                # Stream/connection failures often persist longer
+                                # than a one-second retry window. Other transient
+                                # errors retain the existing three-attempt budget.
+                                max_attempts = 5 if kind == "transport" else 3
+                                delay = min(8.0, 2.0 ** attempt) if kind == "transport" else 0.5 * (attempt + 1)
+                                if transient and attempt + 1 < max_attempts:
                                     self._journal_record(
                                         "record_provider_usage", model_request, None, outcome="retry_failed",
                                     )
@@ -1047,11 +1052,11 @@ class Coordinator:
                                         published_events.append(await self._emit_progress(
                                             generation_origin,
                                             {"phase": "provider_retry", "attempt": attempt + 2,
-                                             "text": f"Provider request failed ({kind}); retrying ({attempt + 2}/3)."},
+                                             "text": f"Provider request failed ({kind}); retrying ({attempt + 2}/{max_attempts}) in {delay:g}s."},
                                             on_progress=on_progress, operation_id=operation_id,
                                             expected_state=State.GENERATING,
                                         ))
-                                        await asyncio.sleep(0.5 * (attempt + 1))
+                                        await self._wait_provider_retry(delay, operation_id)
                                     except asyncio.CancelledError:
                                         self._record_provider_usage(model_request, None, outcome="cancelled")
                                         raise
@@ -1063,6 +1068,12 @@ class Coordinator:
                                         raise asyncio.CancelledError
                                     continue
                                 self._record_provider_usage(model_request, None, outcome="failed")
+                                if kind == "transport":
+                                    from .provider import ProviderError
+                                    raise ProviderError(
+                                        f"{exc} (automatic retries exhausted after {max_attempts} attempts)",
+                                        kind="transport",
+                                    ) from None
                                 raise
                             finally:
                                 if self._lifecycle._generation is generation:
@@ -1603,6 +1614,17 @@ class Coordinator:
         if self.provider_id == "litelm" and entry is not None and entry.source == "default":
             return None
         return entry.value if entry is not None and isinstance(entry.value, str) else None
+
+    async def _wait_provider_retry(self, delay: float, operation_id: str) -> None:
+        """Bounded backoff, responsive to interrupts even after generation ended."""
+        deadline = asyncio.get_running_loop().time() + delay
+        while True:
+            if not self._operation_is_current(operation_id, State.GENERATING):
+                raise asyncio.CancelledError
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(0.1, remaining))
 
     @property
     def effective_effort(self) -> str:

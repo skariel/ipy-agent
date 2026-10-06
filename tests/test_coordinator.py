@@ -367,6 +367,7 @@ def test_model_observation_projects_ordered_sanitized_bounded_rich_output():
     ]
     assert events[1]["display"] == "safe fallback"
     assert events[2]["display"] == "[rich output omitted; available MIME types: image/png]"
+    assert "Image rejected" in events[3]["display"]
     assert len(events[3]["display"]) <= 8_000
     assert all(
         event["execution_id"] == origin.execution_id
@@ -2033,3 +2034,97 @@ async def test_codex_tls_retry_is_automatic_and_never_executes_failed_stream(
             assert "private TLS detail" not in str(submission.events)
     finally:
         await coordinator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover", [True, False])
+async def test_codex_read_errors_retry_five_times_without_executing_partial_source(monkeypatch, recover):
+    from types import SimpleNamespace
+    import httpx
+    from py_agent import codex
+    from py_agent.production_services import ProductionProviderAdapter
+
+    monkeypatch.setattr(codex, "read_codex_credentials", lambda _: SimpleNamespace(
+        access="private-token", account_id="test-account", expires=9999999999999))
+    calls = []
+    class Stream(httpx.AsyncByteStream):
+        def __init__(self, fail):
+            self.fail = fail
+        async def __aiter__(self):
+            event = {"type": "response.completed", "response": {
+                "id": "mock", "status": "completed",
+                "output": [{"type": "message", "role": "assistant", "status": "completed",
+                            "content": [{"type": "output_text", "text": "say('done', final=True)"}]}]}}
+            yield ("data: " + json.dumps(event) + "\n\n").encode()
+            if self.fail:
+                raise httpx.ReadError("private-token private network detail")
+        async def aclose(self):
+            pass
+    def handle(request):
+        calls.append(request)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              stream=Stream(not recover or len(calls) < 5))
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(runtime, router="default", provider="fake", interpreter="basic", executor="local")
+    coordinator.provider = ProductionProviderAdapter(codex.CodexProvider(
+        "openai-codex/gpt-5.4", transport=httpx.MockTransport(handle)), provider_id="codex")
+    executor = CaptureExecutor()
+    coordinator.executor = executor
+    delays = []
+    async def no_wait(delay, operation_id):
+        delays.append(delay)
+    monkeypatch.setattr(coordinator, "_wait_provider_retry", no_wait)
+    await coordinator.start()
+    try:
+        if recover:
+            submission = await coordinator.submit("terminal", "finish")
+            assert submission.result.final
+            assert len(executor.requests) == 1
+            retries = [e for e in submission.events if e.data.get("phase") == "provider_retry"]
+            assert len(retries) == 4
+            assert "5/5" in retries[-1].data["text"]
+            assert "private-token" not in str(submission.events)
+        else:
+            with pytest.raises(ProviderError, match="exhausted after 5 attempts") as caught:
+                await coordinator.submit("terminal", "finish")
+            assert "private-token" not in str(caught.value)
+            assert "network detail" not in str(caught.value)
+            assert not executor.requests
+        assert len(calls) == 5
+        assert delays == [1, 2, 4, 8]
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_transport_backoff_can_be_interrupted_without_another_attempt(monkeypatch):
+    class BrokenProvider:
+        model = "offline/broken"
+        calls = 0
+        async def generate(self, request):
+            self.calls += 1
+            raise ProviderError("ReadError", kind="transport")
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(runtime, router="default", provider="fake", interpreter="basic", executor="local")
+    provider, executor = BrokenProvider(), CaptureExecutor()
+    coordinator.provider, coordinator.executor = provider, executor
+    sleeping = asyncio.Event()
+    original = coordinator._wait_provider_retry
+    async def wait(delay, operation_id):
+        sleeping.set()
+        await original(delay, operation_id)
+    monkeypatch.setattr(coordinator, "_wait_provider_retry", wait)
+    await coordinator.start()
+    task = asyncio.create_task(coordinator.submit("terminal", "finish"))
+    try:
+        await asyncio.wait_for(sleeping.wait(), 2)
+        await coordinator.interrupt()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 0.5)
+        assert provider.calls == 1
+        assert not executor.requests
+    finally:
+        await coordinator.close()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)

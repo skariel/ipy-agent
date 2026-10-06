@@ -266,9 +266,10 @@ def test_mime_bundle_accepts_bounded_json_and_binary_but_filters_unsafe_or_overs
         "text/html": "<b>rich</b>",
     }, {"height": 10, "invalid": float("nan")})
 
-    assert data["text/plain"] == "safe fallback"
+    assert "safe fallback" in data["text/plain"]
+    assert "Image rejected" in data["text/plain"]
     assert data["application/json"] == {"items": [1, True, None]}
-    assert data["image/png"] == "iVBORw=="
+    assert "image/png" not in data
     assert "image/jpeg" not in data
     assert "application/javascript" not in data
     assert data["application/vnd.plotly.v1+json"] == {"data": [{"x": [1, 2]}]}

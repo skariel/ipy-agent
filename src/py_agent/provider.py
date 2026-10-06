@@ -122,13 +122,47 @@ def _validate_messages(messages: list[dict], max_tokens: int | None) -> list[dic
             or not {"role", "content"} <= set(message)
             or set(message) - {"role", "content", "phase"}
             or message["role"] not in {"system", "user", "assistant"}
-            or not isinstance(message["content"], str)
+            or not (
+                isinstance(message["content"], str)
+                or (message["role"] == "user" and isinstance(message["content"], list))
+            )
             or (
                 "phase" in message
                 and (message["role"] != "assistant" or message["phase"] not in {"commentary", "final_answer"})
             )
         ):
             raise ValueError("Only explicit text system/user/assistant messages are supported")
+    from .images import MAX_CONTEXT_IMAGE_BYTES, MAX_CONTEXT_IMAGES, MAX_IMAGE_BYTES, normalize
+    image_count = 0
+    image_bytes = 0
+    for message in messages:
+        content = message["content"]
+        if isinstance(content, str):
+            continue
+        if not content or len(content) > MAX_CONTEXT_IMAGES + 1:
+            raise ValueError("Invalid image message")
+        for part in content:
+            if not isinstance(part, dict):
+                raise ValueError("Invalid multimodal part")
+            if set(part) == {"type", "text"} and part["type"] == "text" and isinstance(part["text"], str):
+                continue
+            if set(part) != {"type", "image_url"} or part["type"] != "image_url":
+                raise ValueError("Only text and inline image parts are supported")
+            image = part["image_url"]
+            if not isinstance(image, dict) or set(image) != {"url"} or not isinstance(image["url"], str):
+                raise ValueError("Invalid inline image")
+            url = image["url"]
+            prefix = next((p for p in ("data:image/png;base64,", "data:image/jpeg;base64,")
+                           if url.startswith(p)), None)
+            if prefix is None or len(url) > MAX_IMAGE_BYTES * 4 // 3 + 100:
+                raise ValueError("Only bounded inline PNG/JPEG images are accepted")
+            normalized = normalize(prefix[5:].split(";")[0], url[len(prefix):])
+            image_bytes += len(normalized.data)
+            if image_bytes > MAX_CONTEXT_IMAGE_BYTES:
+                raise ValueError("Context image byte limit exceeded")
+            image_count += 1
+            if image_count > MAX_CONTEXT_IMAGES:
+                raise ValueError("Too many context images")
     return deepcopy(messages)
 
 
@@ -323,10 +357,21 @@ class LitelmProvider:
 
     async def generate(self, messages: list[dict], *, max_tokens: int | None = None) -> Completion:
         context = [{"role": m["role"], "content": m["content"]} for m in _validate_messages(messages, max_tokens)]
+        from .images import require_vision
+        require_vision(self.model, context)
         try:
             import litelm
         except ImportError as exc:
             raise ProviderError("Install the locked litelm dependencies", kind="configuration") from exc
+        if self.model.startswith("anthropic/"):
+            for message in context:
+                if isinstance(message["content"], list):
+                    for index, part in enumerate(message["content"]):
+                        if part["type"] == "image_url":
+                            header, encoded = part["image_url"]["url"].split(",", 1)
+                            message["content"][index] = {"type": "image", "source": {
+                                "type": "base64", "media_type": header[5:].split(";")[0], "data": encoded,
+                            }}
         kwargs = {"model": self.model, "messages": context, "stream": self.stream, "num_retries": 0}
         provider_id = self.model.split("/", 1)[0] if "/" in self.model else "openai"
         from .codex_auth import read_provider_api_key

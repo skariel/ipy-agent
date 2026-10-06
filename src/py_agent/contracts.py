@@ -9,6 +9,8 @@ import math
 from types import MappingProxyType
 from typing import Awaitable, Callable, Literal, Mapping, Protocol, Sequence
 
+from .images import ImageAttachment
+
 
 @dataclass(frozen=True)
 class Origin:
@@ -341,6 +343,8 @@ class ContextSnapshot:
     messages: tuple[tuple[str, str], ...]
     message_phases: tuple[str | None, ...] = ()
     transform_trace: tuple[str, ...] = ()
+    # Immutable images indexed to their observation/user message.
+    images: tuple[tuple[int, "ImageAttachment"], ...] = ()
 
     def __post_init__(self):
         if type(self.epoch) is not int or self.epoch < 0:
@@ -380,6 +384,19 @@ class ContextSnapshot:
         trace = tuple(self.transform_trace)
         if any(not isinstance(stage, str) or not stage.strip() for stage in trace):
             raise ValueError("Context transform trace must contain nonempty stage names")
+        from .images import MAX_CONTEXT_IMAGE_BYTES, MAX_CONTEXT_IMAGES, ImageAttachment
+        images = tuple(self.images)
+        if len(images) > MAX_CONTEXT_IMAGES:
+            raise ValueError("Context image limit exceeded")
+        for item in images:
+            if (not isinstance(item, tuple) or len(item) != 2
+                    or type(item[0]) is not int or not 0 <= item[0] < len(messages)
+                    or messages[item[0]][0] not in {"user", "observation"}
+                    or not isinstance(item[1], ImageAttachment)):
+                raise ValueError("Context images must align with user/observation messages")
+        if sum(len(image.data) for _, image in images) > MAX_CONTEXT_IMAGE_BYTES:
+            raise ValueError("Context image byte limit exceeded")
+        object.__setattr__(self, "images", images)
         object.__setattr__(self, "messages", tuple(messages))
         object.__setattr__(self, "message_phases", phases)
         object.__setattr__(self, "transform_trace", trace)

@@ -7,7 +7,14 @@ name = "py-agent"
 version = "0.1.0"
 description = "Plugin-driven coding agent with a persistent local IPython workspace"
 requires-python = ">=3.12,<3.15"
-dependencies = ["ipython==9.10.0", "prompt-toolkit==3.0.52", "litelm[anthropic]==0.5.2", "httpx==0.28.1", "pluggy==1.6.0"]
+dependencies = [
+    "ipython==9.10.0",
+    "prompt-toolkit==3.0.52",
+    "litelm[anthropic]==0.5.2",
+    "httpx==0.28.1",
+    "pluggy==1.6.0",
+    "pillow>=11,<13",
+]
 
 [project.optional-dependencies]
 jupyter = ["ipykernel>=6.29,<8", "jupyter-client>=8,<9"]

@@ -11,9 +11,9 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
 from .context import (
-    CONTRACT,
     COLLAPSE_FORCED,
     COLLAPSE_REMINDER,
+    CONTRACT,
     Context,
     Group,
     compact,
@@ -28,6 +28,7 @@ from .contracts import (
 from .limits import Limits
 from .observations import pack_observations
 from .plugins import Contributions, PluginManifest, Service, hookimpl
+
 
 class ProductionContextAdapter:
     """Expose existing context policy through a typed service surface.
@@ -147,13 +148,19 @@ class ProductionContextAdapter:
     def reported_input_tokens(self) -> int | None:
         return self.context.reported_input_tokens
 
-    def provider_messages(self, snapshot: ContextSnapshot) -> tuple[dict[str, str], ...]:
+    def provider_messages(self, snapshot: ContextSnapshot) -> tuple[dict, ...]:
         if not isinstance(snapshot, ContextSnapshot):
             raise TypeError("Context adapter requires a ContextSnapshot")
 
         system_messages = []
         conversation = []
-        for (role, content), phase in zip(snapshot.messages, snapshot.message_phases, strict=True):
+        from .images import content_with_images
+        by_message = {}
+        for index, image in snapshot.images:
+            by_message.setdefault(index, []).append(image)
+        for index, ((role, content), phase) in enumerate(zip(snapshot.messages, snapshot.message_phases, strict=True)):
+            if index in by_message:
+                content = content_with_images(content, by_message[index])
             if role == "system":
                 system_messages.append(content)
             elif role in {"user", "assistant"}:
@@ -194,6 +201,29 @@ class ProductionContextAdapter:
     def observation(self, content: object, refs: Sequence[str] = (), group: Group | None = None) -> Group:
         return self.context.observation(content, refs, group)
 
+    @staticmethod
+    def _snapshot_images(messages):
+        from .images import MAX_CONTEXT_IMAGE_BYTES, MAX_CONTEXT_IMAGES, ImageAttachment
+        # Preserve original alignment. Keep only the newest bounded image history;
+        # older text explicitly records omission, rather than claiming visibility.
+        selected = []
+        for index, message in enumerate(messages):
+            for record in message.get("images", ()):
+                selected.append((index, ImageAttachment.from_record(record)))
+        retained = []
+        byte_count = 0
+        for item in reversed(selected):
+            if len(retained) >= MAX_CONTEXT_IMAGES or byte_count + len(item[1].data) > MAX_CONTEXT_IMAGE_BYTES:
+                break
+            retained.append(item)
+            byte_count += len(item[1].data)
+        retained.reverse()
+        keep = len(retained)
+        omitted = selected[:-keep] if keep else selected
+        for index in {item[0] for item in omitted}:
+            messages[index]["content"] += "\n[Older image attachment omitted by context image limit.]"
+        return tuple(retained)
+
     def snapshot(self) -> ContextSnapshot:
         if self._overflow_recovery:
             return self._overflow_snapshot
@@ -202,10 +232,12 @@ class ProductionContextAdapter:
             messages.append({"role": "system", "content": COLLAPSE_FORCED})
         elif self._reminder_pending:
             messages.append({"role": "system", "content": COLLAPSE_REMINDER})
+        images = self._snapshot_images(messages)
         return ContextSnapshot(
             self.context.epoch,
             tuple((message["role"], self.context.render_boundary(message)) for message in messages),
             tuple(message.get("phase") for message in messages),
+            images=images,
         )
 
     def retention(
@@ -282,6 +314,11 @@ class ProductionContextAdapter:
             stored_index = payload.pop("_stored_output_index", None)
             already_omitted = payload.pop("_output_already_omitted", False)
             reads = payload.pop("_output_reads", [])
+            images = payload.pop("_images", [])
+            from .images import MAX_IMAGES, ImageAttachment
+            if not isinstance(images, (list, tuple)) or len(images) > MAX_IMAGES:
+                raise ValueError("Invalid observation image limit")
+            images = [ImageAttachment.from_record(image).record() for image in images]
             if (not isinstance(reads, list) or len(reads) > 8
                     or any(not isinstance(read, dict) or set(read) != {"text", "reference"}
                            or not isinstance(read["text"], str)
@@ -312,9 +349,10 @@ class ProductionContextAdapter:
             else:
                 content = compact(payload)
             if content:
-                if executed and stored_index is None and not already_omitted:
+                if executed and stored_index is None and not already_omitted and not images:
                     group.execution_output_indexes.append(len(group.messages))
-                group.messages.append({"role": "observation", "content": content})
+                group.messages.append({"role": "observation", "content": content,
+                                       **({"images": images} if images else {})})
             for read in reads:
                 group.execution_output_indexes.append(len(group.messages))
                 group.messages.append({
@@ -377,9 +415,9 @@ class ProductionProviderAdapter:
         self.model = model if isinstance(model, str) else "unknown"
 
     def set_model(self, model: str) -> None:
+        from .codex import CodexProvider
         from .model_catalog import adapter_for_model
         from .provider import LitelmProvider
-        from .codex import CodexProvider
 
         if isinstance(self.adapter, (LitelmProvider, CodexProvider)):
             selected_id = adapter_for_model(model)

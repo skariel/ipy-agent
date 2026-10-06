@@ -304,6 +304,8 @@ class CodexProvider:
 
     def build_request(self, messages: list[dict], *, max_tokens: int | None = None) -> dict:
         messages = _validate_messages(messages, max_tokens)
+        from .images import require_vision
+        require_vision(self.model, messages)
         instructions = []
         inputs = []
         for message in messages:
@@ -313,7 +315,12 @@ class CodexProvider:
                     raise ValueError("Codex system instructions must precede conversation messages")
                 instructions.append(text)
             elif role == "user":
-                inputs.append({"role": "user", "content": [{"type": "input_text", "text": text}]})
+                parts = ([{"type": "input_text", "text": text}] if isinstance(text, str) else [
+                    {"type": "input_text", "text": part["text"]} if part["type"] == "text"
+                    else {"type": "input_image", "image_url": part["image_url"]["url"], "detail": "auto"}
+                    for part in text
+                ])
+                inputs.append({"role": "user", "content": parts})
             else:
                 # Replay the executed cell's actual phase, not discarded later
                 # messages. Observations remain user input, never assistant output.

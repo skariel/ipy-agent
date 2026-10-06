@@ -1,6 +1,7 @@
 """Coordinator conversation component; orchestration remains in Coordinator."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 import inspect
 import json
@@ -45,6 +46,7 @@ class ConversationState:
         self._epoch_config_epoch = None
         self._context: list[tuple[str, str]] = []
         self._context_epoch = 0
+        self._context_images = []
         self._context_overlay: list[tuple[int, str]] = []
         self._context_overlay_epoch: int | None = None
         self._history_sensitive_values: set[str] = set()
@@ -209,6 +211,8 @@ class ConversationState:
                     phases[insertion:insertion] = [None] * len(overlay)
                     snapshot = replace(
                         snapshot, messages=tuple(messages), message_phases=tuple(phases),
+                        images=tuple((i + len(overlay) if i >= insertion else i, image)
+                                     for i, image in snapshot.images),
                     )
                 return snapshot
             # The v1 ContextService protocol exposes reset policy and usage
@@ -217,8 +221,9 @@ class ConversationState:
             needs_reset = getattr(self.coordinator.context_service, "needs_reset", None)
             if callable(needs_reset) and needs_reset():
                 self._context.clear()
+                self._context_images.clear()
                 self._context_epoch += 1
-        return ContextSnapshot(self._context_epoch, (*self._context, ("user", text)))
+        return ContextSnapshot(self._context_epoch, (*self._context, ("user", text)), images=tuple(self._context_images))
 
     def _latest_context(self) -> ContextSnapshot:
         snapshot = getattr(self.coordinator.context_service, "snapshot", None) if self.coordinator.context_service is not None else None
@@ -236,7 +241,7 @@ class ConversationState:
                     message_phases=(*value.message_phases, *((None,) * len(additions))),
                 )
             return value
-        return ContextSnapshot(self._context_epoch, tuple(self._context))
+        return ContextSnapshot(self._context_epoch, tuple(self._context), images=tuple(self._context_images))
 
     def _append_steering_context(self, text: str, request_id: str) -> None:
         """Append steering after the completed cell's observation, never mid-request."""
@@ -290,7 +295,17 @@ class ConversationState:
                     text = observation
                 else:
                     text = json.dumps(observation, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            from .images import MAX_CONTEXT_IMAGE_BYTES, MAX_CONTEXT_IMAGES, ImageAttachment
+            records = observation.get("_images", ()) if isinstance(observation, Mapping) else ()
+            if isinstance(observation, Mapping):
+                text = json.dumps({k: v for k, v in observation.items() if k != "_images"},
+                                  ensure_ascii=False, allow_nan=False, separators=(",", ":"))
             self.coordinator._commit_fallback_context(user_text, assistant_text, text, include_user=include_user)
+            index = len(self._context) - 1
+            self._context_images.extend((index, ImageAttachment.from_record(record)) for record in records)
+            self._context_images = self._context_images[-MAX_CONTEXT_IMAGES:]
+            while sum(len(image.data) for _, image in self._context_images) > MAX_CONTEXT_IMAGE_BYTES:
+                self._context_images.pop(0)
             return
         commit = getattr(self.coordinator.context_service, "commit_response", None)
         if callable(commit):
@@ -310,6 +325,7 @@ class ConversationState:
         def snapshot_data(value: ContextSnapshot) -> dict[str, object]:
             return {
                 "epoch": value.epoch,
+                "images": [{"message_index": i, **image.record()} for i, image in value.images],
                 "messages": [
                     {"role": role, "content": content, "phase": phase}
                     for (role, content), phase in zip(

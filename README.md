@@ -84,11 +84,13 @@ ported; use their API-key integrations where available.
 A provider request is made only after submitting an English request. The `py` CLI itself requires an explicit model (or a plugin/fake provider);
 only `run.sh` supplies the Codex GPT-6.1-Sol launcher default.
 Recognized transient provider failures (rate limits, transport/timeouts, and
-server 5xx errors) receive up to two retries before any Python cell executes;
+server 5xx errors) receive up to two retries before any Python cell executes.
+Transport disconnects (including ReadError) allow up to five attempts with
+1/2/4/8-second interruptible backoff;
 a lost response can still mean both model attempts were billed. Authentication,
 request, format, and unknown local errors are not retried. Recognized transient
-TLS disconnects are transport failures; certificate verification and unknown TLS
-errors are not retried, and TLS verification is never disabled.
+TLS disconnects and generic SSLError are transport failures; certificate verification
+and known TLS configuration errors are not retried, and TLS verification is never disabled.
 
 The default frontend requires a TTY; batch/JSON mode is not implemented. While
 an agent request runs, the status bar shows activity, with completed-cell
@@ -389,3 +391,25 @@ Run `uv run pytest -q` for the test suite and
 `uv run mypy --config-file mypy-strict.toml` for the migrated strict-typed core.
 Whole-repository strict typing is still in progress; see
 [REFACTORING.md](REFACTORING.md) for scope and next steps.
+
+### Visual inspection with Python
+
+Select a vision-capable model, then use ordinary Python:
+
+```python
+from PIL import Image
+from IPython.display import display
+display(Image.open("screenshot.png"))
+```
+
+The next model turn receives the image, not just its repr. IPython image displays and Pillow crops work too. For Matplotlib (optional),
+first run `get_ipython().run_line_magic("matplotlib", "inline")`, then `plt.show()`. Raster images are normalized to metadata-free
+PNG/JPEG: 1536-pixel edges, 512000 bytes/image, four images/cell, 16 active context
+images totaling at most 2 MB. Source decoding is capped at 8 MB/16 million pixels; animation uses its
+first frame. SVG/PDF aren't vision inputs. Invalid images are reported.
+
+Unsupported/unrecognized model families fail explicitly rather than silently
+dropping images. Provider capability may still vary. Images are preserved in
+private model-request journal records and context archives; this is audit history,
+not executable session replay. Collapsed images must be redisplayed for inspection.
+Displaying an image sends its pixels to the configured provider: avoid secrets.

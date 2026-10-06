@@ -26,6 +26,33 @@ class ModelObservations:
     coordinator: Coordinator
 
     def _packed_observation(self, request: ExecutionRequest, result: ExecutionResult):
+        from .images import observation_images
+        records, notices = observation_images(result.output_events)
+        packed = self._packed_text_observation(request, result)
+        if not notices:
+            return packed
+        if isinstance(packed, str):
+            packed = {"output": packed}
+        else:
+            packed = dict(packed)
+        # Metadata remains text; bytes travel separately through context/provider
+        # boundaries, never pasted as base64 into model-visible text.
+        text = "\n".join(notices)
+        if "events" in packed:
+            events = [dict(event) for event in packed["events"]]
+            display_events = [event for event in events if event.get("output_kind") in {"display", "execute_result", "update"}]
+            if display_events:
+                # Preserve event identities/order rather than inventing a rich
+                # event without execution provenance.
+                display_events[-1]["display"] = str(display_events[-1].get("display", ""))[:6000] + "\n" + text
+            packed["events"] = events
+        else:
+            packed["output"] = str(packed.get("output", "")) + "\n" + text
+        if records:
+            packed["_images"] = list(records)
+        return packed
+
+    def _packed_text_observation(self, request: ExecutionRequest, result: ExecutionResult):
         # Archive reads have their own bounded envelope. Never let unrelated
         # stdout (including an oversized stream) hide or re-archive an excerpt.
         reads = []

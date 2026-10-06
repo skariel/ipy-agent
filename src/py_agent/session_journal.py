@@ -470,6 +470,8 @@ class SQLiteSessionJournal:
                 "epoch": request.context.epoch,
                 "messages": [list(message) for message in request.context.messages],
                 "message_phases": list(request.context.message_phases),
+                "images": [{"message_index": i, **image.record()}
+                           for i, image in request.context.images],
                 "transform_trace": list(request.context.transform_trace),
             },
             "transform_trace": list(request.transform_trace),
