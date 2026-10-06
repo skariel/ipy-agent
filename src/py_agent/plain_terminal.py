@@ -237,6 +237,16 @@ class PlainTerminal(TerminalMenus):
     def _bindings(self) -> KeyBindings:
         bindings = KeyBindings()
 
+        @bindings.add("c-i", filter=has_focus("DEFAULT_BUFFER") & ~is_searching, eager=True)
+        def complete_on_tab(event):
+            if self._stdin_request is not None or self._history_suppressed:
+                return
+            buffer = event.current_buffer
+            if buffer.complete_state is not None:
+                buffer.complete_next()
+            else:
+                buffer.start_completion(select_first=True)
+
         @bindings.add("s-escape", "enter", eager=True)
         @bindings.add("escape", "enter", eager=True)
         def submit_multiline(event):
@@ -245,6 +255,11 @@ class PlainTerminal(TerminalMenus):
         @bindings.add("enter", filter=has_focus("DEFAULT_BUFFER") & ~is_searching, eager=True)
         def smart_enter(event):
             buffer = event.current_buffer
+            if buffer.complete_state is not None:
+                if buffer.complete_state.current_completion is not None:
+                    buffer.go_to_completion(buffer.complete_state.complete_index)
+                buffer.complete_state = None
+                return  # First Enter accepts completion; next Enter submits.
             if self._stdin_request is not None:
                 buffer.validate_and_handle()
                 return

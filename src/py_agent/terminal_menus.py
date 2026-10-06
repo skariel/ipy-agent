@@ -7,11 +7,15 @@ import time
 from urllib.parse import urlencode
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.history import DummyHistory
 from prompt_toolkit.completion import FuzzyWordCompleter
+from prompt_toolkit.history import DummyHistory
 
 from .provider import ProviderError
 from .terminal_completion import EFFORTS, model_choices, providers
+
+
+class MenuCancelled(Exception):
+    """Cancel a picker without raising KeyboardInterrupt in a child task."""
 
 
 class TerminalMenus:
@@ -28,12 +32,14 @@ class TerminalMenus:
                                         style=self._style, history=DummyHistory())
                 return await session.prompt_async(
                     label, is_password=password, multiline=False,
-                    completer=FuzzyWordCompleter(list(choices)) if choices and not password else None,
+                    completer=FuzzyWordCompleter(list(choices), WORD=True) if choices and not password else None,
                     complete_while_typing=bool(choices) and not password,
                     enable_history_search=False,
                     pre_run=(lambda: session.default_buffer.start_completion(select_first=False))
                             if choices and not password else None,
                 )
+            except (KeyboardInterrupt, EOFError):
+                raise MenuCancelled() from None
             finally:
                 self._history_suppressed = previous
 
@@ -70,7 +76,7 @@ class TerminalMenus:
             await self._login_codex()
             return
         if provider == "openrouter" and "--api-key" not in flags:
-            await self._login_openrouter()
+            await self._login_openrouter(manual="--manual" in flags)
             return
         key = await self._menu_prompt(f"{provider} API key (hidden): ", password=True)
         entry = api_key_entry(key)
@@ -81,6 +87,7 @@ class TerminalMenus:
         # Async variant of the same Pi device protocol; Ctrl-C cancels polling
         # without a lingering background worker that might save credentials.
         import httpx
+
         from . import oauth
         from .native_auth import auth_error, save
         async with httpx.AsyncClient(timeout=30) as client:
@@ -129,10 +136,11 @@ class TerminalMenus:
             try:
                 while True:
                     done, _ = await asyncio.wait({polling, cancel}, return_when=asyncio.FIRST_COMPLETED)
+                    if cancel in done:
+                        cancel.result()
                     if polling in done:
                         entry = polling.result()
                         break
-                    cancel.result()
                     cancel = asyncio.create_task(self._menu_prompt("Still waiting; Ctrl-C cancels: "))
             finally:
                 for task in (polling, cancel):
@@ -142,12 +150,14 @@ class TerminalMenus:
         await asyncio.to_thread(save, "openai-codex", entry)
         self._write("openai-codex: credentials saved.")
 
-    async def _login_openrouter(self):
+    async def _login_openrouter(self, *, manual=False):
         import base64
         import hashlib
         import secrets
         import webbrowser
+
         import httpx
+
         from . import oauth
         from .native_auth import api_key_entry, auth_error, save
 
@@ -173,7 +183,7 @@ class TerminalMenus:
                     writer.write(b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n"
                                  b"Authorization received. Return to py.")
                 await writer.drain()
-            except (ValueError, ProviderError, OSError, asyncio.TimeoutError):
+            except (TimeoutError, ValueError, ProviderError, OSError):
                 pass
             finally:
                 writer.close()
@@ -191,10 +201,11 @@ class TerminalMenus:
             "callback_url": callback_url, "code_challenge": challenge, "code_challenge_method": "S256"})
         self._write("Open this URL to sign in with OpenRouter:\n" + url)
         try:
-            try:
-                await asyncio.to_thread(webbrowser.open, url)
-            except webbrowser.Error:
-                pass
+            if not manual:
+                try:
+                    await asyncio.to_thread(webbrowser.open, url)
+                except webbrowser.Error:
+                    pass
             async with server:
                 # Accept either local callback or remote redirect paste. Keep
                 # redirect input hidden and outside chat/history as it is secret.
@@ -204,10 +215,10 @@ class TerminalMenus:
                 try:
                     done, _ = await asyncio.wait({received, prompt}, timeout=300,
                                                 return_when=asyncio.FIRST_COMPLETED)
-                    if received in done:
-                        code = received.result()
-                    elif prompt in done:
+                    if prompt in done:
                         code = oauth.parse_openrouter_code(prompt.result())
+                    elif received in done:
+                        code = received.result()
                     else:
                         raise auth_error("browser login timed out")
                 finally:
@@ -248,7 +259,7 @@ class TerminalMenus:
             if command == "login":
                 await self._login(arguments)
             elif command == "logout":
-                from .native_auth import logout, read_document, provider_id
+                from .native_auth import logout, provider_id, read_document
                 selected = arguments or await self._choose("Logout provider", tuple(sorted(read_document())))
                 if selected:
                     provider_id(selected)
@@ -269,7 +280,7 @@ class TerminalMenus:
                     # Only non-secret model/effort selections enter the normal
                     # queue, preserving lifecycle and configuration semantics.
                     self._menu_selection = f"/{command} {selected}"
-        except (KeyboardInterrupt, EOFError):
+        except (MenuCancelled, KeyboardInterrupt, EOFError):
             self._write("Selection/login cancelled.")
         except ProviderError as exc:
             self._write(str(exc))

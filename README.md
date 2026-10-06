@@ -100,12 +100,12 @@ It accepts
 English requests, `@` Python,
 `!` shell escapes, `%` IPython magics, and the
 built-in slash commands `/help`, `/status`, `/interrupt`, `/quit`, `/config`,
-`/plugins`, `/model`, `/effort`, `/context`, and `/history` (when a journal is selected).
+`/plugins`, `/login`, `/logout`, `/auth`, `/model`, `/effort`, `/think`, `/context`, and `/history` (when a journal is selected).
 Slash commands require an identifier (letters, digits, underscores, or hyphens,
 starting with a lowercase letter). Path-prefixed pastes such as `/src/file.py:42`
 remain English input, including when queued as steering. Use a leading backslash
 (e.g. `\/tmp`) to force English input for a path indistinguishable from a command.
-`/model` lists catalog models backed by environment API keys or pi credentials.
+`/model` opens a searchable picker of catalog models backed by environment API keys, native py logins, or Pi credentials.
 Account entitlement is not checked; arbitrary explicit `PROVIDER/MODEL` IDs can
 also be selected. `--model` infers the adapter; `--provider` remains an optional
 override for plugins and testing. `/model PROVIDER/MODEL` can switch between
@@ -113,12 +113,33 @@ API-key and Codex transports within a session, preserving the auth-file path and
 session effort override. Endpoint/stream/token-cap settings must be cleared before
 switching transports. The bundled catalog is a snapshot, not live discovery.
 
-Use `py login`, `py logout`, and `py auth status` outside the interactive agent
-to manage authentication (see above). Provider API-key environment variables
-and read-only Pi compatibility remain available.
+Inside the terminal, `/login` opens a provider picker (type to filter, Tab or
+arrow keys to select); `/login PROVIDER` skips the picker. OpenRouter opens its
+browser login; `/login openrouter --manual` supports remote redirect pasting,
+and `--api-key` uses a hidden key prompt instead. Codex uses device login; other
+providers use hidden API-key entry. `/logout` picks a native login to remove;
+`/auth` or `/auth status` shows secret-free status. Secret prompts never enter
+composer history, the coordinator journal, or model context. Ctrl-C cancels.
+Menus require idle work; explicit model/effort commands keep normal queue behavior.
+The equivalent shell commands `py login`, `py logout`, and `py auth status` remain
+available. Pi/environment fallback can still authenticate after native logout.
+
+Press **Tab** to fuzzy-complete slash commands and relevant arguments, including
+models, providers, reasoning levels, configuration fields, and loaded plugin IDs.
+In the composer, Enter accepts an open completion; the next Enter submits.
+`/model`, `/effort`, and `/think` open searchable selection menus without arguments.
+Explicit arguments still work; `/think` is an alias for `/effort`.
+
+Outside slash commands, **Tab fuzzy-matches the current token against workspace
+file/directory paths** in English, Python, or shell input. No new prefix is needed;
+`@` remains Python. Completion inserts a path only: it never reads or attaches file
+contents. The name index is bounded, refreshed periodically, skips hidden/build/
+dependency trees and symlinks, and does not enumerate paths outside the workspace.
+It is not a full ignore-rule-aware index. Completion/history suggestions are
+disabled during Python stdin and provider secret prompts.
 
 `/model [MODEL_ID]` and `/effort [PRESET]` apply immediate, session-local overrides;
-they do not change the selected provider or persist configuration. Effort presets are
+they do not persist configuration; model changes can replace the transport adapter. Effort presets are
 `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; DeepSeek maps `minimal`/`low`
 to `low`, `medium`/`high` to `high`, `xhigh` to `max`, and disables thinking for `none`.
 `/context save [PATH]`

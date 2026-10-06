@@ -8,7 +8,6 @@ import time
 
 from prompt_toolkit.completion import Completer, Completion
 
-
 COMMANDS = {
     "help": "Command help", "login": "Choose a provider and sign in",
     "logout": "Remove a native provider login", "auth": "Credential status",
@@ -29,8 +28,9 @@ def matches(query: str, value: str) -> bool:
 
 
 def providers() -> tuple[str, ...]:
-    from .model_catalog import MODELS
     from litelm._providers import PROVIDERS
+
+    from .model_catalog import MODELS
     return tuple(sorted(set(MODELS) | set(PROVIDERS)))
 
 
@@ -99,7 +99,10 @@ class TerminalCompleter(Completer):
                 if name in {"login", "logout"}:
                     if name == "logout":
                         from .native_auth import read_document
-                        candidates = tuple(read_document())
+                        try:
+                            candidates = tuple(read_document())
+                        except Exception:
+                            return
                     elif " " in arguments:
                         query = arguments.rsplit(" ", 1)[-1]
                         candidates = ("--api-key", "--manual")
@@ -118,10 +121,18 @@ class TerminalCompleter(Completer):
                     parts = arguments.split(" ")
                     query = parts[-1]
                     if len(parts) == 1:
-                        candidates = ("show", "set", "reset", "save", "load", "diff")
-                    elif parts[0] in {"show", "set", "reset"} and len(parts) == 2:
+                        candidates = ("get", "describe", "set", "reset", "diff", "save", "reload")
+                    elif parts[0] in {"get", "describe", "set", "reset", "save"}:
                         store = getattr(self.coordinator, "config_store", None)
                         candidates = tuple(getattr(getattr(store, "registry", None), "fields", {}))
+                elif name == "plugins":
+                    parts = arguments.split(" ")
+                    query = parts[-1]
+                    if len(parts) == 1:
+                        candidates = ("inspect",)
+                    elif parts[0] == "inspect" and len(parts) == 2:
+                        runtime = getattr(self.coordinator, "_plugin_runtime", None)
+                        candidates = tuple(getattr(runtime, "manifests", {}))
                 elif name == "history":
                     candidates = ("search", "page")
                 elif name == "context":
@@ -140,6 +151,8 @@ class TerminalCompleter(Completer):
             if not query or query.startswith(("~", "/", "\\")):
                 return  # Do not enumerate outside the workspace.
             candidates = self.workspace_paths()
+            if query.startswith("./"):
+                candidates = tuple("./" + path for path in candidates)
         ranked = sorted((v for v in candidates if matches(query, v)),
                         key=lambda v: (not v.casefold().startswith(query.casefold()), len(v), v))
         for value in ranked[:100]:
