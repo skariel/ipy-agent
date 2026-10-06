@@ -1518,7 +1518,7 @@ class Coordinator:
                 return self._context_command(arguments)
             if name == "model":
                 return self._model_command(arguments)
-            if name == "effort":
+            if name in {"effort", "think"}:
                 return self._effort_command(arguments, config)
             if name in core_commands:
                 response = self.command_registry.dispatch(name, arguments)
@@ -1576,7 +1576,7 @@ class Coordinator:
                 return current + f"\nCannot list available models: {exc}"
             return current + "\nAvailable models (configured credentials; account access may vary):\n" + (
                 "\n".join(models) if models else
-                "None. Set a provider API key or login in pi (/login), then retry."
+                "None. Use /login or py login PROVIDER, then retry."
             )
         if len(tokens) != 1:
             return _MODEL_USAGE

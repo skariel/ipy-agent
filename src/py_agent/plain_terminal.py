@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from prompt_toolkit import PromptSession, print_formatted_text
-from prompt_toolkit.filters import has_focus, is_searching
+from prompt_toolkit.filters import Condition, has_focus, is_searching
 from prompt_toolkit.formatted_text import FormattedText, to_formatted_text
 from prompt_toolkit.formatted_text.utils import fragment_list_width, split_lines
 from prompt_toolkit.history import InMemoryHistory
@@ -113,7 +113,7 @@ class _TerminalHistory(InMemoryHistory):
         self._should_record = should_record
 
     def append_string(self, string: str) -> None:
-        if self._should_record():
+        if self._should_record() and not re.match(r"^/login(?:\s|$)", string):
             super().append_string(string)
 
     def load_history_strings(self):
@@ -129,7 +129,7 @@ class _PromptResult:
 
 RESERVED_COMMANDS = frozenset({
     "help", "status", "interrupt", "quit", "exit", "history", "context",
-    "model", "effort",
+    "model", "effort", "think", "login", "logout", "auth",
 })
 
 
@@ -146,8 +146,16 @@ its next model call, in queue order. /interrupt and /quit remain immediate contr
 /history search QUERY   search recent journal events
 /history page ID [OFFSET [CHARS]]  read one bounded event page; never replays code
 /context save [PATH]   save a private, standalone HTML context explorer
-/model [MODEL_ID]       list credential-backed models or switch model/adapter
-/effort [PRESET]        show or change reasoning effort for this session
+/model [MODEL_ID]       searchable model picker or switch model/adapter
+/effort [PRESET]        reasoning-level picker or change effort
+/think [PRESET]         alias for /effort
+/login [PROVIDER]       provider picker; browser login or hidden API-key prompt
+/login PROVIDER --api-key  use API-key prompt (OpenRouter alternative)
+/login openrouter --manual  paste a remote redirect URL in the hidden prompt
+/logout [PROVIDER]      remove a native login (Pi/env fallback remains)
+/auth [status]          show credential status, never secrets
+Tab                    fuzzy-complete commands, arguments, or workspace paths
+                       paths only; no file content is attached; @ remains Python
 Enabled plugins may add slash commands.
 /help                  show this help
 /status                show coordinator state and selected provider
@@ -156,7 +164,11 @@ Enabled plugins may add slash commands.
 Prefix English beginning with @, !, %, or / with a backslash."""
 
 
-class PlainTerminal:
+from .terminal_menus import TerminalMenus
+from .terminal_completion import TerminalCompleter
+
+
+class PlainTerminal(TerminalMenus):
     """A minimal terminal adapter for :class:`Coordinator`.
 
     ``input`` and ``output`` are prompt-toolkit streams and can be injected for
@@ -201,11 +213,18 @@ class PlainTerminal:
         self._active_submission_task: asyncio.Task | None = None
         self._queued_watchers: set[asyncio.Task] = set()
         self._terminal_closed = False
+        self._menu_selection = None
+        self._completer = TerminalCompleter(
+            coordinator, enabled=lambda: self._stdin_request is None and not self._history_suppressed,
+        )
         self.session = PromptSession(
             input=input,
             output=output,
             history=_TerminalHistory(lambda: not self._history_suppressed),
-            enable_history_search=True,
+            enable_history_search=Condition(lambda: self._stdin_request is None and not self._history_suppressed),
+            completer=self._completer,
+            complete_while_typing=False,
+            complete_in_thread=True,
             vi_mode=vi,
             multiline=multiline,
             key_bindings=self._bindings(),
@@ -904,6 +923,8 @@ class PlainTerminal:
         command, _, arguments = text[1:].partition(" ")
         command = command.strip().lower()
         arguments = arguments.strip()
+        if await self._interactive_command(command, arguments):
+            return True
         if command == "help" and not arguments:
             self._write(HELP)
             return True
@@ -1017,7 +1038,9 @@ class PlainTerminal:
                         ))
                     return
                 if handled is True:
-                    continue
+                    if self._menu_selection is None:
+                        continue
+                    text, self._menu_selection = self._menu_selection, None
 
             enqueue = getattr(self.coordinator, "enqueue", None)
             if getattr(self.coordinator, "state", State.IDLE) is State.FAILED:

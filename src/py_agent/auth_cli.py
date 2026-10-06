@@ -8,6 +8,32 @@ import sys
 from .native_auth import api_key_entry, auth_error, auth_path, logout, provider_id, read_document, save
 
 
+def status_lines():
+    document = read_document()
+    lines = [f"py credential store: {auth_path()}"]
+    if not document:
+        lines.append("No native credentials configured. Pi/env fallback remains available.")
+    for provider in sorted(document):
+        provider_id(provider)
+        entry = document[provider]
+        if not isinstance(entry, dict):
+            raise auth_error("invalid credential entry")
+        if entry.get("type") == "api_key":
+            api_key_entry(entry.get("key"))
+            status = "API key stored"
+        elif entry.get("type") == "oauth":
+            import math
+            import time
+            expiry = entry.get("expires")
+            if type(expiry) not in (int, float) or not math.isfinite(expiry):
+                raise auth_error("invalid OAuth expiry")
+            status = "OAuth stored" if expiry > time.time() * 1000 + 30000 else "OAuth expired (refresh on use)"
+        else:
+            raise auth_error("unknown credential type")
+        lines.append(f"{provider}: {status}")
+    return lines
+
+
 def main(arguments):
     parser = argparse.ArgumentParser(prog="py", description="Manage py provider credentials")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -22,29 +48,7 @@ def main(arguments):
     args = parser.parse_args(arguments)
     try:
         if args.command == "auth":
-            document = read_document()
-            print(f"py credential store: {auth_path()}")
-            if not document:
-                print("No native credentials configured. Pi/env fallback remains available.")
-            for provider in sorted(document):
-                provider_id(provider)
-                entry = document[provider]
-                if not isinstance(entry, dict):
-                    raise auth_error("invalid credential entry")
-                kind = entry.get("type")
-                if kind == "api_key":
-                    api_key_entry(entry.get("key"))
-                    status = "API key stored"
-                elif kind == "oauth":
-                    import math
-                    import time
-                    expiry = entry.get("expires")
-                    if type(expiry) not in (int, float) or not math.isfinite(expiry):
-                        raise auth_error("invalid OAuth expiry")
-                    status = "OAuth stored" if expiry > time.time() * 1000 + 30000 else "OAuth expired (refresh on use)"
-                else:
-                    raise auth_error("unknown credential type")
-                print(f"{provider}: {status}")
+            print("\n".join(status_lines()))
             return 0
         provider = provider_id(args.provider)
         if args.command == "logout":

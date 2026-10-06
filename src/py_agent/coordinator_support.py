@@ -45,7 +45,7 @@ _CONTEXT_USAGE = "Usage: /context save [PATH]"
 _MODEL_USAGE = "Usage: /model [MODEL_ID]"
 _EFFORT_PRESETS = ("none", "minimal", "low", "medium", "high", "xhigh")
 _EFFORT_USAGE = "Usage: /effort [none|minimal|low|medium|high|xhigh]"
-_COORDINATOR_COMMANDS = frozenset({"history", "context", "model", "effort"})
+_COORDINATOR_COMMANDS = frozenset({"history", "context", "model", "effort", "think"})
 
 
 def _strip_observation_terminal_controls(text: str) -> str:

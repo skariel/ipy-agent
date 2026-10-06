@@ -591,9 +591,14 @@ def available_models(auth_file: Path | None = None) -> tuple[str, ...]:
     from .provider import ProviderError
 
     def error(message: str) -> ProviderError:
-        return ProviderError("Pi authentication: " + message, kind="authentication")
+        return ProviderError("Provider authentication: " + message, kind="authentication")
 
-    document = _read_auth_document(auth_file or DEFAULT_AUTH_FILE, error=error) or {}
+    if auth_file is not None:
+        document = _read_auth_document(auth_file, error=error) or {}
+    else:
+        from .native_auth import read_document
+        document = _read_auth_document(DEFAULT_AUTH_FILE, error=error) or {}
+        document.update(read_document())
     available = []
     for provider, models in MODELS.items():
         entry = document.get(provider)
