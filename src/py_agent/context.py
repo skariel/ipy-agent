@@ -119,7 +119,8 @@ Raster output is normalized to metadata-free PNG/JPEG: at most 1536 pixels per e
 source pixels. Animation uses its first frame. Unsupported or unsafe images are
 reported. Only the newest 16 attachments, totaling at most 2 MB, remain active. Collapsed images are
 archived, not in active visual context; redisplay to inspect them again. A vision-
-capable model is required; unsupported/unrecognized families stop explicitly.
+capable model is required; known text-only models stop explicitly. Unknown model names are sent with
+their images intact; the provider determines whether they support vision.
 Display only images needed for the task: their pixels go to the selected provider
 and private session history/archives. File completion alone never sends contents.
 

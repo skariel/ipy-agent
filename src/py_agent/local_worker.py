@@ -1123,6 +1123,48 @@ def _make_input_functions(execution_id: str, author: str, origin: dict[str, Any]
     return interactive_input, interactive_getpass, deactivate
 
 
+
+def _make_llm(execution_id, author, origin):
+    from .stdlib import MAX_CALLS_PER_CELL, MAX_RESULT_CHARS
+    owner_thread = threading.get_ident()
+    active = True
+    calls = 0
+
+    def call(payload):
+        nonlocal calls
+        if not active or threading.get_ident() != owner_thread:
+            raise RuntimeError("llm() is only supported in the active cell's main thread")
+        if calls >= MAX_CALLS_PER_CELL:
+            raise RuntimeError("llm() per-cell call limit is 8")
+        calls += 1
+        frame = {"type": "llm_request", "version": PROTOCOL_VERSION,
+                 "execution_id": execution_id, "origin": origin, "author": author,
+                 "sequence": calls, "payload": payload}
+        # Entire request must fit the same bounded wire envelope as any cell.
+        encoded = json.dumps(frame, ensure_ascii=True, allow_nan=False).encode("ascii")
+        if len(encoded) > MAX_FRAME:
+            raise ValueError("llm request exceeds worker frame limit")
+        if _RAW_CAPTURE is not None:
+            _RAW_CAPTURE.barrier()
+        _send(frame)
+        reply = _receive()
+        if (not isinstance(reply, dict) or reply.get("type") not in {"llm_reply", "llm_error"}
+                or reply.get("version") != PROTOCOL_VERSION
+                or reply.get("execution_id") != execution_id or reply.get("origin") != origin
+                or reply.get("author") != author or reply.get("sequence") != calls
+                or set(reply) != {"type", "version", "execution_id", "origin", "author", "sequence", "text"}
+                or not isinstance(reply.get("text"), str) or len(reply["text"]) > MAX_RESULT_CHARS):
+            raise ProtocolError("llm reply does not match request")
+        if reply["type"] == "llm_error":
+            raise RuntimeError(reply["text"])
+        return reply["text"]
+
+    def deactivate():
+        nonlocal active
+        active = False
+
+    return call, deactivate
+
 def _make_say(execution_id: str, author: str, origin: dict[str, Any], stdout, stderr):
     owner_thread = threading.get_ident()
     active = True
@@ -1233,6 +1275,10 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
     )
     _ACTIVE_INPUT_FUNCTIONS = (input_fn, getpass_fn)
     shell.user_ns["say"] = say
+    from .stdlib import _ACTIVE_LLM, llm
+    llm_callback, deactivate_llm = _make_llm(execution_id, author, origin)
+    llm_token = _ACTIVE_LLM.set(llm_callback)
+    shell.user_ns["llm"] = llm
     from py_agent.cell_printer import CellPrinter
 
     cell_printer = CellPrinter(redact=_redact_text)
@@ -1440,6 +1486,8 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
             read_output_active = False
             deactivate_say()
             deactivate_input()
+            deactivate_llm()
+            _ACTIVE_LLM.reset(llm_token)
             _ACTIVE_INPUT_FUNCTIONS = None
             # Do not let a cell's reassignment of sys.std* poison later cells.
             sys.stdin = sys.__stdin__ = null_in

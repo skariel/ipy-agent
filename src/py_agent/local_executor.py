@@ -287,6 +287,7 @@ class LocalExecutor:
         self._active_done = asyncio.Event()
         self._active_done.set()
         self._active_execution_id: str | None = None
+        self._active_llm_task: asyncio.Task | None = None
         self._active_input_task: asyncio.Task | None = None
         self._active_input_cancel: asyncio.Event | None = None
         self._password_secrets: list[str] = []
@@ -558,6 +559,50 @@ class LocalExecutor:
             ))
         return tuple(result)
 
+    async def _service_llm_request(self, frame, request, process, execution_id, origin, sequence):
+        from .stdlib import MAX_CALLS_PER_CELL, MAX_RESULT_CHARS, validate_payload
+        fields = {"type", "version", "execution_id", "origin", "author", "sequence", "payload"}
+        if (set(frame) != fields or frame["origin"] != origin or frame["author"] != request.author
+                or type(frame["sequence"]) is not int or frame["sequence"] != sequence + 1
+                or frame["sequence"] > MAX_CALLS_PER_CELL):
+            raise _ProtocolError("Malformed worker llm request")
+        sequence = frame["sequence"]
+        reply = {"type": "llm_reply", "version": PROTOCOL_VERSION,
+                 "execution_id": execution_id, "origin": origin, "author": request.author,
+                 "sequence": sequence}
+        try:
+            payload = validate_payload(frame["payload"])
+        except (ValueError, TypeError):
+            reply.update(type="llm_error", text="Invalid bounded llm request")
+            await self._send(process, _encode_frame(reply))
+            return sequence
+        if request.llm_handler is None:
+            reply.update(type="llm_error", text="llm() unavailable: this execution has no host model handler")
+            await self._send(process, _encode_frame(reply))
+            return sequence
+        async def invoke():
+            value = await request.llm_handler(payload)
+            if not isinstance(value, str) or len(value) > MAX_RESULT_CHARS:
+                raise ValueError("Invalid bounded llm response")
+            return value
+        task = asyncio.create_task(invoke())
+        self._active_llm_task = task
+        try:
+            reply["text"] = await task
+        except asyncio.CancelledError:
+            reply.update(type="llm_error", text="llm() cancelled; no response accepted")
+            # Task cancellation caused by executor.interrupt is consumed here so
+            # the wire reply completes before SIGINT stops the waiting cell.
+            if asyncio.current_task().cancelling():
+                raise
+        except Exception:
+            reply.update(type="llm_error", text="llm() request failed; no response accepted")
+        finally:
+            if self._active_llm_task is task:
+                self._active_llm_task = None
+        await self._send(process, _encode_frame(reply))
+        return sequence
+
     async def _service_input_request(
         self,
         process: asyncio.subprocess.Process,
@@ -785,6 +830,7 @@ class LocalExecutor:
                 # an interrupt during a queued write must not hit an idle worker.
                 self._active_execution_id = execution_id
                 self._active_done.clear()
+                llm_sequence = 0
                 while True:
                     frame = await self._receive(process)
                     if frame.get("version") != PROTOCOL_VERSION or type(frame.get("version")) is not int:
@@ -800,7 +846,11 @@ class LocalExecutor:
                             continue
                         raise _ProtocolError("Worker result does not match the active execution")
                     kind = frame.get("type")
-                    if kind == "input_request":
+                    if kind == "llm_request":
+                        llm_sequence = await self._service_llm_request(
+                            frame, request, process, execution_id, origin, llm_sequence,
+                        )
+                    elif kind == "input_request":
                         input_sequence = await self._service_input_request(
                             process, frame, request, execution_id, origin, input_sequence,
                         )
@@ -1039,6 +1089,13 @@ class LocalExecutor:
         process = self.process
         if process is None or self._active_done.is_set() or self._active_execution_id is None:
             return
+        llm_task = self._active_llm_task
+        if llm_task is not None and not llm_task.done():
+            llm_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(llm_task), timeout=self.interrupt_timeout)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
         input_task = self._active_input_task
         if input_task is not None and not input_task.done():
             cancel_event = self._active_input_cancel

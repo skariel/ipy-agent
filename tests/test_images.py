@@ -299,3 +299,41 @@ async def test_matplotlib_display_emits_image_mime():
 def test_routed_vision_models_accept_attachments(model):
     from py_agent.images import require_vision
     require_vision(model, [{"role": "user", "content": content_with_images("inspect", [attachment()])}])
+
+
+@pytest.mark.parametrize("model", [
+    "openai-codex/gpt-6.1-sol", "openrouter/openai/gpt-6.1-sol",
+    "custom/new-vision-model",
+])
+def test_new_model_names_do_not_block_images(model):
+    from py_agent.images import require_vision
+    messages = [{"role": "user", "content": content_with_images("inspect", [attachment()])}]
+    require_vision(model, messages)
+    if model.startswith("openai-codex/"):
+        body = CodexProvider(model).build_request(messages)
+        assert body["input"][0]["content"][1]["type"] == "input_image"
+        assert body["input"][0]["content"][1]["image_url"] == attachment().data_url()
+
+
+@pytest.mark.asyncio
+async def test_sol_image_reaches_codex_endpoint(monkeypatch):
+    import httpx
+
+    from py_agent import codex
+    monkeypatch.setattr(codex, "read_codex_credentials", lambda _: SimpleNamespace(
+        access="synthetic-token", account_id="test-account", expires=9999999999999))
+    captured = []
+    def handle(request):
+        captured.append(json.loads(request.content))
+        event = {"type": "response.completed", "response": {
+            "id": "mock", "status": "completed",
+            "output": [{"type": "message", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "say('image received', final=True)"}]}]}}
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              content=("data: " + json.dumps(event) + "\n\n").encode())
+    provider = CodexProvider("openai-codex/gpt-6.1-sol", transport=httpx.MockTransport(handle))
+    response = await provider.generate([
+        {"role": "user", "content": content_with_images("Read the image", [attachment()])}])
+    assert response.successful
+    assert captured[0]["model"] == "gpt-6.1-sol"
+    assert captured[0]["input"][0]["content"][1]["image_url"] == attachment().data_url()

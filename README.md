@@ -408,8 +408,8 @@ PNG/JPEG: 1536-pixel edges, 512000 bytes/image, four images/cell, 16 active cont
 images totaling at most 2 MB. Source decoding is capped at 8 MB/16 million pixels; animation uses its
 first frame. SVG/PDF aren't vision inputs. Invalid images are reported.
 
-Unsupported/unrecognized model families fail explicitly rather than silently
-dropping images. Provider capability may still vary. Images are preserved in
+Known text-only models fail explicitly rather than silently dropping images.
+Unfamiliar models receive images intact; the provider decides capability. Images are preserved in
 private model-request journal records and context archives; this is audit history,
 not executable session replay. Collapsed images must be redisplayed for inspection.
 Displaying an image sends its pixels to the configured provider: avoid secrets.

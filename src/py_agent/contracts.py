@@ -184,7 +184,13 @@ class ExecutionRequest:
         default=None, repr=False, compare=False,
     )
 
+    llm_handler: Callable[[Mapping[str, object]], Awaitable[str]] | None = field(
+        default=None, repr=False, compare=False,
+    )
+
     def __post_init__(self):
+        if self.llm_handler is not None and not callable(self.llm_handler):
+            raise TypeError("llm_handler must be callable or None")
         if type(self.allow_stdin) is not bool:
             raise TypeError("ExecutionRequest allow_stdin must be a boolean")
         if self.input_handler is not None and not callable(self.input_handler):

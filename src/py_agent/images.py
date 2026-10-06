@@ -162,18 +162,25 @@ def observation_images(outputs):
 
 
 def require_vision(model, messages):
-    """Fail explicitly for known text-only or unrecognized model families."""
+    """Reject known text-only models; unknown models defer to the provider.
+
+    A model-name allowlist cannot establish capability and becomes stale.
+    Attachments must always be forwarded intact or rejected, never dropped.
+    """
     if not any(isinstance(m.get("content"), list) for m in messages):
         return
     name = model.lower().rsplit("/", 1)[-1]
-    supported = (name.startswith(("gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-5", "o1", "o3", "o4",
-                                  "claude-3", "claude-sonnet-4", "claude-opus-4", "claude-haiku-4",
-                                  "gemini-"))
-                 or any(marker in name for marker in ("vision", "-vl", "/vl", "pixtral")))
-    if not supported:
+    known_text_only = (
+        name in {"deepseek-chat", "deepseek-reasoner", "gpt-4", "gpt-4-0314",
+                 "gpt-4-0613", "gpt-4-32k", "gpt-4-32k-0314", "gpt-4-32k-0613",
+                 "o1-mini", "o1-preview"}
+        or name.startswith(("gpt-3.5-", "claude-1", "claude-2"))
+    )
+    if known_text_only:
         from .provider import ProviderError
-        raise ProviderError("Image input is unavailable for this model. Select a vision-capable "
-                            "model with /model; image attachments were not silently discarded.",
+        raise ProviderError("Image input is unavailable for this known text-only model. "
+                            "Select a vision-capable model with /model; "
+                            "image attachments were not silently discarded.",
                             kind="configuration")
 
 
