@@ -137,3 +137,36 @@ def test_litelm_configured_effort(monkeypatch):
     coordinator = cli._build_coordinator("litelm", model="deepseek/deepseek-flash", config_store=store)
     assert coordinator._model_options(store.snapshot)["effort"] == "high"
     assert "Effort: high" in dispatch(coordinator, "effort")
+
+
+def test_toolbar_shows_effective_effort_and_updates_with_session_changes():
+    from py_agent.plain_terminal import PlainTerminal
+    from prompt_toolkit.output import DummyOutput
+
+    coordinator = cli._build_coordinator("litelm", model="deepseek/deepseek-chat")
+    terminal = PlainTerminal(coordinator, output=DummyOutput())
+    assert coordinator.effective_effort == "default"
+    assert "deepseek/deepseek-chat | effort: default" in str(terminal._toolbar())
+    coordinator.config_store.set({"model.effort": "low"})
+    assert "effort: low" in str(terminal._toolbar())
+    asyncio.run(coordinator._dispatch_command("think high", coordinator.config_store.snapshot))
+    assert "effort: high" in str(terminal._toolbar())
+    coordinator.config_store.set({"model.effort": "medium"})
+    assert "effort: high" in str(terminal._toolbar())  # Session override wins.
+    asyncio.run(coordinator._dispatch_command("effort none", coordinator.config_store.snapshot))
+    assert "effort: none" in str(terminal._toolbar())
+
+
+def test_codex_toolbar_effort_uses_configured_default():
+    coordinator = cli._build_coordinator("codex", model="openai-codex/gpt-5.4")
+    assert coordinator.effective_effort == coordinator.config_store.snapshot.entries["model.effort"].value
+
+
+def test_toolbar_effort_is_unavailable_for_non_reasoning_provider():
+    from py_agent.builtin_services import BuiltinPlugin
+    from py_agent.coordinator import Coordinator
+    from py_agent.plugins import PluginRuntime
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(runtime, router="default", provider="fake", interpreter="basic", executor="local")
+    assert coordinator.effective_effort == "unavailable"

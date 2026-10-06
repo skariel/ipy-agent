@@ -1604,6 +1604,19 @@ class Coordinator:
             return None
         return entry.value if entry is not None and isinstance(entry.value, str) else None
 
+    @property
+    def effective_effort(self) -> str:
+        """Current session effort, using the same precedence as model requests."""
+        if self.provider_id not in {"codex", "litelm"}:
+            return "unavailable"
+        snapshot = self.config_store.snapshot if self.config_store is not None else None
+        effort = self._effort_override or self._configured_effort(snapshot)
+        if effort is not None:
+            return effort
+        adapter = getattr(self.provider, "adapter", None)
+        fallback = getattr(adapter, "effort", None) if self.provider_id == "codex" else None
+        return fallback if isinstance(fallback, str) and fallback else "default"
+
     def _effort_command(self, arguments: str, config: ConfigSnapshot | None) -> str:
         if not isinstance(arguments, str) or len(arguments) > 32:
             return _EFFORT_USAGE

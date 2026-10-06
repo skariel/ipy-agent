@@ -128,7 +128,8 @@ Press **Tab** to fuzzy-complete slash commands and relevant arguments, including
 models, providers, reasoning levels, configuration fields, and loaded plugin IDs.
 In the composer, Enter accepts an open completion; the next Enter submits.
 `/model`, `/effort`, and `/think` open searchable selection menus without arguments.
-Explicit arguments still work; `/think` is an alias for `/effort`.
+Explicit arguments still work; `/think` is an alias for `/effort`. The bottom toolbar shows the
+current effort beside the model and updates after session/configuration changes.
 
 Outside slash commands, **Tab fuzzy-matches the current token against workspace
 file/directory paths** in English, Python, or shell input. No new prefix is needed;

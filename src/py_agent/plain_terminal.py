@@ -305,9 +305,10 @@ class PlainTerminal(TerminalMenus):
             if type(tokens) is int and tokens >= 0 and type(window) is int and window > 0 else "?"
         )
         model = sanitize(getattr(self.coordinator, "model", "?"))
+        effort = sanitize(getattr(self.coordinator, "effective_effort", "default"))
         cache = getattr(self.coordinator, "cache_summary", ("?", "?", "?"))
         rate, read, write = cache if isinstance(cache, tuple) and len(cache) == 3 else ("?", "?", "?")
-        text = f"{activity} | {model} | {percentage}%/{capacity} | CH {rate}% r{read} w{write}"
+        text = f"{activity} | {model} | effort: {effort} | {percentage}%/{capacity} | CH {rate}% r{read} w{write}"
         return FormattedText([("", text.replace("\n", " ").replace("\t", " "))])
 
     def _panel_width(self) -> int:
