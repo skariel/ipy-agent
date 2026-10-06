@@ -944,3 +944,27 @@ async def test_python_getpass_uses_same_prompt_and_slash_text_is_not_steering(mo
     assert prompt_modes[0] is False
     assert True in prompt_modes
     assert maximum_active_prompts == 1
+
+
+@pytest.mark.parametrize("no_color", [False, True])
+def test_say_wraps_at_word_boundaries(no_color):
+    output = Output()
+    output.get_size = lambda: Size(rows=24, columns=12)
+    terminal = PlainTerminal(CoordinatorStub(), output=output, no_color=no_color)
+    terminal._render_say("hello **wonderful** world")
+    lines = [line.rstrip() for line in sanitize(output.text).splitlines() if line.strip()]
+    assert lines == ["hello", "wonderful", "world"]
+
+
+def test_word_wrap_preserves_styles_and_display_width():
+    from prompt_toolkit.formatted_text import FormattedText
+    from py_agent.terminal_markdown import wrap_fragments
+
+    wrapped = wrap_fragments(FormattedText([
+        ("", "hi won"), ("class:md-bold", "derful 世界"),
+    ]), 9)
+    assert "".join(text for _, text in wrapped) == "hi\nwonderful\n世界"
+    assert ("class:md-bold", "d") in wrapped
+    assert "".join(text for _, text in wrap_fragments(
+        FormattedText([("", "abcdefghijk\n\nx")]), 5,
+    )) == "abcde\nfghij\nk\n\nx"

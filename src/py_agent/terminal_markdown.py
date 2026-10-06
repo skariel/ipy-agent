@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 
 from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.formatted_text.utils import split_lines
+from prompt_toolkit.utils import get_cwidth
 
 
 def _inline(text: str, default_style: str = "") -> list[tuple[str, str]]:
@@ -123,3 +125,46 @@ def markdown_fragments(safe: str) -> FormattedText:
             fragments.extend(_inline(line))
         line_number += 1
     return FormattedText(fragments)
+
+
+def wrap_fragments(content: FormattedText, width: int) -> FormattedText:
+    """Wrap styled text at whitespace, splitting only words wider than the panel."""
+    width = max(1, width)
+    result: list[tuple[str, str]] = []
+    for index, fragments in enumerate(split_lines(content)):
+        if index:
+            result.append(("", "\n"))
+        # Tokenize across style boundaries so emphasis cannot split a word.
+        chars = [(style, char) for style, text, *_ in fragments for char in text]
+        tokens: list[list[tuple[str, str]]] = []
+        for item in chars:
+            if not tokens or item[1].isspace() != tokens[-1][-1][1].isspace():
+                tokens.append([])
+            tokens[-1].append(item)
+        column = 0
+        pending: list[tuple[str, str]] = []
+        for token in tokens:
+            if token[0][1].isspace():
+                pending.extend(token)
+                continue
+            token_width = sum(get_cwidth(char) for _, char in token)
+            space_width = sum(get_cwidth(char) for _, char in pending)
+            if column and column + space_width + token_width > width:
+                result.append(("", "\n"))
+                column = 0
+                pending = []
+            for style, char in pending + token:
+                char_width = get_cwidth(char)
+                if column and column + char_width > width:
+                    result.append(("", "\n"))
+                    column = 0
+                result.append((style, char))
+                column += char_width
+            pending = []
+        # Retain trailing whitespace when it fits without adding an empty row.
+        for style, char in pending:
+            char_width = get_cwidth(char)
+            if column + char_width <= width:
+                result.append((style, char))
+                column += char_width
+    return FormattedText(result)

@@ -34,7 +34,7 @@ from .contracts import (
     OutputEvent, ProgressCallback,
 )
 from .coordinator import Coordinator, State, Submission
-from .terminal_markdown import markdown_fragments
+from .terminal_markdown import markdown_fragments, wrap_fragments
 
 _STRING_ESCAPE = re.compile(r"(?:\x1b[\]PX^_]|[\x90\x98\x9d\x9e\x9f]).*?(?:\x07|\x1b\\|\x9c|$)", re.DOTALL)
 _CSI = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]")
@@ -397,7 +397,7 @@ class PlainTerminal(TerminalMenus):
     def _render_say(self, text: str) -> None:
         self._finish_stream()
         self._panel_blank("say")
-        self._panel(markdown_fragments(sanitize(text)), "say")
+        self._panel(wrap_fragments(markdown_fragments(sanitize(text)), self._panel_width()), "say")
         self._panel_blank("say")
         self._write("")
 
