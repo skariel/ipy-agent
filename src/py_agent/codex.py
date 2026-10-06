@@ -1,7 +1,7 @@
 """Python-native, no-tools adapter for ChatGPT's Codex subscription endpoint.
 
 This is intentionally separate from litelm's API-key adapters. Credentials are
-read from pi on every request, never refreshed or written here. The backend does
+resolved on every request; native py tokens refresh, explicit Pi files remain read-only. The backend does
 not accept max_output_tokens. Completed responses are not rejected for exceeding
 an artificial local token budget. Complete-response validation remains; partial
 stream text is never returned for execution.
@@ -285,7 +285,7 @@ class CodexProvider:
             raise ValueError("Unsupported Codex reasoning effort")
         self.model = model
         self.effort = effort
-        self.auth_file = Path(auth_file) if auth_file is not None else Path.home() / ".pi/agent/auth.json"
+        self.auth_file = Path(auth_file) if auth_file is not None else None
         # A provider instance belongs to one py run. This opaque random value is
         # independent of prompts, paths, and credentials and survives every turn.
         self.session_id = session_id or uuid.uuid4().hex
@@ -344,13 +344,13 @@ class CodexProvider:
             "headers": {"session-id": self.session_id, "x-client-request-id": self.session_id},
             "ignored_max_tokens": max_tokens,
             "output_limit_enforcement": "none",
-            "auth": "pi_oauth_read_only",
+            "auth": "explicit_read_only" if self.auth_file is not None else "py_oauth_with_pi_fallback",
             "remote_output_token_cap": False,
         }
 
     async def generate(self, messages: list[dict], *, max_tokens: int | None = None) -> Completion:
         body = self.build_request(messages, max_tokens=max_tokens)
-        credentials = read_codex_credentials(self.auth_file)
+        credentials = await asyncio.to_thread(read_codex_credentials, self.auth_file)
         headers = {
             "Authorization": f"Bearer {credentials.access}",
             "chatgpt-account-id": credentials.account_id,
@@ -374,7 +374,7 @@ class CodexProvider:
                         status = response.status_code
                         if status in {401, 403}:
                             raise ProviderError(
-                                f"Codex authentication rejected (HTTP {status}); refresh your login in pi with /login openai-codex",
+                                f"Codex authentication rejected (HTTP {status}); retry py login openai-codex (Pi files: pi /login openai-codex)",
                                 kind="authentication",
                             )
                         kind = (

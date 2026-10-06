@@ -51,13 +51,37 @@ uv run --locked py --model openai/YOUR_MODEL
 uv run --locked py --model openai-codex/YOUR_MODEL
 ```
 
-The litelm adapter reads matching static API-key entries from Pi's private
-`~/.pi/agent/auth.json` on each request (or from `--pi-auth PATH`) and passes only
-the selected model provider's key to litelm. If no matching entry exists, litelm's
-normal provider environment remains available. Command-backed `!…` keys and OAuth
-entries are not executed by this adapter. Codex uses Pi subscription credentials
-(login/refresh remain Pi's responsibility). A provider request is made only after submitting an
-English request. The `py` CLI itself requires an explicit model (or a plugin/fake provider);
+Manage credentials directly in py; no Pi installation is needed:
+
+```sh
+uv run --locked py login deepseek              # hidden API-key prompt
+uv run --locked py login openrouter            # browser sign-in (PKCE)
+uv run --locked py login openrouter --api-key  # API-key alternative
+uv run --locked py login openrouter --manual   # paste redirect URL on remote machines
+uv run --locked py login openai-codex          # subscription device-code sign-in
+uv run --locked py auth status                 # no secrets printed
+uv run --locked py logout deepseek
+```
+
+`py login PROVIDER` prompts for an API key for any other API-key provider.
+API-key entry requires a terminal; automation can use provider environment variables.
+Codex device login must be enabled for your account by the provider.
+
+Credentials live in `~/.py/auth.json` (0700 directory, 0600 files), with atomic
+writes and locking. Codex tokens refresh automatically on use. This is private
+plaintext storage, not an encrypted OS keychain. Never commit or share it.
+
+Default reads prefer matching native py credentials, then read Pi's
+`~/.pi/agent/auth.json` as a compatibility fallback. Pi files are never changed
+or refreshed; expired Pi credentials require Pi login/refresh or a native py login.
+`--auth PATH` (alias `--pi-auth PATH`) selects an explicit read-only file instead.
+The litelm adapter passes only the selected provider's static API key; absent
+keys leave its normal provider environment available. Command-backed `!…` keys
+are never executed. `py logout` removes only py's entry: Pi/environment fallback
+may still authenticate afterward. Other subscription OAuth providers are not yet
+ported; use their API-key integrations where available.
+
+A provider request is made only after submitting an English request. The `py` CLI itself requires an explicit model (or a plugin/fake provider);
 only `run.sh` supplies the Codex GPT-6.1-Sol launcher default.
 Recognized transient provider failures (rate limits, transport/timeouts, and
 server 5xx errors) receive up to two retries before any Python cell executes;
@@ -89,9 +113,9 @@ API-key and Codex transports within a session, preserving the auth-file path and
 session effort override. Endpoint/stream/token-cap settings must be cleared before
 switching transports. The bundled catalog is a snapshot, not live discovery.
 
-Authentication remains owned by pi: use pi's `/login` and `/logout` (and token
-refresh), or set provider API-key environment variables. py reads pi's auth file
-on each request; it does not yet implement its own OAuth login/refresh.
+Use `py login`, `py logout`, and `py auth status` outside the interactive agent
+to manage authentication (see above). Provider API-key environment variables
+and read-only Pi compatibility remain available.
 
 `/model [MODEL_ID]` and `/effort [PRESET]` apply immediate, session-local overrides;
 they do not change the selected provider or persist configuration. Effort presets are

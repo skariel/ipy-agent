@@ -208,14 +208,21 @@ def _ssl_failure_kind(exc: BaseException) -> str | None:
         if isinstance(error, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in reasons:
             return "configuration"
         if isinstance(error, ssl.SSLError) or reasons:
-            transient = (
-                isinstance(error, (ssl.SSLEOFError, ssl.SSLZeroReturnError))
-                or getattr(error, "errno", None) in {ssl.SSL_ERROR_EOF, ssl.SSL_ERROR_ZERO_RETURN}
-                or bool(reasons & {
-                    "UNEXPECTED_EOF_WHILE_READING", "DECRYPTION_FAILED_OR_BAD_RECORD_MAC",
-                })
-            )
-            kinds.add("transport" if transient else "configuration")
+            # Generic SSLError can mean a dropped connection, including during
+            # stream reads. Retry within the coordinator's bounded budget,
+            # unless OpenSSL identifies a trust/protocol configuration failure.
+            # Verification stays enabled on every attempt.
+            configuration = {
+                "WRONG_VERSION_NUMBER", "UNSUPPORTED_PROTOCOL",
+                "VERSION_TOO_LOW", "VERSION_TOO_HIGH", "NO_PROTOCOLS_AVAILABLE",
+                "NO_CIPHERS_AVAILABLE", "NO_SHARED_CIPHER", "DH_KEY_TOO_SMALL",
+                "EE_KEY_TOO_SMALL", "CA_KEY_TOO_SMALL", "CA_MD_TOO_WEAK",
+                "TLSV1_ALERT_PROTOCOL_VERSION", "TLSV1_ALERT_INSUFFICIENT_SECURITY",
+                "SSLV3_ALERT_HANDSHAKE_FAILURE", "TLSV1_ALERT_UNKNOWN_CA",
+                "SSLV3_ALERT_BAD_CERTIFICATE", "SSLV3_ALERT_CERTIFICATE_EXPIRED",
+                "TLSV1_ALERT_ACCESS_DENIED", "PEM_LIB", "KEY_VALUES_MISMATCH",
+            }
+            kinds.add("configuration" if reasons & configuration else "transport")
         for linked in (error.__cause__, error.__context__):
             if isinstance(linked, BaseException):
                 pending.append(linked)

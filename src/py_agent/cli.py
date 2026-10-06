@@ -100,8 +100,8 @@ def default_parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--effort", choices=CODEX_EFFORTS, help="Reasoning effort preset")
     result.add_argument(
-        "--pi-auth", type=Path,
-        help="Pi auth.json path for built-in Codex and API-key providers",
+        "--auth", "--pi-auth", dest="pi_auth", type=Path,
+        help="Explicit read-only auth.json (default: native py credentials, then Pi)",
     )
     result.add_argument("--config", type=Path, help="Typed JSON configuration file")
     result.add_argument("--max-tokens", type=int, help="Optional provider response token limit")
@@ -717,7 +717,7 @@ def _coordinator_options(result: argparse.ArgumentParser) -> None:
     result.add_argument("--api-base", default=None)
     result.add_argument("--stream", action=argparse.BooleanOptionalAction, default=None)
     result.add_argument("--effort", choices=CODEX_EFFORTS, default=None)
-    result.add_argument("--pi-auth", type=Path, default=None)
+    result.add_argument("--auth", "--pi-auth", dest="pi_auth", type=Path, default=None)
     result.add_argument("--config", type=Path, default=None)
     result.add_argument("--max-tokens", type=int, default=None)
     result.add_argument("--max-agent-steps", type=int, default=None)
@@ -859,6 +859,9 @@ def _management_main(arguments: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] in {"login", "logout", "auth"}:
+        from .auth_cli import main as auth_main
+        return auth_main(arguments)
     if arguments and arguments[0] in {"kernel", "kernels", "attach"}:
         try:
             return _management_main(arguments)

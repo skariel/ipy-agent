@@ -10,10 +10,9 @@ if [[ ! -x "$PY_AGENT_BIN" ]]; then
     exit 1
 fi
 
-# Kernel management has its own parser and requires an explicit provider or
-# selected configuration when starting; do not prepend terminal options.
+# Management commands have their own parsers; do not prepend terminal options.
 case "${1:-}" in
-    kernel|kernels|attach) exec "$PY_AGENT_BIN" "$@" ;;
+    kernel|kernels|attach|login|logout|auth) exec "$PY_AGENT_BIN" "$@" ;;
 esac
 
 arguments=()

@@ -1,8 +1,6 @@
-"""Read-only Pi credentials; never execute key commands or rotate tokens.
+"""Credential validation. Explicit Pi files remain strictly read-only.
 
-Pi remains the owner of login and refresh. Credentials are re-read for each
-request so atomic updates are picked up without restarting py. No secrets appear
-in reprs or errors.
+Default reads prefer native py credentials. No key commands are executed.
 """
 
 from __future__ import annotations
@@ -75,7 +73,7 @@ def _read_auth_document(path: Path, *, error, missing: str | None = None) -> dic
         current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
         if len(data) > MAX_AUTH_BYTES or identity(before) != identity(after) or identity(after) != identity(current):
-            raise error("auth.json changed during reading; retry after pi finishes updating it")
+            raise error("auth.json changed during reading; retry after credential updates finish")
         document = json.loads(
             data.decode("utf-8"),
             object_pairs_hook=_unique_object,
@@ -100,23 +98,26 @@ def _read_auth_document(path: Path, *, error, missing: str | None = None) -> dic
 
 
 def read_codex_credentials(path: Path | None = None) -> CodexCredentials:
-    """Read and validate Pi's Codex OAuth entry without refreshing it."""
+    """Validate an explicit read-only file, or resolve native/default auth."""
+    if path is None:
+        from .native_auth import codex_credentials
+        return codex_credentials()
     document = _read_auth_document(
         Path(path) if path is not None else DEFAULT_AUTH_FILE,
         error=_error,
-        missing="auth.json not found; log in with pi's /login openai-codex",
+        missing="auth.json not found; use py login openai-codex (or pi /login openai-codex for a Pi file)",
     )
     assert document is not None
     entry = document.get("openai-codex")
     if not isinstance(entry, dict) or entry.get("type") != "oauth":
-        raise _error("no openai-codex OAuth login; use pi's /login openai-codex")
+        raise _error("no openai-codex OAuth login; use py login openai-codex")
     access, account_id, expires = entry.get("access"), entry.get("accountId"), entry.get("expires")
     if not isinstance(access, str) or not 1 <= len(access) <= 32768 or any(ord(c) < 33 or ord(c) > 126 for c in access):
-        raise _error("invalid access token; log in again through pi")
+        raise _error("invalid access token; log in again (py login openai-codex, or Pi for a Pi file)")
     if not isinstance(account_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", account_id):
-        raise _error("missing or invalid accountId; log in again through pi")
+        raise _error("missing or invalid accountId; log in again (py login openai-codex, or Pi for a Pi file)")
     if type(expires) not in (int, float) or not math.isfinite(expires):
-        raise _error("missing or invalid token expiry; log in again through pi")
+        raise _error("missing or invalid token expiry; log in again (py login openai-codex, or Pi for a Pi file)")
     if expires <= time.time() * 1000 + 30_000:
         raise _error(
             "pi's token is expired or about to expire. Refresh/login in pi (/login openai-codex), then retry. py reads but never rewrites pi's shared credentials"
@@ -140,13 +141,16 @@ def read_provider_api_key(
         or provider != provider.strip()
         or any(ord(character) < 33 or ord(character) > 126 for character in provider)
     ):
-        raise ProviderError("Pi authentication: invalid provider identifier", kind="authentication")
+        raise ProviderError("Provider authentication: invalid provider identifier", kind="authentication")
 
     def api_error(message: str) -> ProviderError:
-        return ProviderError(f"Pi authentication for {provider}: {message}", kind="authentication")
+        return ProviderError(f"Provider authentication for {provider}: {message}", kind="authentication")
 
+    if path is None:
+        from .native_auth import select_path
+        path = select_path(provider)
     document = _read_auth_document(
-        Path(path) if path is not None else DEFAULT_AUTH_FILE,
+        Path(path),
         error=api_error,
     )
     if document is None or provider not in document:

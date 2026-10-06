@@ -497,3 +497,25 @@ def test_fake_text_and_unsuccessful_completion():
 def test_explicit_text_context_only(messages, tokens):
     with pytest.raises(ValueError):
         asyncio.run(FakeProvider(["x=1"]).generate(messages, max_tokens=tokens))
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_generic_ssl_failure_is_retryable_but_trust_errors_take_precedence(wrapped):
+    failure = ssl.SSLError(ssl.SSL_ERROR_SSL, "private connection detail")
+    error = failure
+    if wrapped:
+        error = RuntimeError("private URL")
+        error.__cause__ = failure
+    assert _ssl_failure_kind(error) == "transport"
+    failure.__context__ = ssl.SSLCertVerificationError(ssl.SSL_ERROR_SSL, "private certificate")
+    assert _ssl_failure_kind(error) == "configuration"
+
+
+@pytest.mark.parametrize("reason", [
+    "WRONG_VERSION_NUMBER", "NO_SHARED_CIPHER", "UNSUPPORTED_PROTOCOL",
+    "TLSV1_ALERT_PROTOCOL_VERSION", "TLSV1_ALERT_UNKNOWN_CA",
+])
+def test_known_tls_configuration_errors_remain_nonretryable(reason):
+    error = ssl.SSLError(ssl.SSL_ERROR_SSL, "private detail")
+    error.reason = reason
+    assert _ssl_failure_kind(error) == "configuration"

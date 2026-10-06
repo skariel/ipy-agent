@@ -1,7 +1,10 @@
-# pi-ai model identifiers
+# pi-ai model identifiers and authentication flows
 
 `src/py_agent/model_catalog.py` includes identifiers from the generated catalog
 of @earendil-works/pi-ai, licensed under MIT.
+
+`src/py_agent/oauth.py` adapts the OpenRouter PKCE and OpenAI Codex device
+login/token-refresh protocols from that package's `auth/oauth` modules.
 
 Copyright (c) 2025 Mario Zechner
 

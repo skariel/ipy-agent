@@ -1955,3 +1955,81 @@ async def test_coordinator_components_preserve_public_lifecycle_and_dispatch():
         await coordinator.close()
     assert coordinator._lifecycle.state is State.CLOSED
     assert executor.closed == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["connect", "stream"])
+@pytest.mark.parametrize("certificate", [False, True])
+async def test_codex_tls_retry_is_automatic_and_never_executes_failed_stream(
+    monkeypatch, stage, certificate,
+):
+    import ssl
+    from types import SimpleNamespace
+
+    import httpx
+
+    from py_agent import codex
+    from py_agent.production_services import ProductionProviderAdapter
+
+    monkeypatch.setattr(codex, "read_codex_credentials", lambda _: SimpleNamespace(
+        access="test-secret", account_id="test-account", expires=9999999999999,
+    ))
+    calls = []
+
+    class Stream(httpx.AsyncByteStream):
+        def __init__(self, fail):
+            self.fail = fail
+
+        async def __aiter__(self):
+            # Even complete-looking source must not execute from a failed stream.
+            event = {"type": "response.completed", "response": {
+                "id": "mock", "status": "completed",
+                "output": [{"type": "message", "role": "assistant", "status": "completed",
+                            "content": [{"type": "output_text", "text": "say('done', final=True)"}]}],
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            }}
+            yield ("data: " + json.dumps(event) + "\n\n").encode()
+            if self.fail:
+                error_type = ssl.SSLCertVerificationError if certificate else ssl.SSLError
+                raise error_type(ssl.SSL_ERROR_SSL, "private TLS detail test-secret")
+
+        async def aclose(self):
+            pass
+
+    def handle(request):
+        calls.append(request)
+        fail = len(calls) == 1
+        if fail and stage == "connect":
+            error_type = ssl.SSLCertVerificationError if certificate else ssl.SSLError
+            raise error_type(ssl.SSL_ERROR_SSL, "private TLS detail test-secret")
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              stream=Stream(fail))
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(runtime, router="default", provider="fake",
+                              interpreter="basic", executor="local")
+    adapter = codex.CodexProvider("openai-codex/gpt-test", transport=httpx.MockTransport(handle))
+    coordinator.provider = ProductionProviderAdapter(adapter, provider_id="codex")
+    executor = CaptureExecutor()
+    coordinator.executor = executor
+    await coordinator.start()
+    try:
+        if certificate:
+            with pytest.raises(ProviderError) as caught:
+                await coordinator.submit("terminal", "finish")
+            assert caught.value.kind == "configuration"
+            assert len(calls) == 1
+            assert not executor.requests
+            assert "test-secret" not in str(caught.value)
+            assert "private TLS detail" not in str(caught.value)
+        else:
+            submission = await coordinator.submit("terminal", "finish")
+            retries = [event for event in submission.events if event.data.get("phase") == "provider_retry"]
+            assert len(calls) == 2
+            assert len(executor.requests) == 1
+            assert submission.result.final
+            assert len(retries) == 1
+            assert "test-secret" not in str(submission.events)
+            assert "private TLS detail" not in str(submission.events)
+    finally:
+        await coordinator.close()

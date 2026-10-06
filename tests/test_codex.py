@@ -480,7 +480,7 @@ async def test_credentials_reread_each_generation(auth):
     provider = codex.CodexProvider("openai-codex/model", transport=httpx.MockTransport(handle))
     for _ in range(2):
         assert (await provider.generate(MESSAGES, max_tokens=30)).successful
-    assert auth == [Path.home() / ".pi/agent/auth.json"] * 2
+    assert auth == [None] * 2  # Resolve native auth, then read-only Pi fallback.
 
 
 @pytest.mark.parametrize("kind", ["response.completed", "response.done"])
@@ -739,7 +739,9 @@ async def test_transport_failure_is_sanitized_and_stream_closed(auth):
         (ssl.SSLCertVerificationError, ssl.SSL_ERROR_SSL, "untrusted certificate", "configuration"),
         (ssl.SSLError, ssl.SSL_ERROR_SSL, "[SSL: CERTIFICATE_VERIFY_FAILED]", "configuration"),
         (ssl.SSLError, ssl.SSL_ERROR_SSL, "[SSL: WRONG_VERSION_NUMBER]", "configuration"),
-        (ssl.SSLError, ssl.SSL_ERROR_SSL, "unknown TLS error", "configuration"),
+        (ssl.SSLError, ssl.SSL_ERROR_SSL, "unknown TLS error", "transport"),
+        (ssl.SSLError, ssl.SSL_ERROR_SYSCALL, "connection reset", "transport"),
+        (ssl.SSLError, ssl.SSL_ERROR_SSL, "[SSL: NO_SHARED_CIPHER]", "configuration"),
         (ValueError, 0, "local bug", "internal"),
     ],
 )
