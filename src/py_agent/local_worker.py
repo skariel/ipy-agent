@@ -1392,6 +1392,10 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
         read_output_chars += len(excerpt)
 
     shell.user_ns["read_output"] = read_output
+    from .stdlib import install_helpers, runtime_helpers
+    install_helpers(shell.user_ns, runtime_helpers(
+        say=say, preview=cell_printer, read_output=read_output, llm=llm,
+    ))
 
     def publish(data: Any, metadata: Any = None, source: Any = None, *,
                 transient: Any = None, update: bool = False) -> Any:

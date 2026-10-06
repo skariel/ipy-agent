@@ -174,6 +174,10 @@ class Coordinator:
         self._effort_override: str | None = None
         self.session_id = uuid4().hex
         self.config_revision = config_revision
+        self.activity = None
+        self.recovery = None
+        self.execution_outcome = "No execution yet."
+
         self.journal = NoPersistenceJournal() if journal is None else journal
         self._require_methods(
             self.journal, "start", "record_model_request", "record_provider_usage",
@@ -868,16 +872,43 @@ class Coordinator:
                     else self._validate_routed_action(self.router.route(UserAction(origin, text)), origin)
                 )
 
+                resume_checkpoint = None
+                if routed.kind == "command" and routed.source.strip() == "resume":
+                    resume_checkpoint = self.recovery
+                    if resume_checkpoint is None:
+                        submission = await run_command(routed, config)
+                        self._set_state_unless_stopping(State.IDLE)
+                        return submission
+                    if resume_checkpoint.model != self.model:
+                        raise RuntimeError(
+                            "Pending recovery belongs to a different model. Switch back or use /recovery discard."
+                        )
+                    routed = self._validate_routed_action(
+                        self.router.route(UserAction(origin, resume_checkpoint.source)), origin,
+                    )
+                    self.recovery = None
+                elif routed.kind == "ask":
+                    self.recovery = None  # A new task supersedes a pending request.
+
                 if routed.kind == "command":
                     submission = await run_command(routed, config)
                     self._set_state_unless_stopping(State.IDLE)
                     return submission
 
                 if routed.kind == "ask":
-                    context_pending = callable(getattr(self.context_service, "prepare_request", None))
-                    initial_context = self._prepare_context(routed.source, origin.request_id)
+                    context_pending = (
+                        callable(getattr(self.context_service, "prepare_request", None))
+                        and not (resume_checkpoint is not None and resume_checkpoint.committed)
+                    )
+                    if resume_checkpoint is not None:
+                        if not resume_checkpoint.committed:
+                            self._prepare_context(routed.source, origin.request_id)
+                        initial_context = resume_checkpoint.context
+                        context_committed = resume_checkpoint.committed
+                    else:
+                        initial_context = self._prepare_context(routed.source, origin.request_id)
+                        context_committed = False
                     self._observe_context_epoch(initial_context.epoch)
-                    context_committed = False
                     visible_messages: list[str] = []
                     visible_outputs: list[SayOutput] = []
                     published_events: list[OutputEvent] = []
@@ -963,6 +994,8 @@ class Coordinator:
                         if callable(prepare_generation):
                             prepare_generation()
                             snapshot = self._latest_context()
+                        if resume_checkpoint is not None and step == 1:
+                            snapshot = resume_checkpoint.context
                         forced_collapse = getattr(self.context_service, "force_collapse", False) is True
                         if steering_awaiting_dispatch:
                             render_user = getattr(self.context_service, "render_user", None)
@@ -980,15 +1013,19 @@ class Coordinator:
                             )
                         cell_config = self._current_config()
                         epoch_config = self._conversation._epoch_config
-                        context = await self._run_context_transforms(
-                            snapshot, config, cell_config, epoch_config,
-                        )
+                        if resume_checkpoint is not None and step == 1:
+                            context = resume_checkpoint.context  # Never rerun transforms on saved request.
+                        else:
+                            context = await self._run_context_transforms(
+                                snapshot, config, cell_config, epoch_config,
+                            )
                         model_request = ModelRequest(
                             generation_origin, context, self.model, self._model_options(config),
                         )
-                        model_request = await self._run_model_transforms(
-                            model_request, config, cell_config, epoch_config,
-                        )
+                        if resume_checkpoint is None or step != 1:
+                            model_request = await self._run_model_transforms(
+                                model_request, config, cell_config, epoch_config,
+                            )
                         if not self._operation_is_current(operation_id, State.GENERATING):
                             raise asyncio.CancelledError
                         # This is the final post-transform request actually dispatched to
@@ -999,6 +1036,11 @@ class Coordinator:
                             steering_commit_started = True
                             self._append_steering_context(
                                 steering_item.action.source, steering_item.action.origin.request_id,
+                            )
+                        if resume_checkpoint is not None and step == 1:
+                            model_request = replace(
+                                model_request, context=resume_checkpoint.context,
+                                model=resume_checkpoint.model, options=dict(resume_checkpoint.options),
                             )
                         self._lifecycle._active_model_request = model_request
                         self._lifecycle._active_provider_usage_recorded = False
@@ -1016,7 +1058,10 @@ class Coordinator:
                         # responses, plugin validation or code execution. A retry
                         # sends the same already-journaled request; each failed
                         # attempt gets its own usage-unknown journal record.
-                        for attempt in range(5):
+                        from .runtime_status import Activity
+                        activity_started = asyncio.get_running_loop().time()
+                        for attempt in range(6):
+                            self.activity = Activity("Model request", attempt + 1, 5, activity_started)
                             generation = asyncio.create_task(
                                 self.provider.generate(model_request),
                                 name=f"py-agent-generation-{generation_id}-attempt-{attempt + 1}",
@@ -1049,6 +1094,12 @@ class Coordinator:
                                 # errors retain the existing three-attempt budget.
                                 max_attempts = 5 if kind == "transport" else 3
                                 delay = min(8.0, 2.0 ** attempt) if kind == "transport" else 0.5 * (attempt + 1)
+                                if kind == "transport" and attempt == 4:
+                                    # Longer final automatic recovery phase. Remains
+                                    # interruptible and sends only the pending request.
+                                    max_attempts, delay = 6, 15.0
+                                elif kind == "transport" and attempt >= 5:
+                                    max_attempts = 6
                                 if transient and attempt + 1 < max_attempts:
                                     self._journal_record(
                                         "record_provider_usage", model_request, None, outcome="retry_failed",
@@ -1074,6 +1125,12 @@ class Coordinator:
                                     continue
                                 self._record_provider_usage(model_request, None, outcome="failed")
                                 if kind == "transport":
+                                    from .runtime_status import Recovery
+                                    self.recovery = Recovery(
+                                        routed.source, model_request.context, context_committed,
+                                        len(executions) + (resume_checkpoint.executed_cells if resume_checkpoint else 0),
+                                        model_request.model, tuple(model_request.options.items()),
+                                    )
                                     from .provider import ProviderError
                                     raise ProviderError(
                                         f"{exc} (automatic retries exhausted after {max_attempts} attempts)",
@@ -1088,6 +1145,7 @@ class Coordinator:
                         if not isinstance(response, ModelResponse):
                             self._record_provider_usage(model_request, None, outcome="failed")
                             raise TypeError("Provider must return a ModelResponse")
+                        self.activity = None
                         self._record_provider_usage(model_request, response, outcome="returned")
                         if not self._operation_is_current(operation_id, State.GENERATING):
                             raise asyncio.CancelledError
@@ -1515,6 +1573,7 @@ class Coordinator:
                     self._set_state_unless_stopping(State.FAILED)
                 raise
             finally:
+                self.activity = None
                 if self._lifecycle._active_task is task:
                     self._lifecycle._active_task = None
                 if self._lifecycle._active_operation_id == operation_id:
@@ -1529,6 +1588,15 @@ class Coordinator:
         arguments = parts[1].strip() if len(parts) > 1 else ""
         core_commands = getattr(self.command_registry, "commands", {})
         try:
+            if name == "resume":
+                return "No recoverable model request is pending. Python cells are never replayed."
+            if name == "recovery":
+                if arguments == "discard":
+                    self.recovery = None
+                    return "Pending recovery discarded. Completed execution is unchanged."
+                if arguments:
+                    return "Usage: /recovery [discard]"
+                return self.recovery.text() if self.recovery else self.execution_outcome
             if name == "history":
                 self._capture_history_sensitive_config(self._current_config())
                 return self._history_command(arguments)

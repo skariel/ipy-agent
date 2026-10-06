@@ -74,12 +74,18 @@ class ExecutionLifecycle:
     def _record_uncertain_execution(self, request: ExecutionRequest, reason: str) -> None:
         if self._active_execution_request is request and self._active_execution_result_recorded:
             return
+        self.coordinator.execution_outcome = (
+            "Execution is uncertain; side effects may have occurred. Session paused. "
+            "Inspect external state before restart; never replay automatically."
+        )
+        self.coordinator.recovery = None
         self.coordinator._journal_record("record_uncertain_execution", request, reason)
         if self._active_execution_request is request:
             self._active_execution_result_recorded = True
 
     async def _execute_dispatched(self, request: ExecutionRequest) -> ExecutionResult:
         """Commit source before dispatch and result before publishing its output."""
+        self.coordinator.recovery = None
         self.coordinator._journal_record("record_execution_source", request)
         self._active_execution_request = request
         self._active_execution_result_recorded = False
@@ -100,6 +106,22 @@ class ExecutionLifecycle:
             self._execution_active = False
         try:
             self.coordinator._validate_execution_result(request, result)
+            if result.status == "uncertain":
+                self.coordinator.execution_outcome = (
+                    "Execution is uncertain; side effects may have occurred. Session paused. "
+                    "Inspect external state before restart; never replay automatically."
+                )
+                self.coordinator.recovery = None
+            elif result.status == "cancelled":
+                self.coordinator.execution_outcome = (
+                    "Execution cancelled; side effects may have occurred. No Python source is replayed."
+                )
+                self.coordinator.recovery = None
+            else:
+                self.coordinator.execution_outcome = (
+                    f"Last Python cell completed with status {result.status}; "
+                    "its side effects remain. Model recovery never replays it."
+                )
         except Exception as exc:
             self.coordinator._record_uncertain_execution(request, f"Executor returned an invalid result: {type(exc).__name__}")
             raise

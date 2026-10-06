@@ -129,7 +129,7 @@ class _PromptResult:
 
 RESERVED_COMMANDS = frozenset({
     "help", "status", "interrupt", "quit", "exit", "history", "context",
-    "model", "effort", "think", "login", "logout", "auth",
+    "model", "effort", "think", "login", "logout", "auth", "resume", "recovery",
 })
 
 
@@ -154,6 +154,8 @@ its next model call, in queue order. /interrupt and /quit remain immediate contr
 /login openrouter --manual  paste a remote redirect URL in the hidden prompt
 /logout [PROVIDER]      remove a native login (Pi/env fallback remains)
 /auth [status]          show credential status, never secrets
+/recovery [discard]     show or discard pending safe recovery
+/resume                retry pending model request; never replay Python
 Tab                    fuzzy-complete commands, arguments, or workspace paths
                        paths only; no file content is attached; @ remains Python
 Enabled plugins may add slash commands.
@@ -304,6 +306,12 @@ class PlainTerminal(TerminalMenus):
             str((tokens * 100 + window // 2) // window)
             if type(tokens) is int and tokens >= 0 and type(window) is int and window > 0 else "?"
         )
+        detail = getattr(self.coordinator, "activity", None)
+        recovery = getattr(self.coordinator, "recovery", None)
+        if detail is not None:
+            activity = sanitize(detail.text())
+        elif recovery is not None and phase == "IDLE":
+            activity = "Recovery paused · /resume (no cell replay)"
         model = sanitize(getattr(self.coordinator, "model", "?"))
         effort = sanitize(getattr(self.coordinator, "effective_effort", "default"))
         cache = getattr(self.coordinator, "cache_summary", ("?", "?", "?"))
@@ -925,6 +933,13 @@ class PlainTerminal(TerminalMenus):
                     self._write("Request was cancelled; it will not be replayed. The session is still usable.")
             except Exception as exc:
                 self._write(f"Request failed: {exc}")
+                recovery = getattr(self.coordinator, "recovery", None)
+                if recovery is not None:
+                    self._write(recovery.text())
+                else:
+                    outcome = getattr(self.coordinator, "execution_outcome", None)
+                    if outcome:
+                        self._write(outcome)
             else:
                 await self._show_submission(submission, delivered_events=tuple(delivered))
             finally:

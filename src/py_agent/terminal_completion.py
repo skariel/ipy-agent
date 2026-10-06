@@ -15,7 +15,8 @@ COMMANDS = {
     "think": "Alias for /effort", "status": "Session status",
     "interrupt": "Interrupt active work", "quit": "Quit", "exit": "Quit",
     "config": "Session configuration", "plugins": "Plugin information",
-    "context": "Save context", "history": "Inspect journal",
+    "resume": "Resume pending model request without replaying cells",
+    "recovery": "Show/discard recovery checkpoint", "context": "Save context", "history": "Inspect journal",
 }
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
 SKIP = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", "dist", "build"}
@@ -115,6 +116,8 @@ class TerminalCompleter(Completer):
                         candidates = ()
                 elif name in {"think", "effort"}:
                     candidates = EFFORTS
+                elif name == "recovery":
+                    candidates = ("discard",)
                 elif name == "auth":
                     candidates = ("status",)
                 elif name == "config":

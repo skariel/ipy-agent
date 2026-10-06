@@ -8,6 +8,8 @@ from __future__ import annotations
 from contextvars import ContextVar
 import io
 
+from .inspection import source, test_summary
+
 _ACTIVE_LLM = ContextVar("py_active_llm", default=None)
 MAX_PROMPT_CHARS = 65536
 MAX_RESULT_CHARS = 65536
@@ -77,3 +79,44 @@ def validate_payload(payload):
     images = [ImageAttachment.from_record(record) for record in records]
     return _payload(payload["prompt"], system=payload["system"], images=images,
                     max_tokens=payload["max_tokens"])
+
+
+# Documented capabilities must be registered in the actual worker namespace.
+HELPERS = {
+    "say": ("say(text, final=False)", "Communicate with the user; final=True finishes."),
+    "preview": ("preview(value, label=None)", "Bounded output inspection; retain originals in variables."),
+    "read_output": ("read_output(index, start=0, limit=4000)", "Read an archived output excerpt."),
+    "collapse": ("collapse(start_id, end_id, summary)", "Standalone context management; use literal boundary IDs."),
+    "llm": ("llm(prompt, *, system=DEFAULT_SYSTEM, images=(), max_tokens=2048) -> str",
+            "Host-backed call to the current model/effort using a fresh conversation; returns data, never executes."),
+    "source": ("source(path, start=1, end=None, *, limit=6000) -> str",
+               "Bounded numbered source excerpt; reads incrementally, never executes."),
+    "test_summary": ("test_summary(result, *, limit=4000) -> dict",
+                     "Summarize a retained text-mode subprocess result without rerunning tests."),
+}
+
+
+def install_helpers(namespace, implementations):
+    if set(implementations) != set(HELPERS) or not all(callable(fn) for fn in implementations.values()):
+        raise RuntimeError("Session helper registry does not match runtime implementations")
+    namespace.update(implementations)
+
+
+def helper_prompt():
+    lines = ["## Python session standard library",
+             "", "These registered functions are available as Python globals; no import is required:"]
+    lines.extend(f"- {signature}: {description}" for signature, description in HELPERS.values())
+    return "\n".join(lines)
+
+
+
+
+def _standalone_collapse(*args, **kwargs):
+    raise RuntimeError("collapse requires a standalone literal call handled by the coordinator")
+
+
+def runtime_helpers(*, say, preview, read_output, llm):
+    """Actual worker bindings, validated against the documented registry."""
+    return {"say": say, "preview": preview, "read_output": read_output,
+            "collapse": _standalone_collapse, "llm": llm,
+            "source": source, "test_summary": test_summary}

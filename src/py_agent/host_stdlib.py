@@ -36,7 +36,10 @@ def execution_llm_handler(coordinator, execution_origin):
             # brings the agent's system/history/boundaries into the subcall.
             provider = ProductionProviderAdapter(provider.adapter, provider_id=provider.provider_id,
                                                  max_tokens=provider.configured_max_tokens)
+        from .runtime_status import Activity
+        started = asyncio.get_running_loop().time()
         for attempt in range(5):
+            coordinator.activity = Activity("LLM subcall", attempt + 1, 5, started)
             if coordinator._lifecycle._active_execution_request is not request:
                 raise asyncio.CancelledError
             coordinator._journal_record("record_model_request", model_request)
@@ -50,7 +53,12 @@ def execution_llm_handler(coordinator, execution_origin):
                 kind = getattr(exc, "kind", None)
                 attempts = 5 if kind == "transport" else 3
                 if kind in {"transport", "rate_limit", "server"} and attempt + 1 < attempts:
-                    await asyncio.sleep(min(8, 2 ** attempt) if kind == "transport" else .5 * (attempt + 1))
+                    delay = min(8, 2 ** attempt) if kind == "transport" else .5 * (attempt + 1)
+                    coordinator.activity = Activity(
+                        "LLM subcall retry", attempt + 2, attempts, started,
+                        asyncio.get_running_loop().time() + delay,
+                    )
+                    await asyncio.sleep(delay)
                     continue
                 raise ProviderError("llm() provider request failed; no response accepted",
                                     kind=kind or "provider") from None
@@ -64,4 +72,10 @@ def execution_llm_handler(coordinator, execution_origin):
                 raise ValueError("llm() response exceeds 65536 characters")
             return response.text
         raise RuntimeError("llm retry budget exhausted")
-    return call
+    async def observed(payload):
+        previous = coordinator.activity
+        try:
+            return await call(payload)
+        finally:
+            coordinator.activity = previous
+    return observed

@@ -2038,7 +2038,7 @@ async def test_codex_tls_retry_is_automatic_and_never_executes_failed_stream(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("recover", [True, False])
-async def test_codex_read_errors_retry_five_times_without_executing_partial_source(monkeypatch, recover):
+async def test_codex_read_errors_retry_six_times_without_executing_partial_source(monkeypatch, recover):
     from types import SimpleNamespace
     import httpx
     from py_agent import codex
@@ -2063,7 +2063,7 @@ async def test_codex_read_errors_retry_five_times_without_executing_partial_sour
     def handle(request):
         calls.append(request)
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
-                              stream=Stream(not recover or len(calls) < 5))
+                              stream=Stream(not recover or len(calls) < 6))
     runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
     coordinator = Coordinator(runtime, router="default", provider="fake", interpreter="basic", executor="local")
     coordinator.provider = ProductionProviderAdapter(codex.CodexProvider(
@@ -2081,17 +2081,17 @@ async def test_codex_read_errors_retry_five_times_without_executing_partial_sour
             assert submission.result.final
             assert len(executor.requests) == 1
             retries = [e for e in submission.events if e.data.get("phase") == "provider_retry"]
-            assert len(retries) == 4
-            assert "5/5" in retries[-1].data["text"]
+            assert len(retries) == 5
+            assert "6/6" in retries[-1].data["text"]
             assert "private-token" not in str(submission.events)
         else:
-            with pytest.raises(ProviderError, match="exhausted after 5 attempts") as caught:
+            with pytest.raises(ProviderError, match="exhausted after 6 attempts") as caught:
                 await coordinator.submit("terminal", "finish")
             assert "private-token" not in str(caught.value)
             assert "network detail" not in str(caught.value)
             assert not executor.requests
-        assert len(calls) == 5
-        assert delays == [1, 2, 4, 8]
+        assert len(calls) == 6
+        assert delays == [1, 2, 4, 8, 15]
     finally:
         await coordinator.close()
 

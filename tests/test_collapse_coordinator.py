@@ -425,7 +425,7 @@ async def test_real_worker_archive_is_readable_and_collapse_is_not_executed():
         "assert archive['start_id'] == 'u1' and archive['end_id'] == 'm1'\n"
         f"assert any(m['content'] == {setup!r} for g in archive['groups'] for m in g['messages'])\n"
         "assert persisted_value == 42\n"
-        "assert 'collapse' not in globals()\n"
+        "assert callable(collapse)\n"
         "say('archive verified', final=True)"
     )
 

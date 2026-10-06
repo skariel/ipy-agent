@@ -85,8 +85,8 @@ A provider request is made only after submitting an English request. The `py` CL
 only `run.sh` supplies the Codex GPT-6.1-Sol launcher default.
 Recognized transient provider failures (rate limits, transport/timeouts, and
 server 5xx errors) receive up to two retries before any Python cell executes.
-Transport disconnects (including ReadError) allow up to five attempts with
-1/2/4/8-second interruptible backoff;
+Transport disconnects (including ReadError) allow up to six attempts with
+1/2/4/8-second backoff plus a final 15-second automatic recovery cooldown;
 a lost response can still mean both model attempts were billed. Authentication,
 request, format, and unknown local errors are not retried. Recognized transient
 TLS disconnects and generic SSLError are transport failures; certificate verification
@@ -436,3 +436,20 @@ Limits: eight calls/cell, main thread only, 65536-character prompt/system/result
 Pillow images, raster bytes, and ImageAttachment are accepted. A direct executor
 without a host handler reports `llm()` unavailable rather than accessing credentials.
 `from py_agent.stdlib import llm` works during active session execution too.
+
+### Capability discovery, inspection, and recovery
+
+The worker helper registry generates the system-prompt helper listing and validates
+the actual injected functions. `source(path, start=1, end=None, limit=6000)` returns
+bounded numbered source; `test_summary(retained_subprocess_result)` returns a
+structured bounded summary and never reruns tests.
+
+The toolbar shows model/subcall activity, attempt counts, elapsed time, and retry
+countdowns, without prompts or credentials. Transport failures automatically
+retry only model requests, including one final bounded cooldown. On exhaustion,
+`/recovery` describes the checkpoint and completed execution; `/resume` retries
+the pending model turn, not prior Python cells. `/recovery discard` clears it.
+A new English task supersedes a pending checkpoint. Recovery is session-local,
+not durable replay. Completed execution retains side effects; uncertain execution
+pauses the session and never enables automatic cell replay. Interrupt stops
+automatic backoff; nested `llm` retries are visible but do not restart a Python cell.
