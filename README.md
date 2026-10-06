@@ -413,3 +413,26 @@ Unfamiliar models receive images intact; the provider decides capability. Images
 private model-request journal records and context archives; this is audit history,
 not executable session replay. Collapsed images must be redisplayed for inspection.
 Displaying an image sends its pixels to the configured provider: avoid secrets.
+
+### Python session standard library: `llm()`
+
+`llm` is available directly in agent and user Python cells, alongside `say`,
+`preview`, `read_output`, and `collapse`:
+
+```python
+answer = llm("Explain this error briefly: " + str(error))
+preview(answer)
+description = llm("Read this screenshot.", images=[Image.open("screenshot.png")])
+```
+
+`llm(prompt, *, system=..., images=(), max_tokens=2048)` uses the current model
+and effort, a fresh independent context, and a separate helpful-text system prompt.
+It returns text and never executes it. Never eval/exec untrusted returned text.
+Credentials stay on the host. Calls are separately billable, journaled, retryable,
+and interruptible; they contribute to usage totals.
+
+Limits: eight calls/cell, main thread only, 65536-character prompt/system/result,
+1..16384 max_tokens, up to four bounded raster images totaling 512000 bytes.
+Pillow images, raster bytes, and ImageAttachment are accepted. A direct executor
+without a host handler reports `llm()` unavailable rather than accessing credentials.
+`from py_agent.stdlib import llm` works during active session execution too.

@@ -683,6 +683,10 @@ class Coordinator:
 
                 return dispatch_input
 
+            def execution_llm_handler(execution_origin):
+                from .host_stdlib import execution_llm_handler as create_handler
+                return create_handler(self, execution_origin)
+
             def execution_output_handler(
                 execution_origin: Origin, author: str,
                 *, progress: ProgressCallback | None = on_progress,
@@ -735,6 +739,7 @@ class Coordinator:
                     output_handler=execution_output_handler(
                         execution_origin, "user", progress=item.on_progress,
                     ),
+                    llm_handler=execution_llm_handler(execution_origin),
                 )
                 previous_state = self._lifecycle.state
                 self._lifecycle.state = State.EXECUTING
@@ -1313,6 +1318,7 @@ class Coordinator:
                             allow_stdin=allow_stdin,
                             input_handler=execution_input_handler(execution_origin),
                             output_handler=execution_output_handler(execution_origin, "agent"),
+                            llm_handler=execution_llm_handler(execution_origin),
                         )
                         published_events.append(await self._emit_progress(
                             execution_origin,
@@ -1423,6 +1429,7 @@ class Coordinator:
                     allow_stdin=allow_stdin,
                     input_handler=execution_input_handler(execution_origin),
                     output_handler=execution_output_handler(execution_origin, "user"),
+                    llm_handler=execution_llm_handler(execution_origin),
                 )
                 published_events = [await self._emit_progress(
                     execution_origin,

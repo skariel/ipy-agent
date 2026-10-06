@@ -1148,13 +1148,15 @@ def _make_llm(execution_id, author, origin):
             _RAW_CAPTURE.barrier()
         _send(frame)
         reply = _receive()
-        if (not isinstance(reply, dict) or reply.get("type") not in {"llm_reply", "llm_error"}
+        if (not isinstance(reply, dict) or reply.get("type") not in {"llm_reply", "llm_error", "llm_cancelled"}
                 or reply.get("version") != PROTOCOL_VERSION
                 or reply.get("execution_id") != execution_id or reply.get("origin") != origin
                 or reply.get("author") != author or reply.get("sequence") != calls
                 or set(reply) != {"type", "version", "execution_id", "origin", "author", "sequence", "text"}
                 or not isinstance(reply.get("text"), str) or len(reply["text"]) > MAX_RESULT_CHARS):
             raise ProtocolError("llm reply does not match request")
+        if reply["type"] == "llm_cancelled":
+            raise KeyboardInterrupt
         if reply["type"] == "llm_error":
             raise RuntimeError(reply["text"])
         return reply["text"]

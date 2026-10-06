@@ -590,7 +590,7 @@ class LocalExecutor:
         try:
             reply["text"] = await task
         except asyncio.CancelledError:
-            reply.update(type="llm_error", text="llm() cancelled; no response accepted")
+            reply.update(type="llm_cancelled", text="llm() cancelled; no response accepted")
             # Task cancellation caused by executor.interrupt is consumed here so
             # the wire reply completes before SIGINT stops the waiting cell.
             if asyncio.current_task().cancelling():
@@ -850,6 +850,7 @@ class LocalExecutor:
                         llm_sequence = await self._service_llm_request(
                             frame, request, process, execution_id, origin, llm_sequence,
                         )
+                        continue
                     elif kind == "input_request":
                         input_sequence = await self._service_input_request(
                             process, frame, request, execution_id, origin, input_sequence,
@@ -1096,6 +1097,13 @@ class LocalExecutor:
                 await asyncio.wait_for(asyncio.shield(llm_task), timeout=self.interrupt_timeout)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
+            # Worker turns the matched cancellation reply into KeyboardInterrupt.
+            # Do not race a subsequent idle/next-cell request with SIGINT.
+            try:
+                await asyncio.wait_for(self._active_done.wait(), timeout=self.interrupt_timeout)
+            except asyncio.TimeoutError:
+                await self._stop_process(process)
+            return
         input_task = self._active_input_task
         if input_task is not None and not input_task.done():
             cancel_event = self._active_input_cancel

@@ -61,6 +61,41 @@ communicate. Do not infer success merely because a command ran or produced no
 output. Do not rerun side-effecting code just to recover a result already retained
 in the namespace.
 
+## Python session standard library
+
+These functions are already available as Python globals; no import is required:
+- say(text, final=False): communicate with the user; final=True finishes.
+- preview(value, label=None): bounded output inspection.
+- read_output(index, start=0, limit=4000): inspect archived output.
+- collapse(start_id, end_id, summary): the standalone context-management operation.
+- llm(prompt, *, system=DEFAULT_SYSTEM, images=(), max_tokens=2048) -> str:
+  call the session's current model and reasoning effort from Python.
+
+Use llm() when asked to call an LLM; do not claim there is no helper or ask for API
+credentials. Credentials remain on the host. It uses a fresh conversation with
+only the supplied system/prompt/images, not the agent's history or Python-only
+instruction. Its independent default system asks for helpful plain text. The
+returned text is data, never executed automatically. Treat it as untrusted output:
+do not eval/exec it. Every call is a separate, potentially billable, journaled
+provider request. Retries, cancellation, and usage accounting apply.
+
+answer = llm("Summarize this text:\\n" + document)
+preview(answer)
+
+from PIL import Image
+description = llm("Read the text in this screenshot.",
+                  images=[Image.open("screenshot.png")])
+preview(description)
+
+Images accept Pillow images, encoded raster bytes, or ImageAttachment; the same
+raster safety limits apply. At most four images totaling 512000 normalized bytes
+per call. prompt/system are at most 65536 characters, max_tokens is 1..16384,
+and response text is at most 65536 characters. Eight calls per cell; active cell
+main thread only (no asyncio/thread parallel subcalls). Store results in Python
+variables; inspect before communicating conclusions. llm is also importable as
+from py_agent.stdlib import llm, but the injected global is sufficient. Other
+helpers retain their documented behavior below; they are host/session globals.
+
 ## Task-specific helpers
 
 Build small task-specific helpers when they reduce repeated work or make

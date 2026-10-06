@@ -40,7 +40,7 @@ def _payload(prompt, *, system=DEFAULT_SYSTEM, images=(), max_tokens=2048):
         raise ValueError("llm system must be nonempty text, at most 65536 characters")
     if type(max_tokens) is not int or not 1 <= max_tokens <= 16384:
         raise ValueError("llm max_tokens must be an integer from 1 to 16384")
-    from .images import ImageAttachment, MAX_IMAGES, normalize
+    from .images import MAX_IMAGES, ImageAttachment, normalize
     if not isinstance(images, (tuple, list)) or len(images) > MAX_IMAGES:
         raise ValueError("llm images must be a list/tuple of at most four rasters")
     records = []
@@ -68,7 +68,7 @@ def _payload(prompt, *, system=DEFAULT_SYSTEM, images=(), max_tokens=2048):
 
 def validate_payload(payload):
     """Validate again on the trusted host boundary."""
-    from .images import ImageAttachment, MAX_IMAGES
+    from .images import MAX_IMAGES, ImageAttachment
     if not isinstance(payload, dict) or set(payload) != {"prompt", "system", "images", "max_tokens"}:
         raise ValueError("Invalid llm request")
     records = payload["images"]
