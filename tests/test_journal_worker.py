@@ -122,3 +122,41 @@ async def test_journal_failure_before_dispatch_pauses_session(worker):
         assert "execution_result" not in {entry["kind"] for entry in records}
     finally:
         await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_typed_commit_is_acknowledged_and_off_loop(worker):
+    loop_thread = threading.get_ident()
+    callback_threads = []
+
+    def start(journal):
+        callback_threads.append(threading.get_ident())
+        journal.start("typed", 0, "fake", "model")
+
+    await worker.commit(start)
+    assert callback_threads and callback_threads[0] != loop_thread
+    assert len(worker.recent("typed", limit=10)) == 1
+
+
+@pytest.mark.asyncio
+async def test_typed_commit_cancellation_waits_for_admitted_work(worker):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def start(journal):
+        entered.set()
+        assert release.wait(timeout=3)
+        journal.start("cancelled", 0, "fake", "model")
+
+    task = asyncio.create_task(worker.commit(start))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        task.cancel()
+        await asyncio.sleep(.02)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(worker.recent("cancelled", limit=10)) == 1
+    finally:
+        release.set()

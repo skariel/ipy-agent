@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import inspect
 from typing import TYPE_CHECKING
 
 from .async_commit import settle
 from .contracts import ModelRequest, ModelResponse
 from .coordinator_support import State
-from .session_journal import JournalError
+from .session_journal import JournalError, JournalService
 
 if TYPE_CHECKING:
     from .coordinator_runtime import SessionRuntime
@@ -25,6 +26,10 @@ class JournalPolicy:
         self._cache_reports = 0
 
     async def _journal_record(self, method: str, *args: object, **kwargs: object) -> None:
+        """Legacy facade compatibility; runtime code uses typed direct calls."""
+        await self.commit(lambda journal: getattr(journal, method)(*args, **kwargs))
+
+    async def commit(self, action: Callable[[JournalService], None]) -> None:
         if not self.coordinator.conversation._journal_sensitive_config_ready:
             self.coordinator.lifecycle._journal_failed = True
             self.coordinator.lifecycle._set_state_unless_stopping(State.FAILED)
@@ -36,9 +41,9 @@ class JournalPolicy:
         try:
             from .journal_worker import SQLiteJournalWorker
             if isinstance(self.coordinator.journal, SQLiteJournalWorker):
-                await self.coordinator.journal.call(method, *args, **kwargs)
+                await self.coordinator.journal.commit(action)
                 return
-            result = getattr(self.coordinator.journal, method)(*args, **kwargs)
+            result: object = action(self.coordinator.journal)  # type: ignore[func-returns-value]
             if inspect.isawaitable(result):
                 close = getattr(result, "close", None)
                 if callable(close):
@@ -84,7 +89,7 @@ class JournalPolicy:
     ) -> None:
         if self.coordinator.lifecycle.operation.model_request is request and self.coordinator.lifecycle.operation.provider_usage_recorded:
             return
-        await self.coordinator.journal_policy._journal_record("record_provider_usage", request, response, outcome=outcome)
+        await self.coordinator.journal_policy.commit(lambda journal: journal.record_provider_usage(request, response, outcome=outcome))
         if response is not None:
             reported = response.usage.get("normalized", response.usage)
             counters = reported if hasattr(reported, "get") else {}

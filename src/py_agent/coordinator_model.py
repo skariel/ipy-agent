@@ -48,14 +48,12 @@ class ModelRequests:
                     forced_collapse = True
                     model_request = replace(model_request, context=recovery_context)
                     coordinator.lifecycle.operation.begin_model(model_request)
-                    await coordinator.journal_policy._journal_record("record_model_request", model_request)
+                    await coordinator.journal_policy.commit(lambda journal: journal.record_model_request(model_request))  # ruff: ignore[function-uses-loop-variable] -- commit settles before the loop advances
                     continue
                 decision = model_retry(exc, attempt)
                 max_attempts, delay = decision.attempts, decision.delay
                 if decision.retry:
-                    await coordinator.journal_policy._journal_record(
-                        "record_provider_usage", model_request, None, outcome="retry_failed",
-                    )
+                    await coordinator.journal_policy.commit(lambda journal: journal.record_provider_usage(model_request, None, outcome="retry_failed"))  # ruff: ignore[function-uses-loop-variable] -- commit settles before the loop advances
                     try:
                         published_events.append(await coordinator.frontend._emit_progress(
                             generation_origin,

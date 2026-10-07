@@ -13,6 +13,7 @@ from .collapse_control import parse_collapse
 from .configuration import ConfigSnapshot
 from .contracts import (
     AgentDecision,
+    ContextSnapshot,
     ExecutionOutput,
     ExecutionRequest,
     ExecutionResult,
@@ -72,7 +73,6 @@ class RequestRunner:
         on_progress: ProgressCallback | None = None,
         _queued_action: _QueuedAction | None = None,
     ) -> Submission:
-        generation_id: str | None
         coordinator = self.coordinator
         if ((coordinator.lifecycle.state is not State.IDLE or coordinator.lifecycle._lock.locked() or coordinator.lifecycle._queue_worker is not None
              or coordinator.lifecycle._pending_actions) and _queued_action is None):
@@ -359,7 +359,9 @@ class RequestRunner:
                     coordinator.lifecycle._set_state_unless_stopping(State.IDLE)
                     return submission
 
-                if routed.kind == "ask":
+                async def run_agent_turn() -> Submission:
+                    """Run model/cell steps for this request, including safe queue boundaries."""
+                    nonlocal context_pending, steering_commit_started
                     context_pending = (
                         callable(getattr(coordinator.context_service, "prepare_request", None))
                         and not (resume_checkpoint is not None and resume_checkpoint.committed)
@@ -442,18 +444,7 @@ class RequestRunner:
                             snapshot = initial_context if step == 1 else coordinator.conversation._latest_context()
                         coordinator.conversation._observe_context_epoch(snapshot.epoch)
                         if reset_this_step and dispatched_steering:
-                            # Earlier queued user steering is still active task
-                            # input. Restore its provenance after epoch eviction.
-                            for steering_id, steering_text in dispatched_steering:
-                                coordinator.conversation._append_steering_context(steering_text, steering_id)
-                            if callable(getattr(coordinator.context_service, "snapshot", None)):
-                                snapshot = coordinator.conversation._latest_context()
-                            else:
-                                snapshot = replace(
-                                    snapshot,
-                                    messages=(*snapshot.messages, *(("user", text) for _, text in dispatched_steering)),
-                                    message_phases=(*snapshot.message_phases, *((None,) * len(dispatched_steering))),
-                                )
+                            snapshot = self._restore_steering(snapshot, dispatched_steering)
                         prepare_generation = getattr(coordinator.context_service, "prepare_generation", None)
                         if callable(prepare_generation):
                             prepare_generation()
@@ -507,7 +498,7 @@ class RequestRunner:
                                 model=resume_checkpoint.model, options=dict(resume_checkpoint.options),
                             )
                         coordinator.lifecycle.operation.begin_model(model_request)
-                        await coordinator.journal_policy._journal_record("record_model_request", model_request)
+                        await coordinator.journal_policy.commit(lambda journal: journal.record_model_request(model_request))  # ruff: ignore[function-uses-loop-variable] -- commit settles before the loop advances
                         for steering_item in steering_awaiting_dispatch:
                             dispatched_steering.append((
                                 steering_item.action.origin.request_id, steering_item.action.source,
@@ -570,10 +561,7 @@ class RequestRunner:
                         except ValueError as exc:
                             collapse_error = str(exc)
                         if collapse_args is not None or collapse_error is not None:
-                            await coordinator.journal_policy._journal_record(
-                                "record_context_collapse", model_request, response.text,
-                                outcome="requested",
-                            )
+                            await coordinator.journal_policy.commit(lambda journal: journal.record_context_collapse(model_request, response.text, outcome="requested"))  # ruff: ignore[function-uses-loop-variable] -- commit settles before the loop advances
                             if collapse_error is None:
                                 collapse = getattr(coordinator.context_service, "collapse", None)
                                 store_collapsed = getattr(coordinator.executor, "store_collapsed", None)
@@ -603,10 +591,7 @@ class RequestRunner:
                                             raise
                                         collapse_error = str(exc)[:500]
                             if collapse_error is not None:
-                                await coordinator.journal_policy._journal_record(
-                                    "record_context_collapse", model_request, response.text,
-                                    outcome="rejected", detail=collapse_error,
-                                )
+                                await coordinator.journal_policy.commit(lambda journal: journal.record_context_collapse(model_request, response.text, outcome="rejected", detail=collapse_error))  # ruff: ignore[function-uses-loop-variable] -- commit settles before the loop advances
                                 coordinator.conversation._commit_context(
                                     origin.request_id, routed.source,
                                     "[collapse cell rejected; no code executed]",
@@ -628,10 +613,7 @@ class RequestRunner:
                                 context_committed = True
                                 context_pending = False
                                 invalid_generations = 0
-                                await coordinator.journal_policy._journal_record(
-                                    "record_context_collapse", model_request, response.text,
-                                    outcome="succeeded", detail=receipt,
-                                )
+                                await coordinator.journal_policy.commit(lambda journal: journal.record_context_collapse(model_request, response.text, outcome="succeeded", detail=receipt))  # ruff: ignore[function-uses-loop-variable] -- commit settles before the loop advances
                             continue
                         decision = cast(_Interpreter, coordinator.interpreter).interpret(response)
                         if not isinstance(decision, AgentDecision):
@@ -862,6 +844,10 @@ class RequestRunner:
                         events=tuple(published_events),
                     )
 
+
+                if routed.kind == "ask":
+                    return await run_agent_turn()
+
                 return await self.direct.execute(
                     routed, origin, operation_id, allow_stdin=allow_stdin,
                     execution_input_handler=execution_input_handler,
@@ -924,3 +910,18 @@ class RequestRunner:
             coordinator.lifecycle._set_state_unless_stopping(
                 State.IDLE if acknowledged_stop else State.FAILED,
             )
+
+    def _restore_steering(
+        self, snapshot: ContextSnapshot, steering: list[tuple[str, str]],
+    ) -> ContextSnapshot:
+        """Restore still-active queued input after history epoch eviction."""
+        coordinator = self.coordinator
+        for request_id, source in steering:
+            coordinator.conversation._append_steering_context(source, request_id)
+        if callable(getattr(coordinator.context_service, "snapshot", None)):
+            return coordinator.conversation._latest_context()
+        return replace(
+            snapshot,
+            messages=(*snapshot.messages, *(("user", source) for _, source in steering)),
+            message_phases=(*snapshot.message_phases, *((None,) * len(steering))),
+        )

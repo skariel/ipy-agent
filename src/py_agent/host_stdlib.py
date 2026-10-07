@@ -55,7 +55,7 @@ def execution_llm_handler(
             runtime.activity = Activity("LLM subcall", attempt + 1, MAX_MODEL_ATTEMPTS, started)
             if runtime.lifecycle.operation.execution_request is not request:
                 raise asyncio.CancelledError
-            await runtime.journal_policy._journal_record("record_model_request", model_request)
+            await runtime.journal_policy.commit(lambda journal: journal.record_model_request(model_request))
             try:
                 try:
                     response = await asyncio.wait_for(provider.generate(model_request), timeout=180)

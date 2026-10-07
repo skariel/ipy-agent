@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 import threading
 from typing import Any
 
 from .async_commit import settle
-from .session_journal import JournalError, SQLiteSessionJournal
+from .session_journal import JournalError, JournalService, SQLiteSessionJournal
 
 
 class SQLiteJournalWorker:
@@ -35,7 +36,7 @@ class SQLiteJournalWorker:
             self._pool.shutdown(wait=True)
             raise
 
-    def _submit(self, method: str, *args: Any, **kwargs: Any) -> Future[Any]:
+    def _submit(self, method: str | Callable[[JournalService], None], *args: Any, **kwargs: Any) -> Future[Any]:
         with self._lock:
             if self._closed:
                 raise JournalError("Journal worker is closed")
@@ -59,11 +60,17 @@ class SQLiteJournalWorker:
                 raise JournalError("Journal worker is closed")
             self._sensitive_values = tuple(values)
 
-    def _invoke(self, method: str, args: tuple[Any, ...], kwargs: dict[str, Any],
+    def _invoke(self, method: str | Callable[[JournalService], None], args: tuple[Any, ...], kwargs: dict[str, Any],
                 sensitive_values: tuple[str, ...]) -> Any:
         if sensitive_values != self._journal._sensitive_values:
             self._journal.set_sensitive_values(sensitive_values)
+        if callable(method):
+            return method(self._journal)
         return getattr(self._journal, method)(*args, **kwargs)
+
+    async def commit(self, action: Callable[[JournalService], None]) -> None:
+        """Run one typed transaction in the connection's owning thread."""
+        await settle(asyncio.wrap_future(self._submit(action)))
 
     async def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         return await settle(asyncio.wrap_future(self._submit(method, *args, **kwargs)))

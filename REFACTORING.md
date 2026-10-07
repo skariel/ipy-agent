@@ -170,3 +170,22 @@ every job; whole-repository mypy also passes in the Jupyter job.
 Remaining deeper work: decompose the agent loop around explicit turn state,
 narrow other components' runtime dependencies, and replace dynamic journal
 dispatch with a typed compatibility adapter. Those are not implemented here.
+
+## Readability follow-up: direct journal calls and agent responsibilities
+
+Runtime journal writes now call the concrete JournalService method inside one
+typed commit callback. The worker's bounded admission/acknowledgement path runs
+that callback on the connection thread; cancellation still settles admitted
+work. String dispatch remains only for legacy facade/tooling compatibility.
+No per-journal-method forwarding wrappers or new adapter classes were added.
+
+The agent turn is explicitly named as a request-local function, separating it
+from routing/direct execution while retaining request-scoped queue callbacks.
+Epoch-reset steering restoration is a concrete helper with a returned context
+snapshot, rather than another service layer. This is a modest readability
+improvement, not a claim that the large agent loop is fully decomposed.
+
+Added regressions for typed commit acknowledgement/off-loop execution and
+cancellation waiting for an admitted transaction. Full local matrix:
+3.12/3.13/3.14 each 857 passed, 1 skipped; 3.13 + Jupyter 856 passed, 2 skipped.
+Lint/strict typing pass in every job; full mypy passes with Jupyter.

@@ -85,21 +85,21 @@ class ExecutionLifecycle:
             if self.operation.execution_request is request and self.operation.execution_result_recorded:
                 return
             if result is not None:
-                await self.coordinator.journal_policy._journal_record("record_execution_result", request, result)
+                await self.coordinator.journal_policy.commit(lambda journal: journal.record_execution_result(request, result))
             else:
                 self.coordinator.execution_outcome = (
                     "Execution is uncertain; side effects may have occurred. Session paused. "
                     "Inspect external state before restart; never replay automatically."
                 )
                 self.coordinator.recovery = None
-                await self.coordinator.journal_policy._journal_record("record_uncertain_execution", request, reason)
+                await self.coordinator.journal_policy.commit(lambda journal: journal.record_uncertain_execution(request, reason or "Execution outcome unavailable"))
             if self.operation.execution_request is request:
                 self.operation.execution_result_recorded = True
 
     async def _execute_dispatched(self, request: ExecutionRequest) -> ExecutionResult:
         """Commit source before dispatch and result before publishing its output."""
         self.coordinator.recovery = None
-        await self.coordinator.journal_policy._journal_record("record_execution_source", request)
+        await self.coordinator.journal_policy.commit(lambda journal: journal.record_execution_source(request))
         self.operation.begin_execution(request)
         try:
             try:
@@ -151,7 +151,7 @@ class ExecutionLifecycle:
         failure = None
         try:
             if self._journal_started and not self._journal_failed:
-                await self.coordinator.journal_policy._journal_record("end", self.coordinator.session_id, self.coordinator.config_revision, state)
+                await self.coordinator.journal_policy.commit(lambda journal: journal.end(self.coordinator.session_id, self.coordinator.config_revision, state))
         except BaseException as exc:
             failure = exc
         try:
@@ -179,9 +179,7 @@ class ExecutionLifecycle:
                 if config is not None:
                     self.coordinator.config_revision = config.revision
                 self._journal_started = True
-                await self.coordinator.journal_policy._journal_record(
-                    "start", self.coordinator.session_id, self.coordinator.config_revision, self.coordinator.provider_id, self.coordinator.model,
-                )
+                await self.coordinator.journal_policy.commit(lambda journal: journal.start(self.coordinator.session_id, self.coordinator.config_revision, self.coordinator.provider_id, self.coordinator.model))
                 if (callable(getattr(self.coordinator.context_service, "collapse", None))
                         and not callable(getattr(self.coordinator.executor, "store_collapsed", None))):
                     raise ExecutorCapabilityError(
