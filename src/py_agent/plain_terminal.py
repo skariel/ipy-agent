@@ -7,15 +7,15 @@ fallback from rich MIME events.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass
 import inspect
 import json
 import re
 import time
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 import unicodedata
 import weakref
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any
 
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.filters import Condition, has_focus, is_searching
@@ -30,16 +30,28 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 
 from .contracts import (
-    InputCancelledError, InputReply, InputRequest, InputUnavailableError,
-    OutputEvent, ProgressCallback,
+    InputCancelledError,
+    InputReply,
+    InputRequest,
+    InputUnavailableError,
+    OutputEvent,
+    ProgressCallback,
+    QueueTicket,
 )
 from .coordinator import Coordinator, State, Submission
+from .terminal_completion import TerminalCompleter
 from .terminal_markdown import markdown_fragments, wrap_fragments
+from .terminal_menus import TerminalMenus
+
+if TYPE_CHECKING:
+    from prompt_toolkit.input import Input
+    from prompt_toolkit.key_binding import KeyPressEvent
+    from prompt_toolkit.output import Output
 
 _STRING_ESCAPE = re.compile(r"(?:\x1b[\]PX^_]|[\x90\x98\x9d\x9e\x9f]).*?(?:\x07|\x1b\\|\x9c|$)", re.DOTALL)
 _CSI = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]")
 _ESCAPE = re.compile(r"\x1b[ -/]*[@-~]")
-_TERMINAL_PROMPT_LOCKS = weakref.WeakKeyDictionary()
+_TERMINAL_PROMPT_LOCKS: weakref.WeakKeyDictionary[object, asyncio.Lock] = weakref.WeakKeyDictionary()
 _PROMPT_INTERRUPTED = object()
 _SHIFT_ENTER = (Keys.ShiftEscape, Keys.ControlM)
 ANSI_SEQUENCES["\x1b[13;2u"] = _SHIFT_ENTER
@@ -91,10 +103,7 @@ def _thaw_display_value(value: Any) -> Any:
 
 def sanitize(value: Any) -> str:
     """Make untrusted strings safe to print as terminal text."""
-    if isinstance(value, str):
-        text = value
-    else:
-        text = json.dumps(value, ensure_ascii=False, default=str)
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
     text = _STRING_ESCAPE.sub("", text)
     text = _CSI.sub("", text)
     text = _ESCAPE.sub("", text)
@@ -105,10 +114,16 @@ def sanitize(value: Any) -> str:
     )
 
 
+class _SubmitKwargs(TypedDict, total=False):
+    allow_stdin: bool
+    input_handler: Callable[[InputRequest], Awaitable[InputReply]]
+    on_progress: ProgressCallback
+
+
 class _TerminalHistory(InMemoryHistory):
     """Keep composer history but never retain a Python stdin reply."""
 
-    def __init__(self, should_record):
+    def __init__(self, should_record: Callable[[], bool]) -> None:
         super().__init__()
         self._should_record = should_record
 
@@ -116,7 +131,7 @@ class _TerminalHistory(InMemoryHistory):
         if self._should_record() and not re.match(r"^/login(?:\s|$)", string):
             super().append_string(string)
 
-    def load_history_strings(self):
+    def load_history_strings(self) -> Iterator[str]:
         return iter(self.get_strings())
 
 
@@ -166,8 +181,6 @@ Enabled plugins may add slash commands.
 Prefix English beginning with @, !, %, or / with a backslash."""
 
 
-from .terminal_menus import TerminalMenus
-from .terminal_completion import TerminalCompleter
 
 
 class PlainTerminal(TerminalMenus):
@@ -182,13 +195,13 @@ class PlainTerminal(TerminalMenus):
         self,
         coordinator: Coordinator,
         *,
-        input=None,
-        output=None,
+        input: Input | None = None,
+        output: Output | None = None,
         frontend_id: str = "terminal",
         vi: bool = False,
         multiline: bool = False,
         no_color: bool = False,
-    ):
+    ) -> None:
         self.coordinator = coordinator
         self.frontend_id = frontend_id
         self.input = input
@@ -212,14 +225,14 @@ class PlainTerminal(TerminalMenus):
         self._prompt_mode_generation = 0
         self._composer_draft = ""
         self._history_suppressed = False
-        self._active_submission_task: asyncio.Task | None = None
-        self._queued_watchers: set[asyncio.Task] = set()
+        self._active_submission_task: asyncio.Task[None] | None = None
+        self._queued_watchers: set[asyncio.Task[None]] = set()
         self._terminal_closed = False
-        self._menu_selection = None
+        self._menu_selection: str | None = None
         self._completer = TerminalCompleter(
             coordinator, enabled=lambda: self._stdin_request is None and not self._history_suppressed,
         )
-        self.session = PromptSession(
+        self.session: PromptSession[str] = PromptSession(
             input=input,
             output=output,
             history=_TerminalHistory(lambda: not self._history_suppressed),
@@ -240,7 +253,7 @@ class PlainTerminal(TerminalMenus):
         bindings = KeyBindings()
 
         @bindings.add("c-i", filter=has_focus("DEFAULT_BUFFER") & ~is_searching, eager=True)
-        def complete_on_tab(event):
+        def complete_on_tab(event: KeyPressEvent) -> None:
             if self._stdin_request is not None or self._history_suppressed:
                 return
             buffer = event.current_buffer
@@ -251,11 +264,11 @@ class PlainTerminal(TerminalMenus):
 
         @bindings.add("s-escape", "enter", eager=True)
         @bindings.add("escape", "enter", eager=True)
-        def submit_multiline(event):
+        def submit_multiline(event: KeyPressEvent) -> None:
             event.current_buffer.validate_and_handle()
 
         @bindings.add("enter", filter=has_focus("DEFAULT_BUFFER") & ~is_searching, eager=True)
-        def smart_enter(event):
+        def smart_enter(event: KeyPressEvent) -> None:
             buffer = event.current_buffer
             if buffer.complete_state is not None:
                 if buffer.complete_state.current_completion is not None:
@@ -444,12 +457,12 @@ class PlainTerminal(TerminalMenus):
             phase = data.get("phase") if hasattr(data, "get") else None
             # The toolbar carries the ordinary generating/executing state.
             if phase in ("generation_start", "execution_start"):
-                if phase == "execution_start" and execution_id is not None:
-                    if execution_id not in self._execution_numbers:
-                        self._cell_number += 1
-                        self._execution_numbers[execution_id] = self._cell_number
-                        if len(self._execution_numbers) > 128:
-                            self._execution_numbers.pop(next(iter(self._execution_numbers)))
+                if (phase == "execution_start" and execution_id is not None
+                        and execution_id not in self._execution_numbers):
+                    self._cell_number += 1
+                    self._execution_numbers[execution_id] = self._cell_number
+                    if len(self._execution_numbers) > 128:
+                        self._execution_numbers.pop(next(iter(self._execution_numbers)))
                 self.session.app.invalidate()
                 return
             if phase == "cell_complete":
@@ -501,8 +514,8 @@ class PlainTerminal(TerminalMenus):
     @staticmethod
     def _message_not_already_delivered(
         message: str,
-        delivered_events: tuple[object, ...],
-        status_events: tuple[object, ...] = (),
+        delivered_events: tuple[OutputEvent, ...],
+        status_events: tuple[OutputEvent, ...] = (),
     ) -> str:
         say_texts = []
         step_limit_texts = []
@@ -540,13 +553,13 @@ class PlainTerminal(TerminalMenus):
         return message
 
     async def _show_submission(
-        self, submission: Submission, *, delivered_events: tuple[object, ...] = (),
+        self, submission: Submission, *, delivered_events: tuple[OutputEvent, ...] = (),
     ) -> None:
         delivered_keys = {self._event_key(event) for event in delivered_events}
         pairs = submission.executions or (
             ((submission.execution, submission.result),) if submission.result is not None else ()
         )
-        events = tuple(getattr(submission, "events", ()))
+        events: tuple[OutputEvent, ...] = tuple(getattr(submission, "events", ()))
         returned_keys = {self._event_key(event) for event in events}
         all_events = events + tuple(
             event for event in delivered_events if self._event_key(event) not in returned_keys
@@ -555,14 +568,14 @@ class PlainTerminal(TerminalMenus):
             submission.message, all_events, status_events=events,
         )
         events = tuple(event for event in events if self._event_key(event) not in delivered_keys)
-        events_by_execution = {}
+        events_by_execution: dict[str, list[OutputEvent]] = {}
         for event in events:
             execution_id = getattr(getattr(event, "origin", None), "execution_id", None)
             if execution_id is not None:
                 events_by_execution.setdefault(execution_id, []).append(event)
 
-        def show_ordered_events(ordered_events) -> None:
-            pending_stream = None
+        def show_ordered_events(ordered_events: Iterable[OutputEvent]) -> None:
+            pending_stream: str | None = None
             pending_text: list[str] = []
 
             def flush_stream() -> None:
@@ -639,7 +652,7 @@ class PlainTerminal(TerminalMenus):
                 else:
                     self._cell_number = self._execution_numbers[execution_id]
                 self.session.app.invalidate()
-            ordered_events = events_by_execution.get(execution_id, ())
+            ordered_events = events_by_execution.get(execution_id, ()) if execution_id is not None else ()
             live_output = any(
                 self._event_key(event) in delivered_keys
                 and getattr(event, "kind", None) == "stream"
@@ -717,7 +730,7 @@ class PlainTerminal(TerminalMenus):
                     continue
                 self._history_suppressed = request is not None
 
-                async def read_prompt_safely():
+                async def read_prompt_safely(request: InputRequest | None = request) -> object:
                     try:
                         return await self.session.prompt_async(
                             lambda: self._prompt_message(),
@@ -756,7 +769,7 @@ class PlainTerminal(TerminalMenus):
                                 if text is _PROMPT_INTERRUPTED:
                                     raise KeyboardInterrupt
                                 self._composer_draft = ""
-                                return _PromptResult(text, None, generation)
+                                return _PromptResult(cast(str, text), None, generation)
                             # A completed reply for a request that has already
                             # ended is stale and must not be delivered elsewhere.
                             if await prompt_task is _PROMPT_INTERRUPTED:
@@ -777,7 +790,7 @@ class PlainTerminal(TerminalMenus):
                             raise KeyboardInterrupt
                         if request is None:
                             self._composer_draft = ""
-                        return _PromptResult(text, request, generation)
+                        return _PromptResult(cast(str, text), request, generation)
                     # A generation change can outlive the event's set/clear; restart
                     # the prompt so every stdin start/end gets a clean mode boundary.
                     if request is None:
@@ -808,7 +821,7 @@ class PlainTerminal(TerminalMenus):
             )
         if self._stdin_future is not None:
             raise InputUnavailableError("A Python stdin prompt is already pending in this terminal")
-        future = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._stdin_request = request
         self._stdin_future = future
         self._stdin_request_ended.clear()
@@ -846,7 +859,7 @@ class PlainTerminal(TerminalMenus):
         self, text: str, *, on_progress: ProgressCallback | None = None,
     ) -> Submission:
         method = self.coordinator.submit
-        kwargs: dict[str, object] = {}
+        kwargs: _SubmitKwargs = {}
         try:
             parameters = inspect.signature(method).parameters.values()
             accepts_extra = any(
@@ -870,7 +883,7 @@ class PlainTerminal(TerminalMenus):
         delivered.append(event)
         self._show_live_event(event)
 
-    async def _enqueue(self, text: str, on_progress: ProgressCallback):
+    async def _enqueue(self, text: str, on_progress: ProgressCallback) -> QueueTicket | None:
         method = getattr(self.coordinator, "enqueue", None)
         if not callable(method):
             return None
@@ -889,9 +902,9 @@ class PlainTerminal(TerminalMenus):
             kwargs["input_handler"] = self._request_input
         if accepts_extra or "on_progress" in names:
             kwargs["on_progress"] = on_progress
-        return await method(self.frontend_id, text, **kwargs)
+        return cast(QueueTicket, await method(self.frontend_id, text, **kwargs))
 
-    async def _watch_queue_ticket(self, ticket, delivered: list[OutputEvent]) -> None:
+    async def _watch_queue_ticket(self, ticket: QueueTicket, delivered: list[OutputEvent]) -> None:
         try:
             outcome = await ticket.completion
         except asyncio.CancelledError:
@@ -917,7 +930,7 @@ class PlainTerminal(TerminalMenus):
         queue_active = getattr(self.coordinator, "queue_active", False)
         return active or watchers or bool(pending) or queue_active or state is not State.IDLE
 
-    def _start_submission(self, text: str) -> asyncio.Task:
+    def _start_submission(self, text: str) -> asyncio.Task[None]:
         delivered: list[OutputEvent] = []
 
         async def on_progress(event: OutputEvent) -> None:

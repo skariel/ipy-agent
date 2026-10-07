@@ -8,7 +8,7 @@ from __future__ import annotations
 import base64
 import builtins
 import codecs
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import getpass as _getpass
 import inspect as _inspect
 import io
@@ -23,7 +23,7 @@ import subprocess
 import sys
 import threading
 import types
-from typing import Any
+from typing import Any, cast
 
 from .output_safety import redact_json, redact_text, safe_capture
 from .worker_protocol import (
@@ -40,6 +40,11 @@ from .worker_protocol import (
     MAX_RICH_OUTPUT_FRAMES,
     MAX_SAY_MESSAGES,
     PROTOCOL_VERSION,
+    ProtocolError,
+    encode_frame,
+)
+from .worker_protocol import (
+    decode_frame as _decode_frame,
 )
 
 MAX_VISIBLE_OUTPUT_CHARS = 8_000
@@ -73,7 +78,7 @@ def _dispatch_input(prompt: Any = "") -> str:
     functions = _ACTIVE_INPUT_FUNCTIONS
     if functions is None:
         raise RuntimeError("Interactive input is unavailable outside an active execution")
-    return functions[0](prompt)
+    return cast(str, functions[0](prompt))
 
 
 def _dispatch_getpass(
@@ -82,7 +87,7 @@ def _dispatch_getpass(
     functions = _ACTIVE_INPUT_FUNCTIONS
     if functions is None:
         raise RuntimeError("Interactive input is unavailable outside an active execution")
-    return functions[1](prompt, stream, echo_char=echo_char)
+    return cast(str, functions[1](prompt, stream, echo_char=echo_char))
 
 
 def _stdlib_getpass_dispatch(
@@ -96,7 +101,7 @@ def _stdlib_getpass_dispatch(
         name = next(iter(kwargs))
         raise TypeError(f"Unexpected getpass argument: {name}")
     # Resolved in the getpass module namespace after code transplantation.
-    return __py_agent_dispatch_getpass(prompt, stream, echo_char=echo_char)  # noqa: F821
+    return cast(str, __py_agent_dispatch_getpass(prompt, stream, echo_char=echo_char))  # type: ignore[name-defined]  # ruff: ignore[undefined-name]
 
 
 def _secure_getpass_variants() -> None:
@@ -126,21 +131,10 @@ def _secure_getpass_variants() -> None:
         namespace[name] = _dispatch_getpass
 
 
-class ProtocolError(ValueError):
-    pass
 
 
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    value: dict[str, Any] = {}
-    for key, item in pairs:
-        if key in value:
-            raise ProtocolError("Duplicate key in protocol frame")
-        value[key] = item
-    return value
 
 
-def _reject_constant(value: str) -> None:
-    raise ProtocolError(f"Invalid JSON number: {value}")
 
 
 def _read_exact(fd: int, size: int, *, allow_eof: bool = False) -> bytes | None:
@@ -155,18 +149,6 @@ def _read_exact(fd: int, size: int, *, allow_eof: bool = False) -> bytes | None:
     return bytes(chunks)
 
 
-def _decode_frame(payload: bytes) -> dict[str, Any]:
-    try:
-        frame = json.loads(
-            payload.decode("ascii"),
-            object_pairs_hook=_unique_object,
-            parse_constant=_reject_constant,
-        )
-    except (UnicodeError, ValueError, RecursionError) as exc:
-        raise ProtocolError("Malformed protocol frame") from exc
-    if not isinstance(frame, dict):
-        raise ProtocolError("Protocol frame must be an object")
-    return frame
 
 
 class _UnsafeMimeValue(ValueError):
@@ -272,13 +254,7 @@ def _safe_mime_bundle(data: Any, metadata: Any = None) -> tuple[dict[str, Any], 
 
 
 def _encode_payload(frame: dict[str, Any]) -> bytes:
-    try:
-        payload = json.dumps(frame, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")
-    except (TypeError, ValueError, RecursionError) as exc:
-        raise ProtocolError("Protocol frame is not JSON data") from exc
-    if not 0 < len(payload) <= MAX_FRAME:
-        raise ProtocolError("Protocol frame exceeds the byte limit")
-    return len(payload).to_bytes(4, "big") + payload
+    return encode_frame(frame)
 
 
 def _send(frame: dict[str, Any]) -> None:
@@ -537,7 +513,7 @@ def _complete(shell: Any, request_id: str, code: str, cursor_pos: int) -> None:
             matches = sorted(name for name in names if name.startswith(prefix))[:MAX_COMPLETION_MATCHES]
             matches = [name for name in matches if len(name) <= MAX_COMPLETION_MATCH_CHARS]
 
-    bounded_matches = []
+    bounded_matches: list[str] = []
     used_bytes = 0
     for candidate in matches[:MAX_COMPLETION_MATCHES]:
         if type(candidate) is not str or len(candidate) > MAX_COMPLETION_MATCH_CHARS:
@@ -621,10 +597,10 @@ class _UnavailableInput:
     readline = _raise
     readlines = _raise
 
-    def __iter__(self):
+    def __iter__(self) -> _UnavailableInput:
         return self
 
-    def __next__(self):
+    def __next__(self) -> None:
         self._raise()
 
     def isatty(self) -> bool:
@@ -637,7 +613,7 @@ class _UnavailableInput:
 class _OutputBytesWriter:
     """Minimal ``sys.stdout.buffer`` bridge into the bounded text channel."""
 
-    def __init__(self, writer: _OutputWriter):
+    def __init__(self, writer: _OutputWriter) -> None:
         self.writer = writer
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._lock = threading.Lock()
@@ -670,7 +646,7 @@ class _OutputBytesWriter:
 class _OutputWriter(io.TextIOBase):
     """Stream output in small, bounded, origin-tagged protocol frames."""
 
-    def __init__(self, stream: str, execution_id: str, author: str, origin: dict[str, Any]):
+    def __init__(self, stream: str, execution_id: str, author: str, origin: dict[str, Any]) -> None:
         super().__init__()
         self.stream = stream
         self.execution_id = execution_id
@@ -684,11 +660,11 @@ class _OutputWriter(io.TextIOBase):
         self._binary = _OutputBytesWriter(self)
 
     @property
-    def encoding(self) -> str:
+    def encoding(self) -> str:  # type: ignore[override]
         return "utf-8"
 
     @property
-    def errors(self) -> str:
+    def errors(self) -> str:  # type: ignore[override]
         return "replace"
 
     @property
@@ -768,7 +744,7 @@ class _RawOutputCapture:
 
     MAX_RETAINED_STREAMS = 128
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._readers: dict[int, tuple[str, Any, _OutputWriter]] = {}
         self._current: set[int] = set()
         self._wake_read, self._wake_write = os.pipe()
@@ -981,9 +957,12 @@ def _initialize_stdio() -> tuple[Any, Any, Any]:
     null_in = _UnavailableInput()
     null_out = os.fdopen(os.dup(1), "w", encoding="utf-8", errors="replace", buffering=1)
     null_err = os.fdopen(os.dup(2), "w", encoding="utf-8", errors="replace", buffering=1)
-    sys.stdin = sys.__stdin__ = null_in
-    sys.stdout = sys.__stdout__ = null_out
-    sys.stderr = sys.__stderr__ = null_err
+    sys.stdin = null_in
+    sys.__stdin__ = null_in
+    sys.stdout = null_out
+    sys.__stdout__ = null_out
+    sys.stderr = null_err
+    sys.__stderr__ = null_err
     builtins.input = _dispatch_input
     _secure_getpass_variants()
     return null_in, null_out, null_err
@@ -1033,7 +1012,7 @@ def _install_noninteractive_system(shell: Any) -> None:
     shell.system = run_system
 
 
-def _make_input_functions(execution_id: str, author: str, origin: dict[str, Any]):
+def _make_input_functions(execution_id: str, author: str, origin: dict[str, Any]) -> tuple[Callable[..., str], Callable[..., str], Callable[[], None]]:
     """Bridge Python's synchronous input APIs to the framed parent channel."""
     global _PASSWORD_SECRET_CHARS
     owner_thread = threading.get_ident()
@@ -1098,13 +1077,12 @@ def _make_input_functions(execution_id: str, author: str, origin: dict[str, Any]
                 or len(frame["value"]) > MAX_INPUT_VALUE_CHARS):
             raise ProtocolError("Interactive input reply does not match its request")
         value = frame["value"]
-        if password and value:
-            if value not in _PASSWORD_SECRETS:
-                if (len(_PASSWORD_SECRETS) >= MAX_PASSWORD_SECRETS
-                        or _PASSWORD_SECRET_CHARS + len(value) > MAX_PASSWORD_SECRET_CHARS):
-                    raise RuntimeError("Password redaction capacity is exhausted; password was not accepted")
-                _PASSWORD_SECRETS.append(value)
-                _PASSWORD_SECRET_CHARS += len(value)
+        if password and value and value not in _PASSWORD_SECRETS:
+            if (len(_PASSWORD_SECRETS) >= MAX_PASSWORD_SECRETS
+                    or _PASSWORD_SECRET_CHARS + len(value) > MAX_PASSWORD_SECRET_CHARS):
+                raise RuntimeError("Password redaction capacity is exhausted; password was not accepted")
+            _PASSWORD_SECRETS.append(value)
+            _PASSWORD_SECRET_CHARS += len(value)
         return value
 
     def interactive_input(prompt: Any = "") -> str:
@@ -1124,13 +1102,13 @@ def _make_input_functions(execution_id: str, author: str, origin: dict[str, Any]
 
 
 
-def _make_llm(execution_id, author, origin):
+def _make_llm(execution_id: str, author: str, origin: dict[str, Any]) -> tuple[Callable[[dict[str, Any]], str], Callable[[], None]]:
     from .stdlib import MAX_CALLS_PER_CELL, MAX_RESULT_CHARS
     owner_thread = threading.get_ident()
     active = True
     calls = 0
 
-    def call(payload):
+    def call(payload: dict[str, Any]) -> str:
         nonlocal calls
         if not active or threading.get_ident() != owner_thread:
             raise RuntimeError("llm() is only supported in the active cell's main thread")
@@ -1159,15 +1137,15 @@ def _make_llm(execution_id, author, origin):
             raise KeyboardInterrupt
         if reply["type"] == "llm_error":
             raise RuntimeError(reply["text"])
-        return reply["text"]
+        return cast(str, reply["text"])
 
-    def deactivate():
+    def deactivate() -> None:
         nonlocal active
         active = False
 
     return call, deactivate
 
-def _make_say(execution_id: str, author: str, origin: dict[str, Any], stdout, stderr):
+def _make_say(execution_id: str, author: str, origin: dict[str, Any], stdout: _OutputWriter, stderr: _OutputWriter) -> tuple[Callable[..., None], Callable[[], None], Callable[[], bool]]:
     owner_thread = threading.get_ident()
     active = True
     final_requested = False
@@ -1285,9 +1263,12 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
 
     cell_printer = CellPrinter(redact=_redact_text)
     shell.user_ns["preview"] = cell_printer
-    sys.stdin = sys.__stdin__ = null_in
-    sys.stdout = sys.__stdout__ = stdout
-    sys.stderr = sys.__stderr__ = stderr
+    sys.stdin = null_in
+    sys.__stdin__ = null_in
+    sys.stdout = stdout
+    sys.__stdout__ = stdout
+    sys.stderr = stderr
+    sys.__stderr__ = stderr
     builtins.input = _dispatch_input
     _secure_getpass_variants()
     if _RAW_CAPTURE is not None:
@@ -1311,6 +1292,7 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
                   display_id: str | None = None, wait: bool = False,
                   output_read: dict[str, int] | None = None) -> bool:
         nonlocal rich_frame_count, rich_frame_bytes
+        safe_metadata: dict[str, Any]
         if kind == "clear":
             safe_data, safe_metadata = {"wait": bool(wait)}, {}
         else:
@@ -1496,9 +1478,12 @@ def _run_cell(shell: Any, execution_id: str, author: str, source: str, origin: d
             _ACTIVE_LLM.reset(llm_token)
             _ACTIVE_INPUT_FUNCTIONS = None
             # Do not let a cell's reassignment of sys.std* poison later cells.
-            sys.stdin = sys.__stdin__ = null_in
-            sys.stdout = sys.__stdout__ = null_out
-            sys.stderr = sys.__stderr__ = null_err
+            sys.stdin = null_in
+            sys.__stdin__ = null_in
+            sys.stdout = null_out
+            sys.__stdout__ = null_out
+            sys.stderr = null_err
+            sys.__stderr__ = null_err
             builtins.input = _dispatch_input
             _secure_getpass_variants()
 
@@ -1558,7 +1543,7 @@ def main() -> None:
     )
     # Headless inline figures need no GUI event loop. Other GUI backends remain
     # unsupported in this worker; do not silently pretend a GUI was started.
-    def enable_headless_gui(gui=None):
+    def enable_headless_gui(gui: str | None = None) -> None:
         if gui not in (None, "inline"):
             raise NotImplementedError("Use the inline Matplotlib backend in py")
     shell.enable_gui = enable_headless_gui

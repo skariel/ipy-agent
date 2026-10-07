@@ -15,7 +15,7 @@ class Activity:
     started: float = field(default_factory=time.monotonic)
     retry_at: float | None = None
 
-    def text(self):
+    def text(self) -> str:
         elapsed = max(0, int(time.monotonic() - self.started))
         value = f"{self.label} · attempt {self.attempt}/{self.attempts} · {elapsed}s"
         if self.retry_at is not None:
@@ -32,7 +32,7 @@ class Recovery:
     model: str = ""
     options: tuple[tuple[str, str], ...] = field(default=(), repr=False)
 
-    def text(self):
+    def text(self) -> str:
         return (f"Model request failed; no new source accepted. {self.executed_cells} prior cell(s) "
                 "already completed. /resume retries only the pending model request; "
                 "completed cells are never replayed. /recovery discard clears it.")

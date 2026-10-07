@@ -83,11 +83,14 @@ ported; use their API-key integrations where available.
 
 A provider request is made only after submitting an English request. The `py` CLI itself requires an explicit model (or a plugin/fake provider);
 only `run.sh` supplies the Codex GPT-6.1-Sol launcher default.
-Recognized transient provider failures (rate limits, transport/timeouts, and
-server 5xx errors) receive up to two retries before any Python cell executes.
-Transport disconnects (including ReadError) allow up to six attempts with
-1/2/4/8-second backoff plus a final 15-second automatic recovery cooldown;
-a lost response can still mean both model attempts were billed. Authentication,
+Main generation and nested `llm()` calls share one retry policy. Rate limits,
+timeouts, provider unavailability, and server 5xx errors allow three attempts;
+transport disconnects (including ReadError) allow six. Backoffs are 0.5/1 seconds
+or 1/2/4/8/15 seconds, respectively, plus bounded jitter. Numeric Retry-After
+hints are honored up to 60 seconds. Codex streams have a 180-second default idle
+deadline, including with custom HTTP transports. Only model requests retry:
+executed cells are never replayed. A lost response can still mean both attempts
+were billed. Authentication,
 request, format, and unknown local errors are not retried. Recognized transient
 TLS disconnects and generic SSLError are transport failures; certificate verification
 and known TLS configuration errors are not retried, and TLS verification is never disabled.
@@ -157,7 +160,10 @@ successfully generated cells; three consecutive invalid model responses still
 pause to avoid unbounded format-retry requests. `wait()`, a host history API,
 and resume are not implemented. Optional `--journal PATH` enables a private,
 append-only SQLite history; without it persistence is explicitly disabled.
-Prompts, code and output in that journal remain sensitive. `input()` and
+Built-in frontends serialize journal I/O on a dedicated worker with bounded
+admission and await commit acknowledgements. Cancellation waits for admitted
+writes to settle; failed writes are not replayed. Custom synchronous journals
+retain their synchronous contract. Prompts, code and output remain sensitive. `input()` and
 `getpass()` request correlated frontend input; unavailable frontends fail clearly.
 Stdout/stderr over 8,000 characters is replaced by a short notice in the
 completed terminal result, journal and model context. Other frontends may
@@ -387,10 +393,20 @@ integration-verified; full history and dynamic completion remain incomplete. See
 
 ## Development quality checks
 
-Run `uv run pytest -q` for the test suite and
-`uv run mypy --config-file mypy-strict.toml` for the migrated strict-typed core.
-Whole-repository strict typing is still in progress; see
-[REFACTORING.md](REFACTORING.md) for scope and next steps.
+Run the reproducible offline checks:
+
+```sh
+uv sync --locked
+uv run --no-sync pytest -q -m 'not live'
+uv run --no-sync ruff check src tests
+uv run --no-sync mypy --config-file mypy-strict.toml
+```
+
+CI checks Python 3.12–3.14 and an optional Jupyter installation. For the complete
+repository type check, install the optional adapters with
+`uv sync --locked --extra jupyter`, then run `uv run --no-sync mypy`.
+Whole-repository **strict** typing is still in progress; see
+[REFACTORING.md](REFACTORING.md).
 
 ### Visual inspection with Python
 
@@ -445,8 +461,8 @@ bounded numbered source; `test_summary(retained_subprocess_result)` returns a
 structured bounded summary and never reruns tests.
 
 The toolbar shows model/subcall activity, attempt counts, elapsed time, and retry
-countdowns, without prompts or credentials. Transport failures automatically
-retry only model requests, including one final bounded cooldown. On exhaustion,
+countdowns, without prompts or credentials. Both model entrypoints use the
+shared retry policy described above; execution is never retried. On exhaustion,
 `/recovery` describes the checkpoint and completed execution; `/resume` retries
 the pending model turn, not prior Python cells. `/recovery discard` clears it.
 A new English task supersedes a pending checkpoint. Recovery is session-local,

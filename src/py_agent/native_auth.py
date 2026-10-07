@@ -1,6 +1,12 @@
 """Private py credentials; Pi compatibility is read-only."""
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .codex_auth import CodexCredentials
+
+from collections.abc import Iterator
 from contextlib import contextmanager
 import fcntl
 import json
@@ -9,6 +15,7 @@ from pathlib import Path
 import re
 import stat
 import time
+from typing import Any
 import uuid
 
 from .provider import ProviderError
@@ -28,13 +35,13 @@ def provider_id(value: str) -> str:
     return value
 
 
-def read_document() -> dict:
+def read_document() -> dict[str, Any]:
     from .codex_auth import _read_auth_document
     return _read_auth_document(auth_path(), error=auth_error) or {}
 
 
 @contextmanager
-def locked_store():
+def locked_store() -> Iterator[int]:
     """Owned, no-symlink directory and lock; serialize read/modify/refresh/write."""
     path = auth_path()
     directory = lock = None
@@ -79,7 +86,7 @@ def locked_store():
             os.close(directory)
 
 
-def write_document(directory: int, document: dict) -> None:
+def write_document(directory: int, document: dict[str, Any]) -> None:
     from .codex_auth import MAX_AUTH_BYTES
     data = json.dumps(document, allow_nan=False).encode()
     if len(data) > MAX_AUTH_BYTES:
@@ -108,7 +115,7 @@ def write_document(directory: int, document: dict) -> None:
                 pass
 
 
-def save(provider: str, entry: dict) -> None:
+def save(provider: str, entry: dict[str, Any]) -> None:
     provider_id(provider)
     with locked_store() as directory:
         document = read_document()
@@ -127,7 +134,7 @@ def logout(provider: str) -> bool:
         return present
 
 
-def api_key_entry(key: str) -> dict:
+def api_key_entry(key: str) -> dict[str, str]:
     if (not isinstance(key, str) or not 1 <= len(key) <= 65536
             or key.startswith("!") or any(ord(c) < 33 or ord(c) > 126 for c in key)):
         raise auth_error("invalid API key (command-backed keys are not supported)")
@@ -139,18 +146,21 @@ def select_path(provider: str) -> Path:
     return auth_path() if provider in read_document() else DEFAULT_AUTH_FILE
 
 
-def codex_credentials():
+def codex_credentials() -> CodexCredentials:
     from .codex_auth import DEFAULT_AUTH_FILE, read_codex_credentials
-    if "openai-codex" not in read_document():
-        return read_codex_credentials(DEFAULT_AUTH_FILE)
+    # Even the presence check must be serialized: another reader may rotate
+    # auth.json while refreshing, which secure reads correctly reject.
     with locked_store() as directory:
         document = read_document()
+        if "openai-codex" not in document:
+            return read_codex_credentials(DEFAULT_AUTH_FILE)
         entry = document.get("openai-codex")
         if not isinstance(entry, dict) or entry.get("type") != "oauth":
             raise auth_error("no Codex OAuth login; use py login openai-codex")
         expires = entry.get("expires")
         import math
-        if type(expires) not in (int, float) or not math.isfinite(expires):
+        if (not isinstance(expires, (int, float))
+                or type(expires) not in (int, float) or not math.isfinite(expires)):
             raise auth_error("invalid Codex expiry; use py login openai-codex")
         if expires <= time.time() * 1000 + 30_000:
             from .oauth import refresh_codex

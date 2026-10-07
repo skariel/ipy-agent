@@ -6,12 +6,13 @@ services, pipeline transformations, observers, and wrappers own runtime work.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from importlib import metadata
 import inspect
 import re
 from types import MappingProxyType
-from typing import Callable, Literal, Mapping
+from typing import Literal, TypeGuard
 
 import pluggy
 
@@ -27,12 +28,12 @@ class PluginError(ValueError):
     """Invalid plugin configuration; never silently select another backend."""
 
 
-def _valid_name(value: object) -> bool:
+def _valid_name(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and bool(value.strip()) and value == value.strip() and "\x00" not in value
 
 
-def _sequence(value: object, description: str) -> tuple:
-    if isinstance(value, (str, bytes)):
+def _sequence(value: object, description: str) -> tuple[object, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
         raise PluginError(f"{description} must be a sequence")
     try:
         return tuple(value)
@@ -51,7 +52,7 @@ class PluginManifest:
     api_max: int = API_VERSION
     requires: tuple[str, ...] = ()
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not _valid_name(self.id):
             raise PluginError("Plugin ID must be nonempty, trimmed text")
         if (type(self.api_min) is not int or type(self.api_max) is not int
@@ -71,9 +72,9 @@ class PluginManifest:
 class Service:
     kind: str
     id: str
-    factory: Callable
+    factory: Callable[..., object]
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not _valid_name(self.kind) or not _valid_name(self.id):
             raise PluginError("Service kind and ID must be nonempty, trimmed text")
         if not callable(self.factory):
@@ -94,7 +95,7 @@ class CommandContribution:
     summary: str = ""
     usage: str = ""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not isinstance(self.name, str) or re.fullmatch(r"[a-z][a-z0-9_-]*", self.name) is None:
             raise PluginError("Command names must be lowercase identifiers")
         if not callable(self.factory):
@@ -118,7 +119,7 @@ class TransformContribution:
     before: tuple[str, ...] = ()
     after: tuple[str, ...] = ()
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.kind not in ("context", "model-request"):
             raise PluginError("Transform kind must be 'context' or 'model-request'")
         if not _valid_name(self.name):
@@ -148,7 +149,7 @@ class ObserverContribution:
     factory: Callable[[Mapping[str, Scalar]], object]
     critical: bool = True
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not _valid_name(self.name):
             raise PluginError("Observer name must be nonempty, trimmed text")
         if not callable(self.factory):
@@ -164,7 +165,7 @@ class ExecutorWrapperContribution:
     name: str
     factory: Callable[[object], object]
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not _valid_name(self.name):
             raise PluginError("Executor wrapper name must be nonempty, trimmed text")
         if not callable(self.factory):
@@ -181,7 +182,7 @@ class Contributions:
     observers: tuple[ObserverContribution, ...] = ()
     executor_wrappers: tuple[ExecutorWrapperContribution, ...] = ()
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not isinstance(self.manifest, PluginManifest):
             raise PluginError("Contributions require a PluginManifest")
         for attribute in ("services", "config_fields", "commands", "transforms",
@@ -200,10 +201,10 @@ class RegisteredCommand:
         return self.contribution.name
 
     @property
-    def factory(self):
+    def factory(self) -> Callable[[Mapping[str, Scalar]], object]:
         return self.contribution.factory
 
-    def create(self, config: Mapping[str, Scalar]):
+    def create(self, config: Mapping[str, Scalar]) -> object:
         return self.factory(_plugin_config(config))
 
 
@@ -221,7 +222,7 @@ class RegisteredTransform:
         return self.contribution.name
 
     @property
-    def factory(self):
+    def factory(self) -> Callable[[Mapping[str, Scalar]], object]:
         return self.contribution.factory
 
     @property
@@ -236,7 +237,7 @@ class RegisteredTransform:
     def qualified_name(self) -> str:
         return f"{self.plugin_id}:{self.name}"
 
-    def create(self, config: Mapping[str, Scalar]):
+    def create(self, config: Mapping[str, Scalar]) -> object:
         return self.factory(_plugin_config(config))
 
 
@@ -257,7 +258,7 @@ class RegisteredObserver:
     def qualified_name(self) -> str:
         return f"{self.plugin_id}:{self.name}"
 
-    def create(self, config: Mapping[str, Scalar]):
+    def create(self, config: Mapping[str, Scalar]) -> object:
         return self.contribution.factory(_plugin_config(config))
 
 
@@ -275,7 +276,7 @@ class RegisteredExecutorWrapper:
         return f"{self.plugin_id}:{self.name}"
 
     @property
-    def factory(self):
+    def factory(self) -> Callable[[object], object]:
         return self.contribution.factory
 
 
@@ -283,6 +284,7 @@ class Hooks:
     @hookspec
     def py_agent_register(self) -> Contributions:
         """Return declarative contributions; do not start resources here."""
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
@@ -292,7 +294,7 @@ class DiscoveredPlugin:
     distribution: str | None
 
 
-def _entry_points():
+def _entry_points() -> tuple[metadata.EntryPoint, ...]:
     try:
         return tuple(metadata.entry_points(group=ENTRY_POINT_GROUP))
     except Exception:
@@ -324,7 +326,7 @@ def _ordered_transforms(transforms: tuple[RegisteredTransform, ...]) -> Mapping[
         stages = {item.name: item for item in transforms if item.kind == kind}
         if len(stages) != sum(item.kind == kind for item in transforms):
             raise PluginError(f"Duplicate {kind} transform name")
-        edges = {name: set() for name in stages}
+        edges: dict[str, set[str]] = {name: set() for name in stages}
         for name, item in stages.items():
             references = (*item.before, *item.after)
             missing = set(references) - stages.keys()
@@ -334,7 +336,7 @@ def _ordered_transforms(transforms: tuple[RegisteredTransform, ...]) -> Mapping[
                 edges[name].add(successor)
             for predecessor in item.after:
                 edges[predecessor].add(name)
-        remaining = {name: set() for name in stages}
+        remaining: dict[str, set[str]] = {name: set() for name in stages}
         for before, afters in edges.items():
             for after in afters:
                 remaining[after].add(before)
@@ -370,17 +372,38 @@ class PluginRuntime:
     """A fully validated, immutable registry. Build a new one to change plugins."""
 
     __slots__ = (
-        "manifests", "services", "config", "order", "commands", "transforms",
-        "observers", "executor_wrappers", "_sealed",
+        "_sealed",
+        "commands",
+        "config",
+        "executor_wrappers",
+        "manifests",
+        "observers",
+        "order",
+        "services",
+        "transforms",
     )
 
-    def __setattr__(self, name, value):
+    def __setattr__(self, name: str, value: object) -> None:
         if getattr(self, "_sealed", False):
             raise AttributeError("PluginRuntime is immutable")
         object.__setattr__(self, name, value)
 
-    def __init__(self, manifests, services, order, config_fields=(), *, commands=(),
-                 transforms=(), observers=(), executor_wrappers=()):
+    commands: Mapping[str, RegisteredCommand]
+    config: ConfigRegistry
+    executor_wrappers: Mapping[str, RegisteredExecutorWrapper]
+    manifests: Mapping[str, PluginManifest]
+    observers: tuple[RegisteredObserver, ...]
+    order: tuple[str, ...]
+    services: Mapping[tuple[str, str], Service]
+    transforms: Mapping[str, tuple[RegisteredTransform, ...]]
+
+    def __init__(self, manifests: Mapping[str, PluginManifest],
+                 services: Mapping[tuple[str, str], Service], order: Iterable[str],
+                 config_fields: Iterable[ConfigField] = (), *,
+                 commands: Iterable[RegisteredCommand] = (),
+                 transforms: Iterable[RegisteredTransform] = (),
+                 observers: Iterable[RegisteredObserver] = (),
+                 executor_wrappers: Iterable[RegisteredExecutorWrapper] = ()) -> None:
         if not isinstance(manifests, Mapping) or not isinstance(services, Mapping):
             raise PluginError("Plugin registries must be mappings")
         manifest_copy = dict(manifests)
@@ -425,20 +448,20 @@ class PluginRuntime:
             if (not isinstance(item, RegisteredCommand) or item.plugin_id not in manifest_copy
                     or not isinstance(item.contribution, CommandContribution)):
                 raise PluginError("Invalid registered command")
-        for item in transform_items:
-            if (not isinstance(item, RegisteredTransform) or item.plugin_id not in manifest_copy
-                    or not isinstance(item.contribution, TransformContribution)):
+        for transform_item in transform_items:
+            if (not isinstance(transform_item, RegisteredTransform) or transform_item.plugin_id not in manifest_copy
+                    or not isinstance(transform_item.contribution, TransformContribution)):
                 raise PluginError("Invalid registered transform")
-        for item in observer_items:
-            if (not isinstance(item, RegisteredObserver) or item.plugin_id not in manifest_copy
-                    or not isinstance(item.contribution, ObserverContribution)):
+        for observer_item in observer_items:
+            if (not isinstance(observer_item, RegisteredObserver) or observer_item.plugin_id not in manifest_copy
+                    or not isinstance(observer_item.contribution, ObserverContribution)):
                 raise PluginError("Invalid registered observer")
-        for item in wrapper_items:
-            if (not isinstance(item, RegisteredExecutorWrapper) or item.plugin_id not in manifest_copy
-                    or not isinstance(item.contribution, ExecutorWrapperContribution)):
+        for wrapper_item in wrapper_items:
+            if (not isinstance(wrapper_item, RegisteredExecutorWrapper) or wrapper_item.plugin_id not in manifest_copy
+                    or not isinstance(wrapper_item.contribution, ExecutorWrapperContribution)):
                 raise PluginError("Invalid registered executor wrapper")
 
-        def unique(items, key, description):
+        def unique[T](items: Iterable[T], key: Callable[[T], str], description: str) -> None:
             names = [key(item) for item in items]
             if len(names) != len(set(names)):
                 raise PluginError(f"Duplicate {description}")
@@ -471,7 +494,7 @@ class PluginRuntime:
             raise PluginError(f"No enabled {kind} service named {identifier}") from None
 
     @classmethod
-    def load(cls, *, builtins: Mapping[str, object] | None = None, enabled=()):
+    def load(cls, *, builtins: Mapping[str, object] | None = None, enabled: Iterable[str] = ()) -> PluginRuntime:
         """Activate only named external entry points; builtins are explicit too.
 
         Validation is transactional for the registry, not for arbitrary import
@@ -487,7 +510,7 @@ class PluginRuntime:
             raise PluginError("Enabled plugin names must be nonempty, trimmed text")
         if len(names) != len(set(names)):
             raise PluginError("Duplicate enabled plugin name")
-        names = tuple(sorted(names))
+        names = tuple(sorted(name for name in names if _valid_name(name)))
 
         entries = _entry_points() if names else ()
         selected = []
@@ -539,7 +562,10 @@ class PluginRuntime:
                 raise PluginError("Registration hooks must be synchronous, non-wrapper functions")
 
         manifests, services, config_fields = {}, {}, []
-        commands, transforms, observers, wrappers = [], [], [], []
+        commands: list[RegisteredCommand] = []
+        transforms: list[RegisteredTransform] = []
+        observers: list[RegisteredObserver] = []
+        wrappers: list[RegisteredExecutorWrapper] = []
         for name in sorted(plugins):
             caller = pm.subset_hook_caller("py_agent_register", remove_plugins=[
                 other for other in plugins.values() if other is not plugins[name]
@@ -573,9 +599,10 @@ class PluginRuntime:
                 services[key] = service
                 # Preserve the earlier public Service("command", ...) shape.
                 if service.kind == "command":
-                    legacy = CommandContribution(
-                        service.id, lambda _config, factory=service.factory: factory(),
-                    )
+                    def legacy_factory(_config: Mapping[str, Scalar],
+                                       factory: Callable[..., object] = service.factory) -> object:
+                        return factory()
+                    legacy = CommandContribution(service.id, legacy_factory)
                     commands.append(RegisteredCommand(name, legacy))
             if any(not isinstance(item, CommandContribution) for item in contribution.commands):
                 raise PluginError(f"Invalid command contribution from {name}")

@@ -6,6 +6,8 @@ by this module. This is lifecycle hygiene, not a same-user security boundary.
 """
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 import errno
 import json
 import math
@@ -18,10 +20,10 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from typing import Any
 import uuid
+
+CONNECTION_FILE_PLACEHOLDER = "{connection_file}"
 
 DEFAULT_SESSION_ROOT = Path.home() / ".py" / "kernel-sessions"
 _SESSION_ID = re.compile(r"^[a-f0-9]{32}$")
@@ -452,7 +454,7 @@ def _read_connection_file(path: Path) -> dict[str, Any]:
 
 
 def _wait_for_connection_file(
-    process: subprocess.Popen,
+    process: subprocess.Popen[bytes],
     path: Path,
     timeout: float,
 ) -> None:
@@ -470,7 +472,7 @@ def _wait_for_connection_file(
 
 def _wait_for_kernel_ready(connection_file: Path, timeout: float) -> None:
     try:
-        from jupyter_client import BlockingKernelClient
+        from jupyter_client.blocking.client import BlockingKernelClient
     except ImportError as exc:
         raise UnsupportedKernelSessions(
             "Managed Jupyter kernels require the optional 'jupyter_client' package; install py-agent[jupyter]"
@@ -484,7 +486,7 @@ def _wait_for_kernel_ready(connection_file: Path, timeout: float) -> None:
         client.stop_channels()
 
 
-def _terminate_spawned(process: subprocess.Popen) -> None:
+def _terminate_spawned(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
     try:
@@ -540,14 +542,14 @@ def start_session(
     connection_file = directory / _CONNECTION_NAME
     log_file = directory / _LOG_NAME
     command_arguments = [
-        str(connection_file) if item == "{connection_file}" else item
+        str(connection_file) if item == CONNECTION_FILE_PLACEHOLDER else item
         for item in command
     ]
-    if "{connection_file}" not in command:
+    if CONNECTION_FILE_PLACEHOLDER not in command:
         _remove_session_directory(private_root, session_id)
-        raise ValueError("Kernel command must include the {connection_file} placeholder")
+        raise ValueError("Kernel command must include the connection-file placeholder")
     log_fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    process: subprocess.Popen | None = None
+    process: subprocess.Popen[bytes] | None = None
     try:
         with os.fdopen(log_fd, "wb", closefd=True) as log:
             process = subprocess.Popen(
@@ -649,7 +651,7 @@ def get_session(session_id: str, *, root: Path = DEFAULT_SESSION_ROOT) -> Kernel
 
 def _send_shutdown_request(record: _Record, timeout: float) -> bool:
     try:
-        from jupyter_client import BlockingKernelClient
+        from jupyter_client.blocking.client import BlockingKernelClient
     except ImportError:
         return False
     client = BlockingKernelClient(connection_file=str(record.connection_file))
@@ -1007,7 +1009,7 @@ def install_kernelspec(
             "Kernelspec installation requires 'jupyter_client'; install py-agent[jupyter]"
         ) from exc
 
-    argv = [*kernel_argv(), *launch_arguments, "-f", "{connection_file}"]
+    argv = [*kernel_argv(), *launch_arguments, "-f", CONNECTION_FILE_PLACEHOLDER]
     with tempfile.TemporaryDirectory(prefix="py-agent-kernelspec-") as temporary:
         directory = Path(temporary)
         spec = {

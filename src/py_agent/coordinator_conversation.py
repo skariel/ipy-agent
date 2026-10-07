@@ -1,4 +1,4 @@
-"""Coordinator conversation component; orchestration remains in Coordinator."""
+"""SessionRuntime conversation component; orchestration remains in SessionRuntime."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import re
 import shlex
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from .configuration import ConfigSnapshot
 from .context_export import default_export_path, write_context_html
@@ -34,19 +34,20 @@ from .session_journal import (
 )
 
 if TYPE_CHECKING:
-    from .coordinator import Coordinator
+    from .coordinator_runtime import SessionRuntime
+    from .images import ImageAttachment
 
 
 class ConversationState:
     """Owns conversation state and behavior for one coordinator."""
 
-    def __init__(self, coordinator: Coordinator) -> None:
+    def __init__(self, coordinator: SessionRuntime) -> None:
         self.coordinator = coordinator
-        self._epoch_config = None
-        self._epoch_config_epoch = None
+        self._epoch_config: ConfigSnapshot | None = None
+        self._epoch_config_epoch: int | None = None
         self._context: list[tuple[str, str]] = []
         self._context_epoch = 0
-        self._context_images = []
+        self._context_images: list[tuple[int, ImageAttachment]] = []
         self._context_overlay: list[tuple[int, str]] = []
         self._context_overlay_epoch: int | None = None
         self._history_sensitive_values: set[str] = set()
@@ -113,7 +114,7 @@ class ConversationState:
             # paged read path uses overlap-aware masking; short excerpts are
             # omitted whenever config-derived secret values are in scope.
             return "[history excerpt hidden to protect sensitive configuration]"
-        patterns = self.coordinator._history_patterns()
+        patterns = self.coordinator.conversation._history_patterns()
         if not patterns:
             return text
         matcher = re.compile("|".join(re.escape(pattern) for pattern in patterns), re.IGNORECASE)
@@ -122,15 +123,22 @@ class ConversationState:
             text,
         )
 
-    def _read_history_page(self, event_id: str, offset: int, limit: int) -> dict[str, object]:
-        page = self.coordinator.journal.read(self.coordinator.session_id, event_id, offset=offset, limit=limit)
+    async def _history_lookup(self, method: str, *args: object, **kwargs: object) -> object:
+        from .journal_worker import SQLiteJournalWorker
+        journal = self.coordinator.journal
+        if isinstance(journal, SQLiteJournalWorker):
+            return await journal.call(method, *args, **kwargs)
+        return getattr(journal, method)(*args, **kwargs)
+
+    async def _read_history_page(self, event_id: str, offset: int, limit: int) -> dict[str, object]:
+        page = cast(dict[str, object], await self._history_lookup("read", self.coordinator.session_id, event_id, offset=offset, limit=limit))
         content = page.get("content")
         if not isinstance(content, str):
             raise JournalError("Journal returned an invalid history page")
         if self._history_content_hidden:
-            page["content"] = self.coordinator._redact_history_text(content)
+            page["content"] = self.coordinator.conversation._redact_history_text(content)
             return page
-        patterns = self.coordinator._history_patterns()
+        patterns = self.coordinator.conversation._history_patterns()
         if not patterns or not content:
             page["content"] = content
             return page
@@ -141,13 +149,13 @@ class ConversationState:
             MAX_HISTORY_PAGE_CHARS,
             (offset - start) + page_chars + overlap,
         )
-        extended = self.coordinator.journal.read(
+        extended = cast(dict[str, object], await self._history_lookup("read",
             self.coordinator.session_id, event_id, offset=start, limit=extended_limit,
-        )
+        ))
         surrounding = extended.get("content")
         if not isinstance(surrounding, str):
             raise JournalError("Journal returned an invalid history page")
-        masked = self.coordinator._redact_history_text(surrounding, preserve_offsets=True)
+        masked = self.coordinator.conversation._redact_history_text(surrounding, preserve_offsets=True)
         page_start = offset - start
         page["content"] = masked[page_start:page_start + page_chars]
         return page
@@ -263,7 +271,7 @@ class ConversationState:
         if not callable(getattr(self.coordinator.context_service, "snapshot", None)):
             self._context.append(("user", text))
             return
-        epoch = self.coordinator._read_context_epoch()
+        epoch = self.coordinator.conversation._read_context_epoch()
         if epoch is None:
             epoch = self._context_epoch
         if self._context_overlay_epoch != epoch:
@@ -287,7 +295,7 @@ class ConversationState:
             abandon(request_id)
 
     def _commit_context(self, request_id: str, user_text: str, assistant_text: str,
-                        observation=None, phase: str | None = None, *, include_user: bool = True) -> None:
+                        observation: object = None, phase: str | None = None, *, include_user: bool = True) -> None:
         if self.coordinator.context_service is None:
             text = None
             if observation is not None:
@@ -300,7 +308,7 @@ class ConversationState:
             if isinstance(observation, Mapping):
                 text = json.dumps({k: v for k, v in observation.items() if k != "_images"},
                                   ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-            self.coordinator._commit_fallback_context(user_text, assistant_text, text, include_user=include_user)
+            self.coordinator.conversation._commit_fallback_context(user_text, assistant_text, text, include_user=include_user)
             index = len(self._context) - 1
             self._context_images.extend((index, ImageAttachment.from_record(record)) for record in records)
             self._context_images = self._context_images[-MAX_CONTEXT_IMAGES:]
@@ -316,11 +324,11 @@ class ConversationState:
             json.dumps(observation, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
             if observation is not None else None
         )
-        self.coordinator._commit_fallback_context(user_text, assistant_text, text, include_user=include_user)
+        self.coordinator.conversation._commit_fallback_context(user_text, assistant_text, text, include_user=include_user)
 
     def _context_export_payload(self) -> dict[str, object]:
         """Capture current context plus the exact most recent provider request."""
-        snapshot = self.coordinator._latest_context()
+        snapshot = self.coordinator.conversation._latest_context()
 
         def snapshot_data(value: ContextSnapshot) -> dict[str, object]:
             return {
@@ -335,7 +343,7 @@ class ConversationState:
                 "transform_trace": list(value.transform_trace),
             }
 
-        request = self.coordinator._lifecycle._active_model_request
+        request = self.coordinator.lifecycle.operation.model_request
         request_data = None
         if request is not None:
             request_data = {
@@ -431,14 +439,14 @@ class ConversationState:
             return _CONTEXT_USAGE
         path = default_export_path(self.coordinator.session_id) if len(tokens) < 2 else Path(tokens[1])
         try:
-            saved = write_context_html(path, self.coordinator._context_export_payload())
+            saved = write_context_html(path, self.coordinator.conversation._context_export_payload())
         except FileExistsError:
             return f"Context export refused to overwrite existing file: {path}"
         except OSError as exc:
             return f"Context export failed: {exc}"
         return f"Saved private context explorer to {saved} (file mode 0600)."
 
-    def _history_command(self, arguments: str) -> str:
+    async def _history_command(self, arguments: str) -> str:
         if getattr(self.coordinator.journal, "persisted", None) is False:
             return (
                 "History persistence is disabled: this session selected the explicit "
@@ -460,19 +468,19 @@ class ConversationState:
             count = self.coordinator._history_count(values, default=HISTORY_DEFAULT_LIMIT)
             if count is None:
                 return _HISTORY_USAGE
-            return self.coordinator._history_recent(count)
+            return await self.coordinator.conversation._history_recent(count)
         if operation.isdecimal() and len(tokens) == 1:
             count = self.coordinator._history_count(tokens, default=HISTORY_DEFAULT_LIMIT)
-            return self.coordinator._history_recent(count) if count is not None else _HISTORY_USAGE
+            return await self.coordinator.conversation._history_recent(count) if count is not None else _HISTORY_USAGE
         if operation == "search":
-            return self.coordinator._history_search(tokens[1:])
+            return await self.coordinator.conversation._history_search(tokens[1:])
         if operation in {"page", "read"}:
-            return self.coordinator._history_page(tokens[1:])
+            return await self.coordinator.conversation._history_page(tokens[1:])
         return _HISTORY_USAGE
 
-    def _history_recent(self, count: int) -> str:
+    async def _history_recent(self, count: int) -> str:
         try:
-            entries = self.coordinator.journal.recent(self.coordinator.session_id, limit=count)
+            entries = cast(list[dict[str, object]], await self._history_lookup("recent", self.coordinator.session_id, limit=count))
         except Exception:
             return "History is unavailable because the journal could not be read."
         if not entries:
@@ -487,7 +495,7 @@ class ConversationState:
             excerpt = entry.get("excerpt")
             if not isinstance(event_id, str) or not isinstance(kind, str) or not isinstance(excerpt, str):
                 continue
-            safe_excerpt = self.coordinator._redact_history_text(excerpt[:240])
+            safe_excerpt = self.coordinator.conversation._redact_history_text(excerpt[:240])
             safe_id = event_id[:128]
             safe_kind = kind[:100]
             request = f" request={request_id[:128]}" if isinstance(request_id, str) else ""
@@ -496,10 +504,10 @@ class ConversationState:
             return "No readable history entries are available. History is read-only; nothing is replayed."
         return "\n".join(lines)
 
-    def _history_search(self, tokens: list[str]) -> str:
+    async def _history_search(self, tokens: list[str]) -> str:
         count = HISTORY_DEFAULT_LIMIT
         kind = None
-        query_tokens = []
+        query_tokens: list[str] = []
         index = 0
         while index < len(tokens):
             token = tokens[index]
@@ -524,10 +532,10 @@ class ConversationState:
         if not query or len(query) > MAX_HISTORY_SEARCH_QUERY_CHARS:
             return _HISTORY_USAGE
         try:
-            entries = self.coordinator.journal.search(
+            entries = cast(list[dict[str, object]], await self._history_lookup("search",
                 self.coordinator.session_id, query, kind=kind, limit=count,
                 scan_limit=MAX_HISTORY_SEARCH_SCAN,
-            )
+            ))
         except Exception:
             return "History search is unavailable; check the query and journal."
         lines = [
@@ -549,7 +557,7 @@ class ConversationState:
                 f" around={offset}"
                 if type(offset) is int and 0 <= offset <= HISTORY_MAX_OFFSET else ""
             )
-            safe_excerpt = self.coordinator._redact_history_text(excerpt[:400])
+            safe_excerpt = self.coordinator.conversation._redact_history_text(excerpt[:400])
             lines.append(
                 f"{event_id[:128]} {event_kind[:100]}{request}{location}: {safe_excerpt}"
             )
@@ -557,7 +565,7 @@ class ConversationState:
             lines.append("No matches.")
         return "\n".join(lines)
 
-    def _history_page(self, tokens: list[str]) -> str:
+    async def _history_page(self, tokens: list[str]) -> str:
         if not 1 <= len(tokens) <= 3 or re.fullmatch(r"e[0-9]{12}", tokens[0]) is None:
             return _HISTORY_USAGE
         offset = self.coordinator._history_integer(
@@ -569,7 +577,7 @@ class ConversationState:
         if offset is None or limit is None or limit < 1:
             return _HISTORY_USAGE
         try:
-            page = self.coordinator._read_history_page(tokens[0], offset, limit)
+            page = await self.coordinator.conversation._read_history_page(tokens[0], offset, limit)
         except KeyError:
             return "No history event matches that ID in this session."
         except Exception:

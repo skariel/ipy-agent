@@ -17,9 +17,9 @@ from py_agent.contracts import (
     SayOutput,
 )
 from py_agent.session_journal import (
-    JournalError,
     MAX_HISTORY_SEARCH_QUERY_CHARS,
     MAX_HISTORY_SEARCH_SCAN,
+    JournalError,
     NoPersistenceJournal,
     SQLiteSessionJournal,
 )

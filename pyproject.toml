@@ -30,6 +30,7 @@ dev = [
     "mypy",
     "pytest==8.4.2",
     "pytest-asyncio==1.2.0",
+    "pytest-timeout>=2.4,<3",
     "ruff",
 ]
 
@@ -39,6 +40,7 @@ link-mode = "copy"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+addopts = "--strict-config --strict-markers"
 testpaths = ["tests"]
 # Hard stops so a hung await can never wedge a run: faulthandler dumps stacks
 # first, then pytest-timeout fails the test instead of blocking forever.

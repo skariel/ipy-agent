@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 import re
+from typing import cast
 
 from .configuration import ConfigSnapshot
 from .contracts import InputHandler, ProgressCallback, QueueOutcome, RoutedAction
@@ -71,8 +73,8 @@ def _bounded_plain_fallback(
 def _observation_mime_types(data: object) -> tuple[list[str], bool]:
     if not hasattr(data, "keys"):
         return [], False
-    mime_types = []
-    for name in data:
+    mime_types: list[str] = []
+    for name in cast(Iterable[object], data):
         if not isinstance(name, str) or _OBSERVATION_MIME_TYPE.fullmatch(name) is None:
             continue
         if len(mime_types) >= MODEL_OBSERVATION_MAX_MIME_TYPES:
@@ -81,7 +83,7 @@ def _observation_mime_types(data: object) -> tuple[list[str], bool]:
     return mime_types, False
 
 
-class State(str, Enum):
+class State(StrEnum):
     NEW = "new"
     IDLE = "idle"
     GENERATING = "generating"

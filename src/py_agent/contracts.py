@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 import json
 import math
 from types import MappingProxyType
-from typing import Awaitable, Callable, Literal, Mapping, Protocol, Sequence
+from typing import Literal, Protocol
 
 from .images import ImageAttachment
 
@@ -28,7 +29,7 @@ class UserAction:
     text: str
     metadata: Mapping[str, str] = field(default_factory=dict, repr=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
@@ -54,7 +55,7 @@ class QueueOutcome:
     submission: Submission | None = field(default=None, repr=False, compare=False)
     error: str | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not isinstance(self.origin, Origin):
             raise TypeError("QueueOutcome origin must be an Origin")
         if self.status not in {"steered", "completed", "failed", "interrupted", "closed"}:
@@ -79,7 +80,7 @@ class QueueTicket:
     position: int
     completion: Awaitable[QueueOutcome] = field(repr=False, compare=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not isinstance(self.origin, Origin):
             raise TypeError("QueueTicket origin must be an Origin")
         if self.kind not in {"ask", "execute", "command"}:
@@ -119,7 +120,7 @@ class InputRequest:
     prompt: str
     password: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if (not isinstance(self.origin, Origin)
                 or not isinstance(self.origin.execution_id, str)
                 or not 0 < len(self.origin.execution_id) <= 128
@@ -147,7 +148,7 @@ class InputReply:
     value: str = field(repr=False)
     password: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if (not isinstance(self.origin, Origin)
                 or not isinstance(self.origin.execution_id, str)
                 or not 0 < len(self.origin.execution_id) <= 128
@@ -188,7 +189,7 @@ class ExecutionRequest:
         default=None, repr=False, compare=False,
     )
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.llm_handler is not None and not callable(self.llm_handler):
             raise TypeError("llm_handler must be callable or None")
         if type(self.allow_stdin) is not bool:
@@ -206,7 +207,7 @@ class SayOutput:
     content: object
     final: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if type(self.final) is not bool:
             raise TypeError("SayOutput final must be a boolean")
         try:
@@ -258,7 +259,7 @@ class ExecutionOutput:
     display_id: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.kind not in {"stream", "display", "execute_result", "update", "clear"}:
             raise ValueError("ExecutionOutput kind is unsupported")
         if self.display_id is not None and not isinstance(self.display_id, str):
@@ -281,7 +282,7 @@ class ExecutionResult:
     # Worker-owned outputs[index] for a stream already spooled before compaction.
     output_reference: int | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.output_reference is not None and (
             type(self.output_reference) is not int or self.output_reference < 1
         ):
@@ -319,7 +320,7 @@ class OutputEvent:
     metadata: Mapping[str, object] = field(default_factory=dict)
     author: Literal["user", "agent"] | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not isinstance(self.origin, Origin):
             raise TypeError("OutputEvent origin must be an Origin")
         if type(self.sequence) is not int or self.sequence < 0:
@@ -350,9 +351,9 @@ class ContextSnapshot:
     message_phases: tuple[str | None, ...] = ()
     transform_trace: tuple[str, ...] = ()
     # Immutable images indexed to their observation/user message.
-    images: tuple[tuple[int, "ImageAttachment"], ...] = ()
+    images: tuple[tuple[int, ImageAttachment], ...] = ()
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if type(self.epoch) is not int or self.epoch < 0:
             raise ValueError("Context epoch must be a nonnegative integer")
         try:
@@ -416,7 +417,7 @@ class ModelRequest:
     options: Mapping[str, str] = field(default_factory=dict)
     transform_trace: tuple[str, ...] = ()
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not isinstance(self.context, ContextSnapshot):
             raise TypeError("ModelRequest context must be a ContextSnapshot")
         if not isinstance(self.model, str) or not self.model.strip():
@@ -449,7 +450,7 @@ class ModelResponse:
     phase: str | None = None
     adapter_metadata: Mapping[str, object] = field(default_factory=dict, repr=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         object.__setattr__(self, "usage", MappingProxyType(deepcopy(dict(self.usage))))
         object.__setattr__(self, "adapter_metadata", MappingProxyType(deepcopy(dict(self.adapter_metadata))))
 
@@ -467,7 +468,7 @@ class Submission:
     executions: tuple[tuple[ExecutionRequest, ExecutionResult], ...] = ()
     events: tuple[OutputEvent, ...] = ()
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         events = tuple(self.events)
         if any(not isinstance(event, OutputEvent) for event in events):
             raise TypeError("Submission events must contain OutputEvent records")
@@ -493,7 +494,7 @@ class ExecutorCapabilities:
     input: bool = False
     interrupt: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if any(type(value) is not bool for value in (
             self.persistent, self.completion, self.inspection,
             self.rich_output, self.input, self.interrupt,
@@ -504,7 +505,7 @@ class ExecutorCapabilities:
 class ExecutorCapabilityError(RuntimeError):
     """The explicitly selected executor does not implement a requested feature."""
 
-    def __init__(self, capability: str):
+    def __init__(self, capability: str) -> None:
         self.capability = capability
         super().__init__(f"Selected executor does not support {capability}")
 
@@ -516,7 +517,7 @@ class CompletionResult:
     cursor_end: int
     metadata: Mapping[str, object] = field(default_factory=dict)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if isinstance(self.matches, (str, bytes)):
             raise TypeError("Completion matches must be a sequence of strings")
         matches = tuple(self.matches)
@@ -535,7 +536,7 @@ class InspectionResult:
     data: Mapping[str, object] = field(default_factory=dict)
     metadata: Mapping[str, object] = field(default_factory=dict)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if type(self.found) is not bool:
             raise TypeError("Inspection found flag must be a boolean")
         object.__setattr__(self, "data", _freeze_json_mapping(self.data, "Inspection data"))
@@ -549,7 +550,7 @@ class CompletenessResult:
     status: Literal["complete", "incomplete", "invalid"]
     indent: str = ""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.status not in ("complete", "incomplete", "invalid") or not isinstance(self.indent, str):
             raise ValueError("Completeness result is invalid")
 
@@ -571,7 +572,7 @@ class ContextService(Protocol):
 class ObservationService(Protocol):
     """Pack execution evidence for later model-facing observation construction."""
 
-    def pack(self, events: list[dict]) -> Mapping[str, object]: ...
+    def pack(self, events: list[dict[str, object]]) -> Mapping[str, object]: ...
 
 
 class ContextTransform(Protocol):

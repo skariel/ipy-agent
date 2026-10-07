@@ -1,4 +1,5 @@
 """Plugin registry contract tests; no workers, network or model calls."""
+from __future__ import annotations
 
 from types import SimpleNamespace
 

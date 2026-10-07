@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from copy import deepcopy
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+from typing import Any, cast
 
 from .limits import Limits
+from .stdlib import helper_prompt
 
 CONTRACT = """You are py, a coding agent working through a persistent Python/IPython environment.
 
@@ -202,7 +204,6 @@ When excerpts age out, they become references to their original archive ID
 and range, not new archives.
 """
 
-from .stdlib import helper_prompt
 
 CONTRACT = CONTRACT.replace("__SESSION_HELPER_REGISTRY__", helper_prompt())
 
@@ -273,7 +274,7 @@ def validate_namespace_summary(value: object) -> None:
         raise ValueError("Namespace summary exceeds byte limit")
 
 
-def session_metadata(path=None) -> dict:
+def session_metadata(path: str | Path | None = None) -> dict[str, str | None]:
     """Return filesystem-derived launch metadata without running workspace code."""
 
     try:
@@ -288,13 +289,13 @@ def session_metadata(path=None) -> dict:
     return {"current_path": str(current), "git": None}
 
 
-def compact(value) -> str:
+def compact(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
 
 @dataclass(eq=False)
 class Group:
-    messages: list[dict] = field(default_factory=list)
+    messages: list[dict[str, Any]] = field(default_factory=list)
     refs: list[str] = field(default_factory=list)
     execution_output_indexes: list[int] = field(default_factory=list)
 
@@ -304,11 +305,11 @@ class Context:
         self,
         limits: Limits,
         *,
-        context_window_tokens=None,
-        memories_count=0,
-        namespace_summary=None,
-        session_summary=None,
-    ):
+        context_window_tokens: int | None = None,
+        memories_count: int = 0,
+        namespace_summary: object = None,
+        session_summary: object = None,
+    ) -> None:
         self.limits = limits
         self.window_tokens = limits.input_tokens if context_window_tokens is None else context_window_tokens
         if type(self.window_tokens) is not int or self.window_tokens <= 0:
@@ -317,7 +318,7 @@ class Context:
         self.starting_namespace_summary = deepcopy(namespace_summary)
         self.session_summary = session_metadata() if session_summary is None else deepcopy(session_summary)
         self.contract = self.system_prompt(memories_count, namespace_summary)
-        self.reported_input_tokens = None
+        self.reported_input_tokens: int | None = None
         self.epoch = 1
         self.groups: list[Group] = []
         self._next_user_id = 1
@@ -327,13 +328,13 @@ class Context:
         # Like outputs[], these are session data, not durable journal replay.
         self.collapsed: dict[int, str] = {}
 
-    def system_prompt(self, memories_count, namespace_summary=None):
+    def system_prompt(self, memories_count: int, namespace_summary: object = None) -> str:
         # Snapshot the inventory for local diagnostics, not model instructions.
         # The agent can inspect its live namespace when it actually needs it.
         validate_namespace_summary(namespace_summary)
         return CONTRACT
 
-    def record_usage(self, usage):
+    def record_usage(self, usage: object) -> None:
         """Only current, nonstale generation responses may call this method."""
         normalized = usage.get("normalized", {}) if isinstance(usage, dict) else {}
         value = normalized.get("input_tokens") if isinstance(normalized, dict) else None
@@ -342,17 +343,17 @@ class Context:
         # Missing usage does not erase this epoch's last real measurement. A
         # fresh epoch remains unmeasured; byte counts never substitute for tokens.
 
-    def messages(self, groups=None):
+    def messages(self, groups: Iterable[Group] | None = None) -> list[dict[str, Any]]:
         return [{"role": "system", "content": self.contract}] + [
             m.copy() for g in (self.groups if groups is None else groups) for m in g.messages
         ]
 
-    def add(self, role: str, content: str, refs=()) -> Group:
+    def add(self, role: str, content: str, refs: Iterable[str] = ()) -> Group:
         group = Group([{"role": role, "content": content}], list(refs))
         self.groups.append(group)
         return group
 
-    def observation(self, content, refs=(), group=None):
+    def observation(self, content: object, refs: Iterable[str] = (), group: Group | None = None) -> Group:
         message = {"role": "user", "content": compact(content)}
         if group is None:
             group = Group()
@@ -371,10 +372,10 @@ class Context:
         return value
 
     @staticmethod
-    def render_boundary(message: dict) -> str:
+    def render_boundary(message: dict[str, Any]) -> str:
         identity = message.get("boundary_id")
         if identity is None:
-            return message["content"]
+            return cast(str, message["content"])
         text = message["content"]
         if message.get("boundary_kind") == "marker":
             text = "[Automatic collapse boundary.]"
@@ -388,7 +389,7 @@ class Context:
         return group
 
     @staticmethod
-    def _archive_group(group: Group) -> dict:
+    def _archive_group(group: Group) -> dict[str, Any]:
         return deepcopy({
             "messages": group.messages,
             "refs": group.refs,
@@ -483,7 +484,7 @@ class Context:
         self.reported_input_tokens = None  # The previous input measurement is stale.
         return receipt
 
-    def outputs_to_archive(self) -> tuple[tuple[dict, str], ...]:
+    def outputs_to_archive(self) -> tuple[tuple[dict[str, Any], str], ...]:
         """Snapshot eligible old results, excluding references already in outputs[]."""
         live = []
         for group in self.groups:
@@ -494,7 +495,7 @@ class Context:
                         live.append((message, message["content"]))
         return tuple(live[:-10]) if len(live) >= 20 else ()
 
-    def compact_execution_outputs(self, replacements: tuple[tuple[dict, str, int | None], ...]) -> None:
+    def compact_execution_outputs(self, replacements: tuple[tuple[dict[str, Any], str, int | None], ...]) -> None:
         """Replace stored text after ack; reads already refer to an existing archive."""
         if any(message.get("role") != "observation" or message.get("content") != original
                or (index is None and not isinstance(message.get("output_read_reference"), str))
@@ -507,28 +508,28 @@ class Context:
                 index for index in group.execution_output_indexes
                 if id(group.messages[index]) not in archived
             ]
-        for message, _original, index in replacements:
+        for message, original, index in replacements:
             if index is None:
                 message["content"] = f"[Excerpt: {message.pop('output_read_reference')}.]"
             else:
-                message["content"] = f"Output aged out ({len(_original)} chars); saved in outputs[{index}]."
+                message["content"] = f"Output aged out ({len(original)} chars); saved in outputs[{index}]."
 
     @staticmethod
-    def estimate(messages):
+    def estimate(messages: Iterable[dict[str, Any]]) -> int:
         # Deliberately pessimistic UTF-8-byte proxy plus per-message serialization.
         # Not a tokenizer, advertised model window, reported usage, or billing figure.
         return sum(len(m["content"].encode("utf-8")) + 64 for m in messages)
 
-    def check(self, messages):
+    def check(self, messages: Iterable[dict[str, Any]]) -> int:
         # Audit estimate only. Byte counts are not token measurements and must
         # never reject input or silently reset a still-unmeasured context.
         return self.estimate(messages)
 
-    def needs_reset(self):
+    def needs_reset(self) -> bool:
         amount = self.reported_input_tokens
         return amount is not None and amount * 100 >= self.window_tokens * 95
 
-    def retention(self, pending: set[str], *, memories_count=0, namespace_summary=None):
+    def retention(self, pending: set[str], *, memories_count: int = 0, namespace_summary: object = None) -> tuple[list[Group], list[Group]]:
         # Clear ALL dispatched history, not a rolling tail. Only user messages
         # still awaiting committed dispatch survive a reset.
         retained = [g for g in self.groups if pending.intersection(g.refs)]
@@ -536,7 +537,7 @@ class Context:
         self.system_prompt(memories_count, namespace_summary)
         return retained, [g for g in self.groups if g not in retained]
 
-    def commit(self, retained: list[Group], *, memories_count=0, namespace_summary=None):
+    def commit(self, retained: list[Group], *, memories_count: int = 0, namespace_summary: object = None) -> None:
         contract = self.system_prompt(memories_count, namespace_summary)
         self.groups = retained
         self.starting_memories_count = memories_count

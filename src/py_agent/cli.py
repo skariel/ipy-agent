@@ -4,21 +4,42 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Callable, Coroutine, Mapping
+from dataclasses import dataclass
+from inspect import Parameter, signature
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
-from dataclasses import dataclass
-from inspect import Parameter, signature
-from pathlib import Path
 from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, TypedDict, cast
+
+if TYPE_CHECKING:
+    from .configuration import ConfigRegistry, ConfigStore
+    from .coordinator import Coordinator
+    from .journal_worker import SQLiteJournalWorker
+    from .local_executor import LocalExecutor
+    from .plugins import PluginRuntime
+    from .production_services import ProductionContextAdapter
 
 from .plain_terminal import PlainTerminal, sanitize
+
+
+class _RuntimeOptions(TypedDict):
+    model: str | None
+    api_base: str | None
+    stream: bool
+    effort: str
+    auth_file: Path | None
+    context_window_tokens: int
+    startup_timeout: float
+    max_output_chars: int
 
 CODEX_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
 
 
-def _run_bounded(coroutine):
+def _run_bounded[T](coroutine: Coroutine[Any, Any, T]) -> T:
     """Do not let SDK tasks that ignore cancellation hang CLI process shutdown.
 
     Coordinator cleanup occurs in the runner's finally block before this task drain.
@@ -32,7 +53,7 @@ def _run_bounded(coroutine):
     try:
         try:
             # A normal `kill -TERM` must use the same worker cleanup as /quit.
-            def terminate():
+            def terminate() -> None:
                 if not root.cancelling():
                     root.cancel()
 
@@ -124,7 +145,7 @@ def parser() -> argparse.ArgumentParser:
     return default_parser()
 
 
-def _core_config_registry():
+def _core_config_registry() -> ConfigRegistry:
     from .configuration import ApplyAt, ConfigField, ConfigRegistry
 
     return ConfigRegistry((
@@ -180,7 +201,7 @@ def _parse_id_list(value: object, setting: str) -> tuple[str, ...]:
     return values
 
 
-def _trusted_config_values(path: Path | None) -> dict:
+def _trusted_config_values(path: Path | None) -> dict[str, Any]:
     """Read only an explicitly selected, owner-private flat JSON config file."""
     if path is None or not (path.exists() or path.is_symlink()):
         return {}
@@ -189,23 +210,26 @@ def _trusted_config_values(path: Path | None) -> dict:
     return _read_json_mapping(path)
 
 
-def _default_runtime(enabled: tuple[str, ...], options: dict):
+def _default_runtime(enabled: tuple[str, ...], options: _RuntimeOptions) -> PluginRuntime:
     """Build default built-ins plus only the named external entry points."""
     from .builtin_services import BuiltinPlugin
     from .limits import Limits
     from .local_executor import LocalExecutor
     from .plugins import PluginRuntime
     from .production_services import (
-        ProductionContextAdapter, ProductionObservationAdapter, ProductionServicesPlugin,
-        codex_provider_factory, litelm_provider_factory,
+        ProductionContextAdapter,
+        ProductionObservationAdapter,
+        ProductionServicesPlugin,
+        codex_provider_factory,
+        litelm_provider_factory,
     )
 
-    def create_executor():
+    def create_executor() -> LocalExecutor:
         return LocalExecutor(
             timeout=options["startup_timeout"], max_output_chars=options["max_output_chars"],
         )
 
-    def create_litelm():
+    def create_litelm() -> Any:
         model = options["model"]
         if not model:
             raise ValueError("The selected litelm provider requires a model")
@@ -214,7 +238,7 @@ def _default_runtime(enabled: tuple[str, ...], options: dict):
             auth_file=options["auth_file"],
         )()
 
-    def create_codex():
+    def create_codex() -> Any:
         model = options["model"]
         if not model:
             raise ValueError("The selected Codex provider requires a model")
@@ -222,10 +246,10 @@ def _default_runtime(enabled: tuple[str, ...], options: dict):
             model, auth_file=options["auth_file"], effort=options["effort"],
         )()
 
-    def create_context():
+    def create_context() -> ProductionContextAdapter:
         return ProductionContextAdapter(limits=Limits(input_tokens=options["context_window_tokens"]))
 
-    builtins = {
+    builtins: dict[str, Any] = {
         "builtin": BuiltinPlugin(executor_factory=create_executor),
         "production": ProductionServicesPlugin(
             litelm_factory=create_litelm,
@@ -237,14 +261,19 @@ def _default_runtime(enabled: tuple[str, ...], options: dict):
     return PluginRuntime.load(builtins=builtins, enabled=enabled)
 
 
-def _select_runtime_stages(runtime, context_ids, model_ids, observer_ids):
+def _select_runtime_stages(
+    runtime: PluginRuntime,
+    context_ids: tuple[str, ...],
+    model_ids: tuple[str, ...],
+    observer_ids: tuple[str, ...],
+) -> PluginRuntime:
     """Build a runtime containing only explicitly selected pipeline stages."""
     from .plugins import PluginError, PluginRuntime
 
     available_context = {item.qualified_name: item for item in runtime.transforms["context"]}
     available_model = {item.qualified_name: item for item in runtime.transforms["model-request"]}
     available_observers = {item.qualified_name: item for item in runtime.observers}
-    selections = (
+    selections: tuple[tuple[str, set[str], Mapping[str, object]], ...] = (
         ("context transform", set(context_ids), available_context),
         ("model-request transform", set(model_ids), available_model),
         ("observer", set(observer_ids), available_observers),
@@ -270,7 +299,7 @@ def _select_runtime_stages(runtime, context_ids, model_ids, observer_ids):
     )
 
 
-def _with_factory_config(runtime, config_store):
+def _with_factory_config(runtime: PluginRuntime, config_store: ConfigStore) -> PluginRuntime:
     """Inject immutable plugin namespaces into factories that request ``config``.
 
     Generic service factories receive a mapping keyed by plugin ID because the
@@ -279,11 +308,14 @@ def _with_factory_config(runtime, config_store):
     parameter.
     """
     from .plugins import (
-        ExecutorWrapperContribution, PluginRuntime, RegisteredExecutorWrapper, Service,
+        ExecutorWrapperContribution,
+        PluginRuntime,
+        RegisteredExecutorWrapper,
+        Service,
     )
 
     snapshot = config_store.snapshot
-    namespaces = {}
+    namespaces: dict[str, dict[str, Any]] = {}
     for name, field in runtime.config.fields.items():
         entry = snapshot.entries.get(name)
         value = field.default if entry is None else entry.value
@@ -292,7 +324,7 @@ def _with_factory_config(runtime, config_store):
         plugin_id: MappingProxyType(values) for plugin_id, values in namespaces.items()
     })
 
-    def config_parameter(factory):
+    def config_parameter(factory: Callable[..., Any]) -> Parameter | None:
         try:
             return signature(factory).parameters.get("config")
         except (TypeError, ValueError):
@@ -304,12 +336,14 @@ def _with_factory_config(runtime, config_store):
         if parameter is None:
             services[key] = service
             continue
-        factory = service.factory
+        factory: Callable[..., Any] = service.factory
         if parameter.kind is Parameter.POSITIONAL_ONLY:
-            configured = lambda factory=factory: factory(immutable_namespaces)
+            def configured_service(factory: Callable[..., Any] = factory) -> Any:
+                return factory(immutable_namespaces)
         else:
-            configured = lambda factory=factory: factory(config=immutable_namespaces)
-        services[key] = Service(service.kind, service.id, configured)
+            def configured_service(factory: Callable[..., Any] = factory) -> Any:
+                return factory(config=immutable_namespaces)
+        services[key] = Service(service.kind, service.id, configured_service)
 
     wrappers = []
     for registration in runtime.executor_wrappers.values():
@@ -320,14 +354,22 @@ def _with_factory_config(runtime, config_store):
             continue
         owner_config = immutable_namespaces.get(registration.plugin_id, MappingProxyType({}))
         if parameter.kind is Parameter.POSITIONAL_ONLY:
-            configured = lambda delegate, factory=factory, values=owner_config: factory(delegate, values)
+            def configured_wrapper(
+                delegate: Any,
+                factory: Callable[..., Any] = factory,
+                values: Mapping[str, Any] = owner_config,
+            ) -> Any:
+                return factory(delegate, values)
         else:
-            configured = lambda delegate, factory=factory, values=owner_config: factory(
-                delegate, config=values,
-            )
+            def configured_wrapper(
+                delegate: Any,
+                factory: Callable[..., Any] = factory,
+                values: Mapping[str, Any] = owner_config,
+            ) -> Any:
+                return factory(delegate, config=values)
         wrappers.append(RegisteredExecutorWrapper(
             registration.plugin_id,
-            ExecutorWrapperContribution(registration.name, configured),
+            ExecutorWrapperContribution(registration.name, configured_wrapper),
         ))
 
     return PluginRuntime(
@@ -346,8 +388,8 @@ def _with_factory_config(runtime, config_store):
 
 @dataclass(frozen=True)
 class _CliConfiguration:
-    store: object
-    runtime: object
+    store: ConfigStore
+    runtime: PluginRuntime
     provider: str
     model: str | None
     api_base: str | None
@@ -361,13 +403,13 @@ class _CliConfiguration:
     context_transforms: tuple[str, ...]
     model_transforms: tuple[str, ...]
     observers: tuple[str, ...]
-    options: dict
+    options: _RuntimeOptions
 
 
 def _prepare_configuration(args: argparse.Namespace) -> _CliConfiguration:
     """Activate trusted/flag-selected plugins, then load their merged schema."""
-    from .configuration import ConfigRegistry, ConfigStore
     from .config_commands import ConfigCommandService
+    from .configuration import ConfigRegistry, ConfigStore
     from .plugins import PluginError
 
     config_path = getattr(args, "config", None)
@@ -382,7 +424,7 @@ def _prepare_configuration(args: argparse.Namespace) -> _CliConfiguration:
         raise ValueError("Duplicate --plugin ID")
     enabled = tuple(dict.fromkeys((*configured_plugins, *cli_plugins)))
 
-    options = {
+    options: _RuntimeOptions = {
         "model": "",
         "api_base": None,
         "stream": False,
@@ -457,8 +499,8 @@ def _prepare_configuration(args: argparse.Namespace) -> _CliConfiguration:
         store.set(overrides)
 
     snapshot = store.snapshot
-    provider = snapshot.get("provider.id")
-    model = snapshot.get("model.name")
+    provider = cast(str, snapshot.get("provider.id"))
+    model = cast(str, snapshot.get("model.name"))
     if not provider:
         if not model:
             raise ValueError("Select --model PROVIDER/MODEL (or --provider for a plugin/fake service)")
@@ -469,9 +511,9 @@ def _prepare_configuration(args: argparse.Namespace) -> _CliConfiguration:
     # Resolve every selected service before constructing any of them. There is
     # no provider/executor/router fallback on an unknown or disabled ID.
     runtime.select("provider", provider)
-    router = snapshot.get("router.id")
-    interpreter = snapshot.get("interpreter.id")
-    executor = snapshot.get("executor.id")
+    router = cast(str, snapshot.get("router.id"))
+    interpreter = cast(str, snapshot.get("interpreter.id"))
+    executor = cast(str, snapshot.get("executor.id"))
     runtime.select("router", router)
     runtime.select("interpreter", interpreter)
     runtime.select("executor", executor)
@@ -495,9 +537,9 @@ def _prepare_configuration(args: argparse.Namespace) -> _CliConfiguration:
         raise ValueError("Codex model must use the explicit openai-codex/MODEL form")
     if provider == "fake" and model:
         raise ValueError("A model name is not used by the fake provider; remove model.name")
-    api_base = snapshot.get("provider.api_base")
-    stream = snapshot.get("provider.stream")
-    effort = snapshot.get("model.effort")
+    api_base = cast(str, snapshot.get("provider.api_base"))
+    stream = cast(bool, snapshot.get("provider.stream"))
+    effort = cast(str, snapshot.get("model.effort"))
     if provider != "litelm" and api_base:
         raise ValueError("provider.api_base is supported only by the litelm provider")
     if provider != "litelm" and stream:
@@ -519,9 +561,9 @@ def _prepare_configuration(args: argparse.Namespace) -> _CliConfiguration:
         "stream": stream,
         "effort": effort,
         "auth_file": getattr(args, "pi_auth", None),
-        "context_window_tokens": snapshot.get("context.window_tokens"),
-        "startup_timeout": snapshot.get("executor.startup_timeout"),
-        "max_output_chars": snapshot.get("executor.max_output_chars"),
+        "context_window_tokens": cast(int, snapshot.get("context.window_tokens")),
+        "startup_timeout": cast(float, snapshot.get("executor.startup_timeout")),
+        "max_output_chars": cast(int, snapshot.get("executor.max_output_chars")),
     })
     selected_runtime = _select_runtime_stages(
         runtime,
@@ -536,7 +578,7 @@ def _prepare_configuration(args: argparse.Namespace) -> _CliConfiguration:
     )
 
 
-def _initial_config(args: argparse.Namespace):
+def _initial_config(args: argparse.Namespace) -> tuple[ConfigStore, str, str | None, str | None, bool, str, Path | None]:
     """Backward-compatible core tuple, now resolved against enabled plugin schemas."""
     configured = _prepare_configuration(args)
     return (
@@ -556,24 +598,24 @@ def _build_coordinator(
     context_window_tokens: int = 272000,
     startup_timeout: float = 15.0,
     max_output_chars: int = 262144,
-    config_store=None,
+    config_store: ConfigStore | None = None,
     config_path: Path | None = None,
-    runtime=None,
+    runtime: PluginRuntime | None = None,
     router: str = "default",
     interpreter: str = "basic",
     executor: str = "local",
     executor_wrappers: tuple[str, ...] | None = None,
     max_agent_steps: int | None = None,
-    journal=None,
-):
+    journal: SQLiteJournalWorker | None = None,
+) -> Coordinator:
     """Build the explicitly selected services; unknown IDs never downgrade."""
-    from .configuration import ConfigRegistry, ConfigStore
     from .config_commands import ConfigCommandService
+    from .configuration import ConfigRegistry, ConfigStore
     from .coordinator import Coordinator
-    from .plugins import PluginError
     from .plain_terminal import RESERVED_COMMANDS
+    from .plugins import PluginError
 
-    options = {
+    options: _RuntimeOptions = {
         "model": model or "",
         "api_base": api_base,
         "stream": stream,
@@ -631,18 +673,18 @@ def _build_coordinator(
         config_store=config_store,
         journal=journal,
         model=model,
-        max_agent_steps=max_agent_steps if max_agent_steps is not None else config_store.snapshot.get("agent.max_steps"),
+        max_agent_steps=max_agent_steps if max_agent_steps is not None else cast(int, config_store.snapshot.get("agent.max_steps")),
     )
 
 
 async def _run_phase1(args: argparse.Namespace) -> int:
     """Run the coordinator CLI (kept under its old private name for embedders)."""
-    from .session_journal import SQLiteSessionJournal
+    from .journal_worker import SQLiteJournalWorker
 
     configured = _prepare_configuration(args)
     provider, model = configured.provider, configured.model
     journal_path = getattr(args, "journal", None)
-    journal = SQLiteSessionJournal(journal_path) if journal_path is not None else None
+    journal = SQLiteJournalWorker(journal_path) if journal_path is not None else None
     coordinator = None
     try:
         coordinator = _build_coordinator(
@@ -652,10 +694,10 @@ async def _run_phase1(args: argparse.Namespace) -> int:
             stream=configured.stream,
             effort=configured.effort,
             auth_file=getattr(args, "pi_auth", None),
-            context_window_tokens=configured.store.snapshot.get("context.window_tokens"),
-            startup_timeout=configured.store.snapshot.get("executor.startup_timeout"),
-            max_output_chars=configured.store.snapshot.get("executor.max_output_chars"),
-            max_agent_steps=configured.store.snapshot.get("agent.max_steps"),
+            context_window_tokens=cast(int, configured.store.snapshot.get("context.window_tokens")),
+            startup_timeout=cast(float, configured.store.snapshot.get("executor.startup_timeout")),
+            max_output_chars=cast(int, configured.store.snapshot.get("executor.max_output_chars")),
+            max_agent_steps=cast(int, configured.store.snapshot.get("agent.max_steps")),
             config_store=configured.store,
             config_path=configured.config_path,
             runtime=configured.runtime,

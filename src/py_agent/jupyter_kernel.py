@@ -10,30 +10,59 @@ from __future__ import annotations
 import argparse
 import asyncio
 import codeop
+from collections.abc import Awaitable, Callable, Mapping
 import copy
 import importlib
 import inspect
 import re
 import signal
-from collections.abc import Mapping
-from typing import Any
+from types import FrameType
+from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, cast
 
 from .contracts import (
-    CompletenessResult, CompletionResult, ExecutorCapabilityError,
-    InputReply, InputRequest, InputUnavailableError,
-    InspectionResult, MAX_INPUT_VALUE_CHARS, OutputEvent, ProgressCallback,
+    MAX_INPUT_VALUE_CHARS,
+    CompletenessResult,
+    CompletionResult,
+    ExecutorCapabilityError,
+    InputReply,
+    InputRequest,
+    InputUnavailableError,
+    InspectionResult,
+    OutputEvent,
+    ProgressCallback,
 )
 
-try:
-    from ipykernel.kernelbase import Kernel as _IPyKernelBase
-except ImportError as exc:  # Jupyter support is optional.
-    _IPyKernelBase = None
-    _IPYKERNEL_IMPORT_ERROR = exc
+_IPYKERNEL_IMPORT_ERROR: ImportError | None = None
+
+if TYPE_CHECKING:
+    class _IPyKernelBase:
+        """Typed initializer boundary for the optional notebook runtime."""
+
+        def __init__(self, **kwargs: Any) -> None: ...
 else:
-    _IPYKERNEL_IMPORT_ERROR = None
+    try:
+        from ipykernel.kernelbase import Kernel as _IPyKernelBase
+    except ImportError as exc:  # Jupyter support is optional.
+        _IPyKernelBase = None
+        _IPYKERNEL_IMPORT_ERROR = exc
+    else:
+        _IPYKERNEL_IMPORT_ERROR = None
+
+
+class _Coordinator(Protocol):
+    async def submit(self, frontend_id: str, code: str, **kwargs: object) -> object: ...
+
+    async def interrupt(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+
+class _ConfigurationStore(Protocol):
+    @property
+    def snapshot(self) -> Mapping[str, Any]: ...
 
 # Set only by main() before IPKernelApp constructs the protocol kernel.
-_COORDINATOR_FACTORY = None
+_COORDINATOR_FACTORY: Callable[[], object] | None = None
 MAX_STDIN_REPLY_DISCARDS = 32
 JUPYTER_STDIN_TIMEOUT = 300
 
@@ -43,7 +72,7 @@ def jupyter_available() -> bool:
     return _IPyKernelBase is not None
 
 
-def _valid_index(value: object, maximum: int) -> bool:
+def _valid_index(value: object, maximum: int) -> TypeGuard[int]:
     return type(value) is int and 0 <= value <= maximum
 
 
@@ -91,7 +120,7 @@ class _History:
 
     SESSION = 1
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._entries: list[tuple[int, int, str]] = []
 
     def add(self, line: int, source: str) -> None:
@@ -150,17 +179,18 @@ class _CoordinatorKernelMethods:
     implementation_version = "0.1.0"
     language = "python"
     language_version = "3"
+    execution_count: int
 
     def _initialize_adapter(self, coordinator: object) -> None:
         for method in ("submit", "interrupt", "close"):
             if not callable(getattr(coordinator, method, None)):
                 raise TypeError(f"Coordinator must provide {method}()")
-        self.coordinator = coordinator
+        self.coordinator = cast(_Coordinator, coordinator)
         self._execute_lock = asyncio.Lock()
         self._history = _History()
         self._active_execution = False
         self._interrupt_requested = False
-        self._interrupt_task: asyncio.Task | None = None
+        self._interrupt_task: asyncio.Task[None] | None = None
         self._request_sequence = 0
         self._stop_queued_through = 0
 
@@ -243,7 +273,7 @@ class _CoordinatorKernelMethods:
         result = action(*args, **kwargs)
         if inspect.isawaitable(result):
             result = await result
-        return result
+        return cast(object, result)
 
     async def _required_core_action(
         self, name: str, capability: str, *args: object,
@@ -254,12 +284,12 @@ class _CoordinatorKernelMethods:
         result = action(*args)
         if inspect.isawaitable(result):
             result = await result
-        return result
+        return cast(object, result)
 
     @staticmethod
     def _supports_keyword(method: object, keyword: str) -> bool:
         try:
-            parameters = inspect.signature(method).parameters.values()
+            parameters = inspect.signature(cast(Callable[..., object], method)).parameters.values()
         except (TypeError, ValueError):
             return False
         return any(
@@ -273,11 +303,11 @@ class _CoordinatorKernelMethods:
         code: str,
         *,
         allow_stdin: bool,
-        input_handler,
+        input_handler: Callable[[InputRequest], Awaitable[InputReply]] | None,
         on_progress: ProgressCallback | None = None,
     ) -> object:
         submit = self.coordinator.submit
-        kwargs = {}
+        kwargs: dict[str, object] = {}
         if self._supports_keyword(submit, "allow_stdin"):
             kwargs["allow_stdin"] = allow_stdin
         if self._supports_keyword(submit, "input_handler"):
@@ -434,7 +464,7 @@ class _CoordinatorKernelMethods:
                 self._stdin_exchange(request, parent, ident),
                 timeout=JUPYTER_STDIN_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise InputUnavailableError("Jupyter stdin reply timed out") from None
 
     @staticmethod
@@ -702,6 +732,10 @@ class _CoordinatorKernelMethods:
             cursor_pos = len(code)
         try:
             value = await self._required_core_action("complete", "completion", code, cursor_pos)
+            matches: object
+            start: object
+            end: object
+            metadata: object
             if isinstance(value, CompletionResult):
                 matches = value.matches
                 start, end, metadata = value.cursor_start, value.cursor_end, value.metadata
@@ -747,6 +781,9 @@ class _CoordinatorKernelMethods:
             value = await self._required_core_action(
                 "inspect", "inspection", code, cursor_pos, detail_level,
             )
+            found: object
+            data: object
+            metadata: object
             if isinstance(value, InspectionResult):
                 found, data, metadata = value.found, value.data, value.metadata
             elif isinstance(value, Mapping):
@@ -793,7 +830,7 @@ class _CoordinatorKernelMethods:
         try:
             from IPython.core.inputtransformer2 import TransformerManager
 
-            status, indent = TransformerManager().check_complete(code)
+            status, indent = cast(Callable[[], Any], TransformerManager)().check_complete(code)
             return {"status": status, "indent": " " * min(indent, 80) if type(indent) is int and indent > 0 else ""}
         except ImportError:
             try:
@@ -908,7 +945,7 @@ if _IPyKernelBase is None:
     class JupyterKernel(_CoordinatorKernelMethods):
         """Unavailable unless the optional ipykernel dependency is installed."""
 
-        def __init__(self, *args: object, **kwargs: object):
+        def __init__(self, *args: object, **kwargs: object) -> None:
             del args, kwargs
             raise ImportError(
                 "JupyterKernel requires the optional 'ipykernel' package; install ipykernel and jupyter_client"
@@ -916,10 +953,10 @@ if _IPyKernelBase is None:
 
 else:
 
-    class JupyterKernel(_CoordinatorKernelMethods, _IPyKernelBase):
+    class JupyterKernel(_CoordinatorKernelMethods, _IPyKernelBase):  # type: ignore[no-redef]
         """ipykernel protocol frontend that delegates every cell to a Coordinator."""
 
-        def __init__(self, coordinator: object | None = None, **kwargs: Any):
+        def __init__(self, coordinator: object | None = None, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             if coordinator is None:
                 if not callable(_COORDINATOR_FACTORY):
@@ -943,25 +980,29 @@ def _kernel_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _interrupt_signal_handler(app: object, kernel: JupyterKernel):
+def _interrupt_signal_handler(
+    app: Any, kernel: JupyterKernel,
+) -> Callable[[int, FrameType | None], None]:
     """Forward stock Jupyter signal-mode interrupts to the selected executor."""
-    def handle_signal(_signum, _frame):
+    def handle_signal(_signum: int, _frame: FrameType | None) -> None:
         app.io_loop.add_callback(kernel.do_interrupt)
 
     return handle_signal
 
 
-def _graceful_signal_handler(app: object, kernel: JupyterKernel):
+def _graceful_signal_handler(
+    app: Any, kernel: JupyterKernel,
+) -> Callable[[int, FrameType | None], None]:
     """Close the coordinator on SIGTERM before stopping this owned process."""
     shutting_down = False
 
-    def handle_signal(_signum, _frame):
+    def handle_signal(_signum: int, _frame: FrameType | None) -> None:
         nonlocal shutting_down
         if shutting_down:
             return
         shutting_down = True
 
-        async def close_and_stop():
+        async def close_and_stop() -> None:
             try:
                 await kernel.do_shutdown(restart=False)
             finally:
@@ -975,7 +1016,7 @@ def _graceful_signal_handler(app: object, kernel: JupyterKernel):
 def main(argv: list[str] | None = None) -> int:
     """Run an owned IPKernelApp around the same coordinator used by ``py``."""
     coordinator = None
-    app = None
+    app: Any = None
     journal = None
     if not jupyter_available():
         print(
@@ -992,9 +1033,10 @@ def main(argv: list[str] | None = None) -> int:
         from . import cli
 
         selected = cli._prepare_configuration(args)
+        store = cast(_ConfigurationStore, selected.store)
         if args.journal is not None:
-            from .session_journal import SQLiteSessionJournal
-            journal = SQLiteSessionJournal(args.journal)
+            from .journal_worker import SQLiteJournalWorker
+            journal = SQLiteJournalWorker(args.journal)
         coordinator = cli._build_coordinator(
             selected.provider,
             model=selected.model,
@@ -1002,10 +1044,10 @@ def main(argv: list[str] | None = None) -> int:
             stream=selected.stream,
             effort=selected.effort,
             auth_file=args.pi_auth,
-            context_window_tokens=selected.store.snapshot.get("context.window_tokens"),
-            startup_timeout=selected.store.snapshot.get("executor.startup_timeout"),
-            max_output_chars=selected.store.snapshot.get("executor.max_output_chars"),
-            max_agent_steps=selected.store.snapshot.get("agent.max_steps"),
+            context_window_tokens=cast(int, store.snapshot.get("context.window_tokens")),
+            startup_timeout=cast(float, store.snapshot.get("executor.startup_timeout")),
+            max_output_chars=cast(int, store.snapshot.get("executor.max_output_chars")),
+            max_agent_steps=store.snapshot.get("agent.max_steps"),
             config_store=selected.store,
             config_path=selected.config_path,
             runtime=selected.runtime,

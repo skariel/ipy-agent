@@ -138,7 +138,7 @@ async def test_nested_activity_is_visible_and_cleared():
     try:
         await asyncio.wait_for(active.wait(), 3)
         assert coordinator.activity.label == "LLM subcall"
-        assert "attempt 1/5" in coordinator.activity.text()
+        assert "attempt 1/6" in coordinator.activity.text()
         from prompt_toolkit.output import DummyOutput
 
         from py_agent.plain_terminal import PlainTerminal
@@ -244,7 +244,7 @@ async def test_nested_retry_activity_does_not_leak_task_text(monkeypatch):
     coordinator.provider = Provider()
     real_sleep = asyncio.sleep
     async def wait(delay):
-        if delay == 1:
+        if 1 <= delay <= 1.2:
             active.set()
             await release.wait()
         else:

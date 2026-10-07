@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 import hashlib
 import io
+from typing import Literal, Protocol, TypedDict
 import warnings
 
 MAX_IMAGE_BYTES = 512_000
@@ -18,6 +19,39 @@ MAX_CONTEXT_IMAGE_BYTES = 2_000_000
 RASTER_MIMES = ("image/png", "image/jpeg", "image/webp", "image/gif")
 
 
+class _ImageRecord(TypedDict):
+    mime_type: str
+    data: str
+    width: int
+    height: int
+    sha256: str
+
+
+class _DisplayOutput(Protocol):
+    @property
+    def kind(self) -> str: ...
+
+    @property
+    def data(self) -> Mapping[str, object]: ...
+
+    @property
+    def display_id(self) -> str | None: ...
+
+
+class _TextContent(TypedDict):
+    type: Literal["text"]
+    text: str
+
+
+class _ImageURL(TypedDict):
+    url: str
+
+
+class _ImageContent(TypedDict):
+    type: Literal["image_url"]
+    image_url: _ImageURL
+
+
 @dataclass(frozen=True)
 class ImageAttachment:
     mime_type: str
@@ -25,7 +59,7 @@ class ImageAttachment:
     width: int
     height: int
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if (self.mime_type not in {"image/png", "image/jpeg"} or type(self.data) is not bytes
                 or not 1 <= len(self.data) <= MAX_IMAGE_BYTES
                 or type(self.width) is not int or type(self.height) is not int
@@ -33,23 +67,29 @@ class ImageAttachment:
             raise ValueError("Invalid bounded image attachment")
 
     @property
-    def sha256(self):
+    def sha256(self) -> str:
         return hashlib.sha256(self.data).hexdigest()
 
-    def record(self):
+    def record(self) -> _ImageRecord:
         return {"mime_type": self.mime_type, "data": base64.b64encode(self.data).decode("ascii"),
                 "width": self.width, "height": self.height, "sha256": self.sha256}
 
     @classmethod
-    def from_record(cls, record):
+    def from_record(cls, record: object) -> ImageAttachment:
         if not isinstance(record, Mapping):
             raise ValueError("Invalid image record")
         encoded = record.get("data")
         if not isinstance(encoded, str) or len(encoded) > MAX_IMAGE_BYTES * 4 // 3 + 4:
             raise ValueError("Image record exceeds byte limit")
         try:
-            image = cls(record.get("mime_type"), base64.b64decode(encoded, validate=True),
-                        record.get("width"), record.get("height"))
+            mime_type = record.get("mime_type")
+            width = record.get("width")
+            height = record.get("height")
+            if (not isinstance(mime_type, str)
+                    or type(width) is not int or type(height) is not int):
+                raise ValueError("Invalid bounded image attachment")
+            image = cls(mime_type, base64.b64decode(encoded, validate=True),
+                        width, height)
             from PIL import Image
             with Image.open(io.BytesIO(image.data)) as decoded:
                 if decoded.size != (image.width, image.height) or decoded.format != (
@@ -62,11 +102,11 @@ class ImageAttachment:
             raise ValueError("Image record does not match its bytes")
         return image
 
-    def data_url(self):
+    def data_url(self) -> str:
         return "data:" + self.mime_type + ";base64," + base64.b64encode(self.data).decode("ascii")
 
 
-def normalize(mime_type, value):
+def normalize(mime_type: str, value: object) -> ImageAttachment:
     if mime_type not in RASTER_MIMES:
         raise ValueError("Unsupported raster MIME type")
     if isinstance(value, str):
@@ -126,10 +166,13 @@ def normalize(mime_type, value):
         raise ValueError("Invalid or unsafe image") from None
 
 
-def observation_images(outputs):
+def observation_images(
+    outputs: Iterable[_DisplayOutput],
+) -> tuple[tuple[_ImageRecord, ...], tuple[str, ...]]:
     """Take one raster per display bundle. Never stringify image data."""
-    images, notices = [], []
-    display_ids = []
+    images: list[_ImageRecord] = []
+    notices: list[str] = []
+    display_ids: list[str | None] = []
     for output in outputs:
         if output.kind == "clear":
             images.clear()
@@ -161,7 +204,7 @@ def observation_images(outputs):
     return tuple(images), tuple(notices)
 
 
-def require_vision(model, messages):
+def require_vision(model: str, messages: Iterable[Mapping[str, object]]) -> None:
     """Reject known text-only models; unknown models defer to the provider.
 
     A model-name allowlist cannot establish capability and becomes stale.
@@ -184,6 +227,10 @@ def require_vision(model, messages):
                             kind="configuration")
 
 
-def content_with_images(text, images):
-    return ([{"type": "text", "text": text}] +
-            [{"type": "image_url", "image_url": {"url": image.data_url()}} for image in images])
+def content_with_images(
+    text: str, images: Iterable[ImageAttachment],
+) -> list[_TextContent | _ImageContent]:
+    content: list[_TextContent | _ImageContent] = [{"type": "text", "text": text}]
+    content.extend({"type": "image_url", "image_url": {"url": image.data_url()}}
+                   for image in images)
+    return content

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 import re
 import tokenize
+from typing import Any, cast
 
 from .contracts import AgentDecision, ModelRequest, ModelResponse, RoutedAction, UserAction
 from .local_executor import LocalExecutor
@@ -79,7 +81,7 @@ class BasicInterpreter:
         from IPython.core.inputtransformer2 import TransformerManager
 
         try:
-            transformed = TransformerManager().transform_cell(source)
+            transformed = cast(Callable[[], Any], TransformerManager)().transform_cell(source)
             compile(transformed, "<agent-cell>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
         except SyntaxError as exc:
             return f"{type(exc).__name__}: {exc.msg} (line {exc.lineno or 1})"
@@ -111,7 +113,7 @@ class BasicInterpreter:
 
 
 class BuiltinPlugin:
-    def __init__(self, *, executor_factory=LocalExecutor):
+    def __init__(self, *, executor_factory: Callable[..., object] = LocalExecutor) -> None:
         if not callable(executor_factory):
             raise TypeError("executor_factory must be callable")
         self.executor_factory = executor_factory

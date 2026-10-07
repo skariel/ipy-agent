@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-from py_agent.configuration import ApplyAt, ConfigField, ConfigLayer, ConfigRegistry, ConfigStore
 from py_agent.config_commands import ConfigCommandService
+from py_agent.configuration import ApplyAt, ConfigField, ConfigLayer, ConfigRegistry, ConfigStore
 from py_agent.plugins import Contributions, DiscoveredPlugin, PluginManifest, PluginRuntime, hookimpl
 
 

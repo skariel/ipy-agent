@@ -12,6 +12,7 @@ Python namespace snapshot.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 import math
 import os
@@ -20,8 +21,7 @@ import re
 import sqlite3
 import stat
 import time
-from collections.abc import Mapping
-from typing import Protocol
+from typing import Protocol, TypedDict
 
 from .contracts import ExecutionRequest, ExecutionResult, ModelRequest, ModelResponse, Origin
 
@@ -130,7 +130,16 @@ def _json(value: object) -> str:
         raise JournalError("Journal record is not finite JSON data") from exc
 
 
-def _origin_payload(origin: Origin) -> dict[str, object]:
+class _OriginPayload(TypedDict):
+    session_id: str
+    request_id: str
+    frontend_id: str
+    generation_id: str | None
+    execution_id: str | None
+    config_revision: int
+
+
+def _origin_payload(origin: Origin) -> _OriginPayload:
     if not isinstance(origin, Origin):
         raise JournalError("Journal event requires a valid operation origin")
     if type(origin.config_revision) is not int or origin.config_revision < 0:
@@ -281,7 +290,7 @@ class SQLiteSessionJournal:
         max_event_bytes: int = MAX_EVENT_BYTES,
         max_stream_chars: int = MAX_STREAM_CHARS,
         max_say_outputs: int = MAX_SAY_OUTPUTS,
-    ):
+    ) -> None:
         if type(max_event_bytes) is not int or not 1 <= max_event_bytes <= MAX_EVENT_BYTES:
             raise ValueError(f"max_event_bytes must be from 1 to {MAX_EVENT_BYTES}")
         if type(max_stream_chars) is not int or not 1 <= max_stream_chars <= MAX_STREAM_CHARS:
@@ -435,8 +444,11 @@ class SQLiteSessionJournal:
             self.db.execute("COMMIT")
             return event
         except BaseException as exc:
-            if self.db.in_transaction:
-                self.db.execute("ROLLBACK")
+            try:
+                if self.db.in_transaction:
+                    self.db.execute("ROLLBACK")
+            except BaseException as rollback_error:
+                exc.add_note(f"Journal rollback also failed: {type(rollback_error).__name__}")
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
             if isinstance(exc, JournalError):
@@ -444,7 +456,7 @@ class SQLiteSessionJournal:
             raise JournalError("Unable to commit required journal event") from exc
 
     @staticmethod
-    def _request_identity(request: ModelRequest) -> dict[str, object]:
+    def _request_identity(request: ModelRequest) -> _OriginPayload:
         identity = _origin_payload(request.origin)
         if identity["generation_id"] is None:
             raise JournalError("Model request is missing its generation identity")
@@ -653,7 +665,7 @@ class SQLiteSessionJournal:
                 (_redact_text(session_id), kind, scan_limit)
                 if kind is not None else (_redact_text(session_id), scan_limit),
             )
-            result = []
+            result: list[dict[str, object]] = []
             scanned_bytes = 0
             needle = _redact_text(query).casefold()
             for event_id, request_id, event_kind, payload_bytes, text in rows:

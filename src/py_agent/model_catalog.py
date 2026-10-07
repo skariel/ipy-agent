@@ -587,6 +587,7 @@ def adapter_for_model(model: str) -> str:
 
 def available_models(auth_file: Path | None = None) -> tuple[str, ...]:
     from litelm._providers import PROVIDERS
+
     from .codex_auth import DEFAULT_AUTH_FILE, _read_auth_document
     from .provider import ProviderError
 
@@ -599,7 +600,7 @@ def available_models(auth_file: Path | None = None) -> tuple[str, ...]:
         from .native_auth import read_document
         document = _read_auth_document(DEFAULT_AUTH_FILE, error=error) or {}
         document.update(read_document())
-    available = []
+    available: list[str] = []
     for provider, models in MODELS.items():
         entry = document.get(provider)
         stored = isinstance(entry, dict) and (

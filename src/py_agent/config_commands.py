@@ -75,6 +75,9 @@ class CommandRegistry:
 
     __slots__ = ("_commands", "_sealed")
 
+    _commands: Mapping[str, CommandDefinition]
+    _sealed: bool
+
     def __setattr__(self, name: str, value: object) -> None:
         if getattr(self, "_sealed", False):
             raise AttributeError("CommandRegistry is immutable")
@@ -120,15 +123,15 @@ class ConfigCommandService:
     """
 
     __slots__ = (
-        "_store",
-        "_runtime",
-        "_config_path",
-        "_layer_source",
-        "_layer_loader",
-        "_discover_plugins",
         "_baseline",
-        "_restart_baseline",
         "_command_registry",
+        "_config_path",
+        "_discover_plugins",
+        "_layer_loader",
+        "_layer_source",
+        "_restart_baseline",
+        "_runtime",
+        "_store",
     )
 
     def __init__(
@@ -222,7 +225,7 @@ class ConfigCommandService:
         """Show effective value and provenance, with sensitive fields masked."""
         if name is not None:
             self._require_field(name)
-            names = (name,)
+            names: tuple[str, ...] = (name,)
         else:
             names = tuple(self._store.registry.fields)
         if not names:
@@ -735,4 +738,4 @@ def _read_json_mapping(path: Path) -> dict[str, Scalar]:
         ConfigLayer("user", decoded)
     except ConfigError:
         raise ConfigCommandError("Configuration file must contain flat scalar settings") from None
-    return decoded  # type: ignore[return-value]
+    return decoded

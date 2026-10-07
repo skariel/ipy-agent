@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 import getpass
 import sys
+from typing import Any, cast
 
 from .native_auth import api_key_entry, auth_error, auth_path, logout, provider_id, read_document, save
 
 
-def status_lines():
+def status_lines() -> list[str]:
     document = read_document()
     lines = [f"py credential store: {auth_path()}"]
     if not document:
@@ -19,13 +21,16 @@ def status_lines():
         if not isinstance(entry, dict):
             raise auth_error("invalid credential entry")
         if entry.get("type") == "api_key":
-            api_key_entry(entry.get("key"))
+            # api_key_entry performs runtime validation of the JSON value.
+            api_key_entry(cast(str, entry.get("key")))
             status = "API key stored"
         elif entry.get("type") == "oauth":
             import math
             import time
             expiry = entry.get("expires")
-            if type(expiry) not in (int, float) or not math.isfinite(expiry):
+            if type(expiry) is not int and type(expiry) is not float:
+                raise auth_error("invalid OAuth expiry")
+            if not math.isfinite(expiry):
                 raise auth_error("invalid OAuth expiry")
             status = "OAuth stored" if expiry > time.time() * 1000 + 30000 else "OAuth expired (refresh on use)"
         else:
@@ -34,7 +39,7 @@ def status_lines():
     return lines
 
 
-def main(arguments):
+def main(arguments: Sequence[str] | None) -> int:
     parser = argparse.ArgumentParser(prog="py", description="Manage py provider credentials")
     commands = parser.add_subparsers(dest="command", required=True)
     login = commands.add_parser("login", help="Log in or securely enter an API key")
@@ -59,6 +64,7 @@ def main(arguments):
             raise auth_error("--manual is only supported for OpenRouter browser login")
         if provider == "openai-codex" and args.api_key:
             raise auth_error("Codex subscriptions require OAuth; use provider openai for an API key")
+        entry: dict[str, Any]
         if provider == "openai-codex":
             from .oauth import login_codex
             entry = login_codex()

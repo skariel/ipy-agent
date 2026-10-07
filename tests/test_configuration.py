@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pytest
 
 from py_agent.configuration import ApplyAt, ConfigError, ConfigField, ConfigLayer, ConfigRegistry, ConfigStore

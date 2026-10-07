@@ -9,7 +9,10 @@ import pytest
 
 from py_agent.contracts import ExecutionOutput, ExecutionRequest, InputReply, InputRequest, Origin
 from py_agent.local_executor import (
-    LocalExecutor, MAX_FRAME, MAX_QUERY_CHARS, _redact_stream_fragments,
+    MAX_FRAME,
+    MAX_QUERY_CHARS,
+    LocalExecutor,
+    _redact_stream_fragments,
 )
 from py_agent.local_worker import MAX_BINARY_MIME_BYTES, _safe_mime_bundle
 

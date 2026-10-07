@@ -7,6 +7,7 @@ filesystem, subprocesses, network, and credentials available to this process.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 import json
 import math
 import os
@@ -14,13 +15,12 @@ from pathlib import Path
 import re
 import signal
 import sys
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from .contracts import (
     MAX_INPUT_PROMPT_CHARS,
     MAX_INPUT_REQUESTS_PER_EXECUTION,
-    MAX_INPUT_VALUE_CHARS,
     CompletionResult,
     ExecutionOutput,
     ExecutionRequest,
@@ -47,7 +47,6 @@ from .worker_protocol import (
     MAX_COMPLETION_MATCH_CHARS,
     MAX_COMPLETION_MATCHES,
     MAX_ERROR_CHARS,
-    MAX_FRAME,
     MAX_INSPECTION_CHARS,
     MAX_OUTPUT_FRAME_CHARS,
     MAX_PASSWORD_SECRET_CHARS,
@@ -58,6 +57,18 @@ from .worker_protocol import (
     MAX_SAY_MESSAGES,
     PROTOCOL_VERSION,
 )
+from .worker_protocol import (
+    MAX_FRAME as MAX_FRAME,
+)
+from .worker_protocol import (
+    ProtocolError as _ProtocolError,
+)
+from .worker_protocol import (
+    decode_frame as _decode_frame,
+)
+from .worker_protocol import (
+    encode_frame as _encode_frame,
+)
 
 MAX_OUTPUT_CHARS = 1_048_576
 DEFAULT_OUTPUT_CHARS = 262_144
@@ -65,21 +76,10 @@ MAX_SAY_CHARS = MAX_FRAME
 MAX_INPUT_ERROR_CHARS = 8_192
 
 
-class _ProtocolError(ValueError):
-    """Invalid or miscorrelated worker data."""
 
 
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise _ProtocolError("Duplicate key in worker frame")
-        result[key] = value
-    return result
 
 
-def _reject_constant(value: str) -> None:
-    raise _ProtocolError(f"Invalid JSON number: {value}")
 
 
 def _valid_timeout(value: Any) -> bool:
@@ -115,14 +115,6 @@ def _origin_payload(request: ExecutionRequest) -> dict[str, Any]:
     return payload
 
 
-def _encode_frame(message: dict[str, Any]) -> bytes:
-    try:
-        payload = json.dumps(message, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")
-    except (TypeError, ValueError, RecursionError) as exc:
-        raise ValueError("Execution request is not valid JSON data") from exc
-    if not 0 < len(payload) <= MAX_FRAME:
-        raise ValueError(f"Execution request exceeds the {MAX_FRAME}-byte transport limit")
-    return len(payload).to_bytes(4, "big") + payload
 
 
 def _redact_stream_fragments(
@@ -147,7 +139,7 @@ def _redact_stream_fragments(
         ]
         if not indices:
             continue
-        fragments = [events[index].data["text"] for index in indices]
+        fragments = [cast(str, events[index].data["text"]) for index in indices]
         raw_combined = "".join(fragments)
         combined = (
             _strip_partial_secret_suffix(raw_combined, secrets)
@@ -157,7 +149,7 @@ def _redact_stream_fragments(
         if not spans and combined == raw_combined:
             continue
         offset = 0
-        for index, fragment in zip(indices, fragments):
+        for index, fragment in zip(indices, fragments, strict=False):
             end = offset + len(fragment)
             safe_end = min(end, len(combined))
             pieces: list[str] = []
@@ -191,24 +183,12 @@ def _redact_stream_fragments(
     return tuple(result)
 
 
-def _decode_frame(payload: bytes) -> dict[str, Any]:
-    try:
-        value = json.loads(
-            payload.decode("ascii"),
-            object_pairs_hook=_unique_object,
-            parse_constant=_reject_constant,
-        )
-    except (UnicodeError, ValueError, RecursionError) as exc:
-        raise _ProtocolError("Malformed worker frame") from exc
-    if not isinstance(value, dict):
-        raise _ProtocolError("Worker frame must be an object")
-    return value
 
 
 class _OutputCollector:
     """Retain a bounded prefix and report every discarded character."""
 
-    def __init__(self, maximum: int):
+    def __init__(self, maximum: int) -> None:
         self.maximum = maximum
         self.retained = 0
         self.parts: dict[str, list[str]] = {"stdout": [], "stderr": []}
@@ -267,7 +247,7 @@ class LocalExecutor:
         interrupt_timeout: float = 2,
         input_timeout: float = 300,
         max_output_chars: int = DEFAULT_OUTPUT_CHARS,
-    ):
+    ) -> None:
         if not _valid_timeout(timeout):
             raise ValueError("timeout must be a finite positive number")
         if not _valid_timeout(interrupt_timeout):
@@ -287,8 +267,8 @@ class LocalExecutor:
         self._active_done = asyncio.Event()
         self._active_done.set()
         self._active_execution_id: str | None = None
-        self._active_llm_task: asyncio.Task | None = None
-        self._active_input_task: asyncio.Task | None = None
+        self._active_llm_task: asyncio.Task[str] | None = None
+        self._active_input_task: asyncio.Task[InputReply] | None = None
         self._active_input_cancel: asyncio.Event | None = None
         self._password_secrets: list[str] = []
         self._password_secret_chars = 0
@@ -559,7 +539,15 @@ class LocalExecutor:
             ))
         return tuple(result)
 
-    async def _service_llm_request(self, frame, request, process, execution_id, origin, sequence):
+    async def _service_llm_request(
+        self,
+        frame: dict[str, Any],
+        request: ExecutionRequest,
+        process: asyncio.subprocess.Process,
+        execution_id: str,
+        origin: dict[str, Any],
+        sequence: int,
+    ) -> int:
         from .stdlib import MAX_CALLS_PER_CELL, MAX_RESULT_CHARS, validate_payload
         fields = {"type", "version", "execution_id", "origin", "author", "sequence", "payload"}
         if (set(frame) != fields or frame["origin"] != origin or frame["author"] != request.author
@@ -580,8 +568,8 @@ class LocalExecutor:
             reply.update(type="llm_error", text="llm() unavailable: this execution has no host model handler")
             await self._send(process, _encode_frame(reply))
             return sequence
-        async def invoke():
-            value = await request.llm_handler(payload)
+        async def invoke() -> str:
+            value = await cast(Callable[[dict[str, Any]], Awaitable[str]], request.llm_handler)(payload)
             if not isinstance(value, str) or len(value) > MAX_RESULT_CHARS:
                 raise ValueError("Invalid bounded llm response")
             return value
@@ -593,7 +581,7 @@ class LocalExecutor:
             reply.update(type="llm_cancelled", text="llm() cancelled; no response accepted")
             # Task cancellation caused by executor.interrupt is consumed here so
             # the wire reply completes before SIGINT stops the waiting cell.
-            if asyncio.current_task().cancelling():
+            if cast(asyncio.Task[object], asyncio.current_task()).cancelling():
                 raise
         except Exception:
             reply.update(type="llm_error", text="llm() request failed; no response accepted")
@@ -669,7 +657,7 @@ class LocalExecutor:
             return sequence
 
         async def invoke_handler() -> InputReply:
-            result = request.input_handler(input_request)
+            result = cast(Callable[[InputRequest], Awaitable[InputReply]], request.input_handler)(input_request)
             if not hasattr(result, "__await__"):
                 raise TypeError("Input handler must return an awaitable InputReply")
             return await result
@@ -680,7 +668,7 @@ class LocalExecutor:
         self._active_input_task = handler_task
         self._active_input_cancel = cancel_event
 
-        def consume_late_task(task: asyncio.Task) -> None:
+        def consume_late_task(task: asyncio.Task[InputReply]) -> None:
             if not task.cancelled():
                 try:
                     task.exception()
@@ -910,9 +898,8 @@ class LocalExecutor:
                             or "\x00" in display_id
                         ):
                             raise _ProtocolError("Invalid worker display ID")
-                        if output_kind == "clear":
-                            if set(data) != {"wait"} or type(data["wait"]) is not bool or display_id is not None:
-                                raise _ProtocolError("Malformed worker clear-output frame")
+                        if output_kind == "clear" and (set(data) != {"wait"} or type(data["wait"]) is not bool or display_id is not None):
+                            raise _ProtocolError("Malformed worker clear-output frame")
                         try:
                             cost = len(json.dumps(
                                 frame, ensure_ascii=True, allow_nan=False, separators=(",", ":"),
@@ -938,14 +925,14 @@ class LocalExecutor:
                             cost = len(json.dumps(
                                 frame["content"], ensure_ascii=True, allow_nan=False, separators=(",", ":"),
                             ))
-                            output = SayOutput(frame["content"], frame["final"])
+                            say_output = SayOutput(frame["content"], frame["final"])
                         except (TypeError, ValueError, RecursionError) as exc:
                             raise _ProtocolError("Invalid worker say content") from exc
                         if len(say_outputs) >= MAX_SAY_MESSAGES:
                             raise _ProtocolError("Worker emitted too many say messages")
                         if say_characters + cost > MAX_SAY_CHARS:
                             raise _ProtocolError("Worker say output exceeded its aggregate bound")
-                        say_outputs.append(output)
+                        say_outputs.append(say_output)
                         say_characters += cost
                         continue
                     if kind == "result":
@@ -1095,13 +1082,13 @@ class LocalExecutor:
             llm_task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(llm_task), timeout=self.interrupt_timeout)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
             # Worker turns the matched cancellation reply into KeyboardInterrupt.
             # Do not race a subsequent idle/next-cell request with SIGINT.
             try:
                 await asyncio.wait_for(self._active_done.wait(), timeout=self.interrupt_timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 await self._stop_process(process)
             return
         input_task = self._active_input_task
@@ -1112,11 +1099,11 @@ class LocalExecutor:
             input_task.cancel()
             try:
                 await asyncio.wait_for(self._active_done.wait(), timeout=self.interrupt_timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 await self._stop_process(process)
                 try:
                     await asyncio.wait_for(self._active_done.wait(), timeout=self.interrupt_timeout)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
             return
         if sys.platform == "win32":
@@ -1125,7 +1112,7 @@ class LocalExecutor:
             await self._stop_process(process)
             try:
                 await asyncio.wait_for(self._active_done.wait(), timeout=self.interrupt_timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         else:
             try:
@@ -1136,13 +1123,13 @@ class LocalExecutor:
                 pass
             try:
                 await asyncio.wait_for(self._active_done.wait(), timeout=self.interrupt_timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # User code may mask SIGINT or be blocked in an uninterruptible
                 # operation. Do not claim it was interrupted if it did not stop.
                 await self._stop_process(process)
                 try:
                     await asyncio.wait_for(self._active_done.wait(), timeout=self.interrupt_timeout)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # The process has been killed; the active reader will observe
                     # EOF shortly, but no longer owns a usable namespace.
                     pass
@@ -1163,7 +1150,7 @@ class LocalExecutor:
                     pass
                 try:
                     await asyncio.wait_for(process.wait(), timeout=self.interrupt_timeout)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     try:
                         if sys.platform == "win32":
                             process.kill()

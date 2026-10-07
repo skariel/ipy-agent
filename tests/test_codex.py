@@ -833,10 +833,10 @@ async def test_large_unfinished_response_is_never_returned_early(auth):
     assert stream.closed
 
 
-async def test_read_and_write_timeouts_do_not_limit_generation(auth):
+async def test_stream_idle_deadline_is_configured(auth):
     provider, requests, _ = setup()
     assert (await provider.generate(MESSAGES)).successful
-    assert requests[0].extensions["timeout"] == {"connect": 20, "read": None, "write": None, "pool": 20}
+    assert requests[0].extensions["timeout"] == {"connect": 20, "read": 180.0, "write": 180.0, "pool": 20}
 
 
 @pytest.mark.parametrize("secret", [SECRET, ACCOUNT])
@@ -912,3 +912,33 @@ def test_default_session_affinity_is_unique_per_provider():
     first = codex.CodexProvider("openai-codex/model")
     second = codex.CodexProvider("openai-codex/model")
     assert first.session_id != second.session_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", [b"", b"data: {\"type\":\"response.created\"}\n\n"])
+async def test_stream_idle_timeout(monkeypatch, prefix):
+    monkeypatch.setattr(codex, "read_codex_credentials", lambda _path: SimpleNamespace(
+        access="private-token", account_id="test-account", expires=9999999999999))
+    closed = []
+    class StalledStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            if prefix:
+                yield prefix
+            await asyncio.Event().wait()
+        async def aclose(self):
+            closed.append(True)
+    provider = codex.CodexProvider(
+        "openai-codex/gpt-5.4", stream_idle_timeout=.02,
+        transport=httpx.MockTransport(lambda request: httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=StalledStream())))
+    with pytest.raises(ProviderError) as caught:
+        await provider.generate(MESSAGES)
+    assert caught.value.kind == "timeout"
+    assert "private-token" not in str(caught.value)
+    assert closed
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True])
+def test_invalid_stream_timeout(timeout):
+    with pytest.raises(ValueError):
+        codex.CodexProvider("openai-codex/gpt-5.4", stream_idle_timeout=timeout)

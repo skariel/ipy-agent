@@ -1,9 +1,9 @@
-"""Coordinator observations policy."""
+"""SessionRuntime observations policy."""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from .contracts import ExecutionRequest, ExecutionResult
 from .coordinator_support import (
@@ -16,25 +16,22 @@ from .coordinator_support import (
 from .output_reads import output_read_reference
 
 if TYPE_CHECKING:
-    from .coordinator import Coordinator
+    from .coordinator_runtime import SessionRuntime
 
 
 @dataclass
 class ModelObservations:
-    """Coordinator observations policy; no execution or provider replay."""
+    """SessionRuntime observations policy; no execution or provider replay."""
 
-    coordinator: Coordinator
+    coordinator: SessionRuntime
 
-    def _packed_observation(self, request: ExecutionRequest, result: ExecutionResult):
+    def _packed_observation(self, request: ExecutionRequest, result: ExecutionResult) -> str | dict[str, Any]:
         from .images import observation_images
         records, notices = observation_images(result.output_events)
         packed = self._packed_text_observation(request, result)
         if not notices:
             return packed
-        if isinstance(packed, str):
-            packed = {"output": packed}
-        else:
-            packed = dict(packed)
+        packed = {"output": packed} if isinstance(packed, str) else dict(packed)
         # Metadata remains text; bytes travel separately through context/provider
         # boundaries, never pasted as base64 into model-visible text.
         text = "\n".join(notices)
@@ -52,10 +49,10 @@ class ModelObservations:
             packed["_images"] = list(records)
         return packed
 
-    def _packed_text_observation(self, request: ExecutionRequest, result: ExecutionResult):
+    def _packed_text_observation(self, request: ExecutionRequest, result: ExecutionResult) -> str | dict[str, Any]:
         # Archive reads have their own bounded envelope. Never let unrelated
         # stdout (including an oversized stream) hide or re-archive an excerpt.
-        reads = []
+        reads: list[dict[str, str]] = []
         ordinary = []
         read_chars = 0
         for output in result.output_events:
@@ -85,10 +82,10 @@ class ModelObservations:
             return "\n".join([packed, *(read["text"] for read in reads)])
         return {**packed, "_output_reads": reads}
 
-    def _packed_regular_observation(self, request: ExecutionRequest, result: ExecutionResult):
+    def _packed_regular_observation(self, request: ExecutionRequest, result: ExecutionResult) -> str | dict[str, Any]:
         if result.origin != request.origin:
             raise RuntimeError("Cannot pack output from a different execution origin")
-        events = []
+        events: list[dict[str, object]] = []
         omitted_events = 0
         event_index = 0
         display_chars_remaining = MODEL_OBSERVATION_MAX_DISPLAY_CHARS
@@ -161,11 +158,11 @@ class ModelObservations:
                         "text": _strip_observation_terminal_controls(text),
                     })
 
-        for output in result.say_outputs:
-            content = output.content
+        for say_output in result.say_outputs:
+            content = say_output.content
             if isinstance(content, str):
                 content = _strip_observation_terminal_controls(content)
-            append_event({"say": content, "final": output.final})
+            append_event({"say": content, "final": say_output.final})
         if result.status != "success":
             append_event({
                 "error": _strip_observation_terminal_controls(
@@ -186,12 +183,12 @@ class ModelObservations:
                 for event in events
                 if "stream" in event or "display" in event
             ]
-            observed = [text for text in observed if isinstance(text, str) and text]
+            observed_text = [text for text in observed if isinstance(text, str) and text]
             if result.output_events:
-                output_text = "\n".join(observed)
+                output_text = "\n".join(observed_text)
             else:
                 output_text = "".join(
-                    event["text"] for event in events if "stream" in event
+                    cast(str, event["text"]) for event in events if "stream" in event
                 )
             says = "\n".join(
                 _strip_observation_terminal_controls(self.coordinator._say_text(output.content))
@@ -215,7 +212,7 @@ class ModelObservations:
         pack = getattr(self.coordinator.observations, "pack", None)
         if not callable(pack):
             raise TypeError("Selected observation service must expose pack")
-        packed = pack(events)
+        packed: dict[str, Any] = pack(events)
         if not hasattr(packed, "items"):
             raise TypeError("Observation service must return a mapping")
         if (result.output_reference is not None and hasattr(packed, "get")
@@ -232,16 +229,16 @@ class ModelObservations:
         )
         oversized = len(packed["output"]) > 16_000 if plain_output else len(serialized) > 8_000
         if oversized:
-            fallback = {
+            oversized_fallback: dict[str, object] = {
                 "error": f"Observation too long ({len(serialized)} chars); omitted.",
                 "status": "output_too_large", "executed": True,
             }
             if result.output_reference is not None:
-                fallback["error"] += (
+                oversized_fallback["error"] = cast(str, oversized_fallback["error"]) + (
                     f" Stream text is saved as outputs[{result.output_reference}]."
                 )
-                fallback["_stored_output_index"] = result.output_reference
-            return fallback
+                oversized_fallback["_stored_output_index"] = result.output_reference
+            return oversized_fallback
         if result.output_reference is not None:
             return {**packed, "_stored_output_index": result.output_reference}
         return packed

@@ -1906,7 +1906,11 @@ def test_coordinator_components_own_state_without_duplicate_facade_storage():
 
     for owner in (first._conversation, first._frontend, first._lifecycle,
                   first._journal, first._observations):
-        assert owner.coordinator is first
+        assert owner.coordinator is first._runtime
+        assert owner.coordinator is not second._runtime
+    assert first._runner is first._runtime.runner
+    assert first._runner.coordinator is first._runtime
+    assert first._runner.models.coordinator is first._runtime
     assert "_context" not in vars(first)
     assert "_pending_actions" not in vars(first)
     assert "_event_sequence" not in vars(first)
@@ -2040,7 +2044,9 @@ async def test_codex_tls_retry_is_automatic_and_never_executes_failed_stream(
 @pytest.mark.parametrize("recover", [True, False])
 async def test_codex_read_errors_retry_six_times_without_executing_partial_source(monkeypatch, recover):
     from types import SimpleNamespace
+
     import httpx
+
     from py_agent import codex
     from py_agent.production_services import ProductionProviderAdapter
 
@@ -2091,7 +2097,7 @@ async def test_codex_read_errors_retry_six_times_without_executing_partial_sourc
             assert "network detail" not in str(caught.value)
             assert not executor.requests
         assert len(calls) == 6
-        assert delays == [1, 2, 4, 8, 15]
+        assert all(base <= delay <= base * 1.2 for base, delay in zip([1, 2, 4, 8, 15], delays, strict=True))
     finally:
         await coordinator.close()
 

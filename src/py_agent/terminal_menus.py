@@ -2,9 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Sequence
 import shlex
 import time
+from typing import TYPE_CHECKING, Any, cast, overload
 from urllib.parse import urlencode
+
+if TYPE_CHECKING:
+    from prompt_toolkit.styles import BaseStyle
+
+    from .coordinator import Coordinator
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import FuzzyWordCompleter
@@ -19,7 +26,17 @@ class MenuCancelled(Exception):
 
 
 class TerminalMenus:
-    async def _menu_prompt(self, label, choices=(), *, password=False):
+    _menu_selection: str | None
+    _queue_work_is_active: Callable[[], bool]
+    _stdin_request: object | None
+    _prompt_lock: asyncio.Lock
+    _history_suppressed: bool
+    session: PromptSession[str]
+    _style: BaseStyle | None
+    _write: Callable[[str], None]
+    coordinator: Coordinator
+
+    async def _menu_prompt(self, label: str, choices: Sequence[str] = (), *, password: bool = False) -> str:
         if self._queue_work_is_active() or self._stdin_request is not None:
             raise ValueError("Wait for active work to finish before opening a menu.")
         async with self._prompt_lock:
@@ -28,7 +45,7 @@ class TerminalMenus:
             try:
                 # Fresh, history-less session: never reuse the composer buffer
                 # or its completion/history machinery for provider secrets.
-                session = PromptSession(input=self.session.input, output=self.session.output,
+                session: PromptSession[str] = PromptSession(input=self.session.input, output=self.session.output,
                                         style=self._style, history=DummyHistory())
                 return await session.prompt_async(
                     label, is_password=password, multiline=False,
@@ -43,7 +60,7 @@ class TerminalMenus:
             finally:
                 self._history_suppressed = previous
 
-    async def _choose(self, label, choices, *, allow_custom=False):
+    async def _choose(self, label: str, choices: Sequence[str], *, allow_custom: bool = False) -> str | None:
         if not choices and not allow_custom:
             self._write("No choices configured. Use /login first.")
             return None
@@ -55,7 +72,7 @@ class TerminalMenus:
             raise ValueError("Choose a listed value.")
         return value
 
-    async def _login(self, arguments):
+    async def _login(self, arguments: str) -> None:
         from .native_auth import api_key_entry, provider_id, save
         tokens = shlex.split(arguments)
         if not tokens:
@@ -83,7 +100,7 @@ class TerminalMenus:
         await asyncio.to_thread(save, provider, entry)
         self._write(f"{provider}: credentials saved.")
 
-    async def _login_codex(self):
+    async def _login_codex(self) -> None:
         # Async variant of the same Pi device protocol; Ctrl-C cancels polling
         # without a lingering background worker that might save credentials.
         import httpx
@@ -91,7 +108,11 @@ class TerminalMenus:
         from . import oauth
         from .native_auth import auth_error, save
         async with httpx.AsyncClient(timeout=30) as client:
-            async def post(url, *, pending=(), **kwargs):
+            @overload
+            async def post(url: str, *, pending: tuple[()] = (), **kwargs: Any) -> dict[str, Any]: ...
+            @overload
+            async def post(url: str, *, pending: tuple[int, ...], **kwargs: Any) -> dict[str, Any] | None: ...
+            async def post(url: str, *, pending: tuple[int, ...] = (), **kwargs: Any) -> dict[str, Any] | None:
                 try:
                     response = await client.post(url, **kwargs)
                     if response.status_code in pending:
@@ -110,13 +131,13 @@ class TerminalMenus:
             code = oauth._token(device.get("user_code"), "device code")
             import math
             try:
-                interval = float(device.get("interval"))
+                interval = float(cast(Any, device.get("interval")))
                 if not math.isfinite(interval) or not 0 <= interval <= 60:
                     raise ValueError()
             except (TypeError, ValueError):
                 raise auth_error("invalid polling interval") from None
             self._write("Open https://auth.openai.com/codex/device and enter code: " + code)
-            async def poll():
+            async def poll() -> dict[str, Any]:
                 deadline = time.monotonic() + 900
                 while time.monotonic() < deadline:
                     result = await post(oauth.AUTH_BASE + "/api/accounts/deviceauth/token",
@@ -150,7 +171,7 @@ class TerminalMenus:
         await asyncio.to_thread(save, "openai-codex", entry)
         self._write("openai-codex: credentials saved.")
 
-    async def _login_openrouter(self, *, manual=False):
+    async def _login_openrouter(self, *, manual: bool = False) -> None:
         import base64
         import hashlib
         import secrets
@@ -164,9 +185,9 @@ class TerminalMenus:
         verifier = secrets.token_urlsafe(32)
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
         callback_path = "/oauth/callback/" + secrets.token_hex(24)
-        received = asyncio.get_running_loop().create_future()
+        received: asyncio.Future[str] = asyncio.get_running_loop().create_future()
 
-        async def callback(reader, writer):
+        async def callback(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             try:
                 line = await asyncio.wait_for(reader.readline(), timeout=2)
                 if len(line) > 8192:
@@ -234,7 +255,7 @@ class TerminalMenus:
                     data = response.json()
                     if not isinstance(data, dict):
                         raise ValueError()
-                    entry = api_key_entry(data.get("key"))
+                    entry = api_key_entry(cast(str, data.get("key")))
                 except (httpx.HTTPError, ValueError):
                     raise auth_error("authentication network error or invalid response") from None
             await asyncio.to_thread(save, "openrouter", entry)
@@ -245,7 +266,7 @@ class TerminalMenus:
             server.close()
             await server.wait_closed()
 
-    async def _interactive_command(self, command, arguments):
+    async def _interactive_command(self, command: str, arguments: str) -> bool:
         """Return True if handled; False leaves coordinator commands queued."""
         if command not in {"login", "logout", "auth", "model", "effort", "think"}:
             return False

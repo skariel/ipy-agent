@@ -13,11 +13,14 @@ from pathlib import Path
 import shutil
 import sys
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 from .configuration import ApplyAt, ConfigField, Scalar
 from .local_executor import (
-    DEFAULT_OUTPUT_CHARS, MAX_OUTPUT_CHARS, MAX_FRAME, LocalExecutor,
+    DEFAULT_OUTPUT_CHARS,
+    MAX_FRAME,
+    MAX_OUTPUT_CHARS,
+    LocalExecutor,
 )
 from .plugins import Contributions, PluginManifest, Service, hookimpl
 
@@ -84,7 +87,7 @@ class IsolatedExecutor(LocalExecutor):
         interrupt_timeout: float = 2,
         input_timeout: float = 300,
         max_output_chars: int = DEFAULT_OUTPUT_CHARS,
-    ):
+    ) -> None:
         self.wrapper_command = _validate_argv(wrapper_command)
         super().__init__(
             executable=(
@@ -214,12 +217,12 @@ def _isolated_executor_from_namespace(namespace: Mapping[str, Scalar]) -> Isolat
     command = _parse_wrapper_command(namespace.get("wrapper_command", ""))
     return create_isolated_executor(
         command,
-        worker_executable=namespace.get("worker_executable", _DEFAULT_WORKER_EXECUTABLE),
-        runtime_parent=namespace.get("runtime_parent", _DEFAULT_RUNTIME_PARENT),
-        timeout=namespace.get("startup_timeout", 15.0),
-        interrupt_timeout=namespace.get("interrupt_timeout", 2.0),
-        input_timeout=namespace.get("input_timeout", 300.0),
-        max_output_chars=namespace.get("max_output_chars", DEFAULT_OUTPUT_CHARS),
+        worker_executable=cast(str | None, namespace.get("worker_executable", _DEFAULT_WORKER_EXECUTABLE)),
+        runtime_parent=cast(str | None, namespace.get("runtime_parent", _DEFAULT_RUNTIME_PARENT)),
+        timeout=cast(float, namespace.get("startup_timeout", 15.0)),
+        interrupt_timeout=cast(float, namespace.get("interrupt_timeout", 2.0)),
+        input_timeout=cast(float, namespace.get("input_timeout", 300.0)),
+        max_output_chars=cast(int, namespace.get("max_output_chars", DEFAULT_OUTPUT_CHARS)),
     )
 
 
@@ -244,7 +247,7 @@ class IsolatedExecutorPlugin:
     factory as usual.
     """
 
-    def __init__(self, *, config: Mapping[str, Scalar] | None = None):
+    def __init__(self, *, config: Mapping[str, Scalar] | None = None) -> None:
         if config is not None and not isinstance(config, Mapping):
             raise TypeError("Isolated executor config must be a mapping")
         self._config = None if config is None else MappingProxyType(dict(config))
@@ -257,13 +260,14 @@ class IsolatedExecutorPlugin:
                 raise ValueError(
                     "The isolated executor requires an explicit wrapper_command configuration"
                 )
-            namespace = self._config
+            namespace: Mapping[str, Scalar] = self._config
         else:
             if not isinstance(config, Mapping):
                 raise TypeError("Plugin service config must be a mapping")
-            namespace = config.get(PLUGIN_ID)
-            if not isinstance(namespace, Mapping):
+            candidate = config.get(PLUGIN_ID)
+            if not isinstance(candidate, Mapping):
                 raise ValueError(f"Missing {PLUGIN_ID!r} configuration namespace")
+            namespace = candidate
         return _isolated_executor_from_namespace(namespace)
 
     @hookimpl

@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 
-def output_read_reference(metadata: Mapping) -> dict[str, int] | None:
+def output_read_reference(metadata: Mapping[str, object]) -> dict[str, int] | None:
     ref = metadata.get("py_agent_output_read")
     if (isinstance(ref, Mapping)
             and set(ref) == {"index", "start", "end", "total"}

@@ -2,13 +2,30 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from os import PathLike
 from pathlib import Path
 import re
+from typing import TypedDict
 
 MAX_INSPECTION = 6000
 
 
-def source(path, start=1, end=None, *, limit=6000) -> str:
+class _TestSummary(TypedDict):
+    returncode: int
+    summary: str
+    failures: list[str]
+    output_tail: str
+    output_chars: int
+    truncated: bool
+
+
+def source(
+    path: str | PathLike[str],
+    start: int = 1,
+    end: int | None = None,
+    *,
+    limit: int = 6000,
+) -> str:
     """Return numbered UTF-8 source lines. Reads incrementally; never executes."""
     if type(start) is not int or start < 1 or (end is not None and (type(end) is not int or end < start)):
         raise ValueError("source requires positive ordered line numbers")
@@ -49,10 +66,13 @@ def source(path, start=1, end=None, *, limit=6000) -> str:
     return "\n".join(result)[:limit]
 
 
-def test_summary(result, *, limit=4000) -> dict:
+def test_summary(result: object, *, limit: int = 4000) -> _TestSummary:
     """Summarize a retained subprocess result; never invokes/reruns tests."""
     if type(limit) is not int or not 128 <= limit <= MAX_INSPECTION:
         raise ValueError("test_summary limit must be 128..6000 characters")
+    code: object
+    stdout: object
+    stderr: object
     if isinstance(result, Mapping):
         code, stdout, stderr = result.get("returncode"), result.get("stdout", ""), result.get("stderr", "")
     else:
@@ -61,7 +81,7 @@ def test_summary(result, *, limit=4000) -> dict:
     if type(code) is not int or not isinstance(stdout, str) or not isinstance(stderr, str):
         raise TypeError("test_summary requires a completed text-mode subprocess result")
     text = stdout + "\n" + stderr
-    failures = []
+    failures: list[str] = []
     for match in re.finditer(r"(?m)^(?:FAILED|ERROR) [^\r\n]+", text):
         if len(failures) >= 20:
             break

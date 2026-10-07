@@ -2,9 +2,8 @@
 
 This document records the implementation visible in the current CLI, coordinator,
 plugin/configuration modules, optional Jupyter adapter, and `pyproject.toml`, in
-contrast with the target in [ARCHITECTURE_PLAN.md](ARCHITECTURE_PLAN.md). It is a
-code/documentation review, not a verification report: no tests or live provider
-calls were run for this update.
+contrast with the target in [ARCHITECTURE_PLAN.md](ARCHITECTURE_PLAN.md). The original status was a code/documentation review. See the reliability update
+below for offline verification; no live provider calls were made.
 
 ## Current default architecture
 
@@ -210,5 +209,42 @@ Treat Jupyter support as experimental and unverified, not a finished notebook in
 The completion criteria in `ARCHITECTURE_PLAN.md` are therefore not met. The
 external plugin API is not frozen, enabled plugins run as trusted host code,
 default execution is intentionally unrestricted, general middleware/lifecycle
-hooks are absent, and Jupyter is not a managed product workflow. No tests or live
-provider calls were run for this update.
+hooks are absent, and Jupyter is not a managed product workflow. The original review made no live provider calls; see offline verification below.
+
+
+## Reliability update
+
+The coordinator delegates submission orchestration to `RequestRunner` and model
+transport/recovery to `ModelRequests`; lifecycle ownership remains in
+`ExecutionLifecycle`, with identity and side-effect evidence in `Operation`.
+Shared retry classification applies only to model calls, never executed cells.
+Codex streams enforce a configurable idle read deadline. Worker/supervisor JSON
+framing shares strict duplicate-key, finite-number, and object validation.
+
+Built-in SQLite journals run on a bounded single-thread worker and acknowledge
+commits before dispatch or completion. Cancelled callers settle admitted commits;
+bookkeeping is serialized and deduplicated. Journal failure fails the session
+without replay. Custom synchronous journal implementations remain compatible.
+
+The offline suite, Ruff, full repository mypy with Jupyter dependencies, and an
+expanded nine-module strict mypy gate pass locally. CI adds locked Python
+3.12–3.14 checks and an optional Jupyter job. This does not establish live provider
+or stock Jupyter interoperability, nor complete repository-wide strict typing.
+
+## Refactor phase closeout
+
+The runtime/component extraction and reliability phase is complete for the
+offline-tested scope. Coordinator remains the compatibility facade; request
+orchestration and model recovery live in dedicated components. Journal commits
+are acknowledged off-loop, and model retry policy and worker wire validation
+are shared.
+
+The checked-in CI commands passed locally in fresh locked environments:
+Python 3.12, 3.13, and 3.14 each passed 855 tests (one optional-dependency skip),
+Ruff, and strict migration mypy. Python 3.13 with the Jupyter extra passed
+854 tests (two skips) and whole-repository mypy. No live provider calls or
+GitHub-hosted workflow execution were performed.
+
+Remaining runner decomposition and narrower/strict runtime interfaces are
+follow-up work, not blockers for this phase. See REFACTORING.md for the detailed
+audit and verification record.

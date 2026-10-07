@@ -14,18 +14,32 @@ from py_agent import cli
 from py_agent.builtin_services import BuiltinPlugin, FakeProvider
 from py_agent.configuration import ConfigField, ConfigRegistry, ConfigStore
 from py_agent.contracts import (
-    ExecutionRequest, ExecutionResult, ExecutorCapabilities, InputRequest, Origin,
-    OutputEvent, QueueOutcome, QueueTicket, RoutedAction, SayOutput,
+    ExecutionRequest,
+    ExecutionResult,
+    ExecutorCapabilities,
+    InputRequest,
+    Origin,
+    OutputEvent,
+    QueueOutcome,
+    QueueTicket,
+    RoutedAction,
+    SayOutput,
 )
 from py_agent.coordinator import State, Submission
 from py_agent.local_executor import LocalExecutor
-from py_agent.plugins import (
-    CommandContribution, Contributions, PluginError, PluginManifest, PluginRuntime, Service,
-    TransformContribution, hookimpl,
-)
-from py_agent.production_services import ProductionServicesPlugin
 import py_agent.plain_terminal as plain_terminal
 from py_agent.plain_terminal import HELP, PlainTerminal, sanitize
+from py_agent.plugins import (
+    CommandContribution,
+    Contributions,
+    PluginError,
+    PluginManifest,
+    PluginRuntime,
+    Service,
+    TransformContribution,
+    hookimpl,
+)
+from py_agent.production_services import ProductionServicesPlugin
 from py_agent.session_journal import SQLiteSessionJournal
 
 
@@ -958,6 +972,7 @@ def test_say_wraps_at_word_boundaries(no_color):
 
 def test_word_wrap_preserves_styles_and_display_width():
     from prompt_toolkit.formatted_text import FormattedText
+
     from py_agent.terminal_markdown import wrap_fragments
 
     wrapped = wrap_fragments(FormattedText([

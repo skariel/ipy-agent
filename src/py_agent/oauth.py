@@ -5,13 +5,16 @@ See THIRD_PARTY_NOTICES.md. No provider response bodies enter error messages.
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable, Container, Mapping
 import hashlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import math
 import secrets
+import socket
 import threading
 import time
+from typing import Any, cast, overload
 from urllib.parse import parse_qs, urlencode, urlsplit
 import webbrowser
 
@@ -24,7 +27,21 @@ AUTH_BASE = "https://auth.openai.com"
 TOKEN_URL = AUTH_BASE + "/oauth/token"
 
 
-def request(client, url, *, pending=(), **kwargs):
+@overload
+def request(
+    client: httpx.Client, url: str, *, pending: tuple[()] = (), **kwargs: Any
+) -> dict[str, Any]: ...
+
+
+@overload
+def request(
+    client: httpx.Client, url: str, *, pending: Container[int], **kwargs: Any
+) -> dict[str, Any] | None: ...
+
+
+def request(
+    client: httpx.Client, url: str, *, pending: Container[int] = (), **kwargs: Any
+) -> dict[str, Any] | None:
     try:
         response = client.post(url, **kwargs)
         if response.status_code in pending:
@@ -39,17 +56,19 @@ def request(client, url, *, pending=(), **kwargs):
         raise auth_error("authentication network error or invalid response; retry login") from None
 
 
-def _token(value, name):
+def _token(value: object, name: str) -> str:
     if (not isinstance(value, str) or not 1 <= len(value) <= 32768
             or any(ord(c) < 33 or ord(c) > 126 for c in value)):
         raise auth_error(f"provider returned an invalid {name}")
     return value
 
 
-def codex_entry(data, previous=None):
+def codex_entry(
+    data: Mapping[str, Any], previous: Mapping[str, object] | None = None
+) -> dict[str, str | float]:
     access = _token(data.get("access_token"), "access token")
     refresh = _token(data.get("refresh_token") or (previous or {}).get("refresh"), "refresh token")
-    expires_in = data.get("expires_in")
+    expires_in: Any = data.get("expires_in")
     if (type(expires_in) not in (int, float) or not math.isfinite(expires_in)
             or not 30 < expires_in <= 365 * 86400):
         raise auth_error("provider returned invalid token expiry")
@@ -66,7 +85,7 @@ def codex_entry(data, previous=None):
             "expires": time.time() * 1000 + expires_in * 1000, "accountId": account}
 
 
-def refresh_codex(entry):
+def refresh_codex(entry: Mapping[str, object]) -> dict[str, str | float]:
     refresh = _token(entry.get("refresh"), "refresh token")
     with httpx.Client(timeout=30) as client:
         data = request(client, TOKEN_URL, data={
@@ -74,14 +93,15 @@ def refresh_codex(entry):
     return codex_entry(data, entry)
 
 
-def login_codex(notify=print):
+def login_codex(notify: Callable[[str], object] = print) -> dict[str, str | float]:
     with httpx.Client(timeout=30) as client:
         device = request(client, AUTH_BASE + "/api/accounts/deviceauth/usercode",
                          json={"client_id": CLIENT_ID})
         device_id = _token(device.get("device_auth_id"), "device ID")
         user_code = _token(device.get("user_code"), "device code")
         try:
-            interval = float(device.get("interval"))
+            interval_value: Any = device.get("interval")
+            interval = float(interval_value)
             if not math.isfinite(interval) or not 0 <= interval <= 60:
                 raise ValueError()
         except (TypeError, ValueError):
@@ -103,7 +123,7 @@ def login_codex(notify=print):
     raise auth_error("device login timed out; retry py login openai-codex")
 
 
-def parse_openrouter_code(value):
+def parse_openrouter_code(value: str) -> str:
     value = value.strip()
     if "://" in value:
         try:
@@ -116,18 +136,23 @@ def parse_openrouter_code(value):
     return _token(value, "authorization code")
 
 
-def login_openrouter(*, manual=False, notify=print, prompt=input):
+def login_openrouter(
+    *,
+    manual: bool = False,
+    notify: Callable[[str], object] = print,
+    prompt: Callable[[str], str] = input,
+) -> dict[str, str]:
     verifier = secrets.token_urlsafe(32)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     callback_path = "/oauth/callback/" + secrets.token_hex(24)
-    received = []
+    received: list[str] = []
     ready = threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):
+        def log_message(self, *args: object) -> None:
             pass  # Callback URLs contain secrets.
 
-        def do_GET(self):
+        def do_GET(self) -> None:
             if urlsplit(self.path).path != callback_path:
                 self.send_error(404)
                 return
@@ -145,7 +170,7 @@ def login_openrouter(*, manual=False, notify=print, prompt=input):
             self.wfile.write(b"Authorization received. Return to py.")
 
     class CallbackServer(HTTPServer):
-        def get_request(self):
+        def get_request(self) -> tuple[socket.socket, tuple[str, int]]:
             connection, address = super().get_request()
             connection.settimeout(2)
             return connection, address
@@ -178,6 +203,7 @@ def login_openrouter(*, manual=False, notify=print, prompt=input):
             data = request(client, "https://openrouter.ai/api/v1/auth/keys",
                            json={"code": code, "code_verifier": verifier,
                                  "code_challenge_method": "S256"})
-        return api_key_entry(data.get("key"))
+        entry: dict[str, str] = api_key_entry(cast(str, data.get("key")))
+        return entry
     finally:
         server.server_close()

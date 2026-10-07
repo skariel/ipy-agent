@@ -5,6 +5,7 @@ Default reads prefer native py credentials. No key commands are executed.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import json
 import math
@@ -13,6 +14,7 @@ from pathlib import Path
 import re
 import stat
 import time
+from typing import Any, NoReturn
 
 from .provider import ProviderError
 
@@ -33,12 +35,12 @@ class ApiKeyCredentials:
     key: str = field(repr=False)
 
 
-def _error(message):
+def _error(message: str) -> ProviderError:
     return ProviderError("Codex authentication: " + message, kind="authentication")
 
 
-def _unique_object(pairs):
-    result = {}
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
             raise ValueError("Duplicate key")
@@ -46,10 +48,16 @@ def _unique_object(pairs):
     return result
 
 
-def _read_auth_document(path: Path, *, error, missing: str | None = None) -> dict | None:
+def _read_auth_document(
+    path: Path,
+    *,
+    error: Callable[[str], ProviderError],
+    missing: str | None = None,
+) -> dict[str, Any] | None:
     """Bounded, symlink-safe read shared by OAuth and static API-key entries."""
     path = Path(os.path.abspath(path))
-    parent_fd = file_fd = None
+    parent_fd: int | None = None
+    file_fd: int | None = None
     try:
         parent_fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
         for component in path.parts[1:-1]:
@@ -71,13 +79,20 @@ def _read_auth_document(path: Path, *, error, missing: str | None = None) -> dic
             data = stream.read(MAX_AUTH_BYTES + 1)
         after = os.fstat(file_fd)
         current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+
+        def identity(s: os.stat_result) -> tuple[int, int, int, int, int]:
+            return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns
+
         if len(data) > MAX_AUTH_BYTES or identity(before) != identity(after) or identity(after) != identity(current):
             raise error("auth.json changed during reading; retry after credential updates finish")
+
+        def invalid_constant(_: str) -> NoReturn:
+            raise ValueError("Invalid number")
+
         document = json.loads(
             data.decode("utf-8"),
             object_pairs_hook=_unique_object,
-            parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Invalid number")),
+            parse_constant=invalid_constant,
         )
     except ProviderError:
         raise
@@ -101,7 +116,8 @@ def read_codex_credentials(path: Path | None = None) -> CodexCredentials:
     """Validate an explicit read-only file, or resolve native/default auth."""
     if path is None:
         from .native_auth import codex_credentials
-        return codex_credentials()
+        credentials: CodexCredentials = codex_credentials()
+        return credentials
     document = _read_auth_document(
         Path(path) if path is not None else DEFAULT_AUTH_FILE,
         error=_error,
@@ -116,7 +132,7 @@ def read_codex_credentials(path: Path | None = None) -> CodexCredentials:
         raise _error("invalid access token; log in again (py login openai-codex, or Pi for a Pi file)")
     if not isinstance(account_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", account_id):
         raise _error("missing or invalid accountId; log in again (py login openai-codex, or Pi for a Pi file)")
-    if type(expires) not in (int, float) or not math.isfinite(expires):
+    if not isinstance(expires, (int, float)) or type(expires) not in (int, float) or not math.isfinite(expires):
         raise _error("missing or invalid token expiry; log in again (py login openai-codex, or Pi for a Pi file)")
     if expires <= time.time() * 1000 + 30_000:
         raise _error(

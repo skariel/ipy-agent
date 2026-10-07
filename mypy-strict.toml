@@ -11,4 +11,8 @@ files = [
     "src/py_agent/collapse_control.py",
     "src/py_agent/context_export.py",
     "src/py_agent/terminal_markdown.py",
+    "src/py_agent/retry_policy.py",
+    "src/py_agent/async_commit.py",
+    "src/py_agent/worker_protocol.py",
+    "src/py_agent/coordinator_operation.py",
 ]

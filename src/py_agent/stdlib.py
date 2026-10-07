@@ -5,12 +5,19 @@ Other existing helpers remain injected globals (say/preview/read_output/collapse
 """
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 import io
+from typing import TYPE_CHECKING, Any, NoReturn
+
+if TYPE_CHECKING:
+    from PIL.Image import Image as PillowImage
+
+    from .images import ImageAttachment
 
 from .inspection import source, test_summary
 
-_ACTIVE_LLM = ContextVar("py_active_llm", default=None)
+_ACTIVE_LLM: ContextVar[Callable[[dict[str, Any]], str] | None] = ContextVar("py_active_llm", default=None)
 MAX_PROMPT_CHARS = 65536
 MAX_RESULT_CHARS = 65536
 MAX_CALLS_PER_CELL = 8
@@ -22,7 +29,7 @@ DEFAULT_SYSTEM = (
 )
 
 
-def llm(prompt: str, *, system: str = DEFAULT_SYSTEM, images=(), max_tokens: int = 2048) -> str:
+def llm(prompt: str, *, system: str = DEFAULT_SYSTEM, images: Sequence[ImageAttachment | bytes | PillowImage] = (), max_tokens: int = 2048) -> str:
     """Call the session's current model/effort with a fresh, independent context.
 
     Returns text, never executes it. Images accept Pillow images, encoded raster
@@ -35,7 +42,7 @@ def llm(prompt: str, *, system: str = DEFAULT_SYSTEM, images=(), max_tokens: int
     return callback(_payload(prompt, system=system, images=images, max_tokens=max_tokens))
 
 
-def _payload(prompt, *, system=DEFAULT_SYSTEM, images=(), max_tokens=2048):
+def _payload(prompt: str, *, system: str = DEFAULT_SYSTEM, images: Sequence[ImageAttachment | bytes | PillowImage] = (), max_tokens: int = 2048) -> dict[str, Any]:
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > MAX_PROMPT_CHARS:
         raise ValueError("llm prompt must be nonempty text, at most 65536 characters")
     if not isinstance(system, str) or not system.strip() or len(system) > MAX_PROMPT_CHARS:
@@ -68,7 +75,7 @@ def _payload(prompt, *, system=DEFAULT_SYSTEM, images=(), max_tokens=2048):
     return {"prompt": prompt, "system": system, "images": records, "max_tokens": max_tokens}
 
 
-def validate_payload(payload):
+def validate_payload(payload: object) -> dict[str, Any]:
     """Validate again on the trusted host boundary."""
     from .images import MAX_IMAGES, ImageAttachment
     if not isinstance(payload, dict) or set(payload) != {"prompt", "system", "images", "max_tokens"}:
@@ -96,13 +103,13 @@ HELPERS = {
 }
 
 
-def install_helpers(namespace, implementations):
+def install_helpers(namespace: dict[str, object], implementations: Mapping[str, Callable[..., object]]) -> None:
     if set(implementations) != set(HELPERS) or not all(callable(fn) for fn in implementations.values()):
         raise RuntimeError("Session helper registry does not match runtime implementations")
     namespace.update(implementations)
 
 
-def helper_prompt():
+def helper_prompt() -> str:
     lines = ["## Python session standard library",
              "", "These registered functions are available as Python globals; no import is required:"]
     lines.extend(f"- {signature}: {description}" for signature, description in HELPERS.values())
@@ -111,11 +118,11 @@ def helper_prompt():
 
 
 
-def _standalone_collapse(*args, **kwargs):
+def _standalone_collapse(*args: object, **kwargs: object) -> NoReturn:
     raise RuntimeError("collapse requires a standalone literal call handled by the coordinator")
 
 
-def runtime_helpers(*, say, preview, read_output, llm):
+def runtime_helpers(*, say: Callable[..., object], preview: Callable[..., object], read_output: Callable[..., object], llm: Callable[..., object]) -> dict[str, Callable[..., object]]:
     """Actual worker bindings, validated against the documented registry."""
     return {"say": say, "preview": preview, "read_output": read_output,
             "collapse": _standalone_collapse, "llm": llm,

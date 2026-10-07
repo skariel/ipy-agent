@@ -9,6 +9,7 @@ import sys
 
 import pytest
 
+from py_agent.builtin_services import BuiltinPlugin
 from py_agent.configuration import ConfigError
 from py_agent.isolated_executor import (
     PLUGIN_ID,
@@ -16,7 +17,6 @@ from py_agent.isolated_executor import (
     IsolatedExecutorPlugin,
     create_isolated_executor,
 )
-from py_agent.builtin_services import BuiltinPlugin
 from py_agent.local_executor import LocalExecutor
 from py_agent.plugins import PluginError, PluginRuntime
 

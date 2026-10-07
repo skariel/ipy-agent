@@ -2,26 +2,39 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from .contracts import ContextSnapshot, ModelRequest, ModelResponse
 from .images import ImageAttachment
 from .provider import ProviderError
+from .retry_policy import MAX_MODEL_ATTEMPTS, model_retry
 from .stdlib import MAX_RESULT_CHARS, validate_payload
 
+if TYPE_CHECKING:
+    from .contracts import Origin
+    from .coordinator import Coordinator
+    from .coordinator_runtime import SessionRuntime
 
-def execution_llm_handler(coordinator, execution_origin):
-    async def call(payload):
+
+def execution_llm_handler(
+    coordinator: SessionRuntime | Coordinator, execution_origin: Origin,
+) -> Callable[[Any], Awaitable[str]]:
+    from .coordinator_runtime import SessionRuntime
+    runtime = coordinator if isinstance(coordinator, SessionRuntime) else coordinator._runtime
+
+    async def call(payload: Any) -> str:
         from .coordinator_support import State
         from .production_services import ProductionProviderAdapter
-        request = coordinator._lifecycle._active_execution_request
+        request = runtime.lifecycle.operation.execution_request
         if (request is None or request.origin != execution_origin
-                or coordinator.state is not State.EXECUTING):
+                or runtime.lifecycle.state is not State.EXECUTING):
             raise RuntimeError("llm execution is no longer active")
         payload = validate_payload(payload)
         options = {"max_tokens": str(payload["max_tokens"])}
-        effort = coordinator.effective_effort
+        effort = runtime.effective_effort
         if effort not in {"default", "unavailable"}:
             options["effort"] = effort
         context = ContextSnapshot(
@@ -29,8 +42,8 @@ def execution_llm_handler(coordinator, execution_origin):
             images=tuple((1, ImageAttachment.from_record(record)) for record in payload["images"]),
         )
         model_origin = replace(execution_origin, generation_id=uuid4().hex)
-        model_request = ModelRequest(model_origin, context, coordinator.model, options)
-        provider = coordinator.provider
+        model_request = ModelRequest(model_origin, context, runtime.model, options)
+        provider = runtime.provider
         if isinstance(provider, ProductionProviderAdapter):
             # Fresh adapter wrapper omits context overflow recovery and never
             # brings the agent's system/history/boundaries into the subcall.
@@ -38,23 +51,26 @@ def execution_llm_handler(coordinator, execution_origin):
                                                  max_tokens=provider.configured_max_tokens)
         from .runtime_status import Activity
         started = asyncio.get_running_loop().time()
-        for attempt in range(5):
-            coordinator.activity = Activity("LLM subcall", attempt + 1, 5, started)
-            if coordinator._lifecycle._active_execution_request is not request:
+        for attempt in range(MAX_MODEL_ATTEMPTS):
+            runtime.activity = Activity("LLM subcall", attempt + 1, MAX_MODEL_ATTEMPTS, started)
+            if runtime.lifecycle.operation.execution_request is not request:
                 raise asyncio.CancelledError
-            coordinator._journal_record("record_model_request", model_request)
+            await runtime.journal_policy._journal_record("record_model_request", model_request)
             try:
-                response = await asyncio.wait_for(provider.generate(model_request), timeout=180)
+                try:
+                    response = await asyncio.wait_for(provider.generate(model_request), timeout=180)
+                except TimeoutError:
+                    raise ProviderError("llm() request timed out", kind="timeout") from None
             except asyncio.CancelledError:
-                coordinator._record_provider_usage(model_request, None, outcome="cancelled")
+                await runtime.journal_policy._record_provider_usage(model_request, None, outcome="cancelled")
                 raise
             except Exception as exc:
-                coordinator._record_provider_usage(model_request, None, outcome="failed")
+                await runtime.journal_policy._record_provider_usage(model_request, None, outcome="failed")
                 kind = getattr(exc, "kind", None)
-                attempts = 5 if kind == "transport" else 3
-                if kind in {"transport", "rate_limit", "server"} and attempt + 1 < attempts:
-                    delay = min(8, 2 ** attempt) if kind == "transport" else .5 * (attempt + 1)
-                    coordinator.activity = Activity(
+                decision = model_retry(exc, attempt)
+                attempts, delay = decision.attempts, decision.delay
+                if decision.retry:
+                    runtime.activity = Activity(
                         "LLM subcall retry", attempt + 2, attempts, started,
                         asyncio.get_running_loop().time() + delay,
                     )
@@ -63,19 +79,19 @@ def execution_llm_handler(coordinator, execution_origin):
                 raise ProviderError("llm() provider request failed; no response accepted",
                                     kind=kind or "provider") from None
             if not isinstance(response, ModelResponse):
-                coordinator._record_provider_usage(model_request, None, outcome="failed")
+                await runtime.journal_policy._record_provider_usage(model_request, None, outcome="failed")
                 raise TypeError("Invalid llm provider response")
-            coordinator._record_provider_usage(model_request, response, outcome="returned")
+            await runtime.journal_policy._record_provider_usage(model_request, response, outcome="returned")
             if response.finish_status != "complete" or response.rejection_reason or not response.text.strip():
                 raise ProviderError("llm() returned an incomplete response; no text accepted", kind="provider")
             if len(response.text) > MAX_RESULT_CHARS:
                 raise ValueError("llm() response exceeds 65536 characters")
             return response.text
         raise RuntimeError("llm retry budget exhausted")
-    async def observed(payload):
-        previous = coordinator.activity
+    async def observed(payload: Any) -> str:
+        previous = runtime.activity
         try:
             return await call(payload)
         finally:
-            coordinator.activity = previous
+            runtime.activity = previous
     return observed

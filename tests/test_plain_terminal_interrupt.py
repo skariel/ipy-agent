@@ -1,4 +1,6 @@
 """Ctrl-C prompt behavior; no provider or worker is started."""
+from __future__ import annotations
+
 import asyncio
 
 from prompt_toolkit.input import create_pipe_input

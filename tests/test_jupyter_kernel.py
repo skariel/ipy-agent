@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import sys
 from types import SimpleNamespace
@@ -7,8 +9,14 @@ import pytest
 from py_agent import jupyter_kernel
 from py_agent.builtin_services import BuiltinPlugin
 from py_agent.contracts import (
-    CompletionResult, ExecutorCapabilities, ExecutionResult, InspectionResult,
-    InputReply, InputRequest, InputUnavailableError, Origin, OutputEvent,
+    CompletionResult,
+    ExecutionResult,
+    ExecutorCapabilities,
+    InputRequest,
+    InputUnavailableError,
+    InspectionResult,
+    Origin,
+    OutputEvent,
 )
 from py_agent.coordinator import Coordinator
 from py_agent.plugins import PluginRuntime

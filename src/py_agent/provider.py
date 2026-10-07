@@ -8,6 +8,7 @@ usage. Missing counters remain unknown; we never infer cost or sum cache tokens.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Iterable
 from copy import deepcopy
 from dataclasses import dataclass, field
 import inspect
@@ -15,16 +16,16 @@ import json
 from pathlib import Path
 import re
 import ssl
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 
 @dataclass(frozen=True)
 class Completion:
     text: str
     finish_reason: str = "stop"
-    usage: dict = field(default_factory=dict)
+    usage: dict[str, Any] = field(default_factory=dict)
     reasoning: str | None = None
-    raw: dict = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
     rejection_reason: str | None = None
     phase: str | None = None  # native assistant phase, where the provider supplies one
 
@@ -41,20 +42,21 @@ class Completion:
 class Provider(Protocol):
     model: str
 
-    async def generate(self, messages: list[dict], *, max_tokens: int | None = None) -> Completion: ...
+    async def generate(self, messages: list[dict[str, Any]], *, max_tokens: int | None = None) -> Completion: ...
 
 
 class ProviderError(RuntimeError):
     """No executable completion exists. Incurred usage may be unknown."""
 
-    def __init__(self, message: str, *, kind: str = "provider", raw: dict | None = None):
+    def __init__(self, message: str, *, kind: str = "provider", raw: dict[str, Any] | None = None, retry_after: float | None = None) -> None:
         super().__init__(message)
         self.kind = kind
+        self.retry_after = retry_after
         self.raw = raw or {}
         self.usage_unknown = True
 
 
-def _json_object(value: Any) -> dict:
+def _json_object(value: Any) -> dict[str, Any]:
     original = value
     if hasattr(value, "model_dump"):
         try:
@@ -64,7 +66,7 @@ def _json_object(value: Any) -> dict:
     if isinstance(value, dict):
         try:
             encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
-            return json.loads(encoded)
+            return cast(dict[str, Any], json.loads(encoded))
         except (TypeError, ValueError):
             # Some compatibility wrappers implement model_dump() by walking
             # Pydantic internals (including sets) but expose valid JSON through
@@ -86,7 +88,7 @@ def _json_object(value: Any) -> dict:
     raise ProviderError("Non-JSON provider response", kind="shape")
 
 
-def normalize_usage(raw: dict | None) -> dict:
+def normalize_usage(raw: dict[str, Any] | None) -> dict[str, Any]:
     """Keep translated raw metadata beside counters, with no cache arithmetic."""
     if raw is None:
         return {"source": "unknown", "raw": None, "normalized": {}}
@@ -111,7 +113,7 @@ def normalize_usage(raw: dict | None) -> dict:
     return {"source": "reported_by_litelm", "raw": deepcopy(raw), "normalized": counters}
 
 
-def _validate_messages(messages: list[dict], max_tokens: int | None) -> list[dict]:
+def _validate_messages(messages: list[dict[str, Any]], max_tokens: int | None) -> list[dict[str, Any]]:
     if max_tokens is not None and (type(max_tokens) is not int or max_tokens <= 0):
         raise ValueError("max_tokens must be a positive integer or None")
     if not isinstance(messages, list) or not messages:
@@ -166,7 +168,7 @@ def _validate_messages(messages: list[dict], max_tokens: int | None) -> list[dic
     return deepcopy(messages)
 
 
-def _payload_error(message: dict, *, streaming: bool = False) -> str | None:
+def _payload_error(message: dict[str, Any], *, streaming: bool = False) -> str | None:
     if message.get("role") not in ({None, "assistant"} if streaming else {"assistant"}):
         return "Unexpected response role"
     for field_name in ("tool_calls", "function_call", "refusal", "images", "audio"):
@@ -191,7 +193,7 @@ def _payload_error(message: dict, *, streaming: bool = False) -> str | None:
     return None
 
 
-def _completion(raw: dict) -> Completion:
+def _completion(raw: dict[str, Any]) -> Completion:
     usage = normalize_usage(raw.get("usage"))
     choices = raw.get("choices")
     rejection = None
@@ -228,7 +230,8 @@ def _ssl_failure_kind(exc: BaseException) -> str | None:
     take precedence. Some wrappers retain only OpenSSL's bracketed reason.
     Never return exception text (it can contain credentials).
     """
-    pending, seen = [exc], set()
+    pending = [exc]
+    seen: set[int] = set()
     kinds = set()
     while pending and len(seen) < 64:
         error = pending.pop()
@@ -340,7 +343,7 @@ class LitelmProvider:
         api_base: str | None = None,
         stream: bool = False,
         auth_file: Path | None = None,
-    ):
+    ) -> None:
         self.model = self._validated_model(model)
         self.api_base, self.stream = api_base, stream
         self.auth_file = Path(auth_file) if auth_file is not None else None
@@ -355,7 +358,7 @@ class LitelmProvider:
     def set_model(self, model: str) -> None:
         self.model = self._validated_model(model)
 
-    async def generate(self, messages: list[dict], *, max_tokens: int | None = None) -> Completion:
+    async def generate(self, messages: list[dict[str, Any]], *, max_tokens: int | None = None) -> Completion:
         context = [{"role": m["role"], "content": m["content"]} for m in _validate_messages(messages, max_tokens)]
         from .images import require_vision
         require_vision(self.model, context)
@@ -390,7 +393,7 @@ class LitelmProvider:
             # Anthropic path forwards unknown kwargs to the native SDK.
             kwargs["stream_options"] = {"include_usage": True}
         try:
-            response = await litelm.acompletion(**kwargs)
+            response = await litelm.acompletion(**kwargs)  # type: ignore[no-untyped-call]  # litelm has no typed completion API
             if self.stream:
                 return await self._collect(response)
             return _completion(_json_object(response))
@@ -479,15 +482,15 @@ class FakeProvider:
     """
 
     def __init__(
-        self, responses, *, model: str = "fake/deterministic", delay: float = 0, gate: asyncio.Event | None = None
-    ):
+        self, responses: Iterable[Completion | str | BaseException | Callable[..., Completion | str]], *, model: str = "fake/deterministic", delay: float = 0, gate: asyncio.Event | None = None
+    ) -> None:
         self.model, self.delay, self.gate = model, delay, gate
         self.responses = list(responses)
-        self.requests: list[dict] = []
+        self.requests: list[dict[str, Any]] = []
         self.started = asyncio.Event()
         self.cancelled = 0
 
-    async def generate(self, messages: list[dict], *, max_tokens: int | None = None) -> Completion:
+    async def generate(self, messages: list[dict[str, Any]], *, max_tokens: int | None = None) -> Completion:
         context = _validate_messages(messages, max_tokens)
         self.requests.append({"messages": context, "max_tokens": max_tokens, "model": self.model})
         self.started.set()

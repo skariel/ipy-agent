@@ -1,11 +1,12 @@
-"""Coordinator lifecycle component; orchestration remains in Coordinator."""
+"""SessionRuntime lifecycle component; orchestration remains in SessionRuntime."""
 from __future__ import annotations
 
 import asyncio
 from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 from uuid import uuid4
 
+from .async_commit import settle
 from .contracts import (
     MAX_FRONTEND_ID_CHARS,
     MAX_QUEUED_ACTION_CHARS,
@@ -13,7 +14,7 @@ from .contracts import (
     ExecutionResult,
     ExecutorCapabilityError,
     InputHandler,
-    ModelRequest,
+    ModelResponse,
     Origin,
     ProgressCallback,
     QueueFullError,
@@ -21,6 +22,7 @@ from .contracts import (
     QueueTicket,
     UserAction,
 )
+from .coordinator_operation import Operation
 from .coordinator_support import (
     MAX_PENDING_ACTIONS,
     State,
@@ -28,13 +30,24 @@ from .coordinator_support import (
 )
 
 if TYPE_CHECKING:
-    from .coordinator import Coordinator
+    from .coordinator_runtime import SessionRuntime
+
+
+class _LifecycleExecutor(Protocol):
+    async def execute(self, request: ExecutionRequest) -> ExecutionResult: ...
+    async def start(self) -> None: ...
+    async def close(self) -> None: ...
+    async def interrupt(self) -> None: ...
+
+
+class _LifecycleRouter(Protocol):
+    def route(self, action: UserAction) -> object: ...
 
 
 class ExecutionLifecycle:
     """Owns lifecycle state and behavior for one coordinator."""
 
-    def __init__(self, coordinator: Coordinator) -> None:
+    def __init__(self, coordinator: SessionRuntime) -> None:
         self.coordinator = coordinator
         self._journal_started = False
         self._journal_closed = False
@@ -43,67 +56,64 @@ class ExecutionLifecycle:
         self._lock = asyncio.Lock()
         self._queue_lock = asyncio.Lock()
         self._pending_actions: deque[_QueuedAction] = deque()
-        self._queue_worker: asyncio.Task | None = None
+        self._queue_worker: asyncio.Task[None] | None = None
         self._lifecycle_lock = asyncio.Lock()
-        self._close_task: asyncio.Task | None = None
+        self._close_task: asyncio.Task[None] | None = None
         self._executor_close_attempted = False
-        self._active_task: asyncio.Task | None = None
-        self._active_operation_id: str | None = None
-        self._active_model_request: ModelRequest | None = None
-        self._active_provider_usage_recorded = False
-        self._active_execution_request: ExecutionRequest | None = None
-        self._active_execution_result_recorded = False
-        self._execution_active = False
-        self._execution_outcome_status: str | None = None
-        self._generation: asyncio.Task | None = None
+        self.operation = Operation()
+        self._execution_record_lock = asyncio.Lock()
+        self._generation: asyncio.Task[ModelResponse] | None = None
 
     def _set_state_unless_stopping(self, state: State) -> None:
         if self.state not in (State.STOPPING, State.CLOSED):
             self.state = state
 
     def _operation_is_current(self, operation_id: str, state: State) -> bool:
-        return self._active_operation_id == operation_id and self.state is state
+        return self.operation.current(operation_id) and self.state is state
 
-    def _record_execution_result(self, request: ExecutionRequest, result: ExecutionResult) -> None:
-        if self._active_execution_request is request and self._active_execution_result_recorded:
-            return
-        self.coordinator._journal_record("record_execution_result", request, result)
-        if self._active_execution_request is request:
-            self._active_execution_result_recorded = True
+    async def _record_execution_result(self, request: ExecutionRequest, result: ExecutionResult) -> None:
+        await settle(self._commit_execution(request, result=result))
 
-    def _record_uncertain_execution(self, request: ExecutionRequest, reason: str) -> None:
-        if self._active_execution_request is request and self._active_execution_result_recorded:
-            return
-        self.coordinator.execution_outcome = (
-            "Execution is uncertain; side effects may have occurred. Session paused. "
-            "Inspect external state before restart; never replay automatically."
-        )
-        self.coordinator.recovery = None
-        self.coordinator._journal_record("record_uncertain_execution", request, reason)
-        if self._active_execution_request is request:
-            self._active_execution_result_recorded = True
+    async def _record_uncertain_execution(self, request: ExecutionRequest, reason: str) -> None:
+        await settle(self._commit_execution(request, reason=reason))
+
+    async def _commit_execution(
+        self, request: ExecutionRequest, *,
+        result: ExecutionResult | None = None, reason: str | None = None,
+    ) -> None:
+        async with self._execution_record_lock:
+            if self.operation.execution_request is request and self.operation.execution_result_recorded:
+                return
+            if result is not None:
+                await self.coordinator.journal_policy._journal_record("record_execution_result", request, result)
+            else:
+                self.coordinator.execution_outcome = (
+                    "Execution is uncertain; side effects may have occurred. Session paused. "
+                    "Inspect external state before restart; never replay automatically."
+                )
+                self.coordinator.recovery = None
+                await self.coordinator.journal_policy._journal_record("record_uncertain_execution", request, reason)
+            if self.operation.execution_request is request:
+                self.operation.execution_result_recorded = True
 
     async def _execute_dispatched(self, request: ExecutionRequest) -> ExecutionResult:
         """Commit source before dispatch and result before publishing its output."""
         self.coordinator.recovery = None
-        self.coordinator._journal_record("record_execution_source", request)
-        self._active_execution_request = request
-        self._active_execution_result_recorded = False
-        self._execution_outcome_status = None
-        self._execution_active = True
+        await self.coordinator.journal_policy._journal_record("record_execution_source", request)
+        self.operation.begin_execution(request)
         try:
             try:
-                result = await self.coordinator.executor.execute(request)
+                result = await cast(_LifecycleExecutor, self.coordinator.executor).execute(request)
             except asyncio.CancelledError:
-                self.coordinator._record_uncertain_execution(
+                await self.coordinator.lifecycle._record_uncertain_execution(
                     request, "Executor call was cancelled; side effects may have occurred",
                 )
                 raise
             except Exception as exc:
-                self.coordinator._record_uncertain_execution(request, f"Executor raised {type(exc).__name__}")
+                await self.coordinator.lifecycle._record_uncertain_execution(request, f"Executor raised {type(exc).__name__}")
                 raise
         finally:
-            self._execution_active = False
+            self.operation.execution_active = False
         try:
             self.coordinator._validate_execution_result(request, result)
             if result.status == "uncertain":
@@ -123,29 +133,33 @@ class ExecutionLifecycle:
                     "its side effects remain. Model recovery never replays it."
                 )
         except Exception as exc:
-            self.coordinator._record_uncertain_execution(request, f"Executor returned an invalid result: {type(exc).__name__}")
+            await self.coordinator.lifecycle._record_uncertain_execution(request, f"Executor returned an invalid result: {type(exc).__name__}")
             raise
-        self.coordinator._record_execution_result(request, result)
-        self._execution_outcome_status = result.status
+        await self.coordinator.lifecycle._record_execution_result(request, result)
+        self.operation.execution_outcome_status = result.status
         return result
 
     async def _close_executor(self) -> None:
         if self._executor_close_attempted:
             return
         self._executor_close_attempted = True
-        await self.coordinator.executor.close()
+        await cast(_LifecycleExecutor, self.coordinator.executor).close()
 
-    def _close_journal(self, state: str) -> None:
+    async def _close_journal(self, state: str) -> None:
         if self._journal_closed:
             return
         failure = None
         try:
             if self._journal_started and not self._journal_failed:
-                self.coordinator._journal_record("end", self.coordinator.session_id, self.coordinator.config_revision, state)
+                await self.coordinator.journal_policy._journal_record("end", self.coordinator.session_id, self.coordinator.config_revision, state)
         except BaseException as exc:
             failure = exc
         try:
-            self.coordinator.journal.close()
+            from .journal_worker import SQLiteJournalWorker
+            if isinstance(self.coordinator.journal, SQLiteJournalWorker):
+                await self.coordinator.journal.aclose()
+            else:
+                self.coordinator.journal.close()
         except BaseException as exc:
             if failure is None:
                 failure = exc
@@ -159,30 +173,30 @@ class ExecutionLifecycle:
     async def start(self) -> None:
         async with self._lifecycle_lock:
             if self.state is not State.NEW:
-                raise RuntimeError("Coordinator cannot start unless it is new")
+                raise RuntimeError("SessionRuntime cannot start unless it is new")
             try:
                 config = self.coordinator._current_config()
                 if config is not None:
                     self.coordinator.config_revision = config.revision
-                self.coordinator._journal_record(
+                self._journal_started = True
+                await self.coordinator.journal_policy._journal_record(
                     "start", self.coordinator.session_id, self.coordinator.config_revision, self.coordinator.provider_id, self.coordinator.model,
                 )
-                self._journal_started = True
                 if (callable(getattr(self.coordinator.context_service, "collapse", None))
                         and not callable(getattr(self.coordinator.executor, "store_collapsed", None))):
                     raise ExecutorCapabilityError(
                         "store_collapsed archival required by the selected context service"
                     )
-                await self.coordinator.executor.start()
+                await cast(_LifecycleExecutor, self.coordinator.executor).start()
             except BaseException:
                 self.state = State.FAILED
                 try:
-                    await self.coordinator._close_executor()
+                    await self.coordinator.lifecycle._close_executor()
                 except BaseException:
                     # Preserve startup failure; close() remains safe to call.
                     pass
                 try:
-                    self.coordinator._close_journal(State.FAILED.value)
+                    await self.coordinator.lifecycle._close_journal(State.FAILED.value)
                 except BaseException:
                     # Preserve startup failure; the journal has still been closed.
                     pass
@@ -234,7 +248,7 @@ class ExecutionLifecycle:
         config = self.coordinator._current_config()
         revision = config.revision if config is not None else self.coordinator.config_revision
         origin = Origin(self.coordinator.session_id, uuid4().hex, frontend_id, revision)
-        routed = self.coordinator._validate_routed_action(self.coordinator.router.route(UserAction(origin, text)), origin)
+        routed = self.coordinator._validate_routed_action(cast(_LifecycleRouter, self.coordinator.router).route(UserAction(origin, text)), origin)
         loop = asyncio.get_running_loop()
         completion: asyncio.Future[QueueOutcome] = loop.create_future()
         async with self._queue_lock:
@@ -251,26 +265,26 @@ class ExecutionLifecycle:
             ticket = QueueTicket(
                 routed.origin, routed.kind, len(self._pending_actions), asyncio.shield(completion),
             )
-        self.coordinator._start_queue_worker_if_idle()
+        self.coordinator.lifecycle._start_queue_worker_if_idle()
         return ticket
 
     def _start_queue_worker_if_idle(self) -> None:
         if (self._queue_worker is None and self._pending_actions
                 and self.state is State.IDLE and not self._lock.locked()):
             worker = asyncio.create_task(
-                self.coordinator._drain_queue(), name="py-agent-queued-actions",
+                self.coordinator.lifecycle._drain_queue(), name="py-agent-queued-actions",
             )
             self._queue_worker = worker
             # A task cancelled before its coroutine starts never enters the
             # drainer's finally block. Always release the worker slot.
-            worker.add_done_callback(self.coordinator._queue_worker_finished)
+            worker.add_done_callback(self.coordinator.lifecycle._queue_worker_finished)
 
-    def _queue_worker_finished(self, worker: asyncio.Task) -> None:
+    def _queue_worker_finished(self, worker: asyncio.Task[None]) -> None:
         if self._queue_worker is worker:
             self._queue_worker = None
-        self.coordinator._start_queue_worker_if_idle()
+        self.coordinator.lifecycle._start_queue_worker_if_idle()
 
-    async def _fail_pending_actions(self, status: str, error: str) -> None:
+    async def _fail_pending_actions(self, status: Literal["steered", "completed", "failed", "interrupted", "closed"], error: str) -> None:
         async with self._queue_lock:
             pending = tuple(self._pending_actions)
             self._pending_actions.clear()
@@ -288,14 +302,14 @@ class ExecutionLifecycle:
                         return
                     item = self._pending_actions.popleft()
                 try:
-                    submission = await self.coordinator.submit(
+                    submission = await self.coordinator.runner.submit(
                         item.action.origin.frontend_id, item.text, _queued_action=item,
                     )
                 except asyncio.CancelledError:
                     self.coordinator._complete_queue_item(
                         item, QueueOutcome(item.action.origin, "interrupted", error="Queued action was cancelled"),
                     )
-                    await self.coordinator._fail_pending_actions(
+                    await self.coordinator.lifecycle._fail_pending_actions(
                         "interrupted", "Queue processing was cancelled; pending actions were not dispatched",
                     )
                     return
@@ -304,7 +318,7 @@ class ExecutionLifecycle:
                         item, QueueOutcome(item.action.origin, "failed", error=str(exc)),
                     )
                     if self.state in (State.FAILED, State.STOPPING, State.CLOSED):
-                        await self.coordinator._fail_pending_actions("interrupted", "Session is unavailable")
+                        await self.coordinator.lifecycle._fail_pending_actions("interrupted", "Session is unavailable")
                         return
                 else:
                     self.coordinator._complete_queue_item(
@@ -313,13 +327,13 @@ class ExecutionLifecycle:
         finally:
             if self._queue_worker is current:
                 self._queue_worker = None
-            self.coordinator._start_queue_worker_if_idle()
+            self.coordinator.lifecycle._start_queue_worker_if_idle()
 
     async def interrupt(self) -> None:
         if self.state in (State.STOPPING, State.CLOSED, State.NEW, State.FAILED):
             return
         if self.state is State.IDLE:
-            await self.coordinator._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
+            await self.coordinator.lifecycle._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
             worker = self._queue_worker
             if worker is not None and worker is not asyncio.current_task():
                 worker.cancel()
@@ -327,67 +341,67 @@ class ExecutionLifecycle:
         if self.state is State.GENERATING:
             # Invalidate before requesting cancellation. Even a provider that
             # suppresses cancellation cannot cause its late response to execute.
-            self._active_operation_id = None
-            await self.coordinator._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
+            self.operation.invalidate()
+            await self.coordinator.lifecycle._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
             generation = self._generation
             if generation is not None and not generation.done():
                 generation.cancel()
-            elif self._active_task is not None and self._active_task is not asyncio.current_task():
+            elif self.operation.task is not None and self.operation.task is not asyncio.current_task():
                 # Async transforms run before a provider task exists.
-                self._active_task.cancel()
+                self.operation.task.cancel()
             return
         if self.state is State.COMMAND:
             # Commands may have external side effects too; cancel once and do
             # not advertise the session as safe to replay.
-            self._active_operation_id = None
+            self.operation.invalidate()
             self.state = State.FAILED
-            await self.coordinator._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
-            active = self._active_task
+            await self.coordinator.lifecycle._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
+            active = self.operation.task
             if active is not None and active is not asyncio.current_task():
                 active.cancel()
             return
         if self.state in (State.EXECUTING, State.WAITING_FOR_INPUT):
             # Invalidate before requesting cancellation so a late executor result
             # cannot be dispatched even if the executor ignores the interrupt.
-            self._active_operation_id = None
-            await self.coordinator._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
-            if self._execution_active:
+            self.operation.invalidate()
+            await self.coordinator.lifecycle._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
+            if self.operation.execution_active:
                 # Stop the cell and let the cancelled operation choose its own
                 # transition: a "cancelled" result means the executor kept a
                 # usable namespace, anything else fails the session closed.
-                await self.coordinator.executor.interrupt()
+                await cast(_LifecycleExecutor, self.coordinator.executor).interrupt()
             else:
                 # The cell result is already recorded, but output delivery or
                 # observer acknowledgement was cancelled; keep the fail-closed
                 # transition instead of promising an unchanged session.
                 self.state = State.FAILED
-                active = self._active_task
+                active = self.operation.task
                 if active is not None and active is not asyncio.current_task():
                     active.cancel()
 
     async def close(self) -> None:
         task = asyncio.current_task()
-        if task is self._active_task:
+        if task is self.operation.task:
             raise RuntimeError("Cannot close a coordinator from an active submission")
         if self._close_task is None:
-            self._close_task = asyncio.create_task(self.coordinator._close_impl(), name="py-agent-coordinator-close")
+            self._close_task = asyncio.create_task(self.coordinator.lifecycle._close_impl(), name="py-agent-coordinator-close")
         await asyncio.shield(self._close_task)
 
     async def _close_impl(self) -> None:
         async with self._lifecycle_lock:
             if self.state is State.CLOSED:
                 return
-            was_executing = self._execution_active
+            was_executing = self.operation.execution_active
             self.state = State.STOPPING
-            await self.coordinator._fail_pending_actions("closed", "Coordinator closed before queued action dispatch")
+            await self.coordinator.lifecycle._fail_pending_actions("closed", "SessionRuntime closed before queued action dispatch")
             worker = self._queue_worker
             if worker is not None and worker is not asyncio.current_task():
                 worker.cancel()
-            self._active_operation_id = None
+            self.operation.invalidate()
             generation = self._generation
             if generation is not None and not generation.done():
                 generation.cancel()
-            active = self._active_task
+            active = self.operation.task
             failure = None
             if active is not None and active is not asyncio.current_task():
                 active.cancel()
@@ -399,7 +413,7 @@ class ExecutionLifecycle:
                 else:
                     if was_executing:
                         try:
-                            await self.coordinator.executor.interrupt()
+                            await cast(_LifecycleExecutor, self.coordinator.executor).interrupt()
                         except BaseException:
                             pass
                     done, _ = await asyncio.wait({active}, timeout=min(self.coordinator._shutdown_timeout, 1.0))
@@ -410,16 +424,16 @@ class ExecutionLifecycle:
                         # cancelled before its journal is closed. Late completions
                         # cannot overwrite that terminal evidence or be replayed.
                         try:
-                            if (self._active_execution_request is not None
-                                    and not self._active_execution_result_recorded):
-                                self.coordinator._record_uncertain_execution(
-                                    self._active_execution_request,
-                                    "Coordinator shutdown timed out; execution outcome may be uncertain",
+                            if (self.operation.execution_request is not None
+                                    and not self.operation.execution_result_recorded):
+                                await self.coordinator.lifecycle._record_uncertain_execution(
+                                    self.operation.execution_request,
+                                    "SessionRuntime shutdown timed out; execution outcome may be uncertain",
                                 )
-                            if (self._active_model_request is not None
-                                    and not self._active_provider_usage_recorded):
-                                self.coordinator._record_provider_usage(
-                                    self._active_model_request, None, outcome="cancelled",
+                            if (self.operation.model_request is not None
+                                    and not self.operation.provider_usage_recorded):
+                                await self.coordinator.journal_policy._record_provider_usage(
+                                    self.operation.model_request, None, outcome="cancelled",
                                 )
                         except BaseException as exc:
                             failure = exc
@@ -428,12 +442,12 @@ class ExecutionLifecycle:
                 if worker in done:
                     await asyncio.gather(worker, return_exceptions=True)
             try:
-                await self.coordinator._close_executor()
+                await self.coordinator.lifecycle._close_executor()
             except BaseException as exc:
                 if failure is None:
                     failure = exc
             try:
-                self.coordinator._close_journal(State.STOPPING.value)
+                await self.coordinator.lifecycle._close_journal(State.STOPPING.value)
             except BaseException as exc:
                 if failure is None:
                     failure = exc

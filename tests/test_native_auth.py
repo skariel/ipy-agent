@@ -231,3 +231,30 @@ def test_store_rejects_auth_file_symlink(home):
 def test_cli_auth_alias():
     args = cli.parser().parse_args(["--auth", "/tmp/explicit.json", "--model", "openai/model"])
     assert args.pi_auth == Path("/tmp/explicit.json")
+
+
+def test_codex_presence_check_is_inside_store_lock(home, monkeypatch):
+    native_auth.save("openai-codex", entry())
+    from contextlib import contextmanager
+
+    original_lock = native_auth.locked_store
+    original_read = native_auth.read_document
+    held = False
+
+    @contextmanager
+    def tracked_lock():
+        nonlocal held
+        with original_lock() as directory:
+            held = True
+            try:
+                yield directory
+            finally:
+                held = False
+
+    def checked_read():
+        assert held, "credential presence must not race an atomic refresh"
+        return original_read()
+
+    monkeypatch.setattr(native_auth, "locked_store", tracked_lock)
+    monkeypatch.setattr(native_auth, "read_document", checked_read)
+    assert native_auth.codex_credentials().account_id == "account-123"

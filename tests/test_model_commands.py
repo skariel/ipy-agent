@@ -98,8 +98,9 @@ def test_adapter_is_inferred_from_model():
 
 
 def test_model_list_filters_credentials(monkeypatch, tmp_path):
-    from py_agent.model_catalog import available_models, MODELS
     from litelm._providers import PROVIDERS
+
+    from py_agent.model_catalog import MODELS, available_models
     for _, env in PROVIDERS.values():
         if env:
             monkeypatch.delenv(env, raising=False)
@@ -140,8 +141,9 @@ def test_litelm_configured_effort(monkeypatch):
 
 
 def test_toolbar_shows_effective_effort_and_updates_with_session_changes():
-    from py_agent.plain_terminal import PlainTerminal
     from prompt_toolkit.output import DummyOutput
+
+    from py_agent.plain_terminal import PlainTerminal
 
     coordinator = cli._build_coordinator("litelm", model="deepseek/deepseek-chat")
     terminal = PlainTerminal(coordinator, output=DummyOutput())

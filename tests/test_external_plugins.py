@@ -9,9 +9,9 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib.util
+from pathlib import Path
 import sys
 import tomllib
-from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -20,9 +20,9 @@ from py_agent.builtin_services import BuiltinPlugin
 from py_agent.configuration import ConfigStore
 from py_agent.contracts import (
     ContextSnapshot,
-    ExecutorCapabilities,
     ExecutionRequest,
     ExecutionResult,
+    ExecutorCapabilities,
     ModelRequest,
     ModelResponse,
     Origin,
@@ -92,7 +92,7 @@ def test_each_example_is_separately_packaged_and_uses_public_modules(examples):
         assert metadata["project"]["entry-points"]["ipy_agent.plugins"] == {
             plugin_id: f"{package}:plugin"
         }
-        assert examples[distribution].PLUGIN_ID == plugin_id
+        assert plugin_id == examples[distribution].PLUGIN_ID
 
         source = (root / "src" / package / "__init__.py").read_text(encoding="utf-8")
         tree = ast.parse(source)

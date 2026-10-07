@@ -8,7 +8,14 @@ public coordinator contracts to and from those existing adapters.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from .codex import CodexProvider
+    from .images import ImageAttachment
+    from .provider import LitelmProvider
 
 from .context import (
     COLLAPSE_FORCED,
@@ -38,7 +45,7 @@ class ProductionContextAdapter:
     immutable snapshots for providers. Production history is never auto-evicted.
     """
 
-    def __init__(self, context: Context | None = None, *, limits: Limits | None = None):
+    def __init__(self, context: Context | None = None, *, limits: Limits | None = None) -> None:
         if context is not None and limits is not None:
             raise ValueError("Pass a Context or Limits, not both")
         self.context = context if context is not None else Context(limits or Limits())
@@ -148,19 +155,18 @@ class ProductionContextAdapter:
     def reported_input_tokens(self) -> int | None:
         return self.context.reported_input_tokens
 
-    def provider_messages(self, snapshot: ContextSnapshot) -> tuple[dict, ...]:
+    def provider_messages(self, snapshot: ContextSnapshot) -> tuple[dict[str, Any], ...]:
         if not isinstance(snapshot, ContextSnapshot):
             raise TypeError("Context adapter requires a ContextSnapshot")
 
         system_messages = []
         conversation = []
         from .images import content_with_images
-        by_message = {}
+        by_message: dict[int, list[ImageAttachment]] = {}
         for index, image in snapshot.images:
             by_message.setdefault(index, []).append(image)
-        for index, ((role, content), phase) in enumerate(zip(snapshot.messages, snapshot.message_phases, strict=True)):
-            if index in by_message:
-                content = content_with_images(content, by_message[index])
+        for index, ((role, text), phase) in enumerate(zip(snapshot.messages, snapshot.message_phases, strict=True)):
+            content = content_with_images(text, by_message[index]) if index in by_message else text
             if role == "system":
                 system_messages.append(content)
             elif role in {"user", "assistant"}:
@@ -202,15 +208,15 @@ class ProductionContextAdapter:
         return self.context.observation(content, refs, group)
 
     @staticmethod
-    def _snapshot_images(messages):
+    def _snapshot_images(messages: Sequence[dict[str, Any]]) -> tuple[tuple[int, ImageAttachment], ...]:
         from .images import MAX_CONTEXT_IMAGE_BYTES, MAX_CONTEXT_IMAGES, ImageAttachment
         # Preserve original alignment. Keep only the newest bounded image history;
         # older text explicitly records omission, rather than claiming visibility.
-        selected = []
+        selected: list[tuple[int, ImageAttachment]] = []
         for index, message in enumerate(messages):
             for record in message.get("images", ()):
                 selected.append((index, ImageAttachment.from_record(record)))
-        retained = []
+        retained: list[tuple[int, ImageAttachment]] = []
         byte_count = 0
         for item in reversed(selected):
             if len(retained) >= MAX_CONTEXT_IMAGES or byte_count + len(item[1].data) > MAX_CONTEXT_IMAGE_BYTES:
@@ -344,7 +350,7 @@ class ProductionContextAdapter:
                 if len(content) > 8_000:
                     content = "Cell not executed: diagnostic too long; send a smaller cell."
             elif payload.get("status") == "output_too_large" and isinstance(payload.get("error"), str):
-                content = payload["error"]
+                content = cast(str, payload["error"])
                 already_omitted = True
             else:
                 content = compact(payload)
@@ -400,7 +406,7 @@ class ProductionProviderAdapter:
         provider_id: str | None = None,
         context: ContextService | None = None,
         max_tokens: int | None = None,
-    ):
+    ) -> None:
         if not callable(getattr(adapter, "generate", None)):
             raise TypeError("Production provider adapter must expose async generate")
         if max_tokens is not None and (type(max_tokens) is not int or max_tokens <= 0):
@@ -522,7 +528,7 @@ class ProductionProviderAdapter:
 class ProductionObservationAdapter:
     """Project execution evidence to minimal, bounded, readable model text."""
 
-    def pack(self, events: list[dict]) -> Mapping[str, object]:
+    def pack(self, events: list[dict[str, Any]]) -> Mapping[str, object]:
         if not isinstance(events, list) or any(not isinstance(event, dict) for event in events):
             raise TypeError("events must be a list of dictionaries")
         lines: list[str] = []
@@ -555,8 +561,8 @@ class ProductionObservationAdapter:
             return {"output": output, "_output_already_omitted": True}
         return {"output": output}
 
-    def model_content(self, events: list[dict]) -> str:
-        return self.pack(events)["output"]
+    def model_content(self, events: list[dict[str, Any]]) -> str:
+        return str(self.pack(events)["output"])
 
 
 def litelm_provider_factory(
@@ -564,11 +570,11 @@ def litelm_provider_factory(
     *,
     api_base: str | None = None,
     stream: bool = False,
-    auth_file=None,
-) -> Callable[[], Any]:
+    auth_file: Path | None = None,
+) -> Callable[[], LitelmProvider]:
     """Return a lazy factory for the existing API-key provider adapter."""
 
-    def create():
+    def create() -> LitelmProvider:
         from .provider import LitelmProvider
 
         return LitelmProvider(
@@ -581,21 +587,21 @@ def litelm_provider_factory(
 def codex_provider_factory(
     model: str,
     *,
-    auth_file=None,
+    auth_file: Path | None = None,
     session_id: str | None = None,
     effort: str = "medium",
-    transport=None,
-) -> Callable[[], Any]:
+    transport: Any = None,
+) -> Callable[[], CodexProvider]:
     """Return a lazy factory for the existing pi-authenticated Codex adapter.
 
     Authentication and refresh policy remain entirely inside ``CodexProvider``
     and ``codex_auth``. This factory never reads credentials itself.
     """
 
-    def create():
+    def create() -> CodexProvider:
         from .codex import CodexProvider
 
-        kwargs = {"session_id": session_id, "effort": effort, "transport": transport}
+        kwargs: dict[str, Any] = {"session_id": session_id, "effort": effort, "transport": transport}
         if auth_file is not None:
             kwargs["auth_file"] = auth_file
         return CodexProvider(model, **kwargs)
@@ -618,7 +624,7 @@ class ProductionServicesPlugin:
         codex_factory: Callable[[], Any] | None = None,
         context_factory: Callable[[], ContextService] = ProductionContextAdapter,
         observations_factory: Callable[[], ObservationService] = ProductionObservationAdapter,
-    ):
+    ) -> None:
         for name, factory in (
             ("litelm_factory", litelm_factory),
             ("codex_factory", codex_factory),
@@ -645,7 +651,10 @@ class ProductionServicesPlugin:
             if adapter_factory is None:
                 continue
 
-            def create_provider(factory=adapter_factory, selected_id=provider_id):
+            def create_provider(
+                factory: Callable[[], Any] = adapter_factory,
+                selected_id: str = provider_id,
+            ) -> ProductionProviderAdapter:
                 return ProductionProviderAdapter(
                     factory(),
                     provider_id=selected_id,

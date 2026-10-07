@@ -1,12 +1,14 @@
 """Explicit-Tab command and bounded workspace-path completion; no file reads."""
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 import os
 from pathlib import Path
 import re
 import time
 
-from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.completion import CompleteEvent, Completer, Completion
+from prompt_toolkit.document import Document
 
 COMMANDS = {
     "help": "Command help", "login": "Choose a provider and sign in",
@@ -35,21 +37,21 @@ def providers() -> tuple[str, ...]:
     return tuple(sorted(set(MODELS) | set(PROVIDERS)))
 
 
-def model_choices(coordinator) -> tuple[str, ...]:
+def model_choices(coordinator: object) -> tuple[str, ...]:
     from .model_catalog import available_models
     adapter = getattr(getattr(coordinator, "provider", None), "adapter", None)
     return available_models(getattr(adapter, "auth_file", None))
 
 
 class TerminalCompleter(Completer):
-    def __init__(self, coordinator, enabled=lambda: True):
+    def __init__(self, coordinator: object, enabled: Callable[[], bool] = lambda: True) -> None:
         self.coordinator = coordinator
         self.enabled = enabled
-        self._paths = ()
+        self._paths: tuple[str, ...] = ()
         self._stamp = 0.0
-        self._cwd = None
+        self._cwd: Path | None = None
 
-    def workspace_paths(self):
+    def workspace_paths(self) -> tuple[str, ...]:
         cwd = Path.cwd()
         now = time.monotonic()
         if self._cwd == cwd and now - self._stamp < 3:
@@ -80,12 +82,12 @@ class TerminalCompleter(Completer):
         self._cwd, self._stamp, self._paths = cwd, now, tuple(sorted(paths))
         return self._paths
 
-    def get_completions(self, document, complete_event):
+    def get_completions(self, document: Document, complete_event: CompleteEvent) -> Iterator[Completion]:
         if not self.enabled():
             return
         before = document.text_before_cursor
         command = re.fullmatch(r"/([a-z][a-z0-9_-]*|)(?: (.*))?", before)
-        candidates = ()
+        candidates: tuple[str, ...] = ()
         metadata = {}
         if command:
             name, arguments = command.groups()

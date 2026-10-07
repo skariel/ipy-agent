@@ -10,11 +10,12 @@ stream text is never returned for execution.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator, Sequence
 from copy import deepcopy
 import json
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Protocol
 import uuid
 
 import httpx
@@ -41,7 +42,15 @@ _PART_EVENTS = {
 }
 
 
-def read_codex_credentials(path):
+class _CodexCredentials(Protocol):
+    @property
+    def access(self) -> str: ...
+
+    @property
+    def account_id(self) -> str: ...
+
+
+def read_codex_credentials(path: Path | None) -> _CodexCredentials:
     # Lazy import permits the independent adapter/auth modules to be tested and
     # wired separately. There is no fallback to environment or API-key auth.
     from .codex_auth import read_codex_credentials as read
@@ -49,8 +58,8 @@ def read_codex_credentials(path):
     return read(path)
 
 
-def _unique_object(pairs):
-    result = {}
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
             raise ValueError("Duplicate JSON key")
@@ -58,7 +67,7 @@ def _unique_object(pairs):
     return result
 
 
-def _parse_event(data: bytes) -> dict:
+def _parse_event(data: bytes) -> dict[str, Any]:
     try:
         result = json.loads(
             data.decode("utf-8"),
@@ -72,7 +81,7 @@ def _parse_event(data: bytes) -> dict:
         raise ProviderError("Malformed Codex SSE event; no source accepted", kind="shape") from None
 
 
-def _json_response_event(data: bytes, secrets=()) -> dict:
+def _json_response_event(data: bytes, secrets: Sequence[str] = ()) -> dict[str, Any]:
     """Accept only a native Responses object/envelope, never guessed source."""
     try:
         obj = json.loads(
@@ -98,7 +107,20 @@ def _json_response_event(data: bytes, secrets=()) -> dict:
     )
 
 
-async def _events(response, secrets=()):
+async def _idle_chunks(response: httpx.Response, idle_timeout: float) -> AsyncIterator[bytes]:
+    iterator = response.aiter_bytes().__aiter__()
+    while True:
+        try:
+            async with asyncio.timeout(idle_timeout):
+                chunk = await anext(iterator)
+        except StopAsyncIteration:
+            return
+        yield chunk
+
+
+async def _events(
+    response: httpx.Response, secrets: Sequence[str] = (), *, idle_timeout: float = 180.0,
+) -> AsyncIterator[dict[str, Any]]:
     """Validate the complete payload, regardless of a proxy's MIME label.
 
     Native JSON Responses results go through the same terminal-status, refusal,
@@ -111,7 +133,7 @@ async def _events(response, secrets=()):
     done_marker = False
     wire_format = None
     media_type = response.headers.get("content-type", "missing")[:120]
-    async for chunk in response.aiter_bytes(chunk_size=4096):
+    async for chunk in _idle_chunks(response, idle_timeout):
         pending.extend(chunk)
         if wire_format is None:
             start = bytes(pending).lstrip()
@@ -169,12 +191,12 @@ async def _events(response, secrets=()):
         )
 
 
-def _usage(raw: Any) -> dict:
+def _usage(raw: Any) -> dict[str, Any]:
     if raw is None:
         return {"source": "unknown", "raw": None, "normalized": {}}
     if not isinstance(raw, dict):
         raise ProviderError("Unsupported Codex usage shape", kind="shape")
-    normalized = {}
+    normalized: dict[str, int] = {}
     for name, path in {
         "input_tokens": ("input_tokens",),
         "output_tokens": ("output_tokens",),
@@ -183,7 +205,7 @@ def _usage(raw: Any) -> dict:
         "cache_write_tokens": ("input_tokens_details", "cache_write_tokens"),
         "reasoning_tokens": ("output_tokens_details", "reasoning_tokens"),
     }.items():
-        value = raw
+        value: Any = raw
         for key in path:
             value = value.get(key) if isinstance(value, dict) else None
         if value is not None:
@@ -193,7 +215,7 @@ def _usage(raw: Any) -> dict:
     return {"source": "reported_by_codex", "raw": deepcopy(raw), "normalized": normalized}
 
 
-def _item_error(item: Any, *, final=False) -> str | None:
+def _item_error(item: Any, *, final: bool = False) -> str | None:
     if not isinstance(item, dict):
         return "Unsupported Codex output item"
     if item.get("type") not in {"message", "reasoning"}:
@@ -225,9 +247,11 @@ def _item_error(item: Any, *, final=False) -> str | None:
     return None
 
 
-def _completed_items(events):
+def _completed_items(events: Sequence[dict[str, Any]]) -> tuple[list[dict[str, Any]], str | None]:
     """Validate the sparse-terminal SSE variant without using any text deltas."""
-    added, completed, ids = {}, {}, set()
+    added: dict[int, dict[str, Any]] = {}
+    completed: dict[int, dict[str, Any]] = {}
+    ids: set[str] = set()
     for event in events:
         index, item = event.get("output_index"), event.get("item")
         if type(index) is not int or index < 0 or not isinstance(item, dict):
@@ -255,7 +279,7 @@ def _completed_items(events):
     return [completed[index] for index in sorted(completed)], None
 
 
-def _redact(value, secrets):
+def _redact(value: Any, secrets: Sequence[str]) -> Any:
     if isinstance(value, str):
         for secret in secrets:
             if secret:
@@ -276,13 +300,18 @@ class CodexProvider:
         *,
         session_id: str | None = None,
         effort: str = "medium",
-        transport=None,
-    ):
+        transport: httpx.AsyncBaseTransport | None = None,
+        stream_idle_timeout: float = 180.0,
+    ) -> None:
         model = self._validated_model(model)
         if session_id is not None and (not isinstance(session_id, str) or not session_id):
             raise ValueError("session_id must be a nonempty string")
         if effort not in REASONING_EFFORTS:
             raise ValueError("Unsupported Codex reasoning effort")
+        if (isinstance(stream_idle_timeout, bool) or not isinstance(stream_idle_timeout, (int, float))
+                or not 0 < stream_idle_timeout <= 3600):
+            raise ValueError("stream_idle_timeout must be from 0 (exclusive) to 3600 seconds")
+        self.stream_idle_timeout = float(stream_idle_timeout)
         self.model = model
         self.effort = effort
         self.auth_file = Path(auth_file) if auth_file is not None else None
@@ -302,12 +331,12 @@ class CodexProvider:
     def set_model(self, model: str) -> None:
         self.model = self._validated_model(model)
 
-    def build_request(self, messages: list[dict], *, max_tokens: int | None = None) -> dict:
+    def build_request(self, messages: list[dict[str, Any]], *, max_tokens: int | None = None) -> dict[str, Any]:
         messages = _validate_messages(messages, max_tokens)
         from .images import require_vision
         require_vision(self.model, messages)
         instructions = []
-        inputs = []
+        inputs: list[dict[str, Any]] = []
         for message in messages:
             role, text = message["role"], message["content"]
             if role == "system":
@@ -342,7 +371,7 @@ class CodexProvider:
             "text": {"verbosity": "low"},
         }
 
-    def request_details(self, messages: list[dict], *, max_tokens: int | None = None) -> dict:
+    def request_details(self, messages: list[dict[str, Any]], *, max_tokens: int | None = None) -> dict[str, Any]:
         """Exact JSON request plus nonsecret policy, for the supervisor journal."""
         return {
             "adapter": "codex_subscription_sse",
@@ -355,7 +384,7 @@ class CodexProvider:
             "remote_output_token_cap": False,
         }
 
-    async def generate(self, messages: list[dict], *, max_tokens: int | None = None) -> Completion:
+    async def generate(self, messages: list[dict[str, Any]], *, max_tokens: int | None = None) -> Completion:
         body = self.build_request(messages, max_tokens=max_tokens)
         credentials = await asyncio.to_thread(read_codex_credentials, self.auth_file)
         headers = {
@@ -374,7 +403,7 @@ class CodexProvider:
                 transport=self._transport,
                 follow_redirects=False,
                 trust_env=True,
-                timeout=httpx.Timeout(None, connect=20, pool=20),
+                timeout=httpx.Timeout(self.stream_idle_timeout, connect=20, pool=20),
             ) as client:
                 async with client.stream("POST", CODEX_URL, json=body, headers=headers) as response:
                     if response.status_code != 200:
@@ -384,14 +413,21 @@ class CodexProvider:
                                 f"Codex authentication rejected (HTTP {status}); retry py login openai-codex (Pi files: pi /login openai-codex)",
                                 kind="authentication",
                             )
-                        kind = (
+                        kind: str = (
                             "rate_limit" if status == 429 else
                             "timeout" if status == 408 else
                             "overflow" if status == 413 else
                             "provider" if 500 <= status < 600 else
                             "request" if 400 <= status < 500 else "response_status"
                         )
-                        raise ProviderError(f"Codex request failed (HTTP {status}); no source accepted", kind=kind)
+                        try:
+                            retry_after: float | None = float(response.headers.get("retry-after", ""))
+                        except ValueError:
+                            retry_after = None
+                        raise ProviderError(
+                            f"Codex request failed (HTTP {status}); no source accepted",
+                            kind=kind, retry_after=retry_after,
+                        )
                     # Validate actual SSE/JSON data, not just the MIME header:
                     # proxies may omit or relabel a valid streamed response.
                     secrets = (credentials.access, credentials.account_id)
@@ -412,30 +448,32 @@ class CodexProvider:
             raise
         except ProviderError as exc:
             safe = _redact(str(exc), (credentials.access, credentials.account_id))
-            raise ProviderError(safe, kind=exc.kind) from None
+            raise ProviderError(safe, kind=exc.kind, retry_after=exc.retry_after) from None
         except Exception as exc:
             # Raw SSL failures can escape httpx during stream reads. Classify
             # them before generic transport wrappers so certificate failures
             # never become retryable connection errors. Unknown local errors
             # remain nonretryable; never expose URL/header details.
-            kind = _ssl_failure_kind(exc)
-            if kind is None:
-                kind = (
-                    "timeout" if isinstance(exc, httpx.TimeoutException) else
+            failure_kind = _ssl_failure_kind(exc)
+            if failure_kind is None:
+                failure_kind = (
+                    "timeout" if isinstance(exc, (httpx.TimeoutException, TimeoutError)) else
                     "transport" if isinstance(exc, httpx.TransportError) else "internal"
                 )
             raise ProviderError(
-                f"Codex request failed ({type(exc).__name__}); no source accepted", kind=kind
+                f"Codex request failed ({type(exc).__name__}); no source accepted", kind=failure_kind
             ) from None
 
-    async def _collect(self, response, max_tokens, *, secrets=()):
-        terminal = None
-        terminal_type = None
-        rejection = None
+    async def _collect(
+        self, response: httpx.Response, max_tokens: int | None, *, secrets: Sequence[str] = (),
+    ) -> Completion:
+        terminal: dict[str, Any] | None = None
+        terminal_type: str | None = None
+        rejection: str | None = None
         event_count = 0
         for_audit = []
         item_events = []
-        async for event in _events(response, secrets):
+        async for event in _events(response, secrets, idle_timeout=self.stream_idle_timeout):
             event_count += 1
             kind = event["type"]
             if kind == "_sse_done":
@@ -516,7 +554,8 @@ class CodexProvider:
             output, item_rejection = _completed_items(item_events)
             rejection = rejection or item_rejection
             output_source = "completed_item_events"
-        messages, summaries = [], []
+        messages: list[dict[str, Any]] = []
+        summaries: list[str] = []
         if not isinstance(output, list):
             rejection = rejection or "Codex terminal output must be a list"
         else:

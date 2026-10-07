@@ -498,8 +498,9 @@ async def test_real_archive_cancellation_stops_worker_and_coordinator_without_hi
 @pytest.mark.asyncio
 @pytest.mark.parametrize("already_forced", [False, True])
 async def test_overflow_recovery_archives_history_without_executing_code(already_forced):
-    from py_agent.provider import ProviderError
     import ast
+
+    from py_agent.provider import ProviderError
 
     def script(step, request):
         if step == 1:
@@ -545,7 +546,7 @@ async def test_overflow_recovery_rejects_normal_code_and_retries_small_prompt():
             return joined(request).split("standalone Python cell, with no other code or text:\n")[-1]
         return "say('done', final=True)"
 
-    coordinator, provider, executor, context = make_coordinator(script)
+    coordinator, _provider, executor, _context = make_coordinator(script)
     await coordinator.start()
     try:
         result = await coordinator.submit("terminal", "large request " * 2000)
