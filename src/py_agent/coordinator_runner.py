@@ -445,42 +445,12 @@ class RequestRunner:
                         coordinator.conversation._observe_context_epoch(snapshot.epoch)
                         if reset_this_step and dispatched_steering:
                             snapshot = self._restore_steering(snapshot, dispatched_steering)
-                        prepare_generation = getattr(coordinator.context_service, "prepare_generation", None)
-                        if callable(prepare_generation):
-                            prepare_generation()
-                            snapshot = coordinator.conversation._latest_context()
-                        if resume_checkpoint is not None and step == 1:
-                            snapshot = resume_checkpoint.context
-                        forced_collapse = getattr(coordinator.context_service, "force_collapse", False) is True
-                        if steering_awaiting_dispatch:
-                            render_user = getattr(coordinator.context_service, "render_user", None)
-                            additions = tuple(
-                                ("user", render_user(item.action.source, item.action.origin.request_id)
-                                 if callable(render_user) else item.action.source)
-                                for item in steering_awaiting_dispatch
-                            )
-                            snapshot = replace(
-                                snapshot,
-                                messages=(*snapshot.messages, *additions),
-                                message_phases=(
-                                    *snapshot.message_phases, *((None,) * len(additions))
-                                ),
-                            )
-                        cell_config = coordinator._current_config()
-                        epoch_config = coordinator.conversation._epoch_config
-                        if resume_checkpoint is not None and step == 1:
-                            context = resume_checkpoint.context  # Never rerun transforms on saved request.
-                        else:
-                            context = await coordinator._run_context_transforms(
-                                snapshot, config, cell_config, epoch_config,
-                            )
-                        model_request = ModelRequest(
-                            generation_origin, context, coordinator.model, coordinator._model_options(config),
+                        model_request, forced_collapse = await self._prepare_model_request(
+                            snapshot, generation_origin, config,
+                            steering=steering_awaiting_dispatch,
+                            saved_context=resume_checkpoint.context
+                            if resume_checkpoint is not None and step == 1 else None,
                         )
-                        if resume_checkpoint is None or step != 1:
-                            model_request = await coordinator.model_transform(
-                                model_request, config, cell_config, epoch_config,
-                            )
                         if not coordinator.lifecycle._operation_is_current(operation_id, State.GENERATING):
                             raise asyncio.CancelledError from None
                         # This is the final post-transform request actually dispatched to
@@ -645,28 +615,9 @@ class RequestRunner:
                         if decision.kind == "reject" and decision.retryable:
                             if not coordinator.lifecycle._operation_is_current(operation_id, State.GENERATING):
                                 raise asyncio.CancelledError from None
-                            # Preserve only a short diagnostic, never the rejected
-                            # Markdown. A format correction costs one of the same
-                            # bounded agent steps and cannot dispatch code.
-                            detail = decision.reason[:300] or "invalid cell"
-                            if invalid_generations == 0:
-                                correction = (
-                                    "No code was executed. Invalid model response format: "
-                                    + detail
-                                    + ". There is no external tool-call API. Python function calls are available. "
-                                      "Respond with exactly one "
-                                      "complete Python/IPython cell as ordinary assistant message text: "
-                                      "no tool call, JSON, prose outside the cell, or Markdown fences."
-                                )
-                            else:
-                                # The full contract was already sent once; repeating it verbatim only
-                                # pads the next request with the same wall of text.
-                                correction = (
-                                    "Still no valid cell. Invalid model response format: "
-                                    + detail
-                                    + ". Respond with exactly one complete Python/IPython cell and nothing "
-                                      "else: no fences, prose, tool call, JSON, or function call."
-                                )
+                            correction = self._format_correction(
+                                decision.reason, repeated=invalid_generations > 0,
+                            )
                             coordinator.conversation._commit_context(
                                 origin.request_id, routed.source,
                                 "[model response rejected: invalid format; not executed]",
@@ -711,32 +662,24 @@ class RequestRunner:
                                 events=tuple(published_events),
                             )
 
-                        check_syntax = getattr(coordinator.interpreter, "check_syntax", None)
-                        if callable(check_syntax):
-                            syntax_error = check_syntax(decision.source)
-                            if inspect.isawaitable(syntax_error) or (
-                                syntax_error is not None and not isinstance(syntax_error, str)
-                            ):
-                                raise TypeError("Interpreter syntax check must return text or None synchronously")
-                            if syntax_error is not None:
-                                if not syntax_error:
-                                    raise ValueError("Interpreter returned an empty syntax diagnostic")
-                                if not coordinator.lifecycle._operation_is_current(operation_id, State.GENERATING):
-                                    raise asyncio.CancelledError from None
-                                # This is a model-visible correction, not an
-                                # execution or user-visible cell failure. Never
-                                # dispatch malformed source to the executor.
-                                coordinator.conversation._commit_context(
-                                    origin.request_id, routed.source, decision.source,
-                                    {"preflight": {"executed": False, "syntax_error": syntax_error}},
-                                    phase=response.phase, include_user=not context_committed,
-                                )
-                                context_committed = True
-                                context_pending = False
-                                exhausted = preflight_exhausted(response)
-                                if exhausted is not None:
-                                    return exhausted
-                                continue
+                        syntax_error = self._check_cell_syntax(decision.source)
+                        if syntax_error is not None:
+                            if not coordinator.lifecycle._operation_is_current(operation_id, State.GENERATING):
+                                raise asyncio.CancelledError from None
+                            # This is a model-visible correction, not an
+                            # execution or user-visible cell failure. Never
+                            # dispatch malformed source to the executor.
+                            coordinator.conversation._commit_context(
+                                origin.request_id, routed.source, decision.source,
+                                {"preflight": {"executed": False, "syntax_error": syntax_error}},
+                                phase=response.phase, include_user=not context_committed,
+                            )
+                            context_committed = True
+                            context_pending = False
+                            exhausted = preflight_exhausted(response)
+                            if exhausted is not None:
+                                return exhausted
+                            continue
 
                         invalid_generations = 0
                         coordinator.lifecycle.state = State.EXECUTING
@@ -925,3 +868,78 @@ class RequestRunner:
             messages=(*snapshot.messages, *(("user", source) for _, source in steering)),
             message_phases=(*snapshot.message_phases, *((None,) * len(steering))),
         )
+
+    async def _prepare_model_request(
+        self, snapshot: ContextSnapshot, origin: Origin, config: ConfigSnapshot | None, *,
+        steering: list[_QueuedAction], saved_context: ContextSnapshot | None,
+    ) -> tuple[ModelRequest, bool]:
+        """Assemble and transform a request; never commit steering or dispatch it.
+
+        Saved requests bypass both transforms. The caller checks operation
+        identity after awaiting this preparation, then commits/journals before
+        provider dispatch.
+        """
+        coordinator = self.coordinator
+        prepare_generation = getattr(coordinator.context_service, "prepare_generation", None)
+        if callable(prepare_generation):
+            prepare_generation()
+            snapshot = coordinator.conversation._latest_context()
+        if saved_context is not None:
+            snapshot = saved_context
+        forced_collapse = getattr(coordinator.context_service, "force_collapse", False) is True
+        if steering:
+            render_user = getattr(coordinator.context_service, "render_user", None)
+            additions = tuple(
+                ("user", render_user(item.action.source, item.action.origin.request_id)
+                 if callable(render_user) else item.action.source)
+                for item in steering
+            )
+            snapshot = replace(
+                snapshot,
+                messages=(*snapshot.messages, *additions),
+                message_phases=(*snapshot.message_phases, *((None,) * len(additions))),
+            )
+        cell_config = coordinator._current_config()
+        epoch_config = coordinator.conversation._epoch_config
+        context = saved_context
+        if context is None:
+            context = await coordinator._run_context_transforms(
+                snapshot, config, cell_config, epoch_config,
+            )
+        request = ModelRequest(
+            origin, context, coordinator.model, coordinator._model_options(config),
+        )
+        if saved_context is None:
+            request = await coordinator.model_transform(
+                request, config, cell_config, epoch_config,
+            )
+        return request, forced_collapse
+
+    @staticmethod
+    def _format_correction(reason: str, *, repeated: bool) -> str:
+        """Bound rejected-response diagnostics without retaining rejected source."""
+        detail = reason[:300] or "invalid cell"
+        if repeated:
+            return (
+                "Still no valid cell. Invalid model response format: " + detail
+                + ". Respond with exactly one complete Python/IPython cell and nothing "
+                  "else: no fences, prose, tool call, JSON, or function call."
+            )
+        return (
+            "No code was executed. Invalid model response format: " + detail
+            + ". There is no external tool-call API. Python function calls are available. "
+              "Respond with exactly one complete Python/IPython cell as ordinary assistant message text: "
+              "no tool call, JSON, prose outside the cell, or Markdown fences."
+        )
+
+    def _check_cell_syntax(self, source: str) -> str | None:
+        """Validate custom syntax-check contract, without dispatch or context writes."""
+        check = getattr(self.coordinator.interpreter, "check_syntax", None)
+        if not callable(check):
+            return None
+        error = check(source)
+        if inspect.isawaitable(error) or (error is not None and not isinstance(error, str)):
+            raise TypeError("Interpreter syntax check must return text or None synchronously")
+        if error == "":
+            raise ValueError("Interpreter returned an empty syntax diagnostic")
+        return error

@@ -2136,3 +2136,16 @@ async def test_transport_backoff_can_be_interrupted_without_another_attempt(monk
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+def test_format_correction_is_bounded_and_preserves_retry_contract():
+    from py_agent.coordinator_runner import RequestRunner
+
+    first = RequestRunner._format_correction("x" * 1000, repeated=False)
+    repeated = RequestRunner._format_correction("x" * 1000, repeated=True)
+    assert "x" * 300 in first
+    assert "x" * 301 not in first
+    assert "There is no external tool-call API" in first
+    assert "Still no valid cell" in repeated
+    assert len(repeated) < len(first)
+    assert "invalid cell" in RequestRunner._format_correction("", repeated=False)

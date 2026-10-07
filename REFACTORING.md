@@ -189,3 +189,21 @@ Added regressions for typed commit acknowledgement/off-loop execution and
 cancellation waiting for an admitted transaction. Full local matrix:
 3.12/3.13/3.14 each 857 passed, 1 skipped; 3.13 + Jupyter 856 passed, 2 skipped.
 Lint/strict typing pass in every job; full mypy passes with Jupyter.
+
+## Agent loop decomposition: explicit preparation and validation
+
+Extracted `_prepare_model_request` with explicit context/config/steering/saved
+request inputs and a request/forced-collapse result. It handles context assembly
+and transforms only: no steering commit, journal write, or provider dispatch.
+Saved requests retain their transform bypass. The caller retains the post-await
+operation check and the commit-before-dispatch order.
+
+Extracted bounded format corrections and synchronous syntax-contract validation.
+The loop retains rejection context writes, retry limits, state transitions,
+execution dispatch, and evidence/publication ordering. No new service class,
+generic phase framework, or forwarding facade was added.
+
+Full local matrix: Python 3.12/3.13/3.14 each 858 passed, 1 skipped;
+3.13 + Jupyter 857 passed, 2 skipped. Lint and strict types pass in every job,
+and full mypy passes in the Jupyter job. Existing coordinator tests cover the
+behavioral paths; an added test checks bounded format diagnostics.
