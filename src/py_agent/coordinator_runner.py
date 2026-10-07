@@ -306,7 +306,7 @@ class RequestRunner:
                 "Still no valid cell. Invalid model response format: "
                 + detail
                 + ". Respond with exactly one complete Python/IPython cell and nothing "
-                "else: no fences, prose, tool call, JSON, or function call."
+                "else: no fences, prose, external tool calls, or JSON. Python function calls are allowed."
             )
         return (
             "No code was executed. Invalid model response format: "

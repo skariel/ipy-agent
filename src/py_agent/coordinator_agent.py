@@ -226,7 +226,7 @@ class AgentTurn:
             record_usage(response)
         return model_request, response, forced_collapse, generation_origin
 
-    def _preflight_exhausted(self, response: ModelResponse) -> Submission | None:
+    def _preflight_exhausted(self, response: ModelResponse, reason: str) -> Submission | None:
         coordinator, state = self.coordinator, self.state
         state.invalid_generations += 1
         # A limitless successful-cell loop must not turn a
@@ -236,7 +236,9 @@ class AgentTurn:
         coordinator.lifecycle.set_state_unless_stopping(State.IDLE)
         state.visible_messages.append(
             "Agent paused after 3 consecutive invalid model responses; "
-            "no rejected source was executed. Submit a new request to continue."
+            "no rejected source was executed. "
+            f"Last rejection: {reason[:300]}. "
+            "Submit a new request asking for a smaller, valid Python/IPython cell to continue."
         )
         return Submission(
             self.routed,
@@ -311,7 +313,7 @@ class AgentTurn:
                 )
                 state.context_committed = True
                 scope.context_pending = False
-                exhausted = self._preflight_exhausted(response)
+                exhausted = self._preflight_exhausted(response, collapse_error)
                 if exhausted is not None:
                     return exhausted
             else:
@@ -362,7 +364,7 @@ class AgentTurn:
             )
             state.context_committed = True
             scope.context_pending = False
-            exhausted = self._preflight_exhausted(response)
+            exhausted = self._preflight_exhausted(response, f"Response exceeds 8000 characters ({len(response.text)} characters)")
             if exhausted is not None:
                 return exhausted
             return None
@@ -397,7 +399,7 @@ class AgentTurn:
             )
             state.context_committed = True
             scope.context_pending = False
-            exhausted = self._preflight_exhausted(response)
+            exhausted = self._preflight_exhausted(response, f"Cell exceeds 8000 characters ({len(decision.source)} characters)")
             if exhausted is not None:
                 return exhausted
             return None
@@ -419,7 +421,7 @@ class AgentTurn:
             )
             state.context_committed = True
             scope.context_pending = False
-            exhausted = self._preflight_exhausted(response)
+            exhausted = self._preflight_exhausted(response, decision.reason)
             if exhausted is not None:
                 return exhausted
             state.published_events.append(
@@ -482,7 +484,7 @@ class AgentTurn:
             )
             state.context_committed = True
             scope.context_pending = False
-            exhausted = self._preflight_exhausted(response)
+            exhausted = self._preflight_exhausted(response, syntax_error)
             if exhausted is not None:
                 return exhausted
             return None

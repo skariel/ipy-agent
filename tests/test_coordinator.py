@@ -2147,5 +2147,43 @@ def test_format_correction_is_bounded_and_preserves_retry_contract():
     assert "x" * 301 not in first
     assert "There is no external tool-call API" in first
     assert "Still no valid cell" in repeated
+    assert "Python function calls are allowed" in repeated
+    assert "or function call" not in repeated
     assert len(repeated) < len(first)
     assert "invalid cell" in RequestRunner._format_correction("", repeated=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("text", "diagnostic"), [
+    ("Prose\n```python\npass\n```", "mixed or malformed Markdown"),
+    ("if True print('bad')", "SyntaxError"),
+    ("#" + "x" * 8000, "Response exceeds 8000 characters"),
+])
+async def test_invalid_cell_pause_explains_last_rejection(text, diagnostic):
+    class InvalidProvider:
+        model = "offline/invalid-diagnostic"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def generate(self, request):
+            self.calls += 1
+            return ModelResponse(text)
+
+    runtime = PluginRuntime.load(builtins={"builtin": BuiltinPlugin()})
+    coordinator = Coordinator(
+        runtime, router="default", provider="fake", interpreter="basic", executor="local",
+    )
+    provider, executor = InvalidProvider(), CaptureExecutor()
+    coordinator.provider, coordinator.executor = provider, executor
+    await coordinator.start()
+    try:
+        submission = await coordinator.submit("terminal", "complete the task")
+        assert provider.calls == 3
+        assert not executor.requests
+        assert "Last rejection:" in submission.message
+        assert diagnostic in submission.message
+        assert "smaller, valid Python/IPython cell" in submission.message
+        assert coordinator.state is State.IDLE
+    finally:
+        await coordinator.close()

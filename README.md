@@ -157,7 +157,11 @@ calling `say(text, final=True)` completes the request. Without it, the agent
 continues until interrupted or finished by default; `--max-agent-steps N` (or
 `agent.max_steps`) opts into a per-request cap. Zero means unlimited for
 successfully generated cells; three consecutive invalid model responses still
-pause to avoid unbounded format-retry requests. `wait()`, a host history API,
+pause to avoid unbounded format-retry requests. The pause reports the last rejection
+(format, syntax, size, or collapse validation). Submit a new request asking for one
+smaller, valid Python/IPython cell; if failures recur, try a different `/model` or
+`/effort`. Increasing `--max-agent-steps` does not change this safety limit.
+`wait()`, a host history API,
 and resume are not implemented. Optional `--journal PATH` enables a private,
 append-only SQLite history; without it persistence is explicitly disabled.
 Built-in frontends serialize journal I/O on a dedicated worker with bounded
