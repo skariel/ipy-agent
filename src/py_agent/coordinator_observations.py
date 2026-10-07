@@ -25,7 +25,7 @@ class ModelObservations:
 
     coordinator: SessionRuntime
 
-    def _packed_observation(self, request: ExecutionRequest, result: ExecutionResult) -> str | dict[str, Any]:
+    def packed_observation(self, request: ExecutionRequest, result: ExecutionResult) -> str | dict[str, Any]:
         from .images import observation_images
         records, notices = observation_images(result.output_events)
         packed = self._packed_text_observation(request, result)
@@ -243,3 +243,6 @@ class ModelObservations:
             return {**packed, "_stored_output_index": result.output_reference}
         return packed
 
+
+    # Compatibility for observation consumers that exercised the old helper.
+    _packed_observation = packed_observation

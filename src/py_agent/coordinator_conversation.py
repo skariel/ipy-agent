@@ -55,6 +55,16 @@ class ConversationState:
         self._history_content_hidden = False
         self._journal_sensitive_config_ready = True
 
+    @property
+    def journal_sensitive_config_ready(self) -> bool:
+        """Whether persistent history may safely include the current config."""
+        return self._journal_sensitive_config_ready
+
+    @property
+    def epoch_config(self) -> ConfigSnapshot | None:
+        """Configuration captured for the active conversation epoch."""
+        return self._epoch_config
+
     def _commit_fallback_context(self, user_text: str, assistant_text: str,
                                  observation: str | None = None, *, include_user: bool = True) -> None:
         if include_user:
@@ -64,7 +74,7 @@ class ConversationState:
             self._context.append(("observation", observation[:8000]))
         self._context_epoch += 1
 
-    def _capture_history_sensitive_config(self, snapshot: ConfigSnapshot | None) -> None:
+    def capture_history_sensitive_config(self, snapshot: ConfigSnapshot | None) -> None:
         """Retain bounded sensitive values and install write-time journal redaction."""
         if snapshot is None or self.coordinator.config_store is None:
             return
@@ -160,7 +170,7 @@ class ConversationState:
         page["content"] = masked[page_start:page_start + page_chars]
         return page
 
-    def _read_context_epoch(self) -> int | None:
+    def read_context_epoch(self) -> int | None:
         """Read the context epoch when the selected context service exposes it."""
         if self.coordinator.context_service is None:
             return self._context_epoch
@@ -177,7 +187,7 @@ class ConversationState:
                 return value.epoch
         return None
 
-    def _observe_context_epoch(
+    def observe_context_epoch(
         self, epoch: int | None, *, config: ConfigSnapshot | None = None,
     ) -> None:
         """Latch EPOCH settings only after the context reports a newer epoch."""
@@ -191,12 +201,12 @@ class ConversationState:
                 self._context_overlay.clear()
                 self._context_overlay_epoch = epoch
         elif epoch > self._epoch_config_epoch:
-            self._epoch_config = self.coordinator._current_config() if config is None else config
+            self._epoch_config = self.coordinator.current_config() if config is None else config
             self._epoch_config_epoch = epoch
             self._context_overlay.clear()
             self._context_overlay_epoch = epoch
 
-    def _prepare_context(self, text: str, request_id: str) -> ContextSnapshot:
+    def prepare_context(self, text: str, request_id: str) -> ContextSnapshot:
         if self.coordinator.context_service is not None:
             prepare = getattr(self.coordinator.context_service, "prepare_request", None)
             if callable(prepare):
@@ -233,7 +243,7 @@ class ConversationState:
                 self._context_epoch += 1
         return ContextSnapshot(self._context_epoch, (*self._context, ("user", text)), images=tuple(self._context_images))
 
-    def _latest_context(self) -> ContextSnapshot:
+    def latest_context(self) -> ContextSnapshot:
         snapshot = getattr(self.coordinator.context_service, "snapshot", None) if self.coordinator.context_service is not None else None
         if callable(snapshot):
             value = snapshot()
@@ -251,7 +261,7 @@ class ConversationState:
             return value
         return ContextSnapshot(self._context_epoch, tuple(self._context), images=tuple(self._context_images))
 
-    def _append_steering_context(self, text: str, request_id: str) -> None:
+    def append_steering_context(self, text: str, request_id: str) -> None:
         """Append steering after the completed cell's observation, never mid-request."""
         if self.coordinator.context_service is None:
             self._context.append(("user", text))
@@ -271,7 +281,7 @@ class ConversationState:
         if not callable(getattr(self.coordinator.context_service, "snapshot", None)):
             self._context.append(("user", text))
             return
-        epoch = self.coordinator.conversation._read_context_epoch()
+        epoch = self.coordinator.conversation.read_context_epoch()
         if epoch is None:
             epoch = self._context_epoch
         if self._context_overlay_epoch != epoch:
@@ -279,7 +289,7 @@ class ConversationState:
             self._context_overlay_epoch = epoch
         self._context_overlay.append((epoch, text))
 
-    async def _archive_context_outputs(self) -> None:
+    async def archive_context_outputs(self) -> None:
         archive = getattr(self.coordinator.context_service, "archive_execution_outputs", None)
         store = getattr(self.coordinator.executor, "store_outputs", None)
         if callable(archive) and callable(store):
@@ -287,14 +297,14 @@ class ConversationState:
             # observations intact rather than claiming nonexistent references.
             await archive(store)
 
-    def _abandon_context(self, request_id: str) -> None:
+    def abandon_context(self, request_id: str) -> None:
         if self.coordinator.context_service is None:
             return
         abandon = getattr(self.coordinator.context_service, "abandon_request", None)
         if callable(abandon):
             abandon(request_id)
 
-    def _commit_context(self, request_id: str, user_text: str, assistant_text: str,
+    def commit_context(self, request_id: str, user_text: str, assistant_text: str,
                         observation: object = None, phase: str | None = None, *, include_user: bool = True) -> None:
         if self.coordinator.context_service is None:
             text = None
@@ -328,7 +338,7 @@ class ConversationState:
 
     def _context_export_payload(self) -> dict[str, object]:
         """Capture current context plus the exact most recent provider request."""
-        snapshot = self.coordinator.conversation._latest_context()
+        snapshot = self.coordinator.conversation.latest_context()
 
         def snapshot_data(value: ContextSnapshot) -> dict[str, object]:
             return {

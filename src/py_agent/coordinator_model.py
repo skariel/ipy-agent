@@ -35,14 +35,14 @@ class ModelRequests:
             try:
                 response = await generation
             except asyncio.CancelledError:
-                await coordinator.journal_policy._record_provider_usage(model_request, None, outcome="cancelled")
+                await coordinator.journal_policy.record_provider_usage(model_request, None, outcome="cancelled")
                 raise
             except Exception as exc:
                 kind = getattr(exc, "kind", None)
                 recover = getattr(coordinator.context_service, "recover_overflow", None)
                 if kind == "overflow" and attempt == 0 and callable(recover):
-                    await coordinator.journal_policy._record_provider_usage(model_request, None, outcome="failed")
-                    if not coordinator.lifecycle._operation_is_current(operation_id, State.GENERATING):
+                    await coordinator.journal_policy.record_provider_usage(model_request, None, outcome="failed")
+                    if not coordinator.lifecycle.operation_is_current(operation_id, State.GENERATING):
                         raise asyncio.CancelledError from None
                     recovery_context = recover()
                     forced_collapse = True
@@ -55,7 +55,7 @@ class ModelRequests:
                 if decision.retry:
                     await coordinator.journal_policy.commit(lambda journal: journal.record_provider_usage(model_request, None, outcome="retry_failed"))  # ruff: ignore[function-uses-loop-variable] -- commit settles before the loop advances
                     try:
-                        published_events.append(await coordinator.frontend._emit_progress(
+                        published_events.append(await coordinator.frontend.emit_progress(
                             generation_origin,
                             {"phase": "provider_retry", "attempt": attempt + 2,
                              "text": f"Provider request failed ({kind}); retrying ({attempt + 2}/{max_attempts}) in {delay:g}s."},
@@ -64,16 +64,16 @@ class ModelRequests:
                         ))
                         await coordinator.retry_waiter(delay, operation_id)
                     except asyncio.CancelledError:
-                        await coordinator.journal_policy._record_provider_usage(model_request, None, outcome="cancelled")
+                        await coordinator.journal_policy.record_provider_usage(model_request, None, outcome="cancelled")
                         raise
                     except Exception:
-                        await coordinator.journal_policy._record_provider_usage(model_request, None, outcome="failed")
+                        await coordinator.journal_policy.record_provider_usage(model_request, None, outcome="failed")
                         raise
-                    if not coordinator.lifecycle._operation_is_current(operation_id, State.GENERATING):
-                        await coordinator.journal_policy._record_provider_usage(model_request, None, outcome="cancelled")
+                    if not coordinator.lifecycle.operation_is_current(operation_id, State.GENERATING):
+                        await coordinator.journal_policy.record_provider_usage(model_request, None, outcome="cancelled")
                         raise asyncio.CancelledError from None
                     continue
-                await coordinator.journal_policy._record_provider_usage(model_request, None, outcome="failed")
+                await coordinator.journal_policy.record_provider_usage(model_request, None, outcome="failed")
                 if kind == "transport":
                     from .runtime_status import Recovery
                     coordinator.recovery = Recovery(

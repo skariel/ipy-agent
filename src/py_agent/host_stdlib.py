@@ -62,10 +62,10 @@ def execution_llm_handler(
                 except TimeoutError:
                     raise ProviderError("llm() request timed out", kind="timeout") from None
             except asyncio.CancelledError:
-                await runtime.journal_policy._record_provider_usage(model_request, None, outcome="cancelled")
+                await runtime.journal_policy.record_provider_usage(model_request, None, outcome="cancelled")
                 raise
             except Exception as exc:
-                await runtime.journal_policy._record_provider_usage(model_request, None, outcome="failed")
+                await runtime.journal_policy.record_provider_usage(model_request, None, outcome="failed")
                 kind = getattr(exc, "kind", None)
                 decision = model_retry(exc, attempt)
                 attempts, delay = decision.attempts, decision.delay
@@ -79,9 +79,9 @@ def execution_llm_handler(
                 raise ProviderError("llm() provider request failed; no response accepted",
                                     kind=kind or "provider") from None
             if not isinstance(response, ModelResponse):
-                await runtime.journal_policy._record_provider_usage(model_request, None, outcome="failed")
+                await runtime.journal_policy.record_provider_usage(model_request, None, outcome="failed")
                 raise TypeError("Invalid llm provider response")
-            await runtime.journal_policy._record_provider_usage(model_request, response, outcome="returned")
+            await runtime.journal_policy.record_provider_usage(model_request, response, outcome="returned")
             if response.finish_status != "complete" or response.rejection_reason or not response.text.strip():
                 raise ProviderError("llm() returned an incomplete response; no text accepted", kind="provider")
             if len(response.text) > MAX_RESULT_CHARS:

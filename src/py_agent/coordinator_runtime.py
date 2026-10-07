@@ -29,6 +29,7 @@ from .contracts import (
 from .contracts import (
     Submission as Submission,
 )
+from .coordinator_interfaces import Interpreter, RequestRuntime
 from .coordinator_support import (
     _EFFORT_PRESETS,
     _EFFORT_USAGE,
@@ -76,7 +77,7 @@ class SessionRuntime:
     execution_outcome: str
     executor: Executor
     external_commands: Mapping[str, RegisteredCommand]
-    interpreter: object
+    interpreter: Interpreter
     journal: JournalService
     max_agent_steps: int
     model: str
@@ -99,6 +100,11 @@ class SessionRuntime:
         self.model_transform: Callable[[ModelRequest, ConfigSnapshot | None, ConfigSnapshot | None, ConfigSnapshot | None], Awaitable[ModelRequest]] = self._run_model_transforms
         self.retry_waiter: Callable[[float, str], Awaitable[None]] = self._wait_provider_retry
 
+    def execution_llm_handler(self, origin: Origin) -> Callable[[Any], Awaitable[str]]:
+        """Bind nested model calls to the current execution ownership."""
+        from .host_stdlib import execution_llm_handler
+        return execution_llm_handler(self, origin)
+
     @staticmethod
     def _sync_factory(factory: Callable[..., _Service], *args: object) -> _Service:
         value = factory(*args)
@@ -109,7 +115,7 @@ class SessionRuntime:
             raise TypeError('Plugin factories must be synchronous')
         return value
 
-    def _current_config(self) -> ConfigSnapshot | None:
+    def current_config(self) -> ConfigSnapshot | None:
         if self.config_store is None:
             return None
         snapshot = self.config_store.snapshot
@@ -136,11 +142,11 @@ class SessionRuntime:
             values[name.removeprefix(plugin_id + '.')] = field.default if entry is None else entry.value
         return MappingProxyType(values)
 
-    async def _run_context_transforms(self, snapshot: ContextSnapshot, request_config: ConfigSnapshot | None, cell_config: ConfigSnapshot | None, epoch_config: ConfigSnapshot | None) -> ContextSnapshot:
+    async def run_context_transforms(self, snapshot: ContextSnapshot, request_config: ConfigSnapshot | None, cell_config: ConfigSnapshot | None, epoch_config: ConfigSnapshot | None) -> ContextSnapshot:
         current = snapshot
         trace = list(snapshot.transform_trace)
         for registration in self._plugin_runtime.transforms['context']:
-            immediate_config = self._current_config()
+            immediate_config = self.current_config()
             stage = self._sync_factory(registration.create, self._plugin_config(registration.plugin_id, request_config, cell_config, epoch_config, immediate_config))
             transform = getattr(stage, 'transform', None)
             if not callable(transform):
@@ -161,7 +167,7 @@ class SessionRuntime:
         current = request
         trace = list(request.transform_trace)
         for registration in self._plugin_runtime.transforms['model-request']:
-            immediate_config = self._current_config()
+            immediate_config = self.current_config()
             stage = self._sync_factory(registration.create, self._plugin_config(registration.plugin_id, request_config, cell_config, epoch_config, immediate_config))
             transform = getattr(stage, 'transform', None)
             if not callable(transform):
@@ -236,14 +242,14 @@ class SessionRuntime:
         return json.dumps(content, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
 
     @staticmethod
-    def _visible_say_outputs(result: ExecutionResult) -> tuple[SayOutput, ...]:
+    def visible_say_outputs(result: ExecutionResult) -> tuple[SayOutput, ...]:
         return tuple(output for output in result.say_outputs if not output.final or result.status == 'success')
 
     @classmethod
-    def _visible_says(cls, result: ExecutionResult) -> tuple[str, ...]:
-        return tuple(cls._say_text(output.content) for output in cls._visible_say_outputs(result))
+    def visible_says(cls, result: ExecutionResult) -> tuple[str, ...]:
+        return tuple(cls._say_text(output.content) for output in cls.visible_say_outputs(result))
 
-    def _model_options(self, snapshot: ConfigSnapshot | None) -> dict[str, str]:
+    def model_options(self, snapshot: ConfigSnapshot | None) -> dict[str, str]:
         options: dict[str, str] = {}
         if snapshot is not None:
             max_tokens = snapshot.entries.get('model.max_tokens')
@@ -258,7 +264,7 @@ class SessionRuntime:
         return options
 
     @staticmethod
-    def _validate_routed_action(routed: object, origin: Origin) -> RoutedAction:
+    def validate_routed_action(routed: object, origin: Origin) -> RoutedAction:
         if not isinstance(routed, RoutedAction):
             raise TypeError('Router must return a RoutedAction')
         if routed.origin != origin:
@@ -274,11 +280,11 @@ class SessionRuntime:
         return routed
 
     @staticmethod
-    def _complete_queue_item(item: _QueuedAction, outcome: QueueOutcome) -> None:
+    def complete_queue_item(item: _QueuedAction, outcome: QueueOutcome) -> None:
         if not item.completion.done():
             item.completion.set_result(outcome)
 
-    async def _dispatch_command(self, source: str, config: ConfigSnapshot | None) -> str:
+    async def dispatch_command(self, source: str, config: ConfigSnapshot | None) -> str:
         parts = source.split(None, 1)
         name = parts[0] if parts else ''
         arguments = parts[1].strip() if len(parts) > 1 else ''
@@ -294,7 +300,7 @@ class SessionRuntime:
                     return 'Usage: /recovery [discard]'
                 return self.recovery.text() if self.recovery else self.execution_outcome
             if name == 'history':
-                self.conversation._capture_history_sensitive_config(self._current_config())
+                self.conversation.capture_history_sensitive_config(self.current_config())
                 return await self.conversation._history_command(arguments)
             if name == 'context':
                 return self.conversation._context_command(arguments)
@@ -306,8 +312,8 @@ class SessionRuntime:
                 response = cast(_CommandRegistry, self.command_registry).dispatch(name, arguments)
             elif name in self.external_commands:
                 registration = self.external_commands[name]
-                self.conversation._observe_context_epoch(self.conversation._read_context_epoch())
-                cell_config = self._current_config()
+                self.conversation.observe_context_epoch(self.conversation.read_context_epoch())
+                cell_config = self.current_config()
                 command = self._sync_factory(registration.create, self._plugin_config(registration.plugin_id, config, cell_config, self.conversation._epoch_config, cell_config))
                 execute = getattr(command, 'execute', None)
                 if not callable(execute):
@@ -380,7 +386,7 @@ class SessionRuntime:
         """Bounded backoff, responsive to interrupts even after generation ended."""
         deadline = asyncio.get_running_loop().time() + delay
         while True:
-            if not self.lifecycle._operation_is_current(operation_id, State.GENERATING):
+            if not self.lifecycle.operation_is_current(operation_id, State.GENERATING):
                 raise asyncio.CancelledError from None
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
@@ -430,3 +436,8 @@ class SessionRuntime:
             return None
         number = int(value)
         return number if number <= maximum else None
+
+
+if TYPE_CHECKING:
+    # Check the composition root against the phase contract during strict typing.
+    _request_runtime_contract: RequestRuntime = SessionRuntime()

@@ -50,21 +50,21 @@ class DirectExecution:
             output_handler=execution_output_handler(execution_origin, "user"),
             llm_handler=llm_handler_factory(execution_origin),
         )
-        published_events = [await coordinator.frontend._emit_progress(
+        published_events = [await coordinator.frontend.emit_progress(
             execution_origin,
             {"phase": "execution_start", "author": author,
              "text": "Executing user cell."},
             on_progress=on_progress, operation_id=operation_id,
             expected_state=State.EXECUTING, author=author,
         )]
-        result = await coordinator.lifecycle._execute_dispatched(execution_request)
-        if not coordinator.lifecycle._operation_is_current(operation_id, State.EXECUTING):
+        result = await coordinator.lifecycle.execute_dispatched(execution_request)
+        if not coordinator.lifecycle.operation_is_current(operation_id, State.EXECUTING):
             raise asyncio.CancelledError from None
-        published_events.extend(await coordinator.frontend._publish_output(
+        published_events.extend(await coordinator.frontend.publish_output(
             execution_request, result, on_progress=on_progress,
             operation_id=operation_id,
         ))
-        published_events.append(await coordinator.frontend._emit_progress(
+        published_events.append(await coordinator.frontend.emit_progress(
             execution_origin,
             {
                 "phase": "cell_complete", "step": 1, "status": result.status,
@@ -73,14 +73,14 @@ class DirectExecution:
             on_progress=on_progress, operation_id=operation_id,
             expected_state=State.EXECUTING, author=author,
         ))
-        if not coordinator.lifecycle._operation_is_current(operation_id, State.EXECUTING):
+        if not coordinator.lifecycle.operation_is_current(operation_id, State.EXECUTING):
             raise asyncio.CancelledError from None
-        coordinator.lifecycle._set_state_unless_stopping(
+        coordinator.lifecycle.set_state_unless_stopping(
             State.FAILED if result.status in ("uncertain", "cancelled") else State.IDLE,
         )
         return Submission(
-            routed, result=result, message="\n".join(coordinator._visible_says(result)),
+            routed, result=result, message="\n".join(coordinator.visible_says(result)),
             execution=execution_request,
-            say_outputs=coordinator._visible_say_outputs(result),
+            say_outputs=coordinator.visible_say_outputs(result),
             events=tuple(published_events),
         )

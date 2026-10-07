@@ -30,9 +30,9 @@ class JournalPolicy:
         await self.commit(lambda journal: getattr(journal, method)(*args, **kwargs))
 
     async def commit(self, action: Callable[[JournalService], None]) -> None:
-        if not self.coordinator.conversation._journal_sensitive_config_ready:
+        if not self.coordinator.conversation.journal_sensitive_config_ready:
             self.coordinator.lifecycle._journal_failed = True
-            self.coordinator.lifecycle._set_state_unless_stopping(State.FAILED)
+            self.coordinator.lifecycle.set_state_unless_stopping(State.FAILED)
             raise JournalError(
                 "Sensitive configuration exceeds journal redaction limits; operation stopped without replay"
             )
@@ -51,7 +51,7 @@ class JournalPolicy:
                 raise TypeError("SessionRuntime journal methods must commit synchronously")
         except Exception as exc:
             self.coordinator.lifecycle._journal_failed = True
-            self.coordinator.lifecycle._set_state_unless_stopping(State.FAILED)
+            self.coordinator.lifecycle.set_state_unless_stopping(State.FAILED)
             raise JournalError(
                 "Durable journal failed; the operation stopped without replay"
             ) from exc
@@ -73,7 +73,7 @@ class JournalPolicy:
         ) else "?"
         return rate, read, write
 
-    async def _record_provider_usage(
+    async def record_provider_usage(
         self, request: ModelRequest, response: ModelResponse | None, *, outcome: str,
     ) -> None:
         await settle(self._locked_provider_usage(request, response, outcome=outcome))

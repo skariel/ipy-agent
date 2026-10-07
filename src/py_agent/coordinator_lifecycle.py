@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 from uuid import uuid4
 
@@ -64,11 +66,33 @@ class ExecutionLifecycle:
         self._execution_record_lock = asyncio.Lock()
         self._generation: asyncio.Task[ModelResponse] | None = None
 
-    def _set_state_unless_stopping(self, state: State) -> None:
+    @asynccontextmanager
+    async def submission_slot(self, *, queued: bool) -> AsyncIterator[None]:
+        """Admit exactly one submission without overtaking reserved FIFO work."""
+        if ((self.state is not State.IDLE or self._lock.locked()
+             or self._queue_worker is not None or self._pending_actions) and not queued):
+            raise RuntimeError("Session busy, queued work pending, or unavailable")
+        async with self._lock:
+            if (self.state is not State.IDLE
+                    or (not queued and (self._queue_worker is not None or self._pending_actions))):
+                raise RuntimeError("Session busy, queued work pending, or unavailable")
+            yield
+
+    async def boundary_queue_size(self) -> int:
+        """Snapshot a bounded drain budget; arrivals cannot starve generation."""
+        async with self._queue_lock:
+            return len(self._pending_actions)
+
+    async def take_boundary_action(self) -> _QueuedAction | None:
+        """Reserve the next action without holding a queue lock during dispatch."""
+        async with self._queue_lock:
+            return self._pending_actions.popleft() if self._pending_actions else None
+
+    def set_state_unless_stopping(self, state: State) -> None:
         if self.state not in (State.STOPPING, State.CLOSED):
             self.state = state
 
-    def _operation_is_current(self, operation_id: str, state: State) -> bool:
+    def operation_is_current(self, operation_id: str, state: State) -> bool:
         return self.operation.current(operation_id) and self.state is state
 
     async def _record_execution_result(self, request: ExecutionRequest, result: ExecutionResult) -> None:
@@ -96,7 +120,7 @@ class ExecutionLifecycle:
             if self.operation.execution_request is request:
                 self.operation.execution_result_recorded = True
 
-    async def _execute_dispatched(self, request: ExecutionRequest) -> ExecutionResult:
+    async def execute_dispatched(self, request: ExecutionRequest) -> ExecutionResult:
         """Commit source before dispatch and result before publishing its output."""
         self.coordinator.recovery = None
         await self.coordinator.journal_policy.commit(lambda journal: journal.record_execution_source(request))
@@ -175,7 +199,7 @@ class ExecutionLifecycle:
             if self.state is not State.NEW:
                 raise RuntimeError("SessionRuntime cannot start unless it is new")
             try:
-                config = self.coordinator._current_config()
+                config = self.coordinator.current_config()
                 if config is not None:
                     self.coordinator.config_revision = config.revision
                 self._journal_started = True
@@ -243,10 +267,10 @@ class ExecutionLifecycle:
         if on_progress is not None and not callable(on_progress):
             raise TypeError("on_progress must be callable or None")
 
-        config = self.coordinator._current_config()
+        config = self.coordinator.current_config()
         revision = config.revision if config is not None else self.coordinator.config_revision
         origin = Origin(self.coordinator.session_id, uuid4().hex, frontend_id, revision)
-        routed = self.coordinator._validate_routed_action(cast(_LifecycleRouter, self.coordinator.router).route(UserAction(origin, text)), origin)
+        routed = self.coordinator.validate_routed_action(cast(_LifecycleRouter, self.coordinator.router).route(UserAction(origin, text)), origin)
         loop = asyncio.get_running_loop()
         completion: asyncio.Future[QueueOutcome] = loop.create_future()
         async with self._queue_lock:
@@ -263,10 +287,10 @@ class ExecutionLifecycle:
             ticket = QueueTicket(
                 routed.origin, routed.kind, len(self._pending_actions), asyncio.shield(completion),
             )
-        self.coordinator.lifecycle._start_queue_worker_if_idle()
+        self.coordinator.lifecycle.start_queue_worker_if_idle()
         return ticket
 
-    def _start_queue_worker_if_idle(self) -> None:
+    def start_queue_worker_if_idle(self) -> None:
         if (self._queue_worker is None and self._pending_actions
                 and self.state is State.IDLE and not self._lock.locked()):
             worker = asyncio.create_task(
@@ -280,14 +304,14 @@ class ExecutionLifecycle:
     def _queue_worker_finished(self, worker: asyncio.Task[None]) -> None:
         if self._queue_worker is worker:
             self._queue_worker = None
-        self.coordinator.lifecycle._start_queue_worker_if_idle()
+        self.coordinator.lifecycle.start_queue_worker_if_idle()
 
-    async def _fail_pending_actions(self, status: Literal["steered", "completed", "failed", "interrupted", "closed"], error: str) -> None:
+    async def fail_pending_actions(self, status: Literal["steered", "completed", "failed", "interrupted", "closed"], error: str) -> None:
         async with self._queue_lock:
             pending = tuple(self._pending_actions)
             self._pending_actions.clear()
         for item in pending:
-            self.coordinator._complete_queue_item(item, QueueOutcome(item.action.origin, status, error=error))
+            self.coordinator.complete_queue_item(item, QueueOutcome(item.action.origin, status, error=error))
 
     async def _drain_queue(self) -> None:
         current = asyncio.current_task()
@@ -304,34 +328,34 @@ class ExecutionLifecycle:
                         item.action.origin.frontend_id, item.text, _queued_action=item,
                     )
                 except asyncio.CancelledError:
-                    self.coordinator._complete_queue_item(
+                    self.coordinator.complete_queue_item(
                         item, QueueOutcome(item.action.origin, "interrupted", error="Queued action was cancelled"),
                     )
-                    await self.coordinator.lifecycle._fail_pending_actions(
+                    await self.coordinator.lifecycle.fail_pending_actions(
                         "interrupted", "Queue processing was cancelled; pending actions were not dispatched",
                     )
                     return
                 except Exception as exc:
-                    self.coordinator._complete_queue_item(
+                    self.coordinator.complete_queue_item(
                         item, QueueOutcome(item.action.origin, "failed", error=str(exc)),
                     )
                     if self.state in (State.FAILED, State.STOPPING, State.CLOSED):
-                        await self.coordinator.lifecycle._fail_pending_actions("interrupted", "Session is unavailable")
+                        await self.coordinator.lifecycle.fail_pending_actions("interrupted", "Session is unavailable")
                         return
                 else:
-                    self.coordinator._complete_queue_item(
+                    self.coordinator.complete_queue_item(
                         item, QueueOutcome(item.action.origin, "completed", submission=submission),
                     )
         finally:
             if self._queue_worker is current:
                 self._queue_worker = None
-            self.coordinator.lifecycle._start_queue_worker_if_idle()
+            self.coordinator.lifecycle.start_queue_worker_if_idle()
 
     async def interrupt(self) -> None:
         if self.state in (State.STOPPING, State.CLOSED, State.NEW, State.FAILED):
             return
         if self.state is State.IDLE:
-            await self.coordinator.lifecycle._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
+            await self.coordinator.lifecycle.fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
             worker = self._queue_worker
             if worker is not None and worker is not asyncio.current_task():
                 worker.cancel()
@@ -340,7 +364,7 @@ class ExecutionLifecycle:
             # Invalidate before requesting cancellation. Even a provider that
             # suppresses cancellation cannot cause its late response to execute.
             self.operation.invalidate()
-            await self.coordinator.lifecycle._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
+            await self.coordinator.lifecycle.fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
             generation = self._generation
             if generation is not None and not generation.done():
                 generation.cancel()
@@ -353,7 +377,7 @@ class ExecutionLifecycle:
             # not advertise the session as safe to replay.
             self.operation.invalidate()
             self.state = State.FAILED
-            await self.coordinator.lifecycle._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
+            await self.coordinator.lifecycle.fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
             active = self.operation.task
             if active is not None and active is not asyncio.current_task():
                 active.cancel()
@@ -362,7 +386,7 @@ class ExecutionLifecycle:
             # Invalidate before requesting cancellation so a late executor result
             # cannot be dispatched even if the executor ignores the interrupt.
             self.operation.invalidate()
-            await self.coordinator.lifecycle._fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
+            await self.coordinator.lifecycle.fail_pending_actions("interrupted", "Queued action cancelled by explicit interrupt")
             if self.operation.execution_active:
                 # Stop the cell and let the cancelled operation choose its own
                 # transition: a "cancelled" result means the executor kept a
@@ -391,7 +415,7 @@ class ExecutionLifecycle:
                 return
             was_executing = self.operation.execution_active
             self.state = State.STOPPING
-            await self.coordinator.lifecycle._fail_pending_actions("closed", "SessionRuntime closed before queued action dispatch")
+            await self.coordinator.lifecycle.fail_pending_actions("closed", "SessionRuntime closed before queued action dispatch")
             worker = self._queue_worker
             if worker is not None and worker is not asyncio.current_task():
                 worker.cancel()
@@ -430,7 +454,7 @@ class ExecutionLifecycle:
                                 )
                             if (self.operation.model_request is not None
                                     and not self.operation.provider_usage_recorded):
-                                await self.coordinator.journal_policy._record_provider_usage(
+                                await self.coordinator.journal_policy.record_provider_usage(
                                     self.operation.model_request, None, outcome="cancelled",
                                 )
                         except BaseException as exc:

@@ -218,20 +218,20 @@ class Coordinator:
             raise TypeError(f"Selected service is missing callable methods: {', '.join(missing)}")
 
     def _set_state_unless_stopping(self, state: State) -> None:
-        return self._lifecycle._set_state_unless_stopping(state)
+        return self._lifecycle.set_state_unless_stopping(state)
 
     def _commit_fallback_context(self, user_text: str, assistant_text: str,
                                  observation: str | None = None, *, include_user: bool = True) -> None:
         return self._conversation._commit_fallback_context(user_text, assistant_text, observation, include_user=include_user)
 
     def _operation_is_current(self, operation_id: str, state: State) -> bool:
-        return self._lifecycle._operation_is_current(operation_id, state)
+        return self._lifecycle.operation_is_current(operation_id, state)
 
     def _current_config(self) -> ConfigSnapshot | None:
-        return self._runtime._current_config()
+        return self._runtime.current_config()
 
     def _capture_history_sensitive_config(self, snapshot: ConfigSnapshot | None) -> None:
-        return self._conversation._capture_history_sensitive_config(snapshot)
+        return self._conversation.capture_history_sensitive_config(snapshot)
 
     def _history_patterns(self) -> tuple[str, ...]:
         return self._conversation._history_patterns()
@@ -243,12 +243,12 @@ class Coordinator:
         return await self._conversation._read_history_page(event_id, offset, limit)
 
     def _read_context_epoch(self) -> int | None:
-        return self._conversation._read_context_epoch()
+        return self._conversation.read_context_epoch()
 
     def _observe_context_epoch(
         self, epoch: int | None, *, config: ConfigSnapshot | None = None,
     ) -> None:
-        return self._conversation._observe_context_epoch(epoch, config=config)
+        return self._conversation.observe_context_epoch(epoch, config=config)
 
     def _plugin_config(
         self,
@@ -267,7 +267,7 @@ class Coordinator:
         cell_config: ConfigSnapshot | None,
         epoch_config: ConfigSnapshot | None,
     ) -> ContextSnapshot:
-        return await self._runtime._run_context_transforms(snapshot, request_config, cell_config, epoch_config)
+        return await self._runtime.run_context_transforms(snapshot, request_config, cell_config, epoch_config)
 
     @property
     def _run_model_transforms(self) -> Callable[[ModelRequest, ConfigSnapshot | None, ConfigSnapshot | None, ConfigSnapshot | None], Awaitable[ModelRequest]]:
@@ -313,11 +313,11 @@ class Coordinator:
 
     @staticmethod
     def _visible_say_outputs(result: ExecutionResult) -> tuple[SayOutput, ...]:
-        return SessionRuntime._visible_say_outputs(result)
+        return SessionRuntime.visible_say_outputs(result)
 
     @classmethod
     def _visible_says(cls, result: ExecutionResult) -> tuple[str, ...]:
-        return SessionRuntime._visible_says(result)
+        return SessionRuntime.visible_says(result)
 
     def _new_output_event(
         self,
@@ -329,7 +329,7 @@ class Coordinator:
         metadata: dict[str, object] | None = None,
         author: Literal['user', 'agent'] | None = None,
     ) -> OutputEvent:
-        return self._frontend._new_output_event(origin, kind, data, display_id=display_id, metadata=metadata, author=author)
+        return self._frontend.new_output_event(origin, kind, data, display_id=display_id, metadata=metadata, author=author)
 
     async def _dispatch_output_event(
         self,
@@ -351,7 +351,7 @@ class Coordinator:
         expected_state: State,
         author: Literal["user", "agent"] = "agent",
     ) -> OutputEvent:
-        return await self._frontend._emit_progress(origin, data, on_progress=on_progress, operation_id=operation_id, expected_state=expected_state, author=author)
+        return await self._frontend.emit_progress(origin, data, on_progress=on_progress, operation_id=operation_id, expected_state=expected_state, author=author)
 
     async def _publish_output(
         self,
@@ -361,37 +361,37 @@ class Coordinator:
         on_progress: ProgressCallback | None,
         operation_id: str,
     ) -> tuple[OutputEvent, ...]:
-        return await self._frontend._publish_output(request, result, on_progress=on_progress, operation_id=operation_id)
+        return await self._frontend.publish_output(request, result, on_progress=on_progress, operation_id=operation_id)
 
     def _model_options(self, snapshot: ConfigSnapshot | None) -> dict[str, str]:
-        return self._runtime._model_options(snapshot)
+        return self._runtime.model_options(snapshot)
 
     def _prepare_context(self, text: str, request_id: str) -> ContextSnapshot:
-        return self._conversation._prepare_context(text, request_id)
+        return self._conversation.prepare_context(text, request_id)
 
     def _latest_context(self) -> ContextSnapshot:
-        return self._conversation._latest_context()
+        return self._conversation.latest_context()
 
     def _append_steering_context(self, text: str, request_id: str) -> None:
-        return self._conversation._append_steering_context(text, request_id)
+        return self._conversation.append_steering_context(text, request_id)
 
     def _packed_observation(self, request: ExecutionRequest, result: ExecutionResult) -> object:
         # Archive reads have their own bounded envelope. Never let unrelated
         # stdout (including an oversized stream) hide or re-archive an excerpt.
-        return self._observations._packed_observation(request, result)
+        return self._observations.packed_observation(request, result)
 
     def _packed_regular_observation(self, request: ExecutionRequest, result: ExecutionResult) -> object:
         return self._observations._packed_regular_observation(request, result)
 
     async def _archive_context_outputs(self) -> None:
-        return await self._conversation._archive_context_outputs()
+        return await self._conversation.archive_context_outputs()
 
     def _abandon_context(self, request_id: str) -> None:
-        return self._conversation._abandon_context(request_id)
+        return self._conversation.abandon_context(request_id)
 
     def _commit_context(self, request_id: str, user_text: str, assistant_text: str,
                         observation: object | None = None, phase: str | None = None, *, include_user: bool = True) -> None:
-        return self._conversation._commit_context(request_id, user_text, assistant_text, observation, phase, include_user=include_user)
+        return self._conversation.commit_context(request_id, user_text, assistant_text, observation, phase, include_user=include_user)
 
     async def _journal_record(self, method: str, *args: object, **kwargs: object) -> None:
         return await self._journal._journal_record(method, *args, **kwargs)
@@ -403,7 +403,7 @@ class Coordinator:
     async def _record_provider_usage(
         self, request: ModelRequest, response: ModelResponse | None, *, outcome: str,
     ) -> None:
-        return await self._journal._record_provider_usage(request, response, outcome=outcome)
+        return await self._journal.record_provider_usage(request, response, outcome=outcome)
 
     async def _record_execution_result(self, request: ExecutionRequest, result: ExecutionResult) -> None:
         return await self._lifecycle._record_execution_result(request, result)
@@ -412,7 +412,7 @@ class Coordinator:
         return await self._lifecycle._record_uncertain_execution(request, reason)
 
     async def _execute_dispatched(self, request: ExecutionRequest) -> ExecutionResult:
-        return await self._lifecycle._execute_dispatched(request)
+        return await self._lifecycle.execute_dispatched(request)
 
     async def _close_executor(self) -> None:
         return await self._lifecycle._close_executor()
@@ -425,7 +425,7 @@ class Coordinator:
 
     @staticmethod
     def _validate_routed_action(routed: object, origin: Origin) -> RoutedAction:
-        return SessionRuntime._validate_routed_action(routed, origin)
+        return SessionRuntime.validate_routed_action(routed, origin)
 
     @property
     def pending_action_count(self) -> int:
@@ -447,17 +447,17 @@ class Coordinator:
         return await self._lifecycle.enqueue(frontend_id, text, allow_stdin=allow_stdin, input_handler=input_handler, on_progress=on_progress)
 
     def _start_queue_worker_if_idle(self) -> None:
-        return self._lifecycle._start_queue_worker_if_idle()
+        return self._lifecycle.start_queue_worker_if_idle()
 
     def _queue_worker_finished(self, worker: asyncio.Task[None]) -> None:
         return self._lifecycle._queue_worker_finished(worker)
 
     @staticmethod
     def _complete_queue_item(item: _QueuedAction, outcome: QueueOutcome) -> None:
-        return SessionRuntime._complete_queue_item(item, outcome)
+        return SessionRuntime.complete_queue_item(item, outcome)
 
     async def _fail_pending_actions(self, status: Literal["steered", "completed", "failed", "interrupted", "closed"], error: str) -> None:
-        return await self._lifecycle._fail_pending_actions(status, error)
+        return await self._lifecycle.fail_pending_actions(status, error)
 
     async def _drain_queue(self) -> None:
         return await self._lifecycle._drain_queue()
@@ -478,7 +478,7 @@ class Coordinator:
         )
 
     async def _dispatch_command(self, source: str, config: ConfigSnapshot | None) -> str:
-        return await self._runtime._dispatch_command(source, config)
+        return await self._runtime.dispatch_command(source, config)
 
     def _context_export_payload(self) -> dict[str, object]:
         return self._conversation._context_export_payload()
@@ -602,11 +602,11 @@ class Coordinator:
     @property
     def _journal_sensitive_config_ready(self) -> bool:
         """Compatibility view; mutable state is owned by conversation."""
-        return self._conversation._journal_sensitive_config_ready
+        return self._conversation.journal_sensitive_config_ready
 
     @_journal_sensitive_config_ready.setter
     def _journal_sensitive_config_ready(self, value: bool) -> None:
-        self._conversation._journal_sensitive_config_ready = value
+        self._conversation.journal_sensitive_config_ready = value
 
     @property
     def _epoch_config(self) -> ConfigSnapshot | None:

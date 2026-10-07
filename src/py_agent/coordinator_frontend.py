@@ -59,7 +59,7 @@ class FrontendRouting:
 
     def _route_query(self, code: str) -> RoutedAction:
         """Apply the configured input router without dispatching an execution."""
-        config = self.coordinator._current_config()
+        config = self.coordinator.current_config()
         revision = config.revision if config is not None else self.coordinator.config_revision
         origin = Origin(self.coordinator.session_id, uuid4().hex, "inspection", revision)
         if not code:
@@ -165,7 +165,7 @@ class FrontendRouting:
                     self.coordinator.lifecycle.operation.task = None
 
 
-    def _new_output_event(
+    def new_output_event(
         self,
         origin: Origin,
         kind: Literal["stream", "display", "execute_result", "update", "clear", "error", "progress"],
@@ -189,7 +189,7 @@ class FrontendRouting:
         expected_state: State,
     ) -> None:
         """Deliver one event serially and reject delivery after request invalidation."""
-        if not self.coordinator.lifecycle._operation_is_current(operation_id, expected_state):
+        if not self.coordinator.lifecycle.operation_is_current(operation_id, expected_state):
             raise asyncio.CancelledError
         for registration in self.coordinator._observer_registrations:
             observer = self.coordinator.output_observers[registration.qualified_name]
@@ -204,17 +204,17 @@ class FrontendRouting:
                 if registration.critical:
                     raise
                 self.best_effort_observer_failures += 1
-            if not self.coordinator.lifecycle._operation_is_current(operation_id, expected_state):
+            if not self.coordinator.lifecycle.operation_is_current(operation_id, expected_state):
                 raise asyncio.CancelledError
         if on_progress is not None:
             delivered = on_progress(event)
             if not inspect.isawaitable(delivered):
                 raise TypeError("Request progress callback must be async")
             await delivered
-            if not self.coordinator.lifecycle._operation_is_current(operation_id, expected_state):
+            if not self.coordinator.lifecycle.operation_is_current(operation_id, expected_state):
                 raise asyncio.CancelledError
 
-    async def _emit_progress(
+    async def emit_progress(
         self,
         origin: Origin,
         data: dict[str, object],
@@ -224,7 +224,7 @@ class FrontendRouting:
         expected_state: State,
         author: Literal["user", "agent"] = "agent",
     ) -> OutputEvent:
-        event = self.coordinator.frontend._new_output_event(
+        event = self.coordinator.frontend.new_output_event(
             origin, "progress", data, author=author,
         )
         await self.coordinator.frontend._dispatch_output_event(
@@ -233,7 +233,7 @@ class FrontendRouting:
         )
         return event
 
-    async def _publish_output(
+    async def publish_output(
         self,
         request: ExecutionRequest,
         result: ExecutionResult,
@@ -251,7 +251,7 @@ class FrontendRouting:
             display_id: str | None = None,
             metadata: dict[str, object] | None = None,
         ) -> None:
-            event = self.coordinator.frontend._new_output_event(
+            event = self.coordinator.frontend.new_output_event(
                 origin, kind, data, display_id=display_id, metadata=metadata,
                 author=request.author,
             )

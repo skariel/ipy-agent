@@ -306,9 +306,9 @@ in with repeatable `--context-transform PLUGIN:STAGE`,
 corresponding `plugins.context_transforms`, `plugins.model_transforms`, and
 `plugins.observers` comma-separated config settings. Plugin activation and
 service/wrapper/stage selection are not security boundaries: enabled code runs with
-the host process's privileges. See [PLUGIN_API.md](PLUGIN_API.md) and
-[ARCHITECTURE_STATUS.md](ARCHITECTURE_STATUS.md) for the draft API and remaining
-integration gaps.
+the host process's privileges. See [PLUGIN_API.md](PLUGIN_API.md) for the draft
+API. General middleware/lifecycle hooks, hot reload, and a frozen plugin
+compatibility contract are not implemented.
 
 ### Optional wrapper-backed isolated executor
 
@@ -388,8 +388,17 @@ additional dependency for attach. These commands and the kernel entrypoint are i
 workflow is not yet verified end to end. Bounded rich displays are forwarded
 after a submission completes; incremental streaming is unavailable. Correlated
 stdin, bounded completion, and static inspection are implemented but not yet
-integration-verified; full history and dynamic completion remain incomplete. See
-[ARCHITECTURE_STATUS.md](ARCHITECTURE_STATUS.md) for details.
+integration-verified; full history and dynamic completion remain incomplete.
+
+### Architecture scope
+
+The coordinator and persistent worker are the current implementation, not a
+completed general-purpose plugin architecture. Batch/JSON frontends,
+journal-backed session recovery, automatic resumption, and continuous execution
+output streaming are not implemented. Configuration uses defaults, one explicitly
+selected JSON file, and session overrides; there are no automatic project/profile
+layers or automatic service reconstruction for restart-only settings.
+Internal refactoring and typing work is tracked in [REFACTORING.md](REFACTORING.md).
 
 ## Development quality checks
 

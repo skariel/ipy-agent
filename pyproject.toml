@@ -155,7 +155,7 @@ preview = true
 quote-style = "double"
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/examples", "/README.md", "/ARCHITECTURE_PLAN.md", "/ARCHITECTURE_STATUS.md", "/PLUGIN_API.md", "/pyproject.toml", "/uv.lock"]
+include = ["/src", "/tests", "/examples", "/README.md", "/PLUGIN_API.md", "/pyproject.toml", "/uv.lock"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/py_agent"]
