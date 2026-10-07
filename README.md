@@ -24,10 +24,11 @@ uv sync --locked
 uv run --locked py --provider fake
 ```
 
-For an installed, non-editable tool copy, use the repository scripts:
+For an installed, non-editable tool copy:
 
 ```sh
 ./install.sh
+py                                    # choose a model on first run; remembered next time
 ./run.sh                              # codex + gpt-6.1-sol, medium effort
 PROVIDER=fake ./run.sh                # deterministic local wiring; no model calls
 PROVIDER=codex MODEL=openai-codex/YOUR_MODEL ./run.sh
@@ -40,11 +41,27 @@ to `codex` with `openai-codex/gpt-6.1-sol` and medium reasoning effort; requests
 occur only after submitting
 English input. Use `PROVIDER=fake` for the no-network fixture. Installing/running
 this way requires no sandbox tools. The installed copy must
-be reinstalled after source changes.
+be reinstalled after source changes. If `py` is not on PATH, run
+`uv tool update-shell` and restart your shell.
 
 The fake provider is deterministic, makes no model request, and is **not a language
-model**; use it for a local wiring/demo path only. Production providers are explicit
-and require a model:
+model**; use it for a local wiring/demo path only. Running plain `py` opens a
+searchable model picker when no selection is configured. Authenticated models are
+suggested; you can also enter a custom `PROVIDER/MODEL`, or `fake` for local testing.
+The adapter is inferred and the choice is saved atomically to the owner-private
+`~/.py/default-model.json` (identifiers only, never credentials or plugin settings).
+Use `py login PROVIDER` to configure credentials; choosing a model does not log in.
+
+Explicit `--provider`, `--model`, or `--config` bypass the remembered default and
+do not overwrite it. An explicit production provider without a model opens a
+filtered picker. `/model` changes remain session-local. Remove
+`~/.py/default-model.json` to choose a different remembered default on the next
+plain `py` launch. Cancellation saves nothing; a failed save reports a warning
+but still uses the chosen model for that session. `run.sh` supplies explicit
+defaults, so use `py` directly for remembered selection. Non-TTY startup and
+managed kernel commands remain non-interactive.
+
+You can still select a production model explicitly:
 
 ```sh
 uv run --locked py --model openai/YOUR_MODEL
@@ -403,6 +420,11 @@ output streaming are not implemented. Configuration uses defaults, one explicitl
 selected JSON file, and session overrides; there are no automatic project/profile
 layers or automatic service reconstruction for restart-only settings.
 Internal refactoring and typing work is tracked in [REFACTORING.md](REFACTORING.md).
+A pi-style JSONL frontend is proposed in [Implementing `--json` mode](docs/json-mode.md).
+Plugin management, lifecycle, UI, and agent-helper improvements are proposed in
+[Improving plugins](docs/plugin-architecture.md).
+Safe reload boundaries and worker-reset semantics are proposed in
+[Hot reload](docs/hot-reload.md).
 
 ## Development quality checks
 

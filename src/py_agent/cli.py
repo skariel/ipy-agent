@@ -89,7 +89,8 @@ def default_parser() -> argparse.ArgumentParser:
         prog="py",
         description="Persistent local IPython agent. The default executor is unrestricted.",
         epilog=(
-            "Select a model with --model PROVIDER/MODEL; its adapter is inferred. "
+            "With no selection, choose a model interactively; the choice is remembered. "
+            "Use --model PROVIDER/MODEL to override it; its adapter is inferred. "
             "The fake provider is deterministic and is not a language model. "
             "No SRT/bwrap sandbox is required or implied; execution is unrestricted."
         ),
@@ -411,6 +412,7 @@ def _prepare_configuration(args: argparse.Namespace) -> _CliConfiguration:
     from .config_commands import ConfigCommandService
     from .configuration import ConfigRegistry, ConfigStore
     from .plugins import PluginError
+    from .startup_selection import MissingModelSelection
 
     config_path = getattr(args, "config", None)
     if config_path is not None and not isinstance(config_path, Path):
@@ -503,7 +505,7 @@ def _prepare_configuration(args: argparse.Namespace) -> _CliConfiguration:
     model = cast(str, snapshot.get("model.name"))
     if not provider:
         if not model:
-            raise ValueError("Select --model PROVIDER/MODEL (or --provider for a plugin/fake service)")
+            raise MissingModelSelection("Select --model PROVIDER/MODEL (or --provider for a plugin/fake service)")
         from .model_catalog import adapter_for_model
         provider = adapter_for_model(model)
         store.set({"provider.id": provider})
@@ -532,7 +534,7 @@ def _prepare_configuration(args: argparse.Namespace) -> _CliConfiguration:
         raise PluginError(f"No enabled executor wrappers named {sorted(unknown_wrappers)}")
 
     if provider in {"litelm", "codex"} and not model:
-        raise ValueError("Built-in production providers require --model or model.name in the JSON config")
+        raise MissingModelSelection("Built-in production providers require --model or model.name in the JSON config", provider)
     if provider == "codex" and not model.startswith("openai-codex/"):
         raise ValueError("Codex model must use the explicit openai-codex/MODEL form")
     if provider == "fake" and model:
@@ -680,8 +682,9 @@ def _build_coordinator(
 async def _run_phase1(args: argparse.Namespace) -> int:
     """Run the coordinator CLI (kept under its old private name for embedders)."""
     from .journal_worker import SQLiteJournalWorker
+    from .startup_selection import prepare_terminal_configuration
 
-    configured = _prepare_configuration(args)
+    configured = await prepare_terminal_configuration(args)
     provider, model = configured.provider, configured.model
     journal_path = getattr(args, "journal", None)
     journal = SQLiteJournalWorker(journal_path) if journal_path is not None else None
@@ -930,6 +933,9 @@ def main(argv: list[str] | None = None) -> int:
     except asyncio.CancelledError:
         print("py: terminated; active work cancelled without replay.", file=sys.stderr)
         return 143
+    except EOFError:
+        print("py: model selection cancelled.", file=sys.stderr)
+        return 130
     except KeyboardInterrupt:
         print("py: cancelled; active work was not replayed.", file=sys.stderr)
         return 130
