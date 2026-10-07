@@ -31,6 +31,7 @@ from .contracts import (
     Submission,
     UserAction,
 )
+from .coordinator_direct import DirectExecution
 from .coordinator_model import ModelRequests
 from .coordinator_support import (
     MAX_AGENT_RESPONSE_CHARS,
@@ -59,6 +60,7 @@ class RequestRunner:
     def __init__(self, coordinator: SessionRuntime) -> None:
         self.coordinator = coordinator
         self.models = ModelRequests(coordinator)
+        self.direct = DirectExecution(coordinator)
 
     async def submit(
         self,
@@ -860,106 +862,24 @@ class RequestRunner:
                         events=tuple(published_events),
                     )
 
-                # Direct execution bypasses provider and agent policy exactly once.
-                generation_id = None
-                author: Literal["user", "agent"] = "user"
-                if coordinator.lifecycle.operation.identity != operation_id or coordinator.lifecycle.state is not State.IDLE:
-                    raise asyncio.CancelledError from None
-                coordinator.lifecycle.state = State.EXECUTING
-                execution_origin = Origin(
-                    origin.session_id, origin.request_id, origin.frontend_id,
-                    origin.config_revision, None, uuid4().hex,
-                )
-                execution_request = ExecutionRequest(
-                    execution_origin, routed.source, author,
-                    routed.language if routed.language else "ipython",
-                    allow_stdin=allow_stdin,
-                    input_handler=execution_input_handler(execution_origin),
-                    output_handler=execution_output_handler(execution_origin, "user"),
-                    llm_handler=create_handler(coordinator, execution_origin),
-                )
-                published_events = [await coordinator.frontend._emit_progress(
-                    execution_origin,
-                    {"phase": "execution_start", "author": author,
-                     "text": "Executing user cell."},
-                    on_progress=on_progress, operation_id=operation_id,
-                    expected_state=State.EXECUTING, author=author,
-                )]
-                result = await coordinator.lifecycle._execute_dispatched(execution_request)
-                if not coordinator.lifecycle._operation_is_current(operation_id, State.EXECUTING):
-                    raise asyncio.CancelledError from None
-                published_events.extend(await coordinator.frontend._publish_output(
-                    execution_request, result, on_progress=on_progress,
-                    operation_id=operation_id,
-                ))
-                published_events.append(await coordinator.frontend._emit_progress(
-                    execution_origin,
-                    {
-                        "phase": "cell_complete", "step": 1, "status": result.status,
-                        "text": f"User cell completed with status {result.status}.",
-                    },
-                    on_progress=on_progress, operation_id=operation_id,
-                    expected_state=State.EXECUTING, author=author,
-                ))
-                if not coordinator.lifecycle._operation_is_current(operation_id, State.EXECUTING):
-                    raise asyncio.CancelledError from None
-                coordinator.lifecycle._set_state_unless_stopping(
-                    State.FAILED if result.status in ("uncertain", "cancelled") else State.IDLE,
-                )
-                return Submission(
-                    routed, result=result, message="\n".join(coordinator._visible_says(result)),
-                    execution=execution_request,
-                    say_outputs=coordinator._visible_say_outputs(result),
-                    events=tuple(published_events),
+                return await self.direct.execute(
+                    routed, origin, operation_id, allow_stdin=allow_stdin,
+                    execution_input_handler=execution_input_handler,
+                    execution_output_handler=execution_output_handler,
+                    llm_handler_factory=lambda execution_origin: create_handler(coordinator, execution_origin),
+                    on_progress=on_progress,
                 )
             except asyncio.CancelledError:
-                for steering_item in steering_awaiting_dispatch:
-                    coordinator._complete_queue_item(
-                        steering_item,
-                        QueueOutcome(
-                            steering_item.action.origin, "interrupted",
-                            error="Steering was cancelled before provider dispatch",
-                        ),
-                    )
-                if context_pending:
-                    try:
-                        coordinator.conversation._abandon_context(origin.request_id)
-                    except Exception:
-                        pass
-                if coordinator.lifecycle.state is State.GENERATING:
-                    coordinator.lifecycle._set_state_unless_stopping(State.IDLE)
-                elif coordinator.lifecycle.state in (State.EXECUTING, State.COMMAND):
-                    # Execution/commands may already have side effects; never replay them.
-                    # A user interrupt leaves the session usable only when the
-                    # executor reported that the interrupted cell itself stopped.
-                    if (coordinator.lifecycle.state is State.EXECUTING
-                            and coordinator.lifecycle.operation.execution_outcome_status == "cancelled"):
-                        coordinator.lifecycle._set_state_unless_stopping(State.IDLE)
-                    else:
-                        coordinator.lifecycle._set_state_unless_stopping(State.FAILED)
+                self._fail_submission(
+                    origin, steering_awaiting_dispatch, context_pending=context_pending,
+                    steering_commit_started=steering_commit_started, cancelled=True,
+                )
                 raise
             except Exception as exc:
-                for steering_item in steering_awaiting_dispatch:
-                    coordinator._complete_queue_item(
-                        steering_item,
-                        QueueOutcome(
-                            steering_item.action.origin, "failed",
-                            error=(
-                                "Steering failed before provider dispatch"
-                                + ("; context may contain partial steering" if steering_commit_started else "")
-                                + ": " + str(exc)
-                            ),
-                        ),
-                    )
-                if context_pending:
-                    try:
-                        coordinator.conversation._abandon_context(origin.request_id)
-                    except Exception:
-                        pass
-                if coordinator.lifecycle.state is State.GENERATING:
-                    coordinator.lifecycle._set_state_unless_stopping(State.IDLE)
-                elif coordinator.lifecycle.state in (State.EXECUTING, State.COMMAND):
-                    coordinator.lifecycle._set_state_unless_stopping(State.FAILED)
+                self._fail_submission(
+                    origin, steering_awaiting_dispatch, context_pending=context_pending,
+                    steering_commit_started=steering_commit_started, cancelled=False, error=exc,
+                )
                 raise
             finally:
                 coordinator.activity = None
@@ -967,3 +887,40 @@ class RequestRunner:
                 if coordinator.lifecycle.state in (State.FAILED, State.STOPPING, State.CLOSED):
                     await coordinator.lifecycle._fail_pending_actions("interrupted", "Session is unavailable")
                 asyncio.get_running_loop().call_soon(coordinator.lifecycle._start_queue_worker_if_idle)
+
+
+    def _fail_submission(
+        self, origin: Origin, steering: list[_QueuedAction], *,
+        context_pending: bool, steering_commit_started: bool,
+        cancelled: bool, error: Exception | None = None,
+    ) -> None:
+        """Settle reserved steering/context; never replay an admitted side effect."""
+        coordinator = self.coordinator
+        for item in steering:
+            message = (
+                "Steering was cancelled before provider dispatch" if cancelled
+                else "Steering failed before provider dispatch"
+                + ("; context may contain partial steering" if steering_commit_started else "")
+                + ": " + str(error)
+            )
+            coordinator._complete_queue_item(
+                item, QueueOutcome(
+                    item.action.origin, "interrupted" if cancelled else "failed", error=message,
+                ),
+            )
+        if context_pending:
+            try:
+                coordinator.conversation._abandon_context(origin.request_id)
+            except Exception:
+                pass
+        if coordinator.lifecycle.state is State.GENERATING:
+            coordinator.lifecycle._set_state_unless_stopping(State.IDLE)
+        elif coordinator.lifecycle.state in (State.EXECUTING, State.COMMAND):
+            # Only an acknowledged stopped execution permits reuse after cancel.
+            acknowledged_stop = (
+                cancelled and coordinator.lifecycle.state is State.EXECUTING
+                and coordinator.lifecycle.operation.execution_outcome_status == "cancelled"
+            )
+            coordinator.lifecycle._set_state_unless_stopping(
+                State.IDLE if acknowledged_stop else State.FAILED,
+            )

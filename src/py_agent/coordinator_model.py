@@ -3,17 +3,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from typing import TYPE_CHECKING
 
 from .contracts import ModelRequest, ModelResponse, Origin, OutputEvent, ProgressCallback
+from .coordinator_interfaces import ModelRuntime
 from .coordinator_support import State
-
-if TYPE_CHECKING:
-    from .coordinator_runtime import SessionRuntime
 
 
 class ModelRequests:
-    def __init__(self, coordinator: SessionRuntime) -> None:
+    def __init__(self, coordinator: ModelRuntime) -> None:
         self.coordinator = coordinator
 
     async def generate(

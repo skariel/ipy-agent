@@ -1911,6 +1911,8 @@ def test_coordinator_components_own_state_without_duplicate_facade_storage():
     assert first._runner is first._runtime.runner
     assert first._runner.coordinator is first._runtime
     assert first._runner.models.coordinator is first._runtime
+    assert first._runner.direct.coordinator is first._runtime
+    assert first._runner.direct is not second._runner.direct
     assert "_context" not in vars(first)
     assert "_pending_actions" not in vars(first)
     assert "_event_sequence" not in vars(first)

@@ -147,3 +147,26 @@ and documentation changes. Unrelated pre-existing deletions of `_repro.py`,
 Further request-phase decomposition and narrower runtime interfaces remain
 explicit follow-up tasks; full strict typing and live-provider verification are
 not claimed by this closeout.
+
+## Implemented follow-up: request phases and strict interfaces
+
+- Extracted direct user-cell execution into `DirectExecution`, independent of
+  queue/outer-operation cleanup. Nested llm handler construction is injected;
+  it retains the execution origin and existing host runtime checks.
+- Added `DirectRuntime` and `ModelRuntime` capability protocols. Model retries
+  no longer type against the complete SessionRuntime. The runner remains the
+  orchestration owner; the agent loop has not been mechanically split.
+- Centralized cancellation/error settlement in `_fail_submission`, preserving
+  reserved steering outcomes, best-effort context abandonment, and the rule
+  that only acknowledged stopped execution permits reuse after cancellation.
+- Expanded strict mypy from 9 to 21 files: all coordinator components, both new
+  interface/phase modules, and the journal worker. Dynamic synchronous journal
+  compatibility remains supported; this is not a claim of fully typed dispatch.
+- Strengthened per-session ownership assertions for the direct phase.
+
+Full locked local matrix rerun: 3.12/3.13/3.14 each 855 passed, 1 skipped;
+3.13 + Jupyter 854 passed, 2 skipped. Lint and the expanded strict gate pass in
+every job; whole-repository mypy also passes in the Jupyter job.
+Remaining deeper work: decompose the agent loop around explicit turn state,
+narrow other components' runtime dependencies, and replace dynamic journal
+dispatch with a typed compatibility adapter. Those are not implemented here.
