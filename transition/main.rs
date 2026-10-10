@@ -1272,7 +1272,8 @@ Keep orthogonal parts as direct functions/state, not a UI/provider framework.
 [x] R10.11 Human cell previews have clear operation/source/stdout/stderr boundaries,
       status and refs/counts, width-aware word wrapping. Preview/history limits
       remain independent: rendering never modifies H or model context.
-[x] R10.12 /model list [query] and /models [query] list matching models offline;
+[x] R10.12 /model list [query] and /models [query] list matching cached,
+      built-in/configured models, refreshing stale supported catalogs per R16;
       /model <id-or-query> resolves an exact ID or unique fuzzy match, rejects
       ambiguity with choices. /effort (/think) validates supported level spellings.
       /login lists available methods/providers rather than silently selecting one;
@@ -1997,6 +1998,84 @@ this does not claim live-provider parity or that a model always follows curation
 [x] R15.09 Prompt guidance explains active preference/project/person curation, stale removal, splitting/merging, small scoped entries and ordinary filesystem-only management.
       Tests: skills_curation_prompt_contract, e2e_skills_provider_wire_snapshot_edit_reset_resume_new; review: instruction text and actual wire inclusion inspected.
 
+## 31. Refreshable model catalogs
+Source layout stays single-file: implementation, specification and tests live
+in main.rs. Model metadata is data, not code or durable skill instructions.
+
+Commands:
+- /model list [query] and /models [query]: list built-in/configured/cached models.
+- /model list refresh [provider] and /models refresh [provider]: force discovery,
+  even when the cache is fresh or automatic refresh is disabled. Omitted provider
+  means the active provider; codex is an alias for openai-codex.
+- JSON models commands accept refresh:true and optional provider. Ordinary JSON
+  models and agent.llm.list remain offline/cache-only introspection.
+
+Discovery currently supports Codex subscriptions and the OpenAI API. Other
+providers retain their built-in/configured inventory and report unsupported
+explicit refresh; there is no guessed compatible endpoint.
+Codex GET /codex/models uses authorization, account routing and client_version;
+OpenAI GET /models proves available IDs, not their unknown capabilities.
+Source: openai/codex models-manager, codex-api endpoint/models and protocol
+openai_models.rs (reviewed 2026-10-10). Native context_window takes precedence over
+max_context_window; the effective input allowance uses the native percentage.
+Do not reuse public API context maxima as native subscription defaults.
+
+Configuration under model_catalog, manageable with /config:
+  auto_refresh: true
+  refresh_interval_seconds: 3600
+  retry_interval_seconds: 300
+  codex_client_version: "0.155.0"
+Catalog refresh preferences apply immediately; they never rewrite session
+prompts or startup snapshots. Refresh is activity-triggered on login/model
+selection/listing (and implicit Codex default selection), not a background timer.
+Only stale, credential-backed supported catalogs fetch automatically; recent
+failed attempts back off. Forced refresh bypasses both intervals. The Codex
+catalog compatibility revision is separate from py's package version and is
+included in cache scope; do not send py 0.1.0 as an obsolete Codex revision.
+PY_MODEL_CATALOG_AUTO_REFRESH=0/1 is a user-owned override, also used by fixtures
+so routine tests never accidentally probe external endpoints.
+
+Cache: ~/.py/models.json (PY_HOME respected), versioned and private, atomically
+written under a cancellable lock. Entries are bound to provider, endpoint,
+credential/principal and compatibility revision using hashes, not plaintext
+credentials/account IDs. Codex principal identity survives ordinary token
+rotation but changes with account/subject/plan; API keys have distinct scopes.
+Failed refreshes preserve good descriptors and record an attempt timestamp;
+concurrent failures/older responses cannot overwrite newer good scoped data.
+Invalid caches are ignored safely. Offline use starts with cached/bundled data.
+
+Remote responses are bounded to 8 MiB/2048 entries. Normalize whitelisted metadata
+only; never execute/import/inject remote instructions, messages, tools or plugins.
+Reject malformed schemas atomically and reject reflected credential data. Native
+reasoning presets are limited to implemented levels; ultra is not supported.
+Unknown API IDs, including fine-tunes, are visible but cannot be selected or
+invoked without explicit API/context/capability metadata in config.json. Explicit
+user declarations override discovery; discovery never fabricates capabilities.
+Account catalogs mark absent built-ins unavailable without destroying legacy
+session IDs. HTTP errors are bounded/redacted, never silently retried for inference.
+
+Refreshing does not select a model, rebuild Python, change globals, modify the
+frozen system prompt or select discovery payloads into model context. It can update
+capability/pressure limits. Genuine cancellation retains the prior cache; an old
+agent.loop.stop is not cancellation of a later metadata operation.
+
+Acceptance evidence: cargo build -j 8; PY_HARNESS_BIN=$PWD/target/debug/py cargo
+ test -j 8 -- --test-threads=4. 233 tests pass, including 16 catalog tests;
+local real-binary fixtures verify HTTP wire/caches, not live account compatibility.
+[x] R16.01 Native/API endpoints, normalization, fresh IDs/aliases and private
+    persistent cache work. Tests: e2e_catalog_force_refresh_native_metadata_namespace_prompt_and_private_cache; catalog_native_limits_fields_aliases_and_efforts.
+[x] R16.02 Stale auto refresh, fresh suppression, explicit bypass, failure backoff,
+    disabled auto and endpoint forms work. Tests: e2e_catalog_automatic_ttl_force_fresh_bypass_and_expiry; e2e_catalog_failure_backoff_preserves_stale_cache_and_manual_retry; e2e_catalog_auto_disabled_manual_refresh_and_prefix_endpoint_forms.
+[x] R16.03 Malformed/oversized/error responses are atomic, redacted and cannot
+    import instructions or reflected credentials. Tests: e2e_catalog_rejections_are_atomic_bounded_redacted_and_instruction_free; catalog_native_rejects_malformed_response_atomically; catalog_cache_validation_strips_instructions_and_rejects_unsafe_files.
+[x] R16.04 Account/endpoint/token scope and unknown-ID capability gates work.
+    Tests: e2e_catalog_principal_endpoint_rotation_and_logout_scope; e2e_catalog_openai_unknown_ids_need_declared_capabilities_and_key_scope; catalog_api_known_metadata_unknown_ids_and_safe_field_selection.
+[x] R16.05 Active model, namespace and exact wire prompt survive refresh; prior
+    turn stop does not abort refresh; genuine interruption preserves cache.
+    Tests: e2e_catalog_force_refresh_native_metadata_namespace_prompt_and_private_cache; e2e_catalog_interrupt_is_operation_local_and_retains_exact_cache.
+[x] R16.06 Configuration/default validation and unsupported/missing-credential
+    requests fail without probes. Tests: catalog_config_defaults_overrides_and_invalid_values; e2e_catalog_missing_credentials_unsupported_provider_and_bad_refresh_flag_do_not_fetch.
+
 ## 26. Running this transition
 Build: cargo build --release --manifest-path transition/Cargo.toml
 Run local: transition/target/release/py --no-model
@@ -2012,12 +2091,34 @@ Shift+Enter inserts a newline on supported enhanced-key terminals; Ctrl-J is a
 fallback. Continuations align with the two-column > prompt. Semantic status
 lines show the model only while thinking, and numbered cells end with status,
 elapsed time and history refs. NO_COLOR disables generated styles. /model list filters
-known/configured models; /model codex/53cod is a unique fuzzy query, not a new ID.
+cached/built-in/configured models and refreshes stale supported catalogs; /model
+list refresh forces discovery. /model codex/sol61 selects the current Sol alias.
 Config lives in ~/.py/config.json (or PY_HOME); credentials in private auth.json.
-Example for a user-declared custom ID (not a claim sol-6.1 ships in the catalog):
-  {"providers":{"openai-codex":{"models":[{"id":"sol-6.1",
+Current Sol uses gpt-6.1-sol; /model codex/sol61 resolves its known alias.
+Current Codex/API metadata is checked against official model documentation:
+https://developers.openai.com/codex/models and /api/docs/models/gpt-6.1-sol
+(2026-10-10), not inferred from the old pinned adapter catalog. Sol/Astra/Luna
+and GPT-5.6 variants expose documented reasoning levels, including max; unsupported
+levels fail locally. Catalog membership is not account/workspace access proof.
+Successful explicit login selects a model from that provider only if the active
+model is unusable. Usable selections are preserved; global defaults are not changed.
+On a new process, saved Codex credentials may select the current recommended Codex
+model only when no CLI/environment/config/session model was explicitly chosen.
+Initial resolved settings are journaled separately from user setting changes and
+restored on resume, even if global defaults have since changed. Input admission,
+pressure and remaining-input accounting respect separate input caps: public API
+metadata uses 922000/1050000 input/combined tokens, while the current native Codex
+fallback uses 258400/272000 and remote discovery supplies authoritative values.
+Provider tokens are still
+estimated, not counted exactly.
+Codex HTTP rejections include bounded, credential-redacted service diagnostics;
+there is still no automatic retry or model fallback after rejection.
+Legacy gpt-5.2/gpt-5.3 Codex subscription entries are marked deprecated; their
+availability is not implied by this offline catalog.
+Example for a user-declared custom ID (not a claim this fixture model exists):
+  {"providers":{"openai-codex":{"models":[{"id":"fixture-6.1",
     "api":"openai-codex-responses","context_limit":512000,"reasoning":true}]}}}
-Then /model codex/sol61 and its Tab completion resolve that configured model.
+Then /model codex/fixture61 and its Tab completion resolve that configured model.
 No Pi/Pig config or credentials are implicitly imported. Endpoint overrides are
 user-owned and may receive credentials; PY_CODEX_AUTH_BASE_URL and
 PY_CODEX_DEVICE_TIMEOUT_SECONDS exist for controlled protocol fixtures, not
@@ -2048,6 +2149,7 @@ R01–R13 acceptance.
 fn test_command(program:impl AsRef<std::ffi::OsStr>)->std::process::Command{
     let mut command=std::process::Command::new(program);
     for (_,_,key) in PROVIDERS{command.env_remove(key);}
+    command.env("PY_MODEL_CATALOG_AUTO_REFRESH","0");
     for key in ["PY_HOME","PY_MODEL","PY_CONTEXT_LIMIT","PY_CODEX_AUTH_BASE_URL",
         "PY_CODEX_DEVICE_TIMEOUT_SECONDS","PY_OAUTH_BROWSER","PY_OAUTH_TIMEOUT_SECONDS",
         "PY_OAUTH_CALLBACK_PORT","PY_ANTHROPIC_AUTH_BASE_URL","PY_ANTHROPIC_AUTHORIZE_URL"]{command.env_remove(key);}
@@ -3726,7 +3828,7 @@ struct Host {
     attachments:HashMap<String,usize>, queued:HashMap<String,Option<(usize,usize)>>, config:Value, config_defaults:Value, auth:Value,
     model:String, effort:String, no_model:bool, context_limit:usize,
     trigger:usize,retain:usize,current_code:Option<String>, usage:Value,
-    skills:Value, initializing:bool, startup_ready:bool,
+    skills:Value, catalog:Value, initializing:bool, startup_ready:bool,
 }
 impl Host {
     fn event(&self,kind:&str,payload:Value) {
@@ -3760,13 +3862,15 @@ impl Host {
         self.revision+=1;Ok(id)
     }
     fn chars(&self)->usize{self.system_prompt().chars().count()+512+self.context.iter().map(|i|i.text.chars().count()+64).sum::<usize>()}
-    fn forced(&self)->bool{self.chars().div_ceil(3)>self.context_limit.saturating_sub(4096)*9/10}
+    fn input_budget(&self)->usize{model_input_budget(self.context_limit,&self.reasoning_metadata(&self.model),4096)}
+    fn forced(&self)->bool{self.chars().div_ceil(3)>self.input_budget()*9/10}
     fn context_usage(&self)->Value{
         json!({"context_revision":self.revision,"item_count":self.context.len(),
             "rendered_chars":self.chars(),"estimated_input_tokens":self.chars().div_ceil(3),
             "measured_last_input_tokens":self.usage["last_input_tokens"],
             "model_context_limit":self.context_limit,"reserved_output_tokens":4096,
-            "remaining_input_tokens":self.context_limit.saturating_sub(4096+self.chars().div_ceil(3)),
+            "input_token_budget":self.input_budget(),
+            "remaining_input_tokens":self.input_budget().saturating_sub(self.chars().div_ceil(3)),
             "system_chars":self.system_prompt().chars().count(),"skills_estimated_tokens":self.skills["estimated_added_tokens"],
             "forced":self.forced(),"force_threshold":0.9,"estimator":"unicode-chars/3-v1 estimate; system/control allowance included; image budget separate"})
     }
@@ -3796,7 +3900,7 @@ impl Host {
                 let text=v["text"].as_str().ok_or("text required")?;
                 let max=v["max_chars"].as_u64().ok_or("positive maximum required")? as usize;
                 if max==0||text.chars().count()>max {return Err("selection exceeds max_chars".into());}
-                if (self.chars()+text.chars().count()).div_ceil(3)+4096>=self.context_limit {
+                if (self.chars()+text.chars().count()+64).div_ceil(3)>=self.input_budget() {
                     return Err("selection exceeds next-request context budget".into());
                 }
                 let id=self.add_context("user",text.into(),true,vec![])?;Ok(json!(id))
@@ -4144,7 +4248,7 @@ impl Host {
             let lock=OpenOptions::new().create(true).read(true).write(true).truncate(false).mode(0o600).open(home.join("config.lock"))?;
             if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX)}!=0{return Err(io::Error::last_os_error().into());}
             if config_path.exists(){load_json(&config_path)?}else{
-                let defaults=json!({"skills":skills_defaults()});write_private_json(&config_path,&defaults)?;defaults
+                let defaults=json!({"skills":skills_defaults(),"model_catalog":model_catalog_defaults()});write_private_json(&config_path,&defaults)?;defaults
             }
         };
         validate_config(&config)?;
@@ -4174,7 +4278,7 @@ impl Host {
             bg_tasks:HashMap::new(),wakeups:HashMap::new(),servicing:false,
             incoming:None,input_closed:false,pending:std::collections::VecDeque::new(),attachments:HashMap::new(),queued:HashMap::new(),config:json!({}),config_defaults:json!({}),auth:json!({}),model:std::env::var("PY_MODEL").unwrap_or_else(|_|"openai/gpt-4.1".into()),
             effort:"medium".into(),no_model,context_limit:std::env::var("PY_CONTEXT_LIMIT").ok().and_then(|s|s.parse().ok()).unwrap_or(128000),trigger:20,retain:10,current_code:None,usage:json!({}),
-            skills,initializing:false,startup_ready:false};
+            skills,catalog:empty_model_catalog(),initializing:false,startup_ready:false};
         for name in ["code","user","stdout","stderr","stdin","raw","say","requests","responses","usage"]{
             host.history.insert(name.into(),vec![]);
         }
@@ -4187,7 +4291,7 @@ impl Host {
                 "user"=>{host.hist_push("user",p["text"].clone());},
                 "stdin"=>{host.history.get_mut("stdin").unwrap().push(json!({"$event":sequence}));},
                 "worker_reset"=>{host.generation=p["generation"].as_u64().ok_or("invalid worker generation")? as usize;},
-                "settings_change"=>{settings=Some(p.clone());},
+                "settings_initial"|"settings_change"=>{settings=Some(p.clone());},
                 "task_state"|"task_settled"|"wakeup_state"=>host.bg_restore(ev["kind"].as_str().unwrap(),p)?,
                 "cell_start"=>{host.cells=host.cells.max(p["cell"].as_u64().ok_or("invalid session cell number")? as usize);},
                 "stream"=>{
@@ -4213,6 +4317,9 @@ impl Host {
         }
         host.config_defaults=config.clone();host.config=config;
         host.auth=load_json(&host.home.join("auth.json"))?;
+        match load_model_catalog(&host.home.join("models.json")){
+            Ok(cache)=>host.catalog=cache,Err(_)=>host.event("notice",json!({"text":"Invalid model catalog cache ignored; using offline inventory until refresh."}))
+        }
         host.configure()?;
         if let Some(settings)=settings{
             host.set_model(settings["model"].as_str().ok_or("invalid session model")?.into())?;
@@ -4220,8 +4327,12 @@ impl Host {
             host.validate_effort(&host.effort)?;
         }
         if let Some(model)=model_override{host.choose_model(model)?;}
+        if !resumed&&model_override.is_none()&&host.config["model"].is_null()&&std::env::var("PY_MODEL").is_err()
+            &&host.auth["openai-codex"].is_object(){host.select_model_after_login("openai-codex");}
         if let Some(effort)=effort_override{host.change_effort(effort)?;}
+        host.validate_effort(&host.effort)?;
         host.check_system_budget(host.context_limit)?;
+        if !resumed{host.journal.append("settings_initial",json!({"model":host.model,"effort":host.effort}))?;}
         if resumed {
             host.bg_recover()?;
             host.generation+=1;
@@ -4321,6 +4432,8 @@ impl Host {
                     Some("api-key")|None=>self.key_login(provider,v["key"].as_str().ok_or("key required")?)?,
                     _=>return Err("Unsupported login method: browser, manual, device, oauth or api-key".into())
                 }
+                let provider=self.resolve_provider(provider)?;
+                self.select_model_after_login(&provider);
                 self.event("completed",json!({"command_id":id,"status":"ok"}));
             },
             "logout"=>{
@@ -4328,7 +4441,14 @@ impl Host {
                 self.event("completed",json!({"command_id":id,"status":"ok"}));
             },
             "auth"=>self.event("auth",json!({"command_id":id,"providers":self.auth_status()})),
-            "models"=>self.event("models",json!({"command_id":id,"models":self.models()})),
+            "models"=>{
+                let refresh=v.get("refresh").map(|r|r.as_bool().ok_or("refresh must be boolean")).transpose()?.unwrap_or(false);
+                if refresh{
+                    let provider=v["provider"].as_str().unwrap_or_else(||self.model.split_once('/').map_or("openai",|p|p.0)).to_string();
+                    self.refresh_model_catalog(&provider,true)?;
+                }
+                self.event("models",json!({"command_id":id,"models":self.models()}));
+            },
             "recovery"=>self.event("recovery",{
                 let mut status=self.recovery_status()?;status["command_id"]=json!(id);status
             }),
@@ -4360,6 +4480,10 @@ const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete or
 // reads credentials, starts I/O or changes session state. A false/absent reasoning
 // flag means no fields. `off` means unset for APIs/models without verified disable
 // semantics, NOT a promise that the provider's default stops internal reasoning.
+fn model_input_budget(context_limit:usize,meta:&Value,reserved_output:usize)->usize{
+    let combined=context_limit.saturating_sub(reserved_output);
+    meta["max_input_tokens"].as_u64().map_or(combined,|cap|combined.min(cap as usize))
+}
 fn reasoning_fields(api:&str,provider:&str,id:&str,meta:&Value,effort:&str,max:usize)->Result<Value>{
     if !["off","minimal","low","medium","high","xhigh","max"].contains(&effort){
         return Err("effort must be off/minimal/low/medium/high/xhigh/max".into());
@@ -4368,14 +4492,18 @@ fn reasoning_fields(api:&str,provider:&str,id:&str,meta:&Value,effort:&str,max:u
     let mut fields=json!({});
     if meta["reasoning"]!=true{return Ok(fields);}
     let adaptive=id.contains("opus-4-6")||id.contains("opus-4.6");
-    if effort=="max" && !(api=="anthropic-messages"&&adaptive){
-        return Err("max effort is supported only by Anthropic Messages Opus 4.6; use high or xhigh".into());
+    let supported=meta["reasoning_efforts"].as_array();
+    if supported.is_some_and(|levels|!levels.iter().any(|level|level==effort)){
+        return Err(format!("Effort {effort} unsupported by {id}; supported: {}",meta["reasoning_efforts"]).into());
     }
-    let xhigh=id.contains("gpt-5.2")||id.contains("gpt-5.3");
+    if effort=="max" && !(api=="anthropic-messages"&&adaptive) && !supported.is_some_and(|levels|levels.iter().any(|level|level=="max")){
+        return Err("max effort requires explicit model capability metadata (or Anthropic Messages Opus 4.6); use high or xhigh".into());
+    }
+    let xhigh=id.contains("gpt-5.2")||id.contains("gpt-5.3")||supported.is_some_and(|levels|levels.iter().any(|level|level=="xhigh"));
     let clamped=if effort=="xhigh"&&!xhigh{"high"}else{effort};
     match api{
-        "openai-responses" if effort!="off"=>{
-            fields["reasoning"]=json!({"effort":clamped,"summary":"auto"});
+        "openai-responses" if effort!="off"||supported.is_some()=>{
+            fields["reasoning"]=json!({"effort":if effort=="off"{"none"}else{clamped},"summary":"auto"});
             fields["include"]=json!(["reasoning.encrypted_content"]);
         },
         "openai-completions"=>{
@@ -4456,10 +4584,43 @@ impl Host {
     }
     fn models(&self)->Value{
         let mut models:Vec<Value>=serde_json::from_str(CATALOG).unwrap();
+        // Official Codex/API model docs checked 2026-10-10. Availability remains
+        // account/workspace dependent; this is offline metadata, not an access probe.
+        for (id,name,aliases,off) in [
+            ("gpt-6.1-sol","GPT-6.1 Sol",vec!["sol61","sol6.1"],false),
+            ("gpt-6-astra","GPT-6 Astra",vec!["astra6"],false),
+            ("gpt-6-sol","GPT-6 Sol",vec!["sol6"],true),
+            ("gpt-6-luna","GPT-6 Luna",vec!["luna6"],true),
+            ("gpt-5.6-sol","GPT-5.6 Sol",vec!["sol56","sol5.6"],true),
+            ("gpt-5.6-terra","GPT-5.6 Terra",vec!["terra56","terra5.6"],true),
+            ("gpt-5.6-luna","GPT-5.6 Luna",vec!["luna56","luna5.6"],true),
+        ]{
+            let mut efforts=vec!["low","medium","high","xhigh","max"];
+            if off{efforts.insert(0,"off");}
+            for (provider,api) in [("openai","openai-responses"),("openai-codex","openai-codex-responses")]{
+                models.push(json!({"id":format!("{provider}/{id}"),"name":name,"aliases":aliases,"provider":provider,
+                    "api":api,"context_limit":if provider=="openai-codex"{272000}else{1050000},
+                    "max_input_tokens":if provider=="openai-codex"{258400}else{922000},"max_tokens":128000,
+                    "image_input":true,"reasoning":true,"image_output":false,"reasoning_efforts":efforts}));
+            }
+        }
         for id in ["gpt-5.2","gpt-5.2-codex","gpt-5.3-codex"]{
             models.push(json!({"id":format!("openai-codex/{id}"),"name":id,"provider":"openai-codex",
                 "api":"openai-codex-responses","context_limit":400000,"max_tokens":128000,
-                "image_input":true,"reasoning":true,"image_output":false}));
+                "image_input":true,"reasoning":true,"image_output":false,"deprecated":true}));
+        }
+        for provider in ["openai","openai-codex"]{
+            let record=&self.catalog["providers"][provider];
+            if self.catalog_identity(provider).is_some_and(|identity|record["identity"]==identity){
+                if let Some(discovered)=record["models"].as_array(){
+                    for model in models.iter_mut().filter(|m|m["provider"]==provider){
+                        model["available"]=json!(discovered.iter().any(|d|d["id"]==model["id"]));
+                    }
+                    for model in discovered{
+                        models.retain(|m|m["id"]!=model["id"]);models.push(model.clone());
+                    }
+                }
+            }
         }
         if let Some(providers)=self.config["providers"].as_object(){
             for (provider,cfg) in providers{
@@ -4467,7 +4628,7 @@ impl Host {
                     for item in list{
                         let mut item=item.clone();
                         item["id"]=json!(format!("{provider}/{}",item["id"].as_str().unwrap_or("")));
-                        item["provider"]=json!(provider);item["configured"]=json!(true);
+                        item["provider"]=json!(provider);item["configured"]=json!(true);item["user_declared"]=json!(true);
                         models.retain(|v|v["id"]!=item["id"]);models.push(item);
                     }
                 }
@@ -4481,7 +4642,8 @@ impl Host {
             let cfg=&self.config["providers"][provider];
             let env=cfg["key_env"].as_str().or(PROVIDERS.iter().find(|p|p.0==provider).map(|p|p.2)).unwrap_or("");
             item["credential_backed"]=json!(!self.credential(provider,env).trim().is_empty());
-            item["ready"]=json!(self.provider_config(item["id"].as_str().unwrap()).is_ok());
+            item["ready"]=json!(self.provider_config(item["id"].as_str().unwrap()).is_ok()
+                &&item["metadata_complete"]!=false&&(item["available"]!=false||item["user_declared"]==true));
         }
         json!(models)
     }
@@ -4519,10 +4681,17 @@ impl Host {
     fn invoke_inner(&mut self,model:&str,messages:Vec<Value>,max:usize)->Result<String>{
         let (provider,id)=model.split_once('/').unwrap_or(("openai",model));
         let api=self.model_api(model);
+        let meta=self.reasoning_metadata(model);
+        if meta["metadata_complete"]==false{return Err("model capabilities are incomplete; declare this model's API/context/capabilities in config.json before selecting or invoking it".into());}
+        if meta["available"]==false&&meta["user_declared"]!=true{return Err("model not offered in the last account catalog; /model list refresh or select another model".into());}
         // Validate before an operation intent or network request. Unsupported
         // capability metadata is deliberately not inferred from API compatibility.
-        let fields=reasoning_fields(&api,provider_alias(provider),id,
-            &self.reasoning_metadata(model),&self.effort,max)?;
+        let fields=reasoning_fields(&api,provider_alias(provider),id,&meta,&self.effort,max)?;
+        if meta["max_input_tokens"].is_u64(){
+            let input=serde_json::to_string(&messages)?.chars().count().div_ceil(3);
+            let available=model_input_budget(self.model_limit(model)?,&meta,max);
+            if input>available{return Err(format!("estimated request input {input} exceeds model input budget {available}; reduce the prompt/context before retrying").into());}
+        }
         self.reload_auth()?;
         if model.starts_with("github-copilot/"){self.refresh_copilot()?;}
         let codex=model.starts_with("openai-codex/")||model.starts_with("codex/");
@@ -4885,7 +5054,8 @@ impl Host{
             if model["image_output"]==true{continue;}
             if provider.is_some_and(|p|!model["provider"].as_str().unwrap_or("").eq_ignore_ascii_case(p)){continue;}
             let candidate=if provider.is_some(){id.split_once('/').map_or(id,|(_,id)|id)}else{id};
-            let score=fuzzy_score(needle,candidate).or_else(||fuzzy_score(needle,model["name"].as_str().unwrap_or("")));
+            let score=fuzzy_score(needle,candidate).or_else(||fuzzy_score(needle,model["name"].as_str().unwrap_or("")))
+                .or_else(||model["aliases"].as_array().and_then(|aliases|aliases.iter().filter_map(|a|a.as_str().and_then(|a|fuzzy_score(needle,a))).max()));
             if let Some(score)=score{found.push((score,model.clone()));}
         }
         found.sort_by(|a,b|b.0.cmp(&a.0).then_with(||a.1["id"].as_str().cmp(&b.1["id"].as_str())));
@@ -4896,32 +5066,41 @@ impl Host{
         let canonical=query.split_once('/').map(|(p,id)|format!("{}/{id}",provider_alias(p))).unwrap_or(query.into());
         let models=self.models();
         let exact:Vec<_>=models.as_array().unwrap().iter().filter(|m|m["image_output"]!=true&&
-            m["id"].as_str().is_some_and(|id|id.eq_ignore_ascii_case(&canonical)||
-                (!query.contains('/')&&id.split_once('/').is_some_and(|(_,id)|id.eq_ignore_ascii_case(query))))).collect();
+            (m["id"].as_str().is_some_and(|id|id.eq_ignore_ascii_case(&canonical)||
+                (!query.contains('/')&&id.split_once('/').is_some_and(|(_,id)|id.eq_ignore_ascii_case(query))))
+             ||m["aliases"].as_array().is_some_and(|aliases|aliases.iter().any(|alias|alias.as_str().is_some_and(|alias|
+                if let Some((provider,needle))=canonical.split_once('/'){
+                    m["provider"].as_str().is_some_and(|p|p.eq_ignore_ascii_case(provider))&&alias.eq_ignore_ascii_case(needle)
+                }else{alias.eq_ignore_ascii_case(query)}))))).collect();
         let found=if exact.is_empty(){self.matching_models(query)}else{exact.into_iter().cloned().collect()};
         if found.is_empty(){return Err(format!("No model matches {query}; /model list shows known/configured models").into());}
         if found.len()!=1{
             return Err(format!("Model query is ambiguous: {}. Use a full provider/model ID.",
                 found.iter().take(16).filter_map(|m|m["id"].as_str()).collect::<Vec<_>>().join(", ")).into());
         }
+        if found[0]["metadata_complete"]==false{return Err("model discovered without capability metadata; declare its API/context/capabilities in config.json first".into());}
+        if found[0]["available"]==false&&found[0]["user_declared"]!=true{return Err("model not offered in the last account catalog; /model list refresh to check availability".into());}
         let model=found[0]["id"].as_str().unwrap();
-        self.check_system_budget(self.model_limit(model)?)?;
+        self.check_model_system_budget(model,self.model_limit(model)?)?;
         self.set_model(model.into())?;
         if self.validate_effort(&self.effort).is_err(){
-            self.effort="medium".into();self.event("notice",json!({"text":"Previous effort unsupported by this model; reset to medium."}));
+            self.effort=found[0]["default_effort"].as_str().unwrap_or("medium").into();
+            self.event("notice",json!({"text":format!("Previous effort unsupported by this model; reset to {}.",self.effort)}));
         }
         self.save_session_settings()?;
-        self.event("notice",json!({"text":format!("Model: {} [{}]",self.model,self.effort)}));Ok(())
+        self.event("notice",json!({"text":format!("Model: {} [{}]",self.model,self.effort)}));
+        if found[0]["deprecated"]==true{self.event("notice",json!({"text":"This legacy Codex model is deprecated for ChatGPT sign-in. Try /model codex/sol61 or /model codex/luna6; availability depends on your account/workspace."}));}
+        Ok(())
     }
     fn validate_effort(&self,effort:&str)->Result<()>{
         if !["off","minimal","low","medium","high","xhigh","max"].contains(&effort){
-            return Err("Unsupported effort: choose off, minimal, low, medium, high or xhigh; max is Opus 4.6 only".into());
+            return Err("Unsupported effort: choose off, minimal, low, medium, high, xhigh or max (model-dependent)".into());
         }
-        if effort=="max"{
-            let meta=self.reasoning_metadata(&self.model);
-            if meta["reasoning"]!=true||meta["api"]!="anthropic-messages"||!self.model.contains("claude-opus-4-6"){
-                return Err("Effort max unsupported by this model (Opus 4.6 only)".into());
-            }
+        let meta=self.reasoning_metadata(&self.model);
+        if let Some(levels)=meta["reasoning_efforts"].as_array(){
+            if !levels.iter().any(|level|level==effort){return Err(format!("Effort {effort} unsupported by this model; supported: {}",meta["reasoning_efforts"]).into());}
+        }else if effort=="max"&&!(meta["reasoning"]==true&&meta["api"]=="anthropic-messages"&&self.model.contains("claude-opus-4-6")){
+            return Err("Effort max unsupported by this model; requires explicit capability metadata or Opus 4.6".into());
         }
         Ok(())
     }
@@ -4935,11 +5114,14 @@ impl Host{
     }
     fn list_models(&self,query:&str){
         let found=self.matching_models(query);
-        let mut table="## Models (known/configured; offline inventory)\n\n| Model | Authentication | Context |\n| --- | --- | ---: |\n".to_string();
+        let mut table="## Models (built-in/configured/cached inventory)\n\n| Model | Authentication | Context |\n| --- | --- | ---: |\n".to_string();
         for model in found{
-            let ready=if model["credential_backed"]==true{"credentials present"}
+            let ready=if model["metadata_complete"]==false{"needs capability metadata"}
+                else if model["available"]==false&&model["user_declared"]!=true{"not in account catalog"}
+                else if model["credential_backed"]==true{"credentials present"}
                 else if model["ready"]==true{"local/anonymous"}else{"login needed"};
-            table.push_str(&format!("| {} | {} | {} |\n",model["id"].as_str().unwrap_or(""),ready,model["context_limit"]));
+            table.push_str(&format!("| {}{} | {} | {} |\n",model["id"].as_str().unwrap_or(""),
+                if model["deprecated"]==true{" (deprecated for subscription)"}else{""},ready,model["context_limit"]));
         }
         self.event("say",json!({"text":table}));
     }
@@ -4979,11 +5161,16 @@ impl Host{
         match command{
             "/quit"|"/exit"=>{self.bg_guard(transition_cancel(args)?)?;return Ok(false);},
             "/tasks"|"/task"|"/bg"|"/wakeups"|"/wakeup"=>self.ui_background_command(command,args)?,
-            "/help"|"/hotkeys"=>self.ui_text("py — ordinary persistent Python, unrestricted execution.\nOrdinary Python. No sandbox.\n! shell / @ Python: hidden from the model; !! / @@: visible.\nTab: fuzzy picker for commands, arguments, Python names, executables and files.\nType to filter; arrows/Tab move, Enter selects (not submits); Esc cancels.\nShift+Enter inserts newline on supported terminals; Ctrl-J is a fallback.\nContinuation lines align after the two-column > prompt.\nPython brackets/suites and bracketed multiline paste form a single cell.\nCtrl-D: exit idle editor. Ctrl-C: clear editor / cancel active operation.\n/model list [query] /models [query]: offline model inventory\n/model <provider/id or fuzzy query>: select, rejecting ambiguity\n/effort <off|minimal|low|medium|high|xhigh> (/think, /thinking)\n/login [provider] [browser|manual|device|api-key] /logout [provider] /auth\n/status /context /config /recovery /session /sessions\n/config get <key> | set <key> <JSON-value> | unset <key> | reload\nDurable entries: ~/.py/skills/*.md (or PY_HOME); ordinary file editing, no skills API.\nCore entries and inventory freeze on /new; reset/resume preserve that snapshot.\nCore Python runs unrestricted in every fresh main worker; prefer definitions/imports.\n/new /resume <path or fuzzy session> /reset /compact [instructions]\n/tasks [state] /task <id> /task logs <id> [stdout|stderr|both]\n/task kill <id> [--force] /bg shell|python <source>\n/wakeups /wakeup cancel|run <id>\n/quit, /new and /resume require --cancel-tasks while jobs run.\nH stores full history; previews show at most 12 original lines.\nSession resume restores H/context/settings, never Python variables or execution.\n/quit: exit. Browser OAuth: Codex callback, Anthropic hidden code paste.\nUnsupported provider protocols and live subscription parity are not claimed."),
+            "/help"|"/hotkeys"=>self.ui_text("py — ordinary persistent Python, unrestricted execution.\nOrdinary Python. No sandbox.\n! shell / @ Python: hidden from the model; !! / @@: visible.\nTab: fuzzy picker for commands, arguments, Python names, executables and files.\nType to filter; arrows/Tab move, Enter selects (not submits); Esc cancels.\nShift+Enter inserts newline on supported terminals; Ctrl-J is a fallback.\nContinuation lines align after the two-column > prompt.\nPython brackets/suites and bracketed multiline paste form a single cell.\nCtrl-D: exit idle editor. Ctrl-C: clear editor / cancel active operation.\n/model list [query] /models [query]: cached inventory, refreshed when stale\n/model list refresh [provider] /models refresh [provider]: force refresh\n/model <provider/id or fuzzy query>: select, rejecting ambiguity\n/effort <off|minimal|low|medium|high|xhigh> (/think, /thinking)\n/login [provider] [browser|manual|device|api-key] /logout [provider] /auth\n/status /context /config /recovery /session /sessions\n/config get <key> | set <key> <JSON-value> | unset <key> | reload\nDurable entries: ~/.py/skills/*.md (or PY_HOME); ordinary file editing, no skills API.\nCore entries and inventory freeze on /new; reset/resume preserve that snapshot.\nCore Python runs unrestricted in every fresh main worker; prefer definitions/imports.\n/new /resume <path or fuzzy session> /reset /compact [instructions]\n/tasks [state] /task <id> /task logs <id> [stdout|stderr|both]\n/task kill <id> [--force] /bg shell|python <source>\n/wakeups /wakeup cancel|run <id>\n/quit, /new and /resume require --cancel-tasks while jobs run.\nH stores full history; previews show at most 12 original lines.\nSession resume restores H/context/settings, never Python variables or execution.\n/quit: exit. Browser OAuth: Codex callback, Anthropic hidden code paste.\nUnsupported provider protocols and live subscription parity are not claimed."),
             "/model" if args.is_empty()=>self.ui_text(&self.model),
-            "/model" if args=="list"||args.starts_with("list ")=>self.list_models(args.strip_prefix("list").unwrap().trim()),
-            "/model"=>self.choose_model(args)?,
-            "/models"=>self.list_models(args),
+            "/model" if args=="list"||args.starts_with("list ")=>self.model_list_command(args.strip_prefix("list").unwrap().trim())?,
+            "/model"=>{
+                let provider=args.split_once('/').map(|p|provider_alias(p.0).to_string()).unwrap_or_else(||self.model.split_once('/').map_or("openai",|p|provider_alias(p.0)).to_string());
+                let cancel_revision=self.cancel_revision;self.maybe_refresh_model_catalog(&provider);
+                if self.cancel_revision!=cancel_revision{return Err("model selection cancelled; previous selection retained".into());}
+                self.choose_model(args)?;
+            },
+            "/models"=>self.model_list_command(args)?,
             "/effort"|"/think"|"/thinking"=>if args.is_empty(){self.ui_text(&self.effort);}else{self.change_effort(args)?;},
             "/login"=>self.interactive_login(args)?,
             "/logout"=>if args.is_empty(){
@@ -5216,7 +5403,7 @@ fn cli()->Result<()>{
                     "--effort"=>{
                         let value=value.to_lowercase();
                         if !["off","minimal","low","medium","high","xhigh","max"].contains(&value.as_str()){
-                            return Err("Unsupported effort: off, minimal, low, medium, high, xhigh or max (Opus 4.6 only)".into());
+                            return Err("Unsupported effort: off, minimal, low, medium, high, xhigh or max (model-dependent)".into());
                         }
                         if effort.replace(value).is_some(){return Err("--effort specified more than once".into());}
                     },
@@ -5229,7 +5416,7 @@ fn cli()->Result<()>{
         i+=1;
     }
     if help{
-        ui_text("Usage: py [options]\nPersistent ordinary Python + a Python-writing model. No sandbox.\n\n--model <provider/id or unique fuzzy query>: choose a known/configured model\n--effort <off|minimal|low|medium|high|xhigh|max>: reasoning preference (max: Opus 4.6)\n--session <path>, --resume <path>: restore an existing journal; fresh Python, no replay\n--no-model: local Python/shell mode, no automatic model turns\n--json: write versioned JSONL events to stdout instead of human previews\n--json-input: read JSONL commands from stdin instead of the editor\n--spec: print the embedded specification and coverage ledger\n--help, -h: show this help without starting Python or creating files\n--version, -V: show the version without creating files\n\nJSON input and output are independent; combine --json --json-input for automation.\nPY_HOME chooses global state storage (default ~/.py); PY_MODEL/config.json choose defaults.\nCLI model/effort override restored session settings and are saved in that session, not global defaults.\nInteractive: /help, /login, /model list, /new, /resume. Tab fuzzily completes.\n! / @: hidden shell / Python; !! / @@: visible. Empty prompts are ignored.\nThere are no positional prompts or CLI API-key flags; use hidden /login entry.");
+        ui_text("Usage: py [options]\nPersistent ordinary Python + a Python-writing model. No sandbox.\n\n--model <provider/id or unique fuzzy query>: choose a known/configured model\n--effort <off|minimal|low|medium|high|xhigh|max>: reasoning preference (supported levels depend on the model)\n--session <path>, --resume <path>: restore an existing journal; fresh Python, no replay\n--no-model: local Python/shell mode, no automatic model turns\n--json: write versioned JSONL events to stdout instead of human previews\n--json-input: read JSONL commands from stdin instead of the editor\n--spec: print the embedded specification and coverage ledger\n--help, -h: show this help without starting Python or creating files\n--version, -V: show the version without creating files\n\nJSON input and output are independent; combine --json --json-input for automation.\nPY_HOME chooses global state storage (default ~/.py); PY_MODEL/config.json choose defaults.\nCLI model/effort override restored session settings and are saved in that session, not global defaults.\nInteractive: /help, /login, /model list, /new, /resume. Tab fuzzily completes.\n! / @: hidden shell / Python; !! / @@: visible. Empty prompts are ignored.\nThere are no positional prompts or CLI API-key flags; use hidden /login entry.");
         return Ok(());
     }
     if version{println!("py {} (transition)",env!("CARGO_PKG_VERSION"));return Ok(());}
@@ -6012,6 +6199,9 @@ impl CompletionCatalog{
             let (start,_)=completion_token(prefix,arg_start);let raw_word=&prefix[start..];let word=if all{""}else{raw_word};
             if command=="/model"||command=="/models"{
                 if command=="/model"&&start==arg_start{if let Some(score)=fuzzy_score(word,"list"){items.push((score,"list".into(),"list".into()));}}
+                if line[..start].trim_end()=="/model list"||line[..start].trim_end()=="/models"{
+                    if let Some(score)=fuzzy_score(word,"refresh"){items.push((score,"refresh".into(),"refresh".into()));}
+                }
                 if let Some(models)=self.models.as_array(){for model in models{
                     if model["image_output"]==true{continue;}
                     let Some(id)=model["id"].as_str()else{continue;};
@@ -6026,14 +6216,22 @@ impl CompletionCatalog{
                             }
                         }
                     }
-                    let score=fuzzy_score(word,&value).or_else(||fuzzy_score(word,name).map(|s|s-100));
-                    if let Some(score)=score{items.push((score,format!("{value}  {name}"),value));}
+                    let score=fuzzy_score(word,&value).or_else(||fuzzy_score(word,name).map(|s|s-100))
+                        .or_else(||model["aliases"].as_array().and_then(|aliases|aliases.iter().filter_map(|a|a.as_str().and_then(|a|{
+                            let alias=if raw_word.contains('/'){format!("{}/{a}",value.split_once('/').unwrap().0)}else{a.into()};fuzzy_score(word,&alias)
+                        })).max()));
+                    if let Some(score)=score{
+                        let aliases=model["aliases"].as_array().map(|a|a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+                        let display=if aliases.is_empty(){format!("{value}  {name}")}else{format!("{value}  {name}  [{aliases}]")};
+                        items.push((score,display,value));
+                    }
                 }}
             }else if matches!(command,"/effort"|"/think"|"/thinking"){
-                let max=self.current_model.contains("claude-opus-4-6")&&self.models.as_array().is_some_and(|models|
-                    models.iter().any(|m|m["id"]==self.current_model&&m["reasoning"]==true&&m["api"]=="anthropic-messages"));
+                let model=self.models.as_array().and_then(|models|models.iter().find(|m|m["id"]==self.current_model));
+                let supported=model.and_then(|m|m["reasoning_efforts"].as_array());
+                let max=model.is_some_and(|m|m["reasoning"]==true&&m["api"]=="anthropic-messages"&&self.current_model.contains("claude-opus-4-6"));
                 for effort in ["off","minimal","low","medium","high","xhigh","max"]{
-                    if effort=="max"&&!max{continue;}
+                    if supported.map_or(effort=="max"&&!max,|levels|!levels.iter().any(|level|level==effort)){continue;}
                     if let Some(score)=fuzzy_score(word,effort){items.push((score,effort.into(),effort.into()));}
                 }
             }else if matches!(command,"/login"|"/logout"|"/auth"){
@@ -6484,15 +6682,16 @@ impl Host{
         Ok(())
     }
     fn model_limit(&self,model:&str)->Result<usize>{
+        let canonical=model.split_once('/').map(|(p,id)|format!("{}/{id}",provider_alias(p))).unwrap_or(model.into());
         let models=self.models();
-        let mut limit=models.as_array().unwrap().iter().find(|v|v["id"]==model)
+        let mut limit=models.as_array().unwrap().iter().find(|v|v["id"]==canonical)
             .and_then(|descriptor|descriptor["context_limit"].as_u64()).map_or(self.context_limit,|n|n as usize);
         if let Ok(value)=std::env::var("PY_CONTEXT_LIMIT"){limit=value.parse()?;}
         Ok(limit)
     }
     fn set_model(&mut self,model:String)->Result<()>{
         let limit=self.model_limit(&model)?;
-        if self.startup_ready{self.check_system_budget(limit)?;}
+        if self.startup_ready{self.check_model_system_budget(&model,limit)?;}
         self.context_limit=limit;self.model=model;Ok(())
     }
     fn status(&self)->Value{json!({"state":self.state.label(),"cells":self.cells,"active_cell":self.active_cell,
@@ -6549,6 +6748,20 @@ impl Host {
         self.store_credential(&provider,Some(json!({"type":"api_key","key":key})))
     }
     fn logout(&mut self,provider:&str)->Result<()>{self.store_credential(provider,None)}
+    fn select_model_after_login(&mut self,provider:&str){
+        // Login must never disguise selection failures as authentication failures,
+        // override a usable model, or write a global model default.
+        let cancel_revision=self.cancel_revision;self.maybe_refresh_model_catalog(provider);
+        if self.cancel_revision!=cancel_revision{return;}
+        if self.provider_config(&self.model).is_ok(){return;}
+        let models=self.models();
+        let candidates:Vec<_>=models.as_array().unwrap().iter().filter(|m|m["provider"]==provider
+            &&m["ready"]==true&&m["image_output"]!=true&&m["deprecated"]!=true).collect();
+        let selected=candidates.iter().find(|m|m["id"]=="openai-codex/gpt-6.1-sol").or_else(||candidates.first());
+        if let Some(model)=selected.and_then(|m|m["id"].as_str()){
+            if let Err(error)=self.choose_model(model){self.event("notice",json!({"text":format!("Credentials stored, but model selection failed: {error}. Use /model to select a usable model.")}));}
+        }else{self.event("notice",json!({"text":"Credentials stored; no usable known/configured model for this provider. Use /model to select a model."}));}
+    }
     fn interactive_login(&mut self,arguments:&str)->Result<()>{
         if arguments.is_empty(){return self.interactive_login_inner(arguments);}
         self.with_state(UiState::Login,None,|host|host.interactive_login_inner(arguments))
@@ -6582,7 +6795,8 @@ impl Host {
             },
             _=>return Err(format!("Unsupported login method for {provider}; /login lists available methods (never put a credential in the command)").into())
         }
-        self.ui_text(&format!("Stored credentials for {provider}. Live provider compatibility is not verified by login alone."));Ok(())
+        self.ui_text(&format!("Stored credentials for {provider}. Live provider compatibility is not verified by login alone."));
+        self.select_model_after_login(&provider);Ok(())
     }
 }
 
@@ -7501,22 +7715,57 @@ impl Host{
         }
         let session=self.journal.path.file_stem().and_then(|s|s.to_str()).unwrap_or("py-session");
         let mut body=json!({"model":id,"store":false,"stream":true,"instructions":instructions.join("\n"),"input":input,
-            "text":{"verbosity":"low"},"include":["reasoning.encrypted_content"],"prompt_cache_key":session});
+            "text":{"verbosity":"medium"},"include":["reasoning.encrypted_content"],"prompt_cache_key":session});
         let effort=self.effort.as_str();
-        if !["off","minimal","low","medium","high","xhigh"].contains(&effort){return Err("Codex effort must be off/minimal/low/medium/high/xhigh".into());}
-        if effort!="off"{body["reasoning"]=json!({"effort":if effort=="minimal"&&(id.starts_with("gpt-5.2")||id.starts_with("gpt-5.3")){"low"}else{effort},"summary":"auto"});}
+        let meta=self.reasoning_metadata(&format!("openai-codex/{id}"));
+        reasoning_fields("openai-codex-responses","openai-codex",id,&meta,effort,4096)?;
+        if effort!="off"||meta["reasoning_efforts"].is_array(){body["reasoning"]=json!({"effort":if effort=="off"{"none"}else if effort=="minimal"&&(id.starts_with("gpt-5.2")||id.starts_with("gpt-5.3")){"low"}else{effort},"summary":"auto"});}
         let endpoint=if url.ends_with("/codex/responses"){url.to_string()}else if url.ends_with("/codex"){format!("{url}/responses")}else{format!("{url}/codex/responses")};
         Ok(client.post(endpoint).bearer_auth(key).header("chatgpt-account-id",self.auth["openai-codex"]["accountId"].as_str().ok_or("Codex account ID missing")?)
             .header("OpenAI-Beta","responses=experimental").header("Accept","text/event-stream").header("originator","py")
             .header("User-Agent","py-rust/0.1.0").header("session-id",session).header("x-client-request-id",session).json(&body))
     }
     fn codex_sse(&mut self,request:reqwest::RequestBuilder,operation:&str)->Result<Value>{
+        let mut secrets=Vec::new();credential_secret_values(&self.auth,&mut secrets);
+        if let Ok((_,key,_))=self.provider_config("openai-codex/gpt-6.1-sol"){if !key.is_empty(){secrets.push(key);}}
         self.codex_wait(async{
-            let response=request.send().await.map_err(|_|"Codex provider network error; outcome unknown")?;
-            if !response.status().is_success(){return Err(format!("Codex provider HTTP {}; no automatic retry",response.status()).into());}
+            let mut response=request.send().await.map_err(|_|"Codex provider network error; outcome unknown")?;
+            let status=response.status();
+            if !status.is_success(){
+                let mut bytes=Vec::new();
+                while let Some(chunk)=response.chunk().await.map_err(|_|"Codex error response disconnected")?{
+                    if bytes.len()+chunk.len()>65536{return Err(format!("Codex provider HTTP {status}; error body exceeds 64 KiB; no automatic retry").into());}
+                    bytes.extend_from_slice(&chunk);
+                }
+                let detail=codex_error_detail(&bytes,&secrets);
+                return Err(format!("Codex provider HTTP {status}{detail}; no automatic retry").into());
+            }
             codex_read_sse(response).await
         },operation)
     }
+}
+fn credential_secret_values(value:&Value,out:&mut Vec<String>){
+    if let Some(object)=value.as_object(){for (key,value) in object{
+        if matches!(key.as_str(),"key"|"access"|"refresh"|"access_token"|"refresh_token"|"id_token"|"accountId"){
+            if let Some(value)=value.as_str().filter(|v|!v.is_empty()){out.push(value.into());}
+        }else{credential_secret_values(value,out);}
+    }}else if let Some(values)=value.as_array(){for value in values{credential_secret_values(value,out);}}
+}
+fn codex_error_detail(bytes:&[u8],secrets:&[String])->String{
+    let Ok(text)=std::str::from_utf8(bytes)else{return ": unreadable error response".into();};
+    let mut detail=if let Ok(body)=serde_json::from_str::<Value>(text){
+        let error=&body["error"];
+        [error["message"].as_str().or(error.as_str()).or(body["message"].as_str()).or(body["detail"].as_str()),
+            error["code"].as_str(),error["param"].as_str()].into_iter().flatten().collect::<Vec<_>>().join("; ")
+    }else{text.to_string()};
+    // Redact before truncation so a token crossing the preview boundary cannot
+    // leak a partial prefix. Never store the raw rejection body in the journal.
+    let mut secrets:Vec<_>=secrets.iter().filter(|s|!s.is_empty()).collect();secrets.sort_by_key(|s|std::cmp::Reverse(s.len()));
+    for secret in secrets{detail=detail.replace(secret,"[redacted]");}
+    let truncated=detail.chars().count()>1024;
+    let mut safe:String=detail.chars().take(1024).map(|c|if c.is_control()||matches!(c,'\u{2028}'|'\u{2029}'){ ' ' }else{c}).collect();
+    if truncated{safe.push_str(" [truncated]");}
+    if safe.trim().is_empty(){String::new()}else{format!(": {}",safe.trim())}
 }
 async fn codex_read_sse(mut response:reqwest::Response)->Result<Value>{
     let mut bytes=Vec::new();let mut data=Vec::new();let mut delta=String::new();let mut total=0usize;
@@ -7611,6 +7860,87 @@ def completed(events,id):return next(v for v in events if v.get('kind')=='comple
             &std::env::var("PY_HARNESS_BIN").expect("build CLI and set PY_HARNESS_BIN")]).output().unwrap();
         assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stderr),String::from_utf8_lossy(&out.stdout));
     }
+    #[test]
+    fn e2e_codex_default_login_selects_current_model_and_outer_turn(){fixture(r#"
+json.dump({'providers':{'openai-codex':{'base_url':base}}},open(home+'/config.json','w'))
+responses.extend([jsonreply({'device_auth_id':'d','user_code':'ABCD','interval':0}),jsonreply({'authorization_code':'code-SECRET','code_verifier':'verifier-SECRET'}),jsonreply(tokens()),(200,sse("agent.say('2')\nagent.loop.stop()"),'text/event-stream')])
+p=subprocess.run([sys.argv[1],'--json','--json-input'],input=''.join(json.dumps(c)+'\n' for c in [login(),{'id':'outer','kind':'submit','text':'1+1'}]),capture_output=True,text=True,env=env,timeout=12)
+assert p.returncode==0,(p.stdout,p.stderr)
+e=[json.loads(l) for l in p.stdout.splitlines()]
+assert completed(e,'login')['status']=='ok' and completed(e,'outer')['status']=='ok',e
+body=json.loads(requests[-1][2]);assert body['model']=='gpt-6.1-sol' and body['text']['verbosity']=='medium',body
+assert body['reasoning']['effort']=='medium' and requests[-1][0]=='/codex/responses',requests
+assert any(v['kind']=='say' and v.get('text')=='2' for v in e),e
+assert 'openai-codex/gpt-6.1-sol' in journals()
+# Later processes use stored Codex only for an implicit, credentialless default.
+e=run([{'id':'status','kind':'status'}]);assert next(v for v in e if v['kind']=='ready')['model']=='openai-codex/gpt-6.1-sol',e
+config=json.load(open(home+'/config.json'));config['model']='openai/gpt-4o';json.dump(config,open(home+'/config.json','w'))
+e=run([{'id':'status','kind':'status'}]);assert next(v for v in e if v['kind']=='ready')['model']=='openai/gpt-4o',e
+# Explicit saved selections remain authoritative on resume.
+config.pop('model');json.dump(config,open(home+'/config.json','w'))
+path=next(v['session'] for v in e if v['kind']=='ready')
+p=subprocess.run([sys.argv[1],'--json','--json-input','--no-model','--resume',path],input='',capture_output=True,text=True,env=env,timeout=12)
+assert p.returncode==0,(p.stdout,p.stderr)
+assert next(json.loads(l) for l in p.stdout.splitlines() if json.loads(l)['kind']=='ready')['model']=='openai/gpt-4o',p.stdout
+assert json.load(open(home+'/config.json')).get('model') is None
+assert all(s not in journals() for s in ['code-SECRET','verifier-SECRET','refresh-SECRET',jwt()])
+"#);}
+    #[test]
+    fn e2e_codex_login_preserves_usable_model_and_cancelled_login(){fixture(r#"
+json.dump({'providers':{'openai-codex':{'base_url':base}}},open(home+'/config.json','w'))
+json.dump({'openai':{'type':'api_key','key':'working-api-SECRET'}},open(home+'/auth.json','w'))
+responses.extend([jsonreply({'device_auth_id':'d','user_code':'ABCD','interval':0}),jsonreply({'authorization_code':'c','code_verifier':'v'}),jsonreply(tokens())])
+e=run([login(),{'id':'status','kind':'status'}])
+assert completed(e,'login')['status']=='ok',e
+assert next(v for v in e if v['kind']=='status')['model']=='openai/gpt-4.1',e
+os.unlink(home+'/auth.json')
+responses.append(jsonreply({'error':'access_denied'},403))
+e=run([login(),{'id':'status','kind':'status'}]);assert any(v['kind']=='error' and v.get('command_id')=='login' for v in e),e
+assert next(v for v in e if v['kind']=='status')['model']=='openai/gpt-4.1',e
+assert 'working-api-SECRET' not in journals(),journals()
+"#);}
+    #[test]
+    fn e2e_codex_http_rejection_details_redaction_bounds_and_no_retry(){fixture(r#"
+auth(time.time()*1000+3600000)
+responses.append(jsonreply({'error':{'message':'Model unavailable for subscription. '+jwt()+' refresh-SECRET acct_fixture\n\x1b[31m','code':'model_not_found','param':'model'}},400))
+e=run([py("agent.llm('hello',model='codex/gpt-5.3-codex')")]);assert completed(e,'python')['status']=='error',e
+assert len(requests)==1,requests
+j=journals();assert 'Model unavailable for subscription' in j and 'model_not_found' in j and '[redacted]' in j,j
+assert all(s not in j and s not in json.dumps(e) for s in [jwt(),'refresh-SECRET','acct_fixture']),e
+assert '\\u001b' not in j,j
+responses.append(jsonreply({'error':{'message':'x'*80000}},400))
+e=run([py("agent.llm('hello',model='codex/gpt-5.3-codex')")]);assert completed(e,'python')['status']=='error',e
+assert len(requests)==2 and 'error body exceeds 64 KiB' in journals(),requests
+"#);}
+    #[test]
+    fn e2e_codex_separate_input_limit_accounting_and_predispatch_rejection(){
+        assert_eq!(super::model_input_budget(1050000,&serde_json::json!({"max_input_tokens":922000}),4096),922000);
+        assert_eq!(super::model_input_budget(32000,&serde_json::json!({"max_input_tokens":922000}),4096),27904);
+        fixture(r#"
+config=json.load(open(home+'/config.json'));config['model']='openai-codex/gpt-6.1-sol';json.dump(config,open(home+'/config.json','w'))
+e=run([py("agent.llm('x'*(258400*3),model='codex/gpt-6.1-sol')")])
+ready=next(v for v in e if v['kind']=='ready');usage=ready['context_usage']
+assert usage['model_context_limit']==272000 and usage['input_token_budget']==258400,usage
+assert usage['remaining_input_tokens']==258400-usage['estimated_input_tokens'],usage
+assert completed(e,'python')['status']=='error',e
+assert not requests,requests
+assert 'exceeds model input budget 258400' in journals(),journals()
+"#);}
+    #[test]
+    fn e2e_codex_current_model_alias_effort_and_catalog(){fixture(r#"
+auth(time.time()*1000+3600000)
+responses.extend([(200,sse('sol-answer'),'text/event-stream'),(200,sse('luna-answer'),'text/event-stream')])
+commands='/model codex/sol61\n/effort max\n@print(agent.llm("hello",model="codex/gpt-6.1-sol"))\n/effort minimal\n/model codex/luna6\n/effort off\n@print(agent.llm("hello",model="codex/gpt-6-luna"))\n'
+p=subprocess.run([sys.argv[1],'--json','--no-model'],input=commands,capture_output=True,text=True,env=env,timeout=12)
+assert p.returncode==0,(p.stdout,p.stderr)
+e=[json.loads(l) for l in p.stdout.splitlines()]
+completed_python=[v for v in e if v['kind']=='completed'];assert len(completed_python)==2 and all(v['status']=='ok' for v in completed_python),e
+assert any(v['kind']=='error' and 'unsupported' in v.get('error','') for v in e),e
+assert len(requests)==2,requests
+bodies=[json.loads(r[2]) for r in requests]
+assert bodies[0]['model']=='gpt-6.1-sol' and bodies[0]['reasoning']['effort']=='max',bodies
+assert bodies[1]['model']=='gpt-6-luna' and bodies[1]['reasoning']['effort']=='none',bodies
+"#);}
     #[test]
     fn e2e_codex_device_login_pending_and_protocol_sse(){fixture(r#"
 responses.extend([jsonreply({'device_auth_id':'device-SECRET','user_code':'ABCD','interval':'0'}),jsonreply('',403),jsonreply({'authorization_code':'code-SECRET','code_verifier':'verifier-SECRET'}),jsonreply(tokens()),(200,sse('answer'),'text/event-stream')])
@@ -8834,14 +9164,14 @@ for args in [['--wat'],['--model'],['--effort'],['--session'],['--resume'],['--m
     #[test]
     fn e2e_json_startup_fuzzy_model_effort_and_configured_exact(){check(r#"
 os.makedirs(home)
-json.dump({'model':'openai/gpt-4o','providers':{'unlisted':{'base_url':'http://localhost:1','models':[{'id':'fixture-model','api':'openai-completions','context_limit':64000}]},'openai-codex':{'models':[{'id':'sol-6.1','api':'openai-codex-responses','context_limit':512000,'reasoning':True}]}}},open(home+'/config.json','w'))
+json.dump({'model':'openai/gpt-4o','providers':{'unlisted':{'base_url':'http://localhost:1','models':[{'id':'fixture-model','api':'openai-completions','context_limit':64000}]},'openai-codex':{'models':[{'id':'fixture-6.1','api':'openai-codex-responses','context_limit':512000,'reasoning':True}]}}},open(home+'/config.json','w'))
 commands=json.dumps({'id':'status','kind':'status'})+'\n'
-for model,expected in [('codex/53cod','openai-codex/gpt-5.3-codex'),('unlisted/fixture-model','unlisted/fixture-model'),('codex/sol61','openai-codex/sol-6.1')]:
+for model,expected in [('codex/53cod','openai-codex/gpt-5.3-codex'),('unlisted/fixture-model','unlisted/fixture-model'),('codex/fixture61','openai-codex/fixture-6.1')]:
  p=run(['--json','--json-input','--no-model','--model',model,'--effort','low'],commands)
  values=events(p)
  status=next(v for v in values if v['kind']=='status')
  ready=next(v for v in values if v['kind']=='ready')
- assert ready['context_usage']['model_context_limit']=={'codex/53cod':400000,'unlisted/fixture-model':64000,'codex/sol61':512000}[model],values
+ assert ready['context_usage']['model_context_limit']=={'codex/53cod':400000,'unlisted/fixture-model':64000,'codex/fixture61':512000}[model],values
  assert status['model']==expected and status['effort']=='low',values
  assert any(v['kind']=='notice' and expected in v['text'] for v in values),values
  assert any(v['kind']=='settings_change' and v['payload']['effort']=='low' for v in records()),records()
@@ -8887,7 +9217,7 @@ p=run(['--no-model'],'\n  \n');assert p.returncode==0,(p.stdout,p.stderr)
     #[test]
     fn e2e_tab_effort_capabilities_and_unlisted_login_provider(){check(r#"
 import pty,fcntl,termios,select,time
-os.makedirs(home);json.dump({'providers':{'custom-unlisted':{'base_url':'http://localhost:1'},'openai-codex':{'models':[{'id':'sol-6.1','api':'openai-codex-responses','context_limit':512000,'reasoning':True}]}}},open(home+'/config.json','w'))
+os.makedirs(home);json.dump({'providers':{'custom-unlisted':{'base_url':'http://localhost:1'},'openai-codex':{'models':[{'id':'fixture-6.1','api':'openai-codex-responses','context_limit':512000,'reasoning':True}]}}},open(home+'/config.json','w'))
 def probe(model,want_max):
  m,s=pty.openpty()
  def tty():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
@@ -8909,14 +9239,16 @@ def probe(model,want_max):
   os.write(m,b'\x03');ready(start)
   start=len(data);os.write(m,b'/logout cstmted\t\r');ready(start)
   start=len(data);os.write(m,b'/model codex/sol61\t\r');ready(start)
+  assert any(v['kind']=='settings_change' and v['payload']['model']=='openai-codex/gpt-6.1-sol' for v in records()),records()
+  start=len(data);os.write(m,b'/model codex/fixture61\t\r');ready(start)
   os.write(m,b'/quit\r');p.wait(timeout=3)
   history=open(home+'/editor-history').read()
-  assert '/logout custom-unlisted' in history and '/model codex/sol-6.1' in history,(history,data)
-  assert any(v['kind']=='settings_change' and v['payload']['model']=='openai-codex/sol-6.1' for v in records()),records()
+  assert '/logout custom-unlisted' in history and '/model codex/fixture-6.1' in history,(history,data)
+  assert any(v['kind']=='settings_change' and v['payload']['model']=='openai-codex/fixture-6.1' for v in records()),records()
  finally:
   if p.poll() is None:p.kill();p.wait()
   os.close(m)
-probe('openai/gpt-4.1',False);probe('anthropic/claude-opus-4-6',True)
+probe('openai/gpt-4.1',False);probe('anthropic/claude-opus-4-6',True);probe('codex/sol61',True)
 "#);}
 }
 
@@ -11094,6 +11426,749 @@ assert not any(v['kind']=='task_settled' for v in r),r[-3:]
 }
 
 // Durable entries remain ordinary files; only initialization interprets them.
+// Pure, bounded catalog normalization. Remote instructions and tool metadata
+// are intentionally never copied into normalized descriptors.
+fn catalog_safe_id(id:&str)->bool{
+    !id.is_empty()&&id.len()<=128&&id.bytes().all(|c|c.is_ascii_alphanumeric()||matches!(c,b'.'|b'_'|b'-'))
+}
+// OpenAI fine-tuned model IDs contain colons; Codex native slugs do not.
+fn catalog_api_id(id:&str)->bool{
+    !id.is_empty()&&id.len()<=128&&id.bytes().all(|c|c.is_ascii_alphanumeric()||matches!(c,b'.'|b'_'|b'-'|b':'))
+}
+fn catalog_safe_label(text:&str,max:usize)->bool{
+    !text.trim().is_empty()&&text.chars().count()<=max
+        &&!text.chars().any(|c|c.is_control()||matches!(c,'\u{2028}'|'\u{2029}'))
+}
+fn catalog_optional_limit(item:&Value,key:&str)->Result<Option<u64>>{
+    match item.get(key){
+        None|Some(Value::Null)=>Ok(None),
+        Some(value)=>{
+            let n=value.as_u64().filter(|n|(1..=16777216).contains(n))
+                .ok_or_else(||format!("Invalid model catalog {key}: expected an integer in 1..=16777216"))?;
+            Ok(Some(n))
+        }
+    }
+}
+fn catalog_effort(effort:&str)->Option<&str>{
+    match effort{
+        "none"=>Some("off"),
+        "off"|"minimal"|"low"|"medium"|"high"|"xhigh"|"max"=>Some(effort),
+        _=>None,
+    }
+}
+fn catalog_aliases(slug:&str,base:Option<&Value>)->Vec<String>{
+    let mut aliases=base.and_then(|m|m["aliases"].as_array()).map(|values|values.iter()
+        .filter_map(Value::as_str).filter(|s|catalog_safe_id(s)).map(str::to_string).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some((version,kind))=slug.strip_prefix("gpt-").and_then(|s|s.rsplit_once('-')){
+        if ["sol","astra","luna","terra"].contains(&kind)&&!version.is_empty()
+            &&!version.starts_with('.')&&!version.ends_with('.')
+            &&version.bytes().all(|c|c.is_ascii_digit()||c==b'.'){
+            let alias=format!("{kind}{}",version.replace('.',""));
+            if catalog_safe_id(&alias)&&!aliases.contains(&alias){aliases.push(alias);}
+        }
+    }
+    aliases
+}
+fn normalize_codex_catalog(body:&Value,base:&[Value])->Result<Vec<Value>>{
+    let entries=body["models"].as_array().ok_or("Codex model catalog requires a models array")?;
+    if entries.len()>2048{return Err("Codex model catalog exceeds 2048 entries".into());}
+    let mut seen=std::collections::HashSet::new();
+    let mut normalized=Vec::new();
+    for item in entries{
+        let slug=item["slug"].as_str().filter(|id|catalog_safe_id(id)).ok_or("Invalid Codex catalog model slug")?;
+        if !seen.insert(slug){return Err(format!("Duplicate Codex catalog model slug: {slug}").into());}
+        let name=item["display_name"].as_str().filter(|s|catalog_safe_label(s,256))
+            .ok_or("Invalid Codex catalog model display_name")?;
+        let visibility=item["visibility"].as_str().filter(|s|matches!(*s,"list"|"hide"|"none"))
+            .ok_or("Invalid Codex catalog model visibility")?;
+        let context=catalog_optional_limit(item,"context_window")?;
+        let maximum=catalog_optional_limit(item,"max_context_window")?;
+        let context=context.or(maximum);
+        let percent=match item.get("effective_context_window_percent"){
+            None=>95,
+            Some(value)=>value.as_u64().filter(|n|(1..=100).contains(n))
+                .ok_or("Invalid Codex effective_context_window_percent")?,
+        };
+        let input=context.map(|n|n*percent/100);
+        if input==Some(0){return Err("Codex effective input limit must be positive".into());}
+        let priority=match item.get("priority"){
+            None=>i32::MAX as i64,
+            Some(value)=>value.as_i64().filter(|n|(i32::MIN as i64..=i32::MAX as i64).contains(n))
+                .ok_or("Invalid Codex catalog priority")?,
+        };
+        let mut levels=Vec::new();
+        match item.get("supported_reasoning_levels"){
+            None=>{},
+            Some(value)=>{
+                for level in value.as_array().filter(|a|a.len()<=32).ok_or("Invalid Codex supported_reasoning_levels")?{
+                    let effort=level["effort"].as_str().filter(|s|catalog_safe_id(s)&&s.len()<=32)
+                        .ok_or("Invalid Codex reasoning effort preset")?;
+                    if let Some(effort)=catalog_effort(effort){
+                        if !levels.contains(&effort){levels.push(effort);}
+                    }
+                }
+            }
+        }
+        let preferred=match item.get("default_reasoning_level"){
+            None|Some(Value::Null)=>None,
+            Some(value)=>Some(value.as_str().filter(|s|catalog_safe_id(s)&&s.len()<=32)
+                .ok_or("Invalid Codex default_reasoning_level")?),
+        };
+        let default=preferred.and_then(catalog_effort).filter(|s|levels.contains(s))
+            .or_else(||if levels.contains(&"medium"){Some("medium")}else{levels.first().copied()});
+        let image_input=match item.get("input_modalities"){
+            None=>true, // The native schema's documented default.
+            Some(value)=>{
+                let modalities=value.as_array().filter(|a|a.len()<=32).ok_or("Invalid Codex input_modalities")?;
+                for modality in modalities{
+                    if !modality.as_str().is_some_and(|s|catalog_safe_id(s)&&s.len()<=32){
+                        return Err("Invalid Codex input modality".into());
+                    }
+                }
+                modalities.iter().any(|v|v=="image")
+            }
+        };
+        // Validate hidden descriptors too: never accept a partial malformed catalog.
+        if visibility!="list"{continue;}
+        let id=format!("openai-codex/{slug}");
+        let known=base.iter().find(|m|m["id"]==id);
+        normalized.push(json!({"id":id,"name":name,"provider":"openai-codex",
+            "api":"openai-codex-responses","aliases":catalog_aliases(slug,known),
+            "context_limit":context,"max_input_tokens":input,"reasoning":!levels.is_empty(),
+            "reasoning_efforts":levels,"default_effort":default,"image_input":image_input,
+            "image_output":false,"deprecated":false,"priority":priority,
+            "metadata_complete":context.is_some()&&!levels.is_empty(),
+            "available":true,"source":"provider-discovery"}));
+    }
+    normalized.sort_by(|a,b|a["priority"].as_i64().cmp(&b["priority"].as_i64())
+        .then_with(||a["id"].as_str().cmp(&b["id"].as_str())));
+    Ok(normalized)
+}
+fn normalize_openai_catalog(body:&Value,base:&[Value],provider:&str)->Result<Vec<Value>>{
+    if !catalog_safe_id(provider){return Err("Invalid model catalog provider ID".into());}
+    let entries=body["data"].as_array().ok_or("API model catalog requires a data array")?;
+    if entries.len()>2048{return Err("API model catalog exceeds 2048 entries".into());}
+    let mut seen=std::collections::HashSet::new();
+    let mut normalized=Vec::new();
+    for entry in entries{
+        let slug=entry["id"].as_str().filter(|id|catalog_api_id(id)).ok_or("Invalid API catalog model ID")?;
+        if !seen.insert(slug){return Err(format!("Duplicate API catalog model ID: {slug}").into());}
+        let id=format!("{provider}/{slug}");
+        let known=base.iter().find(|m|m["id"]==id);
+        let mut model=json!({"id":id,"name":slug,"provider":provider,"context_limit":null,
+            "metadata_complete":false,"available":true,"source":"provider-discovery"});
+        if let Some(known)=known{
+            // /models proves availability only, not protocol or capabilities.
+            for key in ["name","api","context_limit","max_input_tokens","max_tokens","image_input",
+                "image_output","reasoning","reasoning_efforts","default_effort","aliases","deprecated"]{
+                if let Some(value)=known.get(key){model[key]=value.clone();}
+            }
+            model["metadata_complete"]=json!(known["metadata_complete"]!=false
+                &&known["context_limit"].as_u64().is_some_and(|n|(1..=16777216).contains(&n))
+                &&known["api"].as_str().is_some_and(|s|!s.is_empty()));
+        }
+        normalized.push(model);
+    }
+    normalized.sort_by(|a,b|a["id"].as_str().cmp(&b["id"].as_str()));
+    Ok(normalized)
+}
+
+const MODEL_CATALOG_MAX_BYTES:u64=8*1024*1024;
+// Native catalog compatibility revision, not this harness's package version.
+// Current upstream metadata requires 0.153/0.155 for the GPT-6 family.
+fn model_catalog_defaults()->Value{json!({"auto_refresh":true,"refresh_interval_seconds":3600,"retry_interval_seconds":300,"codex_client_version":"0.155.0"})}
+fn model_catalog_options(config:&Value)->Result<Value>{
+    let mut options=model_catalog_defaults();
+    if let Some(value)=config.get("model_catalog"){
+        for (key,value) in value.as_object().ok_or("model_catalog must be an object")?{
+            if options.get(key).is_none(){return Err(format!("unknown model_catalog option {key}").into());}
+            if key=="auto_refresh"{if !value.is_boolean(){return Err("model_catalog.auto_refresh must be boolean".into());}}
+            else if key=="codex_client_version"{
+                if !value.as_str().is_some_and(|s|s.len()<=32&&s.split('.').count()==3&&s.split('.').all(|p|!p.is_empty()&&p.bytes().all(|b|b.is_ascii_digit())&&p.parse::<u32>().is_ok())){return Err("model_catalog.codex_client_version must be a numeric major.minor.patch string".into());}
+            }
+            else if !value.as_u64().is_some_and(|n|(1..=604800).contains(&n)){return Err(format!("model_catalog.{key} must be an integer in 1..=604800").into());}
+            options[key]=value.clone();
+        }
+    }
+    Ok(options)
+}
+fn catalog_contains_secret(value:&Value,secrets:&[String])->bool{
+    match value{
+        Value::String(text)=>secrets.iter().any(|s|!s.is_empty()&&text.contains(s)),
+        Value::Array(values)=>values.iter().any(|v|catalog_contains_secret(v,secrets)),
+        Value::Object(values)=>values.values().any(|v|catalog_contains_secret(v,secrets)),_=>false
+    }
+}
+fn empty_model_catalog()->Value{json!({"version":1,"providers":{}})}
+fn load_model_catalog(path:&Path)->Result<Value>{
+    let file=match OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path){
+        Ok(file)=>file,Err(error)if error.kind()==io::ErrorKind::NotFound=>return Ok(empty_model_catalog()),Err(error)=>return Err(error.into())
+    };
+    if !file.metadata()?.is_file()||file.metadata()?.len()>MODEL_CATALOG_MAX_BYTES{return Err("model catalog cache must be a regular file of at most 8 MiB".into());}
+    let mut cache:Value=serde_json::from_reader(file)?;
+    if cache["version"]!=1||!cache["providers"].is_object(){return Err("invalid model catalog cache".into());}
+    for (provider,record) in cache["providers"].as_object_mut().unwrap(){
+        if !["openai","openai-codex"].contains(&provider.as_str())||!record["identity"].as_str().is_some_and(|s|s.len()==64&&s.bytes().all(|c|c.is_ascii_hexdigit())){
+            return Err("invalid model catalog cache identity".into());
+        }
+        for key in ["fetched_at_ms","attempted_at_ms"]{if record.get(key).is_some_and(|v|!v.is_u64()){return Err("invalid model catalog timestamp".into());}}
+        if let Some(models)=record.get_mut("models"){
+            let models=models.as_array_mut().filter(|m|m.len()<=2048).ok_or("invalid model catalog cache entries")?;
+            let mut seen=HashSet::new();
+            for model in models{
+                let id=model["id"].as_str().ok_or("invalid cached model ID")?;
+                let (p,slug)=id.split_once('/').ok_or("invalid cached model ID")?;
+                let valid_slug=if provider=="openai-codex"{catalog_safe_id(slug)}else{catalog_api_id(slug)};
+                if p!=provider.as_str()||!valid_slug||!seen.insert(id.to_string()){return Err("invalid cached model identity".into());}
+                if !model["name"].as_str().is_some_and(|s|catalog_safe_label(s,256))||!model["metadata_complete"].is_boolean(){return Err("invalid cached model metadata".into());}
+                for key in ["context_limit","max_input_tokens","max_tokens"]{catalog_optional_limit(model,key)?;}
+                if let Some(levels)=model.get("reasoning_efforts"){
+                    if !levels.as_array().is_some_and(|a|a.len()<=7&&a.iter().all(|v|v.as_str().is_some_and(|s|catalog_effort(s)==Some(s)))){return Err("invalid cached model effort metadata".into());}
+                }
+                for key in ["reasoning","image_input","image_output","deprecated"]{if model.get(key).is_some_and(|v|!v.is_boolean()){return Err("invalid cached model capability".into());}}
+                if model["metadata_complete"]==true&&(!model["context_limit"].is_u64()
+                    ||!model["api"].as_str().is_some_and(|s|["openai-codex-responses","openai-responses","openai-completions","image-generation"].contains(&s))
+                    ||(provider=="openai-codex"&&(!model["reasoning_efforts"].as_array().is_some_and(|a|!a.is_empty())||model["api"]!="openai-codex-responses"))){return Err("inconsistent cached model capabilities".into());}
+                if let Some(aliases)=model.get("aliases"){
+                    if !aliases.as_array().is_some_and(|a|a.len()<=32&&a.iter().all(|v|v.as_str().is_some_and(catalog_safe_id))){return Err("invalid cached model aliases".into());}
+                }
+                let mut safe=json!({});
+                for key in ["id","name","api","context_limit","max_input_tokens","max_tokens","reasoning","reasoning_efforts","default_effort","image_input","image_output","deprecated","priority","aliases","metadata_complete"]{
+                    if let Some(value)=model.get(key){safe[key]=value.clone();}
+                }
+                safe["provider"]=json!(provider);safe["source"]=json!("provider-discovery");safe["available"]=json!(true);*model=safe;
+            }
+        }
+    }
+    Ok(cache)
+}
+impl Host{
+    fn catalog_endpoint(&self,provider:&str)->Result<(String,String)>{
+        let provider=provider_alias(provider);
+        if !["openai","openai-codex"].contains(&provider){return Err("catalog refresh currently supports codex and openai; other providers retain offline/configured inventory".into());}
+        let (base,key,_)=self.provider_config(&format!("{provider}/catalog-discovery"))?;
+        let endpoint=if provider=="openai-codex"{
+            let base=base.strip_suffix("/codex/responses").map(|s|format!("{s}/codex")).unwrap_or(base);
+            if base.ends_with("/codex"){format!("{base}/models")}else{format!("{base}/codex/models")}
+        }else{format!("{}/models",base.trim_end_matches('/'))};
+        Ok((endpoint,key))
+    }
+    fn catalog_identity(&self,provider:&str)->Option<String>{
+        let provider=provider_alias(provider);
+        let (endpoint,key)=self.catalog_endpoint(provider).ok()?;
+        // Credential/account/endpoint-bound; no plaintext identity or token is cached.
+        let principal=if provider=="openai-codex"{
+            key.split('.').nth(1).and_then(|part|base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(part.trim_end_matches('=')).ok())
+                .and_then(|bytes|serde_json::from_slice::<Value>(&bytes).ok())
+                .filter(|claims|claims["https://api.openai.com/auth"]["chatgpt_account_id"]==self.auth[provider]["accountId"])
+                .map(|claims|json!({"auth":claims["https://api.openai.com/auth"],"profile":claims["https://api.openai.com/profile"],"subject":claims["sub"],"email":claims["email"]}).to_string()).unwrap_or(key)
+        }else{key};
+        let revision=if provider=="openai-codex"{model_catalog_options(&self.config_defaults).ok()?["codex_client_version"].as_str()?.to_string()}else{String::new()};
+        let scope=format!("{provider}\0{endpoint}\0{principal}\0{revision}\0{}",self.auth[provider]["accountId"].as_str().unwrap_or(""));
+        Some(ring::digest::digest(&ring::digest::SHA256,scope.as_bytes()).as_ref().iter().map(|b|format!("{b:02x}")).collect())
+    }
+    fn catalog_auto_enabled(&self)->bool{
+        match std::env::var("PY_MODEL_CATALOG_AUTO_REFRESH").ok().as_deref(){Some("0"|"false")=>false,Some("1"|"true")=>true,_=>model_catalog_options(&self.config_defaults).map_or(false,|v|v["auto_refresh"]==true)}
+    }
+    fn maybe_refresh_model_catalog(&mut self,provider:&str){
+        if !self.catalog_auto_enabled()||self.catalog_identity(provider).is_none(){return;}
+        if let Err(error)=self.refresh_model_catalog(provider,false){
+            self.event("notice",json!({"text":format!("Model catalog refresh failed: {error}. Keeping cached/offline inventory; /model list refresh retries explicitly.")}));
+        }
+    }
+    fn refresh_model_catalog(&mut self,provider:&str,force:bool)->Result<bool>{
+        let provider=provider_alias(provider).to_string();
+        self.reload_auth()?;
+        self.catalog_endpoint(&provider)?;
+        let before=self.catalog_identity(&provider).ok_or("catalog refresh requires credentials; /login the provider first")?;
+        let record=&self.catalog["providers"][&provider];let now=now_ms() as u64;
+        let options=model_catalog_options(&self.config_defaults)?;
+        if !force&&record["identity"]==before{
+            let recent=|key:&str,seconds:u64|record[key].as_u64().is_some_and(|t|t<=now&&now-t<seconds*1000);
+            if recent("fetched_at_ms",options["refresh_interval_seconds"].as_u64().unwrap())||recent("attempted_at_ms",options["retry_interval_seconds"].as_u64().unwrap()){return Ok(false);}
+        }
+        self.event("notice",json!({"text":format!("Refreshing {provider} model catalog…")}));
+        let cancel_revision=self.cancel_revision;
+        let result=self.with_state(UiState::Running,None,|host|{
+            if provider=="openai-codex"{host.refresh_codex()?;}
+            let (endpoint,key)=host.catalog_endpoint(&provider)?;
+            let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).build()?;
+            let mut request=client.get(endpoint).bearer_auth(&key).header("Accept","application/json").header("originator","py").header("User-Agent","py-rust/0.1.0");
+            if provider=="openai-codex"{
+                request=request.query(&[("client_version",options["codex_client_version"].as_str().unwrap())]).header("chatgpt-account-id",host.auth["openai-codex"]["accountId"].as_str().ok_or("Codex account ID missing")?);
+            }
+            let mut secrets=Vec::new();credential_secret_values(&host.auth,&mut secrets);secrets.push(key);
+            let body=host.codex_wait(async{
+                let mut response=request.send().await.map_err(|_|"model catalog network error")?;let status=response.status();let mut bytes=Vec::new();
+                while let Some(chunk)=response.chunk().await.map_err(|_|"model catalog response disconnected")?{
+                    if bytes.len() as u64+chunk.len() as u64>MODEL_CATALOG_MAX_BYTES{return Err("model catalog response exceeds 8 MiB".into());}bytes.extend_from_slice(&chunk);
+                }
+                if !status.is_success(){return Err(format!("model catalog HTTP {status}{}",codex_error_detail(&bytes,&secrets)).into());}
+                Ok(serde_json::from_slice::<Value>(&bytes).map_err(|_|"model catalog returned invalid JSON")?)
+            },"model_catalog")?;
+            let base=host.models();
+            if provider=="openai-codex"{normalize_codex_catalog(&body,base.as_array().unwrap())}else{normalize_openai_catalog(&body,base.as_array().unwrap(),&provider)}
+        });
+        // Metadata/validation failures may echo a credential in an ID or label too.
+        let mut secrets=Vec::new();credential_secret_values(&self.auth,&mut secrets);
+        if let Ok((_,key))=self.catalog_endpoint(&provider){secrets.push(key);}
+        let mut result:Result<Vec<Value>>=result.map_err(|error|format!("model catalog refresh{}",codex_error_detail(error.to_string().as_bytes(),&secrets)).into());
+        if result.as_ref().is_ok_and(|models|catalog_contains_secret(&json!(models),&secrets)){
+            result=Err("model catalog contained reflected credential data; update rejected".into());
+        }
+        // Tokens can rotate during refresh; bind the response to the actual principal.
+        let identity=self.catalog_identity(&provider).unwrap_or(before);
+        let mut record=if self.catalog["providers"][&provider]["identity"]==identity{self.catalog["providers"][&provider].clone()}else{json!({"identity":identity})};
+        record["attempted_at_ms"]=json!(now_ms() as u64);
+        if self.cancel_revision!=cancel_revision{return Err("model catalog refresh cancelled; previous cache retained".into());}
+        if let Ok(models)=&result{record["models"]=json!(models);record["fetched_at_ms"]=json!(now_ms() as u64);}
+        self.commit_model_catalog(&provider,record)?;
+        self.context_limit=self.model_limit(&self.model)?;
+        match result{
+            Ok(models)=>{
+                self.journal.append("model_catalog_refresh",json!({"provider":provider,"count":models.len(),"fetched_at_ms":now_ms() as u64}))?;
+                self.event("notice",json!({"text":format!("Updated {provider} model catalog: {} entries. Active model and session prompt unchanged.",models.len())}));Ok(true)
+            },Err(error)=>Err(error)
+        }
+    }
+    fn commit_model_catalog(&mut self,provider:&str,mut record:Value)->Result<()>{
+        let lock=OpenOptions::new().create(true).read(true).write(true).truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(self.home.join("models.lock"))?;
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        loop{
+            if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0{break;}
+            let error=io::Error::last_os_error();if error.raw_os_error()!=Some(libc::EWOULDBLOCK){return Err(error.into());}
+            if std::time::Instant::now()>=deadline||self.codex_cancel("model_catalog")?{return Err("model catalog cache busy/cancelled; previous cache retained".into());}
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let path=self.home.join("models.json");
+        let mut cache=load_model_catalog(&path).unwrap_or_else(|_|empty_model_catalog());
+        let latest=&cache["providers"][provider];
+        // A failed/older concurrent request must not replace a newer good snapshot.
+        if latest["identity"]==record["identity"]&&latest["models"].is_array()
+            &&latest["fetched_at_ms"].as_u64().unwrap_or(0)>record["fetched_at_ms"].as_u64().unwrap_or(0){
+            record["models"]=latest["models"].clone();record["fetched_at_ms"]=latest["fetched_at_ms"].clone();
+        }
+        record["attempted_at_ms"]=json!(record["attempted_at_ms"].as_u64().unwrap_or(0).max(latest["attempted_at_ms"].as_u64().unwrap_or(0)));
+        cache["providers"][provider]=record;
+        if serde_json::to_vec(&cache)?.len() as u64>MODEL_CATALOG_MAX_BYTES{return Err("normalized model cache exceeds 8 MiB".into());}
+        write_private_json(&path,&cache)?;self.catalog=cache;Ok(())
+    }
+    fn model_list_command(&mut self,args:&str)->Result<()>{
+        let (verb,rest)=args.split_once(char::is_whitespace).map(|(a,b)|(a,b.trim())).unwrap_or((args,""));
+        let provider=self.model.split_once('/').map(|p|provider_alias(p.0)).unwrap_or("openai").to_string();
+        if verb=="refresh"{
+            let target=if rest.is_empty(){provider}else{self.resolve_provider(rest)?};
+            let result=self.refresh_model_catalog(&target,true);
+            self.list_models(&format!("{target}/"));result.map(|_|())
+        }else{self.maybe_refresh_model_catalog(&provider);self.list_models(args);Ok(())}
+    }
+}
+
+#[cfg(test)]
+mod catalog_normalization_tests{
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    fn native(slug:&str)->Value{json!({"slug":slug,"display_name":"A native model","visibility":"list",
+        "context_window":272000,"max_context_window":872000,
+        "supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"max"}],
+        "default_reasoning_level":"low","input_modalities":["text","image"],"priority":1})}
+    #[test]
+    fn catalog_native_limits_fields_aliases_and_efforts(){
+        let mut item=native("gpt-6.2-sol");
+        item["supported_reasoning_levels"].as_array_mut().unwrap().push(json!({"effort":"ultra"}));
+        item["base_instructions"]=json!("REMOTE_INSTRUCTIONS_MUST_NOT_SURVIVE");
+        item["model_messages"]=json!(["untrusted instructions"]);item["tools"]=json!([{"type":"shell"}]);item["supported_in_api"]=json!(false);
+        let base=vec![json!({"id":"openai-codex/gpt-6.2-sol","aliases":["sol6.2"],"context_limit":1050000,"max_input_tokens":922000,"max_tokens":128000})];
+        let models=normalize_codex_catalog(&json!({"models":[item]}),&base).unwrap();let model=&models[0];
+        assert_eq!(model["context_limit"],272000);assert_eq!(model["max_input_tokens"],258400);
+        assert_eq!(model["aliases"],json!(["sol6.2","sol62"]));assert_eq!(model["reasoning_efforts"],json!(["low","medium","max"]));
+        assert_eq!(model["default_effort"],"low");assert_eq!(model["image_input"],true);assert_eq!(model["metadata_complete"],true);assert!(model.get("max_tokens").is_none());
+        for key in ["base_instructions","model_messages","tools","supported_in_api"]{assert!(model.get(key).is_none());}
+        assert!(!model.to_string().contains("REMOTE_INSTRUCTIONS_MUST_NOT_SURVIVE"));
+    }
+    #[test]
+    fn catalog_native_visibility_sorting_and_missing_metadata(){
+        let mut first=native("first");first["priority"]=json!(2);first["input_modalities"]=json!(["text"]);
+        first["supported_reasoning_levels"]=json!([{"effort":"none"},{"effort":"low"}]);first["default_reasoning_level"]=json!("none");
+        let mut second=native("second");second["priority"]=json!(1);second["context_window"]=Value::Null;second["effective_context_window_percent"]=json!(90);
+        let mut hidden=native("hidden");hidden["visibility"]=json!("hide");let mut unavailable=native("unavailable");unavailable["visibility"]=json!("none");
+        let incomplete=json!({"slug":"incomplete","display_name":"Incomplete","visibility":"list"});
+        let models=normalize_codex_catalog(&json!({"models":[first,hidden,incomplete,second,unavailable]}),&[]).unwrap();
+        assert_eq!(models.len(),3);assert_eq!(models[0]["id"],"openai-codex/second");assert_eq!(models[0]["context_limit"],872000);assert_eq!(models[0]["max_input_tokens"],784800);
+        assert_eq!(models[1]["image_input"],false);assert_eq!(models[1]["default_effort"],"off");assert_eq!(models[2]["metadata_complete"],false);
+        assert_eq!(models[2]["context_limit"],Value::Null);assert_eq!(models[2]["reasoning"],false);assert_eq!(models[2]["image_input"],true);
+    }
+    #[test]
+    fn catalog_native_rejects_malformed_response_atomically(){
+        for field in ["slug","display_name","visibility"]{let mut bad=native("bad");bad[field]=Value::Null;assert!(normalize_codex_catalog(&json!({"models":[native("good"),bad]}),&[]).is_err(),"{field}");}
+        for (field,value) in [("slug",json!("bad/id")),("slug",json!("bad\nID")),("slug",json!("bad:ID")),
+            ("display_name",json!("bad\u{2028}name")),("display_name",json!("x".repeat(257))),
+            ("context_window",json!(true)),("context_window",json!(-1)),("max_context_window",json!(16777217)),
+            ("effective_context_window_percent",json!(0)),("effective_context_window_percent",json!(101)),
+            ("supported_reasoning_levels",json!([{"effort":false}])),("default_reasoning_level",json!(false)),
+            ("input_modalities",json!([true])),("priority",json!(1.5)),("visibility",json!("unknown"))]{
+            let mut bad=native("bad");bad[field]=value;assert!(normalize_codex_catalog(&json!({"models":[native("good"),bad]}),&[]).is_err(),"{field}");
+        }
+        assert!(normalize_codex_catalog(&json!({"models":[native("same"),native("same")]}),&[]).is_err());assert!(normalize_codex_catalog(&json!({"models":vec![native("x");2049]}),&[]).is_err());
+        assert!(normalize_codex_catalog(&json!({"models":{}}),&[]).is_err());let mut hidden=native("bad");hidden["visibility"]=json!("hide");hidden["context_window"]=json!(false);
+        assert!(normalize_codex_catalog(&json!({"models":[native("good"),hidden]}),&[]).is_err());
+    }
+    #[test]
+    fn catalog_api_known_metadata_unknown_ids_and_safe_field_selection(){
+        let base=vec![json!({"id":"openai/known","name":"Known model","api":"openai-responses","context_limit":32000,"max_tokens":4096,"reasoning":true,"reasoning_efforts":["low","high"],"aliases":["known-alias"],"tools":["base tool metadata not copied"],"base_instructions":"not copied"})];
+        let models=normalize_openai_catalog(&json!({"data":[{"id":"unknown","context_limit":999999,"api":"untrusted","base_instructions":"untrusted"},{"id":"known","reasoning":false},{"id":"ft:gpt-4.1:org:custom:abc"}]}),&base,"openai").unwrap();
+        let known=models.iter().find(|m|m["id"]=="openai/known").unwrap();let unknown=models.iter().find(|m|m["id"]=="openai/unknown").unwrap();
+        assert_eq!(known["context_limit"],32000);assert_eq!(known["reasoning"],true);assert_eq!(known["metadata_complete"],true);
+        assert!(known.get("tools").is_none());assert!(known.get("base_instructions").is_none());assert_eq!(unknown["metadata_complete"],false);assert_eq!(unknown["context_limit"],Value::Null);
+        assert!(unknown.get("api").is_none());assert!(unknown.get("reasoning").is_none());assert!(unknown.get("base_instructions").is_none());
+        assert!(models.iter().any(|m|m["id"]=="openai/ft:gpt-4.1:org:custom:abc"&&m["metadata_complete"]==false));
+    }
+    #[test]
+    fn catalog_api_rejects_malformed_duplicate_or_oversized_ids(){
+        for body in [json!({}),json!({"data":{}}),json!({"data":[{}]}),json!({"data":[{"id":false}]}),json!({"data":[{"id":""}]}),json!({"data":[{"id":"bad/id"}]}),json!({"data":[{"id":"x".repeat(129)}]}),json!({"data":[{"id":"same"},{"id":"same"}]}),json!({"data":vec![json!({"id":"x"});2049]})]{assert!(normalize_openai_catalog(&body,&[],"openai").is_err());}
+        assert!(normalize_openai_catalog(&json!({"data":[]}),&[],"bad/provider").is_err());assert_eq!(normalize_openai_catalog(&json!({"data":[]}),&[],"openai").unwrap(),Vec::<Value>::new());
+    }
+    #[test]
+    fn catalog_config_defaults_overrides_and_invalid_values(){
+        assert_eq!(model_catalog_options(&json!({})).unwrap(),model_catalog_defaults());
+        let options=model_catalog_options(&json!({"model_catalog":{"auto_refresh":false,"refresh_interval_seconds":604800,"retry_interval_seconds":1}})).unwrap();
+        assert_eq!(options["auto_refresh"],false);assert_eq!(options["refresh_interval_seconds"],604800);assert_eq!(options["retry_interval_seconds"],1);
+        for value in [json!(false),json!({"unknown":1}),json!({"auto_refresh":1}),json!({"refresh_interval_seconds":0}),json!({"retry_interval_seconds":604801}),json!({"retry_interval_seconds":true})]{assert!(model_catalog_options(&json!({"model_catalog":value})).is_err(),"{value}");}
+    }
+    #[test]
+    fn catalog_cache_validation_strips_instructions_and_rejects_unsafe_files(){
+        let root=std::env::temp_dir().join(format!("py-catalog-cache-{}-{}",std::process::id(),now_ms()));fs::create_dir(&root).unwrap();fs::set_permissions(&root,fs::Permissions::from_mode(0o700)).unwrap();
+        let path=root.join("models.json");assert_eq!(load_model_catalog(&path).unwrap(),empty_model_catalog());
+        let mut model=normalize_codex_catalog(&json!({"models":[native("gpt-6.2-sol")]}),&[]).unwrap().remove(0);model["base_instructions"]=json!("MUST_NOT_LOAD");
+        let mut cache=json!({"version":1,"providers":{"openai-codex":{"identity":"a".repeat(64),"attempted_at_ms":1,"fetched_at_ms":1,"models":[model]}}});
+        write_private_json(&path,&cache).unwrap();let safe=load_model_catalog(&path).unwrap();assert!(!safe.to_string().contains("MUST_NOT_LOAD"));assert_eq!(safe["providers"]["openai-codex"]["models"][0]["context_limit"],272000);
+        cache["providers"]["openai-codex"]["models"][0]["id"]=json!("openai/wrong-provider");write_private_json(&path,&cache).unwrap();assert!(load_model_catalog(&path).is_err());
+        fs::remove_file(&path).unwrap();std::os::unix::fs::symlink(root.join("missing.json"),&path).unwrap();assert!(load_model_catalog(&path).is_err());fs::remove_file(&path).unwrap();fs::create_dir(&path).unwrap();assert!(load_model_catalog(&path).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod catalog_refresh_e2e {
+    fn fixture(body: &str) {
+        let prefix = r#"
+import os,sys,json,tempfile,threading,subprocess,time,base64,glob,pathlib,urllib.parse,select
+from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
+home=tempfile.mkdtemp(prefix='py-catalog-e2e-')
+requests=[];responses=[];hold_refresh=False;release_refresh=threading.Event()
+class Handler(BaseHTTPRequestHandler):
+ def log_message(self,*a):pass
+ def do_GET(self):
+  requests.append({'method':'GET','path':self.path,'headers':{k.lower():v for k,v in self.headers.items()}})
+  if hold_refresh:release_refresh.wait(timeout=5)
+  status,data,kind=responses.pop(0) if responses else (500,b'unexpected model catalog request','text/plain')
+  if isinstance(data,dict):data=json.dumps(data).encode()
+  elif isinstance(data,str):data=data.encode()
+  self.send_response(status);self.send_header('Content-Type',kind);self.send_header('Content-Length',str(len(data)));self.end_headers()
+  try:self.wfile.write(data)
+  except (BrokenPipeError,ConnectionResetError):pass
+ def do_POST(self):
+  raw=self.rfile.read(int(self.headers.get('Content-Length',0)))
+  requests.append({'method':'POST','path':self.path,'headers':{k.lower():v for k,v in self.headers.items()},'body':raw.decode()})
+  if not responses or responses[0][2]!='text/event-stream':self.send_error(500,'unexpected provider invocation');return
+  status,data,kind=responses.pop(0)
+  self.send_response(status);self.send_header('Content-Type',kind);self.end_headers();self.wfile.write(data.encode())
+server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+threading.Thread(target=server.serve_forever,daemon=True).start()
+base='http://127.0.0.1:'+str(server.server_port)
+def jwt(account='account-SECRET',subject='subject-SECRET',plan='plus',issued=1):
+ claims={'https://api.openai.com/auth':{'chatgpt_account_id':account,'chatgpt_plan_type':plan},'sub':subject,'iat':issued,'exp':issued+3600}
+ return 'header.'+base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip('=')+'.signature'
+def auth(account='account-SECRET',subject='subject-SECRET',plan='plus',issued=1):
+ value={'openai-codex':{'type':'oauth','access':jwt(account,subject,plan,issued),'refresh':'refresh-SECRET','expires':int((time.time()+3600)*1000),'accountId':account}}
+ pathlib.Path(home+'/auth.json').write_text(json.dumps(value));os.chmod(home+'/auth.json',0o600)
+config={'model':'openai-codex/gpt-6.1-sol','effort':'high','providers':{'openai-codex':{'base_url':base}},'model_catalog':{'auto_refresh':False}}
+def save_config():pathlib.Path(home+'/config.json').write_text(json.dumps(config))
+save_config();auth()
+env=dict(os.environ,PY_HOME=home,PY_MODEL_CATALOG_AUTO_REFRESH='0')
+def native(slug='gpt-6.2-sol',context=64000):
+ return {'slug':slug,'display_name':'Fixture '+slug,'visibility':'list','priority':1,'context_window':context,'max_context_window':872000,'effective_context_window_percent':95,'supported_reasoning_levels':[{'effort':'low'},{'effort':'medium'},{'effort':'high'},{'effort':'max'},{'effort':'ultra'}],'default_reasoning_level':'low','input_modalities':['text','image'],'base_instructions':'REMOTE_INSTRUCTIONS_NOT_ADOPTED','model_messages':['REMOTE_MESSAGES_NOT_ADOPTED'],'tools':[{'type':'shell'}]}
+def reply(data,status=200,kind='application/json'):responses.append((status,data,kind))
+def catalog(*models):return {'models':list(models) if models else [native()]}
+def stop_reply():reply('data: '+json.dumps({'type':'response.completed','response':{'status':'completed','output':[{'type':'message','content':[{'type':'output_text','text':'agent.loop.stop()'}]}],'usage':{'input_tokens':20,'output_tokens':5}}})+'\n\n',kind='text/event-stream')
+def refresh(id='refresh',provider=None):
+ v={'id':id,'kind':'models','refresh':True}
+ if provider is not None:v['provider']=provider
+ return v
+def models(id='models'):return {'id':id,'kind':'models'}
+def py(source,id='python'):return {'id':id,'kind':'python','source':source}
+def run(commands=None,lines=None,auto=False,args=None,model=False):
+ flags=['--json',*([] if model else ['--no-model']),*(args or [])]
+ if lines is None:
+  flags.append('--json-input');text=''.join(json.dumps(c)+'\n' for c in (commands or []))
+ else:text=lines
+ p=subprocess.run([sys.argv[1],*flags],input=text,capture_output=True,text=True,env=dict(env,PY_MODEL_CATALOG_AUTO_REFRESH='1' if auto else '0'),timeout=20)
+ assert p.returncode==0,(p.stdout,p.stderr)
+ return [json.loads(line) for line in p.stdout.splitlines()]
+def run_steps(commands):
+ p=subprocess.Popen([sys.argv[1],'--json','--json-input'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,bufsize=0)
+ events=[]
+ def wait(kind,id=None):
+  deadline=time.monotonic()+10
+  while time.monotonic()<deadline:
+   if not select.select([p.stdout],[],[],.1)[0]:continue
+   line=p.stdout.readline();assert line,(kind,id,events,p.stderr.read())
+   value=json.loads(line);events.append(value)
+   assert not(value['kind']=='error' and (id is None or value.get('command_id')==id)),value
+   if value['kind']==kind and (id is None or value.get('command_id')==id):return
+  raise AssertionError((kind,id,events))
+ wait('ready')
+ for command in commands:
+  p.stdin.write((json.dumps(command)+'\n').encode());p.stdin.flush()
+  kind={'models':'models','status':'status'}.get(command['kind'],'completed')
+  wait(kind,None if kind=='status' else command['id'])
+ p.stdin.close();p.stdin=None
+ out,err=p.communicate(timeout=10);assert p.returncode==0,(out,err,events)
+ events.extend(json.loads(line) for line in out.splitlines())
+ return events
+def event(events,kind,id=None):
+ matches=[v for v in events if v['kind']==kind and (id is None or v.get('command_id')==id)]
+ assert matches,(kind,id,events)
+ return matches[0]
+def model_map(events,id='models'):return {m['id']:m for m in event(events,'models',id)['models']}
+def failed(events,id):return event(events,'error',id)
+def cache():return json.loads(pathlib.Path(home+'/models.json').read_text())
+def record():return cache()['providers']['openai-codex']
+def journal_records():return [json.loads(line) for file in glob.glob(home+'/sessions/*.jsonl') for line in pathlib.Path(file).read_text().splitlines()]
+def journals():return ''.join(pathlib.Path(file).read_text() for file in glob.glob(home+'/sessions/*.jsonl'))
+def expire():
+ value=cache();r=value['providers']['openai-codex'];r['fetched_at_ms']=r['attempted_at_ms']=int(time.time()*1000)-7200000
+ pathlib.Path(home+'/models.json').write_text(json.dumps(value))
+def no_secrets():
+ text=pathlib.Path(home+'/models.json').read_text()+journals()
+ for secret in [jwt(),'account-SECRET','subject-SECRET','refresh-SECRET','REMOTE_INSTRUCTIONS_NOT_ADOPTED','REMOTE_MESSAGES_NOT_ADOPTED']:
+  assert secret not in text,(secret,text[:1000])
+"#;
+        let script = format!("{prefix}\n{body}");
+        let output = crate::test_command("python3")
+            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").expect("build CLI and set PY_HARNESS_BIN"), env!("CARGO_PKG_VERSION")])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn e2e_catalog_interrupt_is_operation_local_and_retains_exact_cache() {
+        fixture(r#"
+reply(catalog());run([refresh()]);original=pathlib.Path(home+'/models.json').read_bytes()
+hold_refresh=True;reply(catalog(native(context=128000)))
+p=subprocess.Popen([sys.argv[1],'--json','--json-input','--no-model'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,bufsize=0)
+seen=[]
+def wait_event(kind,id=None):
+ deadline=time.monotonic()+5
+ while time.monotonic()<deadline:
+  if not select.select([p.stdout],[],[],.05)[0]:continue
+  line=p.stdout.readline();assert line,(kind,id,seen)
+  v=json.loads(line);seen.append(v)
+  if v['kind']==kind and (id is None or v.get('command_id')==id):return v
+ raise AssertionError((kind,id,seen))
+def send(v):p.stdin.write((json.dumps(v)+'\n').encode());p.stdin.flush()
+try:
+ wait_event('ready');send(refresh('slow'))
+ deadline=time.monotonic()+5
+ while len(requests)<2:
+  assert time.monotonic()<deadline,requests;time.sleep(.01)
+ send({'id':'interrupt','kind':'interrupt'})
+ wait_event('completed','interrupt');error=wait_event('error','slow')
+ assert 'cancelled' in error['error'],seen
+ assert pathlib.Path(home+'/models.json').read_bytes()==original
+ send(models('after'));assert 'openai-codex/gpt-6.2-sol' in {m['id'] for m in wait_event('models','after')['models']}
+ send(py('assert 1+1==2','alive'));assert wait_event('completed','alive')['status']=='ok',seen
+ p.stdin.close();p.stdin=None;out,err=p.communicate(timeout=5);assert p.returncode==0,(out,err,seen)
+finally:
+ release_refresh.set()
+ if p.poll() is None:p.kill();p.wait()
+no_secrets()
+"#);
+    }
+
+    #[test]
+    fn e2e_catalog_force_refresh_native_metadata_namespace_prompt_and_private_cache() {
+        fixture(r#"
+os.makedirs(home+'/skills')
+pathlib.Path(home+'/skills/helper.md').write_text('---\nkind: python\ncreated: 2026-10-10T09:00:00Z\nupdated: 2026-10-10T09:00:00Z\norigin: user\ndescription: Frozen helper.\ncore: true\n---\n```python\ndef helper(x):\n    return x+7\n```\n')
+stop_reply();reply(catalog(native('gpt-6.1-sol',32000),native('gpt-6.2-sol',64000)));stop_reply()
+ev=run_steps([py('persistent=42; assert helper(1)==8','before'),{'id':'outer-before','kind':'submit','text':'first turn'},refresh(),{'id':'outer-after','kind':'submit','text':'second turn'},py('assert persistent==42 and helper(1)==8','after'),{'id':'status','kind':'status'}])
+assert event(ev,'completed','before')['status']=='ok' and event(ev,'completed','after')['status']=='ok',ev
+status=event(ev,'status');assert status['model']=='openai-codex/gpt-6.1-sol' and status['worker_generation']==0,status
+assert status['context_usage']['model_context_limit']==32000 and status['context_usage']['input_token_budget']==27904,status
+snapshot=[r for r in journal_records() if r['kind']=='skills_snapshot'];assert len(snapshot)==1,snapshot
+assert 'def helper' in snapshot[0]['payload']['system'] and 'REMOTE_' not in snapshot[0]['payload']['system'],snapshot
+assert len([r for r in journal_records() if r['kind']=='startup_begin'])==1,journal_records()
+gets=[r for r in requests if r['method']=='GET'];posts=[r for r in requests if r['method']=='POST']
+assert len(gets)==1 and len(posts)==2,requests
+assert event(ev,'completed','outer-before')['status']=='ok' and event(ev,'completed','outer-after')['status']=='ok',ev
+wire_systems=[json.loads(r['body'])['instructions'] for r in posts]
+assert wire_systems[0]==wire_systems[1]==snapshot[0]['payload']['system'],wire_systems
+url=urllib.parse.urlsplit(gets[0]['path']);assert url.path=='/codex/models' and urllib.parse.parse_qs(url.query)['client_version']==['0.155.0'],requests
+assert gets[0]['headers']['authorization']=='Bearer '+jwt() and gets[0]['headers']['chatgpt-account-id']=='account-SECRET',requests
+learned=next(m for m in record()['models'] if m['id']=='openai-codex/gpt-6.2-sol')
+assert learned['context_limit']==64000 and learned['max_input_tokens']==60800 and learned['metadata_complete'] is True,learned
+assert 'sol62' in learned['aliases'] and 'ultra' not in learned['reasoning_efforts'],learned
+assert os.stat(home+'/models.json').st_mode&0o777==0o600
+assert os.stat(home+'/models.lock').st_mode&0o777==0o600
+no_secrets()
+# Offline, cross-process reuse and fuzzy alias selection require no new request.
+ev=run([models()]);assert model_map(ev)['openai-codex/gpt-6.2-sol']['ready'] is True,ev
+assert len(requests)==3,requests
+ev=run(lines='/model codex/sol62\n/status\n')
+status=event(ev,'info')['value'];assert status['model']=='openai-codex/gpt-6.2-sol' and status['context_usage']['model_context_limit']==64000,status
+assert len(requests)==3,requests
+"#);
+    }
+
+    #[test]
+    fn e2e_catalog_automatic_ttl_force_fresh_bypass_and_expiry() {
+        fixture(r#"
+config['model_catalog']={'auto_refresh':True,'refresh_interval_seconds':3600,'retry_interval_seconds':300};save_config()
+reply(catalog(native('gpt-6.1-sol',32000)))
+reply(catalog(native('gpt-6.1-sol',64000)))
+ev=run(lines='/model list\n/models\n/model list refresh\n',auto=True)
+assert len(requests)==2,requests
+assert len([v for v in ev if v['kind']=='notice' and 'Updated openai-codex model catalog' in v.get('text','')])==2,ev
+assert record()['models'][0]['context_limit']==64000,record()
+# A fresh process/list still uses the persisted fresh catalog.
+run(lines='/model list\n',auto=True);assert len(requests)==2,requests
+expire();reply(catalog(native('gpt-6.1-sol',128000)))
+run(lines='/model list\n',auto=True)
+assert len(requests)==3 and record()['models'][0]['context_limit']==128000,(requests,record())
+"#);
+    }
+
+    #[test]
+    fn e2e_catalog_failure_backoff_preserves_stale_cache_and_manual_retry() {
+        fixture(r#"
+reply(catalog());run([refresh()]);original=record()['models'];expire()
+reply({'error':{'message':'service temporarily unavailable'}},503)
+ev=run(lines='/model list\n/model list\n',auto=True)
+assert len(requests)==2,requests
+assert any(v['kind']=='notice' and 'Keeping cached/offline inventory' in v.get('text','') for v in ev),ev
+assert record()['models']==original,record()
+assert record()['fetched_at_ms']<int(time.time()*1000)-3600000,record()
+reply(catalog(native('gpt-6.2-sol',128000)))
+ev=run([refresh('retry')]);assert event(ev,'models','retry')['models'],ev
+assert len(requests)==3 and record()['models'][0]['context_limit']==128000,(requests,record())
+"#);
+    }
+
+    #[test]
+    fn e2e_catalog_rejections_are_atomic_bounded_redacted_and_instruction_free() {
+        fixture(r#"
+reply(catalog());run([refresh()]);original=record()['models']
+cases=[(200,b'{not json','application/json'),(200,catalog(dict(native(),context_window=True)),'application/json'),(400,{'error':{'message':'rejected '+jwt()+' refresh-SECRET account-SECRET\n\x1b[31m'}},'application/json'),(200,b'x'*(8*1024*1024+1),'application/json'),(200,catalog(dict(native(),display_name='Reflected refresh-SECRET')),'application/json')]
+for i,(status,data,kind) in enumerate(cases):
+ responses.append((status,data,kind));identifier='bad-'+str(i)
+ ev=run([refresh(identifier),models('fallback')]);error=failed(ev,identifier)
+ assert record()['models']==original,(i,record())
+ assert 'openai-codex/gpt-6.2-sol' in model_map(ev,'fallback'),ev
+ assert not any(v['kind']=='models' and v.get('command_id')==identifier for v in ev),ev
+ if i==2:
+  assert '[redacted]' in error['error'] and jwt() not in json.dumps(ev) and 'refresh-SECRET' not in json.dumps(ev),ev
+ if i==3:assert 'exceeds 8 MiB' in error['error'],error
+assert len(requests)==len(cases)+1,requests
+no_secrets()
+"#);
+    }
+
+    #[test]
+    fn e2e_catalog_principal_endpoint_rotation_and_logout_scope() {
+        fixture(r#"
+reply(catalog());run([refresh()]);identity=record()['identity']
+# Token timestamps/rotation alone do not invalidate same-principal metadata.
+auth(issued=20)
+ev=run([models()]);assert 'openai-codex/gpt-6.2-sol' in model_map(ev),ev
+assert record()['identity']==identity and len(requests)==1,(record(),requests)
+# Account, subject, plan and endpoint each scope the cache independently.
+for account,subject,plan in [('different-account','subject-SECRET','plus'),('account-SECRET','different-subject','plus'),('account-SECRET','subject-SECRET','pro')]:
+ auth(account,subject,plan,issued=20)
+ ev=run([models()]);assert 'openai-codex/gpt-6.2-sol' not in model_map(ev),ev
+ assert len(requests)==1,requests
+ # Original account cache remains on disk; it is simply not adopted.
+ assert record()['identity']==identity,record()
+auth(issued=20)
+config['providers']['openai-codex']['base_url']=base+'/different';save_config()
+ev=run([models()]);assert 'openai-codex/gpt-6.2-sol' not in model_map(ev),ev
+config['providers']['openai-codex']['base_url']=base;save_config()
+ev=run([{'id':'logout','kind':'logout','provider':'codex'},models()])
+assert event(ev,'completed','logout')['status']=='ok',ev
+assert 'openai-codex/gpt-6.2-sol' not in model_map(ev),ev
+assert len(requests)==1,requests
+"#);
+    }
+
+    #[test]
+    fn e2e_catalog_openai_unknown_ids_need_declared_capabilities_and_key_scope() {
+        fixture(r#"
+config={'model':'openai/gpt-4.1','effort':'medium','providers':{'openai':{'base_url':base+'/v1'}},'model_catalog':{'auto_refresh':False}}
+save_config();pathlib.Path(home+'/auth.json').write_text(json.dumps({'openai':{'type':'api_key','key':'api-key-SECRET'}}))
+unknown='ft:gpt-4.1:fixture:custom'
+reply({'data':[{'id':'gpt-4.1'},{'id':unknown,'context_limit':999999,'base_instructions':'REMOTE_INSTRUCTIONS_NOT_ADOPTED'}]})
+ev=run([refresh(provider='openai'),models()]);m=model_map(ev)
+assert requests[0]['path']=='/v1/models' and requests[0]['headers']['authorization']=='Bearer api-key-SECRET',requests
+assert m['openai/gpt-4.1']['ready'] is True and m['openai/gpt-4.1']['metadata_complete'] is True,m
+assert m['openai/'+unknown]['metadata_complete'] is False and m['openai/'+unknown]['ready'] is False,m
+assert m['openai/'+unknown]['context_limit'] is None,m
+# Both explicit selection and invocation are gated before HTTP.
+ev=run(lines='/model openai/'+unknown+'\n@agent.llm("hello",model="openai/'+unknown+'")\n')
+assert any(v['kind']=='error' and 'capability metadata' in v.get('error','') for v in ev),ev
+assert event(ev,'completed')['status']=='error',ev
+assert len(requests)==1,requests
+# Explicit user descriptors override incomplete discovered metadata.
+config['providers']['openai']['models']=[{'id':unknown,'api':'openai-responses','context_limit':32000,'reasoning':False,'image_input':False,'image_output':False}];save_config()
+ev=run([models()]);assert model_map(ev)['openai/'+unknown]['user_declared'] is True and model_map(ev)['openai/'+unknown]['ready'] is True,ev
+ev=run(lines='/model openai/'+unknown+'\n/status\n');status=event(ev,'info')['value']
+assert status['model']=='openai/'+unknown and status['context_usage']['model_context_limit']==32000,status
+# Another API key cannot inherit this key's discovered availability/IDs.
+config['providers']['openai'].pop('models');save_config()
+pathlib.Path(home+'/auth.json').write_text(json.dumps({'openai':{'type':'api_key','key':'different-api-key-SECRET'}}))
+ev=run([models()]);assert 'openai/'+unknown not in model_map(ev),ev
+text=pathlib.Path(home+'/models.json').read_text()+journals()
+assert 'api-key-SECRET' not in text and 'different-api-key-SECRET' not in text and 'REMOTE_INSTRUCTIONS_NOT_ADOPTED' not in text,text[:1000]
+assert len(requests)==1,requests
+"#);
+    }
+
+    #[test]
+    fn e2e_catalog_auto_disabled_manual_refresh_and_prefix_endpoint_forms() {
+        fixture(r#"
+run(lines='/model list\n/models\n/model codex/sol61\n');assert not requests,requests
+# Auto disabling never disables an explicit refresh.
+reply(catalog(native('gpt-6.1-sol')))
+ev=run(lines='/model list refresh codex\n');assert len(requests)==1,requests
+assert any(v['kind']=='notice' and 'Updated openai-codex' in v.get('text','') for v in ev),ev
+for suffix in ['/codex','/codex/responses']:
+ config['providers']['openai-codex']['base_url']=base+suffix;save_config()
+ reply(catalog(native('gpt-6.1-sol')))
+ run([refresh(provider='codex')])
+ assert urllib.parse.urlsplit(requests[-1]['path']).path=='/codex/models',requests
+assert len(requests)==3,requests
+"#);
+    }
+
+    #[test]
+    fn e2e_catalog_missing_credentials_unsupported_provider_and_bad_refresh_flag_do_not_fetch() {
+        fixture(r#"
+os.unlink(home+'/auth.json')
+ev=run([refresh('missing'),{'id':'invalid','kind':'models','refresh':'yes'},models()])
+assert 'login' in failed(ev,'missing')['error'].lower(),ev
+assert 'refresh must be boolean' in failed(ev,'invalid')['error'],ev
+assert event(ev,'models','models')['models'],ev
+assert not requests,requests
+ev=run(lines='/model list refresh anthropic\n/model list refresh nonexistent-provider\n')
+assert any(v['kind']=='error' and 'currently supports codex and openai' in v.get('error','') for v in ev),ev
+assert any(v['kind']=='error' and 'Unknown provider' in v.get('error','') for v in ev),ev
+assert not requests,requests
+"#);
+    }
+}
+
+
 fn skills_defaults()->Value{json!({"enabled":true,"max_system_tokens":8000,"max_core_entry_tokens":2000,
     "max_inventory_entry_tokens":128,"max_entries":128,"max_file_bytes":65536})}
 fn skills_options(config:&Value)->Result<Value>{
@@ -11120,7 +12195,7 @@ fn config_has_secrets(value:&Value)->bool{
 }
 fn validate_config(config:&Value)->Result<()>{
     if config_has_secrets(config){return Err("credentials belong in auth.json and /login, not config.json".into());}
-    skills_options(config)?;
+    skills_options(config)?;model_catalog_options(config)?;
     for key in ["model","effort"]{if let Some(value)=config.get(key){
         if !value.as_str().is_some_and(|s|!s.trim().is_empty()){return Err(format!("{key} must be a nonempty string").into());}
     }}
@@ -11128,7 +12203,7 @@ fn validate_config(config:&Value)->Result<()>{
     if let Some(providers)=config.get("providers"){if !providers.is_object(){return Err("providers must be an object".into());}}
     Ok(())
 }
-fn effective_config(config:&Value)->Result<Value>{let mut value=config.clone();value["skills"]=skills_options(config)?;Ok(value)}
+fn effective_config(config:&Value)->Result<Value>{let mut value=config.clone();value["skills"]=skills_options(config)?;value["model_catalog"]=model_catalog_options(config)?;Ok(value)}
 fn skills_tokens(text:&str)->usize{text.chars().count().div_ceil(3)}
 fn valid_skill_date(date:&str)->bool{
     if date.len()!=20||!date.is_ascii(){return false;}
@@ -11233,9 +12308,11 @@ fn build_skills_snapshot(home:&Path,config:&Value)->Result<Value>{
 }
 impl Host{
     fn system_prompt(&self)->&str{self.skills["system"].as_str().unwrap_or(SYSTEM)}
-    fn check_system_budget(&self,limit:usize)->Result<()>{
+    fn check_system_budget(&self,limit:usize)->Result<()>{self.check_model_system_budget(&self.model,limit)}
+    fn check_model_system_budget(&self,model:&str,limit:usize)->Result<()>{
         let protected=(self.system_prompt().chars().count()+512).div_ceil(3);
-        if protected+4096+1024>=limit{return Err(format!("Unsatisfiable protected system-prefix budget: {protected} estimated tokens plus 4096 output and 1024 continuation reserve do not fit context limit {limit}; choose a larger-context model or start a new session with fewer core entries").into());}
+        let available=model_input_budget(limit,&self.reasoning_metadata(model),4096);
+        if protected+1024>=available{return Err(format!("Unsatisfiable protected system-prefix budget: {protected} estimated input tokens plus 1024 continuation reserve do not fit input budget {available} (context limit {limit}, 4096 output reserve); choose a larger-context model or start a new session with fewer core entries").into());}
         Ok(())
     }
     fn initialize_skills(&mut self)->Result<()>{
@@ -11270,7 +12347,7 @@ impl Host{
         if verb=="reload"{
             if !rest.is_empty(){return Err("usage: /config reload".into());}
             let next=load_json(&self.home.join("config.json"))?;validate_config(&next)?;self.config_defaults=next;
-            self.ui_text("Configuration reloaded. Session prompt/startup snapshot unchanged; loading defaults apply on /new.");return Ok(());
+            self.ui_text("Configuration reloaded. Session prompt/startup snapshot unchanged; catalog refresh preferences apply immediately, other loading defaults apply on /new.");return Ok(());
         }
         let (key,value)=rest.split_once(char::is_whitespace).map(|(a,b)|(a,b.trim())).unwrap_or((rest,""));
         let parts=key.split('.').collect::<Vec<_>>();
@@ -11297,7 +12374,7 @@ impl Host{
         let path=self.home.join("config.json");
         if load_json(&path)?!=self.config_defaults{return Err("config.json changed externally; /config reload before editing".into());}
         write_private_json(&path,&next)?;self.config_defaults=next;
-        self.ui_text("Configuration saved. Current session snapshot unchanged; loading defaults apply on /new.");Ok(())
+        self.ui_text("Configuration saved. Current session snapshot unchanged; catalog refresh preferences apply immediately, other loading defaults apply on /new.");Ok(())
     }
 }
 
