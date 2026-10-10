@@ -1,4 +1,5738 @@
-// Single-file transition harness: specification, embedded CPython, runtime and CLI E2E tests.
+// py transition harness
+//
+// File map (kept in one handwritten Rust source file by design):
+//   1. Core types and durable storage
+//   2. Python worker, session state, and model loop
+//   3. CLI, terminal UI, editor, completion, and picker
+//   4. Provider transport and authentication
+//   5. Background tasks and wakeups
+//   6. Model catalog and durable skills
+//   7. Embedded specification and Python worker source
+//   8. Tests and external-process fixtures
+
+// =============================================================================
+// Imports and shared aliases
+// =============================================================================
+
+use serde_json::{Value, json};
+use std::{fs::{self,File,OpenOptions}, io::{self,Write,BufRead,BufReader},
+    path::{Path,PathBuf}, process::{Command,Child}, collections::{HashMap,HashSet},
+    os::unix::{net::UnixStream,io::AsRawFd,fs::OpenOptionsExt,process::CommandExt}};
+use base64::{Engine as _,engine::general_purpose::STANDARD as B64};
+
+type Result<T> = std::result::Result<T,Box<dyn std::error::Error>>;
+
+// =============================================================================
+// Core types and durable storage
+// =============================================================================
+
+#[derive(Clone)]
+struct Item { id:String, role:String, text:String, output:bool, ranges:Vec<(usize,usize)> }
+
+struct Journal { file:File, offsets:Vec<(u64,u64)>, path:PathBuf, seq:usize, failed:bool }
+impl Journal {
+    fn open(path:PathBuf)->Result<Self>{
+        use std::io::Seek;
+        let file=OpenOptions::new().create(true).read(true).append(true).mode(0o600).open(&path)?;
+        if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0 {
+            return Err("session is already open".into());
+        }
+        let mut reader=BufReader::new(File::open(&path)?);
+        let mut offsets=vec![];let mut position=0u64;let mut line=Vec::new();
+        loop{
+            line.clear();let size=reader.read_until(b'\n',&mut line)?;
+            if size==0{break;}
+            if !line.ends_with(b"\n"){
+                let backup=path.with_extension(format!("torn-{}.jsonl",std::process::id()));
+                fs::copy(&path,backup)?;file.set_len(position)?;file.sync_all()?;break;
+            }
+            let value:Value=serde_json::from_slice(&line)?;
+            if value["seq"].as_u64()!=Some(offsets.len() as u64){return Err("invalid journal sequence".into());}
+            offsets.push((position,size as u64));position+=size as u64;
+        }
+        file.sync_all()?;
+        File::open(path.parent().ok_or("journal directory missing")?)?.sync_all()?;
+        let seq=offsets.len();
+        let _=reader.seek(std::io::SeekFrom::Start(0));
+        Ok(Self{file,offsets,path,seq,failed:false})
+    }
+    fn event(&self,index:usize)->Result<Value>{
+        use std::io::{Read,Seek,SeekFrom};
+        let &(offset,size)=self.offsets.get(index).ok_or("history event out of range")?;
+        let mut file=File::open(&self.path)?;file.seek(SeekFrom::Start(offset))?;
+        let mut bytes=vec![0;size as usize];file.read_exact(&mut bytes)?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+    fn append(&mut self,kind:&str,payload:Value)->Result<usize>{
+        if self.failed{return Err("session journal write previously failed; restart and recover before continuing".into());}
+        let n=self.seq;
+        let v=json!({"schema_version":1,"seq":n,"kind":kind,"payload":payload,
+            "session_id":self.path.file_stem().unwrap().to_string_lossy(),
+            "timestamp_ms":now_ms()});
+        let bytes=format!("{v}\n").into_bytes();
+        let write=(||->io::Result<u64>{
+            let offset=self.file.metadata()?.len();
+            self.file.write_all(&bytes)?;self.file.flush()?;self.file.sync_all()?;Ok(offset)
+        })();
+        let offset=match write{Ok(offset)=>offset,Err(e)=>{self.failed=true;return Err(e.into());}};
+        self.offsets.push((offset,bytes.len() as u64));self.seq+=1;Ok(n)
+    }
+}
+fn now_ms()->u128 {std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()}
+
+// Captures bounded chunks as execution proceeds; payload lives only in the journal.
+// A lazy index permits nested helper commands without preallocating empty streams.
+struct Capture {
+    file:File, name:String, operation:String, index:Option<usize>,
+    bytes:usize, newlines:usize, chars:Option<usize>, last:Option<u8>,
+    preview:Vec<u8>, preview_lines:usize, carry:Vec<u8>, chunk:usize,
+}
+impl Capture {
+    fn open(path:&Path,name:&str,operation:&str)->Result<Self>{
+        Ok(Self{file:File::open(path)?,name:name.into(),operation:operation.into(),
+            index:None,bytes:0,newlines:0,chars:Some(0),last:None,
+            preview:vec![],preview_lines:0,carry:vec![],chunk:0})
+    }
+    fn commit(&mut self,host:&mut Host,bytes:&[u8])->Result<()>{
+        let index=*self.index.get_or_insert_with(||host.history[&self.name].len());
+        let seq=host.journal.append("stream",json!({"collection":self.name,"index":index,
+            "operation":self.operation,"base64":B64.encode(bytes),
+            "text":String::from_utf8_lossy(bytes),"chunk":self.chunk}))?;
+        let list=host.history.get_mut(&self.name).ok_or("missing stream collection")?;
+        if list.len()==index{list.push(json!({"$chunks":[]}));}
+        list[index]["$chunks"].as_array_mut().ok_or("invalid stream history")?.push(json!(seq));
+        self.chunk+=1;self.bytes+=bytes.len();
+        self.newlines+=bytes.iter().filter(|&&b|b==b'\n').count();
+        if !bytes.is_empty(){self.last=bytes.last().copied();}
+        if let Some(count)=self.chars{
+            self.carry.extend_from_slice(bytes);
+            match std::str::from_utf8(&self.carry){
+                Ok(s)=>{self.chars=Some(count+s.chars().count());self.carry.clear();},
+                Err(e)=>{
+                    let prefix=std::str::from_utf8(&self.carry[..e.valid_up_to()])?;
+                    self.chars=if e.error_len().is_some(){None}else{Some(count+prefix.chars().count())};
+                    self.carry=self.carry[e.valid_up_to()..].to_vec();
+                }
+            }
+        }
+        for &b in bytes{
+            if self.preview_lines>=12||self.preview.len()>=8000{break;}
+            self.preview.push(b);if b==b'\n'{self.preview_lines+=1;}
+        }
+        Ok(())
+    }
+    fn drain(&mut self,host:&mut Host)->Result<bool>{
+        use std::io::Read;
+        let mut buffer=[0u8;65536];
+        // Bound each poll's work, even when a child continuously writes.
+        for _ in 0..4{
+            let size=self.file.read(&mut buffer)?;
+            if size==0{return Ok(false);}
+            self.commit(host,&buffer[..size])?;
+        }
+        Ok(true)
+    }
+    fn finish(mut self,host:&mut Host,complete:bool)->Result<Value>{
+        while self.drain(host)?{}
+        self.finish_metadata(host,complete)
+    }
+    fn finish_metadata(mut self,host:&mut Host,complete:bool)->Result<Value>{
+        if self.index.is_none(){self.commit(host,&[])?;}
+        if !self.carry.is_empty(){self.chars=None;}
+        let index=self.index.ok_or("missing capture index")?;
+        let lines=self.newlines+usize::from(self.last.is_some()&&self.last!=Some(b'\n'));
+        let metadata=json!({"ref":format!("H.{}[{index}]",self.name),"index":index,
+            "bytes":self.bytes,"chars":self.chars,"lines":lines,
+            "preview":String::from_utf8_lossy(&self.preview).lines().take(12).collect::<Vec<_>>().join("\n"),
+            "preview_truncated":self.preview.len()<self.bytes,
+            "omitted_lines":lines.saturating_sub(12),"complete":complete});
+        let mut durable=metadata.clone();durable.as_object_mut().unwrap().remove("preview");
+        host.journal.append(if complete{"stream_complete"}else{"stream_closed"},json!({"collection":self.name,"operation":self.operation,
+            "metadata":durable}))?;
+        Ok(metadata)
+    }
+}
+
+// =============================================================================
+// Python worker IPC
+// =============================================================================
+
+struct Worker { child:Child, reader:BufReader<UnixStream>, writer:UnixStream, dir:PathBuf }
+impl Worker {
+    fn spawn(home:&Path,generation:usize)->Result<Self>{
+        let dir=home.join(format!("worker-{}-{}-{}",std::process::id(),generation,unique_id()));
+        fs::create_dir_all(&dir)?;
+        let script=dir.join("worker.py");fs::write(&script,PYTHON)?;
+        let (host,child_socket)=UnixStream::pair()?;
+        let fd=child_socket.as_raw_fd();
+        let mut command=Command::new(std::env::var("PY_PYTHON").unwrap_or_else(|_|"python3".into()));
+        command.args(["-u",script.to_str().unwrap(),&fd.to_string()])
+            .stdin(std::process::Stdio::null());
+        unsafe {command.pre_exec(move || {
+            if libc::setsid()<0 {return Err(io::Error::last_os_error());}
+            if libc::fcntl(fd,libc::F_SETFD,0)<0 {return Err(io::Error::last_os_error());}
+            Ok(())
+        });}
+        let child=command.spawn()?;drop(child_socket);
+        let writer=host.try_clone()?;
+        let mut worker=Self{child,reader:BufReader::new(host),writer,dir};
+        if worker.recv()?["kind"]!="ready" {return Err("worker did not initialize".into());}
+        Ok(worker)
+    }
+    fn send(&mut self,v:&Value)->Result<()> {writeln!(self.writer,"{}",v)?;Ok(())}
+    fn reply(&mut self,id:&Value,mut response:Value)->Result<()>{
+        response["kind"]=json!("rpc_reply");response["rpc_id"]=id.clone();self.send(&response)
+    }
+    fn recv(&mut self)->Result<Value>{
+        let mut line=String::new();
+        if self.reader.read_line(&mut line)?==0{return Err("Python worker disconnected".into());}
+        Ok(serde_json::from_str(&line)?)
+    }
+}
+impl Drop for Worker {
+    fn drop(&mut self){let _=self.send(&json!({"kind":"shutdown"}));
+        unsafe{libc::kill(-(self.child.id() as i32),libc::SIGKILL);}
+        let _=self.child.kill();
+        let _=self.child.wait();let _=fs::remove_dir_all(&self.dir);}
+}
+
+// =============================================================================
+// Session host and model loop
+// =============================================================================
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum UiState{Idle,Thinking,Running,Input,Login}
+impl UiState{
+    fn label(self)->&'static str{match self{Self::Idle=>"idle",Self::Thinking=>"thinking",Self::Running=>"running",Self::Input=>"input",Self::Login=>"login"}}
+}
+struct Host {
+    state:UiState,thinking_model:Option<String>,cells:usize,active_cell:Option<usize>,
+    active_language:Option<String>,active_started:Option<std::time::Instant>,cancel_revision:u64,
+    status_line:std::cell::Cell<bool>, busy_draft:EditBuffer, busy_input:Option<BusyInput>, input_busy_paused:bool,last_cell:Value,
+    journal:Journal, worker:Worker, home:PathBuf, context:Vec<Item>,
+    history:HashMap<String,Vec<Value>>, ids:HashSet<String>, json:bool,
+    stop:bool, stop_wakeup:Option<(f64,String)>, reset:bool, reset_explicit:bool, generation:usize, revision:usize,
+    bg_tasks:HashMap<String,BgTask>, wakeups:HashMap<String,Wakeup>, servicing:bool,
+    incoming:Option<std::sync::mpsc::Receiver<Value>>, input_closed:bool, pending:std::collections::VecDeque<Value>,
+    attachments:HashMap<String,usize>, queued:HashMap<String,Option<(usize,usize)>>,
+    deferred_say:Vec<(usize,String)>, agent_turn:bool, config:Value, config_defaults:Value, auth:Value,
+    model:String, effort:String, no_model:bool, context_limit:usize,
+    trigger:usize,retain:usize,current_code:Option<String>, usage:Value,
+    skills:Value, catalog:Value, initializing:bool, startup_ready:bool,
+}
+impl Host {
+    fn event(&self,kind:&str,payload:Value) {
+        let mut v=payload;v["kind"]=json!(kind);v["schema_version"]=json!(1);
+        if self.json {println!("{}",v);} else {
+            if let Some(busy)=&self.busy_input{
+                busy.event(&v,self.state_payload());return;
+            }
+            if kind=="state"&&self.incoming.is_none()&&terminal_editor_available(false)
+                &&matches!(v["state"].as_str(),Some("idle"|"running"|"thinking")){return;}
+            let transient=terminal_color_for(1);
+            if transient&&kind=="state"{
+                let state=v["state"].as_str().unwrap_or("idle");
+                print!("\r\x1b[K");
+                if state!="idle"{
+                    let text=terminal_state(&v,terminal_width()).join("\n");print!("{text}");self.status_line.set(true);
+                }else{self.status_line.set(false);}
+                let _=io::stdout().flush();return;
+            }
+            if transient&&self.status_line.replace(false){print!("\r\x1b[K");}
+            match kind {
+                "state"=>for line in terminal_state(&v,terminal_width()){println!("{line}");},
+                // A cell gets one durable visual boundary, at completion. While
+                // active, the transient prompt communicates running/thinking.
+                "cell_start"=>{},
+                "cell_end"=>for line in terminal_cell_end(&v,terminal_width()){println!("{line}");},
+                "say"=>for line in terminal_markdown(v["text"].as_str().unwrap_or(""),terminal_width()){println!("{line}");},
+                "final"=>for line in terminal_style_lines(terminal_markdown(v["text"].as_str().unwrap_or(""),terminal_width()),"1;97"){println!("{line}");},
+                "input_prompt"=>{print!("{}",terminal_wrap(v["prompt"].as_str().unwrap_or(""),terminal_width()).0.join("\n"));let _=io::stdout().flush();},
+                "source"|"preview"=>for line in terminal_preview(&v,terminal_width()){println!("{line}");},
+                "rejected"|"error"=>for line in terminal_wrap(v["error"].as_str().unwrap_or("operation rejected"),terminal_width()).0{eprintln!("{}",terminal_styled_for(&line,"31",2));},
+                "queued"|"queue_sent"=>for line in terminal_queue(&v,terminal_width()){println!("{line}");},
+                "notice"=>for line in terminal_style_lines(terminal_wrap(v["text"].as_str().unwrap_or(""),terminal_width()).0,"2"){println!("{line}");},
+                _=>{}
+            }
+        }
+    }
+    fn hist_push(&mut self,name:&str,value:Value)->usize{
+        let value=if ["raw","requests","responses","say","usage","stdin"].contains(&name) && self.journal.seq>0{
+            json!({"$event":self.journal.seq-1})
+        }else{value};
+        let list=self.history.entry(name.into()).or_default();let n=list.len();list.push(value);n
+    }
+    fn add_context(&mut self,role:&str,text:String,output:bool,ranges:Vec<(usize,usize)>)->Result<String>{
+        let id=format!("c{}",self.journal.seq);
+        let ranges=if ranges.is_empty(){vec![(self.journal.seq,self.journal.seq+1)]}else{ranges};
+        let n=self.journal.append("context_add",json!({"id":id,"role":role,"text":text,"output":output,"ranges":ranges}))?;
+        self.context.push(Item{id:id.clone(),role:role.into(),text,output,
+            ranges:if ranges.is_empty(){vec![(n,n+1)]}else{ranges}});
+        self.revision+=1;Ok(id)
+    }
+    fn chars(&self)->usize{self.system_prompt().chars().count()+512+self.context.iter().map(|i|i.text.chars().count()+64).sum::<usize>()}
+    fn input_budget(&self)->usize{model_input_budget(self.context_limit,&self.reasoning_metadata(&self.model),4096)}
+    fn forced(&self)->bool{self.chars().div_ceil(3)>self.input_budget()*9/10}
+    fn context_usage(&self)->Value{
+        json!({"context_revision":self.revision,"item_count":self.context.len(),
+            "rendered_chars":self.chars(),"estimated_input_tokens":self.chars().div_ceil(3),
+            "measured_last_input_tokens":self.usage["last_input_tokens"],
+            "model_context_limit":self.context_limit,"reserved_output_tokens":4096,
+            "input_token_budget":self.input_budget(),
+            "remaining_input_tokens":self.input_budget().saturating_sub(self.chars().div_ceil(3)),
+            "system_chars":self.system_prompt().chars().count(),"skills_estimated_tokens":self.skills["estimated_added_tokens"],
+            "forced":self.forced(),"force_threshold":0.9,"estimator":"unicode-chars/3-v1 estimate; system/control allowance included; image budget separate"})
+    }
+}
+
+impl Host {
+    fn rpc(&mut self,v:&Value)->Result<Value>{
+        let op=v["op"].as_str().unwrap_or("");
+        if self.initializing && !["history","history_len","cell","cell_len"].contains(&op){return Err("startup entries may define/import helpers and read H, but cannot use agent bridge controls, context, input or side-effect helpers during initialization".into());}
+        match op {
+            "cell"=>self.cell_view(v["cell"].as_u64().ok_or("cell number must be a positive integer")? as usize),
+            "cell_len"=>Ok(json!(self.cells)),
+            "history"=>{
+                let name=v["collection"].as_str().ok_or("missing collection")?;
+                let len=if name=="events"{self.journal.seq}else{self.history.get(name).ok_or("unknown H collection")?.len()};
+                if let Some(n)=v["index"].as_i64(){
+                    let index=if n<0{len as i64+n}else{n};
+                    if index<0||index as usize>=len{return Err("H index out of range".into());}
+                    return self.history_value(name,index as usize);
+                }
+                let a=v["start"].as_u64().unwrap_or(0) as usize;
+                let b=v["stop"].as_u64().unwrap_or(len as u64) as usize;
+                if a>b{return Err("invalid H slice".into());}
+                Ok(json!((a.min(len)..b.min(len)).map(|n|self.history_value(name,n)).collect::<Result<Vec<_>>>()?))
+            },
+            "history_len"=>Ok(json!(if v["collection"]=="events"{self.journal.seq}
+                else{self.history.get(v["collection"].as_str().unwrap_or("")).map_or(0,Vec::len)})),
+            "read_text"=>{
+                let text=v["text"].as_str().ok_or("text required")?;
+                let max=v["max_chars"].as_u64().ok_or("positive maximum required")? as usize;
+                if max==0||text.chars().count()>max {return Err("selection exceeds max_chars".into());}
+                if (self.chars()+text.chars().count()+64).div_ceil(3)>=self.input_budget() {
+                    return Err("selection exceeds next-request context budget".into());
+                }
+                let id=self.add_context("user",text.into(),true,vec![])?;Ok(json!(id))
+            },
+            "context_usage"=>Ok(self.context_usage()),
+            "context_items"=>Ok(json!(self.context.iter().map(|i|json!({"id":i.id,"role":i.role,
+                "chars":i.text.chars().count(),"ranges":i.ranges})).collect::<Vec<_>>())),
+            "say"|"final"=>{
+                let text=v["text"].as_str().unwrap_or("");let final_answer=op=="final";
+                self.journal.append("say",json!({"text":text,"final":final_answer}))?;
+                self.hist_push("say",json!(text));
+                if final_answer&&self.active_cell.is_some()&&!self.json{
+                    self.deferred_say.push((self.active_cell.unwrap(),text.into()));
+                }else{self.event(if final_answer{"final"}else{"say"},json!({"text":text}));}
+                if final_answer{
+                    // Steering still wins before this staged stop commits.
+                    self.stop=true;self.stop_wakeup=None;
+                }
+                Ok(Value::Null)
+            },
+            "stop"=>{
+                let wakeup=match v.get("wakeup").filter(|w|!w.is_null()){
+                    None=>None,
+                    Some(w)=>{let values=w.as_array().filter(|a|a.len()==2).ok_or("wakeup must be [seconds, reason]")?;
+                        let seconds=bg_seconds(&values[0],604800.0)?.ok_or("wakeup duration required")?;
+                        let reason=bg_text(&json!({"reason":values[1]}),"reason",512)?.ok_or("wakeup reason required")?.to_owned();
+                        Some((seconds,reason))}
+                };
+                self.stop=true;self.stop_wakeup=wakeup;Ok(Value::Null)
+            },
+            "bg_run"=>self.bg_run(v),
+            "task_list"=>self.bg_list(v.get("state").filter(|x|!x.is_null()).map(|x|x.as_str().ok_or("state must be a string")).transpose()?),
+            "task_get"=>self.bg_get(v["task_id"].as_str().ok_or("task_id required")?),
+            "task_kill"=>self.bg_kill(v["task_id"].as_str().ok_or("task_id required")?,v.get("force").map(|x|x.as_bool().ok_or("force must be boolean")).transpose()?.unwrap_or(false)),
+            "reset"=>{self.reset=true;self.reset_explicit=true;Ok(Value::Null)},
+            "collapse"=>self.collapse(v),
+            "sh"=>self.shell(v),
+            "llm"=>self.inner_llm(v),
+            "models"=>{self.reload_auth()?;Ok(self.models())},
+            "image"=>self.image(v),
+            "read_raw"=>self.read_raw(v),
+            // input RPCs are serviced asynchronously in execute, not in this handler.
+            _=>Err(format!("unsupported agent operation: {op}").into())
+        }
+    }
+    fn collapse(&mut self,v:&Value)->Result<Value>{
+        let a=self.context.iter().position(|i|i.id==v["start"]).ok_or("missing start boundary")?;
+        let b=self.context.iter().position(|i|i.id==v["end"]).ok_or("missing end boundary")?;
+        if a>=b{return Err("collapse requires ordered distinct boundaries".into());}
+        let source=v["source"].as_str().ok_or("missing retained call")?;
+        let mut ranges:Vec<(usize,usize)>=self.context[a..b].iter().flat_map(|i|i.ranges.clone()).collect();
+        ranges.sort_unstable();
+        let mut merged:Vec<(usize,usize)>=vec![];
+        for (s,e) in ranges{
+            if let Some(last)=merged.last_mut(){if s<=last.1{last.1=last.1.max(e);continue;}}
+            merged.push((s,e));
+        }
+        let end=self.context[b].clone();
+        let preserve=end.role=="user"||end.role=="summary";
+        let mut text=format!("[Collapsed originals: {:?}]\n{}",merged,source);
+        if preserve{text.push_str("\n[Preserved boundary]\n");text.push_str(&end.text);}
+        let mut all_ranges=merged.clone();if preserve{all_ranges.extend(end.ranges.clone());}
+        let id=self.context[a].id.clone();
+        let own=self.current_code.clone();
+        let mut next=self.context.clone();
+        next.splice(a..=b,[Item{id:id.clone(),role:"summary".into(),text:text.clone(),output:false,ranges:all_ranges.clone()}]);
+        if let Some(own)=own{next.retain(|i|i.id!=own||i.id==id);}
+        let after=self.system_prompt().chars().count()+512+next.iter().map(|i|i.text.chars().count()+64).sum::<usize>();
+        if after>=self.chars(){return Err("collapse must reduce rendered context size".into());}
+        self.journal.append("context_replace",json!({"items":next.iter().map(item_json).collect::<Vec<_>>(),
+            "summary":v["summary"],"ranges":merged}))?;
+        self.context=next;self.revision+=1;Ok(Value::Null)
+    }
+}
+fn item_json(i:&Item)->Value{json!({"id":i.id,"role":i.role,"text":i.text,"output":i.output,"ranges":i.ranges})}
+
+fn stream_info(bytes:&[u8],name:&str,index:usize)->Value{
+    let decoded=std::str::from_utf8(bytes).ok();
+    let lines=bytes.iter().filter(|&&b|b==b'\n').count()+usize::from(!bytes.is_empty()&&!bytes.ends_with(b"\n"));
+    let preview=String::from_utf8_lossy(bytes).lines().take(12).collect::<Vec<_>>().join("\n");
+    json!({"ref":format!("H.{name}[{index}]"),"index":index,"bytes":bytes.len(),
+        "chars":decoded.map(|s|s.chars().count()),"lines":lines,
+        "preview":preview,"preview_truncated":lines>12,
+        "omitted_lines":lines.saturating_sub(12),"complete":true})
+}
+impl Host{
+    fn execute(&mut self,id:&str,source:&str,retain_source:bool)->Result<Value>{
+        let source_ref=format!("H.code[{}]",self.history["code"].len());
+        let result=self.with_cell("python",id,&source_ref,|host|host.execute_inner(id,source,retain_source));
+        if !self.agent_turn{self.flush_deferred_say(None);}
+        result
+    }
+    fn execute_inner(&mut self,id:&str,source:&str,retain_source:bool)->Result<Value>{
+        self.stop=false;self.stop_wakeup=None;self.reset=false;self.reset_explicit=false;
+        let code_index=self.hist_push("code",json!(source));
+        let n=self.journal.append("code",json!({"index":code_index,"source":source,
+            "operation":id,"worker_generation":self.generation,"initialization":self.initializing}))?;
+        self.current_code=None;
+        let forced=!self.initializing&&self.forced();
+        if retain_source{
+            self.current_code=Some(self.add_context("assistant",source.into(),false,vec![(n,n+1)])?);
+        }
+        let out=self.worker.dir.join("stdout");let err=self.worker.dir.join("stderr");
+        self.journal.append("intent",json!({"operation":id,"type":"python","code_index":code_index}))?;
+        // Fresh capture paths ensure a pre-start crash cannot recapture a prior
+        // cell's output. A worker that opens/writes them before started still has
+        // its partial bytes committed below even if its handshake is lost.
+        for path in [&out,&err]{OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(path)?;}
+        if !self.json{
+            self.event("source",json!({"cell":self.active_cell,"command_id":id,
+                "code":stream_info(source.as_bytes(),"code",code_index)}));
+        }
+        let sent=self.worker.send(&json!({"kind":"execute","source":source,"stdout":out,"stderr":err,"forced":forced})).is_ok();
+        let mut cancelled=false;
+        let mut started=false;
+        let mut complete=true;
+        let mut worker_exit=None;
+        let mut captures:Option<(Capture,Capture)>=None;
+        let mut cancel_time=None;
+        let mut prompt:Option<InputPrompt>=None;
+        let mut input_rpc=Value::Null;
+        let status=if !sent{complete=false;self.reset=true;"worker_crashed".to_string()}else{'execution:loop{
+            self.service_background()?;
+            if let Some((stdout,stderr))=captures.as_mut(){
+                stdout.drain(self)?;stderr.drain(self)?;
+            }
+            if started && self.poll_target(self.worker.child.id() as i32,
+                if prompt.is_some(){0}else{libc::SIGINT})? {
+                if !cancelled{cancel_time=Some(std::time::Instant::now());}cancelled=true;
+            }
+            if cancelled {
+                if let Some(p)=prompt.take(){
+                    let response=self.close_input(&p,"cancel",None)?;
+                    if self.worker.reply(&input_rpc,response).is_err(){complete=false;self.reset=true;break 'execution "worker_crashed".to_string();}
+                }
+            }
+            while let Some(pos)=self.pending.iter().position(|v|v["kind"]=="stdin_reply"){
+                let command=self.pending.remove(pos).unwrap();
+                if let Some(p)=&prompt{
+                    if let Some((response,cancel))=self.reply_input(p,&command)?{
+                        prompt=None;
+                        if self.worker.reply(&input_rpc,response).is_err(){complete=false;self.reset=true;break 'execution "worker_crashed".to_string();}
+                        if cancel{cancelled=true;cancel_time=Some(std::time::Instant::now());}
+                    }
+                }else{self.event("rejected",json!({"command_id":command["id"],"error":"no matching active input prompt"}));}
+            }
+            if let Some(p)=prompt.as_mut(){
+                let response=if self.input_closed{Some(self.close_input(p,"eof",None)?)}
+                    else if self.incoming.is_none(){self.terminal_input(p)?}else{None};
+                if let Some(response)=response{
+                    prompt=None;
+                    if self.worker.reply(&input_rpc,response).is_err(){complete=false;self.reset=true;break 'execution "worker_crashed".to_string();}
+                }
+            }
+            if cancel_time.is_some_and(|t:std::time::Instant|t.elapsed()>std::time::Duration::from_secs(2)){
+                unsafe{libc::kill(-(self.worker.child.id() as i32),libc::SIGKILL);}
+                complete=false;self.reset=true;break "cancelled".to_string();
+            }
+            let mut pollfd=libc::pollfd{fd:self.worker.reader.get_ref().as_raw_fd(),events:libc::POLLIN,revents:0};
+            if self.worker.reader.buffer().is_empty() && unsafe{libc::poll(&mut pollfd,1,20)}<=0{continue;}
+            let v=match self.worker.recv(){
+                Ok(v)=>v,
+                Err(_)=>{
+                    complete=false;self.reset=true;
+                    // A disconnected worker cannot be reused. Give an exiting process
+                    // time to expose its actual exit status, then terminate its group.
+                    for _ in 0..10{
+                        if let Some(exit)=self.worker.child.try_wait()?{worker_exit=Some(exit);break;}
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    unsafe{libc::kill(-(self.worker.child.id() as i32),libc::SIGKILL);}
+                    if worker_exit.is_none(){worker_exit=Some(self.worker.child.wait()?);}
+                    break if cancelled{"cancelled".to_string()}else{"worker_crashed".to_string()};
+                }
+            };
+
+            if v["kind"]=="started"{
+                if started{complete=false;self.reset=true;break "worker_protocol_error".to_string();}
+                captures=Some((Capture::open(&out,"stdout",id)?,Capture::open(&err,"stderr",id)?));
+                started=true;continue;
+            }
+            if v["kind"]=="done"{
+                if !started{complete=false;self.reset=true;break "worker_protocol_error".to_string();}
+                break if cancelled{"cancelled".to_string()}else{v["status"].as_str().unwrap_or("error").to_string()};
+            }
+            if v["kind"]=="rpc"{
+                if !started||v["rpc_id"].as_u64().is_none(){complete=false;self.reset=true;break "worker_protocol_error".to_string();}
+                let response=if cancelled{input_exception("cancel")}else{
+                    if v["op"]=="input" && !self.initializing{
+                        input_rpc=v["rpc_id"].clone();
+                        prompt=Some(self.begin_input(id,v["prompt"].as_str().unwrap_or(""))?);
+                        continue;
+                    }
+                    let checkpoint=self.cancel_revision;
+                    let response=match self.rpc(&v){
+                        Ok(value)=>json!({"ok":true,"value":value}),
+                        Err(e)=>json!({"ok":false,"error":e.to_string()})
+                    };
+                    if self.cancel_revision!=checkpoint{
+                        // A helper can consume the interrupt while Python waits
+                        // on its RPC. Preserve sticky cancellation/semantic status
+                        // instead of treating that request as an ordinary error.
+                        cancelled=true;cancel_time=Some(std::time::Instant::now());
+                        input_exception("cancel")
+                    }else{response}
+                };
+                if self.worker.reply(&v["rpc_id"],response).is_err(){complete=false;self.reset=true;break "worker_crashed".to_string();}
+                continue;
+            }
+            complete=false;self.reset=true;break "worker_protocol_error".to_string();
+        }};
+        if prompt.is_some(){self.set_state(UiState::Running,None);}
+        if self.reset&&worker_exit.is_none(){
+            worker_exit=self.worker.child.try_wait()?;
+            if worker_exit.is_none(){unsafe{libc::kill(-(self.worker.child.id() as i32),libc::SIGKILL);}
+                worker_exit=Some(self.worker.child.wait()?);}
+        }
+        let (stdout,stderr)=match captures{
+            Some(captures)=>captures,
+            None=>(Capture::open(&out,"stdout",id)?,Capture::open(&err,"stderr",id)?)
+        };
+        let stdout=stdout.finish(self,complete)?;
+        let stderr=stderr.finish(self,complete)?;
+        let code=stream_info(source.as_bytes(),"code",code_index);
+        let metadata=json!({"command_id":id,"status":status,"exit_code":if let Some(exit)=worker_exit{exit.code()}else if status=="ok"{Some(0)}else{Some(1)},
+            "stdout":stdout,"stderr":stderr,"code":code,"context_usage":self.context_usage()});
+        let mut preview=metadata.clone();preview["cell"]=json!(self.active_cell);
+        if !self.json{preview.as_object_mut().unwrap().remove("code");}
+        self.event("preview",preview);
+        let mut metadata=metadata;
+        for stream in ["code","stdout","stderr"] {
+            metadata[stream].as_object_mut().unwrap().remove("preview");
+        }
+        self.journal.append("completion",metadata.clone())?;
+        if retain_source {
+            let mut observation=metadata.clone();
+            for s in ["stdout","stderr","code"]{observation[s].as_object_mut().unwrap().remove("preview");}
+            self.add_context("user",format!("[Execution metadata] {}",observation),false,vec![])?;
+        }
+        self.current_code=None;
+        if status!="ok"{self.stop=false;self.stop_wakeup=None;}
+        if self.reset && !self.initializing {
+            if self.reset_explicit{self.reset_worker()?;}else{
+                self.with_state(UiState::Running,None,|host|host.replace_worker(false))?;
+            }
+        }
+        Ok(metadata)
+    }
+    fn reset_worker(&mut self)->Result<()>{
+        self.with_state(UiState::Running,None,Self::reset_worker_inner)
+    }
+    fn reset_worker_inner(&mut self)->Result<()>{self.replace_worker(true)}
+    fn replace_worker(&mut self,initialize:bool)->Result<()>{
+        self.startup_ready=false;
+        self.generation+=1;
+        self.worker=Worker::spawn(&self.home,self.generation)?;
+        let notice="Session loaded into fresh Python. Previous variables are undefined; H and context are restored.";
+        self.journal.append("worker_reset",json!({"generation":self.generation}))?;
+        self.add_context("user",notice.into(),false,vec![])?;
+        self.event("notice",json!({"text":notice}));
+        if !initialize&&self.skills["entries"].as_array().is_some_and(|entries|entries.iter().any(|e|e["core"]==true&&e["kind"]=="python")){
+            self.journal.append("startup_blocked",json!({"generation":self.generation,"reason":"worker failure; core initialization requires explicit reset"}))?;
+            self.event("notice",json!({"text":"Core Python was not automatically re-executed after worker failure. /reset explicitly authorizes initialization; the outer agent is blocked until then."}));
+            Ok(())
+        }else{self.initialize_skills()}
+    }
+    fn shell(&mut self,v:&Value)->Result<Value>{
+        v["command"].as_str().ok_or("shell command required")?;
+        let id=format!("sh{}",self.journal.seq);
+        // cell_start is the only durable event before shell_inner's intent.
+        let source_ref=format!("H.events[{}]['payload']['source']",self.journal.seq+1);
+        self.with_cell("shell",&id,&source_ref,|host|host.shell_inner(v,&id))
+    }
+    fn shell_inner(&mut self,v:&Value,id:&str)->Result<Value>{
+        let command=v["command"].as_str().ok_or("shell command required")?;
+        let source_event=self.journal.append("intent",json!({"operation":id,"type":"shell","source":command}))?;
+        let mut c=Command::new("/bin/sh");c.args(["-c",command]);
+        if let Some(dir)=v["options"]["cwd"].as_str(){c.current_dir(dir);}
+        if let Some(env)=v["options"]["env"].as_object(){
+            for (k,v) in env {c.env(k,v.as_str().ok_or("environment value must be string")?);}
+        }
+        let timeout=match &v["options"]["timeout"]{
+            Value::Null=>None,
+            value=>{let seconds=value.as_f64().ok_or("timeout must be positive seconds")?;
+                if !seconds.is_finite()||seconds<=0.0{return Err("timeout must be positive seconds".into());}
+                Some(std::time::Duration::try_from_secs_f64(seconds)?)
+            }
+        };
+        let out_path=self.home.join(format!(".{id}-stdout-{}",self.worker.child.id()));
+        let err_path=self.home.join(format!(".{id}-stderr-{}",self.worker.child.id()));
+        let create=|path:&Path|->std::io::Result<File>{
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
+        };
+        c.stdout(create(&out_path)?).stderr(create(&err_path)?).stdin(std::process::Stdio::null());
+        unsafe{c.pre_exec(||{if libc::setsid()<0{return Err(std::io::Error::last_os_error());}Ok(())});}
+        if !self.json{
+            let mut code=stream_info(command.as_bytes(),"events",source_event);
+            code["ref"]=json!(format!("H.events[{source_event}]['payload']['source']"));
+            self.event("source",json!({"cell":self.active_cell,"command_id":id,"code":code}));
+        }
+        let mut child=c.spawn()?;
+        let pid=child.id() as i32;
+        let mut stdout=Capture::open(&out_path,"stdout",id)?;
+        let mut stderr=Capture::open(&err_path,"stderr",id)?;
+        let began=std::time::Instant::now();
+        let mut stopped=None;
+        let mut state=None;
+        let exit=loop{
+            stdout.drain(self)?;stderr.drain(self)?;
+            if self.poll_target(pid,libc::SIGTERM)?&&stopped.is_none(){
+                stopped=Some(std::time::Instant::now());state=Some("cancelled");
+            }
+            if timeout.is_some_and(|limit|began.elapsed()>=limit)&&stopped.is_none(){
+                self.journal.append("shell_timeout",json!({"operation":id}))?;
+                unsafe{libc::kill(-pid,libc::SIGTERM);}
+                stopped=Some(std::time::Instant::now());state=Some("timeout");
+            }
+            if stopped.is_some_and(|when|when.elapsed()>=std::time::Duration::from_millis(200)){
+                unsafe{libc::kill(-pid,libc::SIGKILL);}
+            }
+            if let Some(status)=child.try_wait()?{break status;}
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        // No detached descendants may retain session output descriptors.
+        unsafe{libc::kill(-pid,libc::SIGKILL);}
+        let stdout=stdout.finish(self,true)?;
+        let stderr=stderr.finish(self,true)?;
+        fs::remove_file(&out_path)?;fs::remove_file(&err_path)?;
+        let mut code=stream_info(command.as_bytes(),"events",source_event);
+        code["ref"]=json!(format!("H.events[{source_event}]['payload']['source']"));
+        let mut preview=json!({"cell":self.active_cell,"command_id":id,"stdout":stdout,"stderr":stderr,
+            "status":state.unwrap_or(if exit.success(){"ok"}else{"error"}),"code":code,
+            "terminal_controls":v["terminal_controls"]==true});
+        if !self.json{preview.as_object_mut().unwrap().remove("code");}
+        self.event("preview",preview);
+        let mut result=json!({"exit_code":exit.code(),"status":state.unwrap_or(if exit.success(){"ok"}else{"error"}),
+            "stdout":stdout,"stderr":stderr});
+        for stream in ["stdout","stderr"]{
+            result[stream].as_object_mut().unwrap().remove("preview");
+        }
+        let mut durable=result.clone();durable["operation"]=json!(id);
+        self.journal.append("shell_completion",durable)?;Ok(result)
+    }
+    fn evict(&mut self)->Result<()>{
+        let eligible:Vec<usize>=self.context.iter().enumerate().filter_map(|(n,i)|i.output.then_some(n)).collect();
+        if eligible.len()<self.trigger{return Ok(());}
+        for &n in eligible.iter().take(eligible.len().saturating_sub(self.retain)){
+            let i=&mut self.context[n];
+            i.text=format!("[Output omitted: originals {:?}; {} chars]",i.ranges,i.text.chars().count());
+            i.output=false;
+        }
+        self.journal.append("context_replace",json!({"items":self.context.iter().map(item_json).collect::<Vec<_>>(),"reason":"output_batch"}))?;
+        self.revision+=1;Ok(())
+    }
+}
+
+impl Host {
+    fn new(home:PathBuf,resume:Option<PathBuf>,json_mode:bool,no_model:bool,model_override:Option<&str>,effort_override:Option<&str>)->Result<Self>{
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(home.join("sessions"))?;
+        fs::set_permissions(&home,fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(home.join("sessions"),fs::Permissions::from_mode(0o700))?;
+        let resumed=resume.is_some();
+        let path=resume.unwrap_or_else(||home.join("sessions").join(format!("{}-{}-{}.jsonl",now_ms(),std::process::id(),unique_id())));
+        let config_path=home.join("config.json");
+        let config={
+            let lock=OpenOptions::new().create(true).read(true).write(true).truncate(false).mode(0o600).open(home.join("config.lock"))?;
+            if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX)}!=0{return Err(io::Error::last_os_error().into());}
+            if config_path.exists(){load_json(&config_path)?}else{
+                let defaults=json!({"skills":skills_defaults(),"model_catalog":model_catalog_defaults()});write_private_json(&config_path,&defaults)?;defaults
+            }
+        };
+        validate_config(&config)?;
+        let mut journal=Journal::open(path)?;
+        let mut snapshot=None;let mut unfinished_startup=false;let mut generation=0;
+        for sequence in 0..journal.seq{
+            let ev=journal.event(sequence)?;
+            match ev["kind"].as_str().unwrap_or(""){
+                "skills_snapshot"=>{if snapshot.is_some(){return Err("duplicate skills snapshot".into());}snapshot=Some(ev["payload"].clone());},
+                "worker_reset"=>generation=ev["payload"]["generation"].as_u64().ok_or("invalid worker generation")? as usize,
+                "startup_begin"|"startup_blocked"=>unfinished_startup=true,
+                "startup_end"=>unfinished_startup=ev["payload"]["status"]!="ok",
+                _=>{}
+            }
+        }
+        let skills=if let Some(snapshot)=snapshot{
+            if snapshot["version"]!=1||!snapshot["system"].is_string()||!snapshot["entries"].is_array(){return Err("invalid skills snapshot".into());}snapshot
+        }else{
+            let snapshot=if resumed{json!({"version":1,"system":SYSTEM,"entries":[],"options":{"enabled":false},"estimated_added_tokens":0,"legacy":true})}
+                else{build_skills_snapshot(&home,&config)?};
+            journal.append("skills_snapshot",snapshot.clone())?;snapshot
+        };
+        let worker=Worker::spawn(&home,if resumed{generation+1}else{0})?;
+        let mut host=Self{state:UiState::Idle,thinking_model:None,cells:0,active_cell:None,
+            active_language:None,active_started:None,cancel_revision:0,
+            status_line:std::cell::Cell::new(false),busy_draft:EditBuffer::default(),busy_input:None,input_busy_paused:false,last_cell:Value::Null,
+            journal,worker,home,context:vec![],history:HashMap::new(),ids:HashSet::new(),
+            json:json_mode,stop:false,stop_wakeup:None,reset:false,reset_explicit:false,generation:0,revision:0,
+            bg_tasks:HashMap::new(),wakeups:HashMap::new(),servicing:false,
+            incoming:None,input_closed:false,pending:std::collections::VecDeque::new(),attachments:HashMap::new(),queued:HashMap::new(),
+            deferred_say:vec![],agent_turn:false,config:json!({}),config_defaults:json!({}),auth:json!({}),model:std::env::var("PY_MODEL").unwrap_or_else(|_|"openai/gpt-4.1".into()),
+            effort:"medium".into(),no_model,context_limit:std::env::var("PY_CONTEXT_LIMIT").ok().and_then(|s|s.parse().ok()).unwrap_or(128000),trigger:20,retain:10,current_code:None,usage:json!({}),
+            skills,catalog:empty_model_catalog(),initializing:false,startup_ready:false};
+        for name in ["code","user","stdout","stderr","stdin","raw","say","requests","responses","usage"]{
+            host.history.insert(name.into(),vec![]);
+        }
+        let mut settings=None;
+        for sequence in 0..host.journal.seq {
+            let ev=host.journal.event(sequence)?;
+            let p=&ev["payload"];
+            match ev["kind"].as_str().unwrap_or("") {
+                "code"=>{host.hist_push("code",p["source"].clone());},
+                "user"=>{host.hist_push("user",p["text"].clone());},
+                "stdin"=>{host.history.get_mut("stdin").unwrap().push(json!({"$event":sequence}));},
+                "worker_reset"=>{host.generation=p["generation"].as_u64().ok_or("invalid worker generation")? as usize;},
+                "settings_initial"|"settings_change"=>{settings=Some(p.clone());},
+                "task_state"|"task_settled"|"wakeup_state"=>host.bg_restore(ev["kind"].as_str().unwrap(),p)?,
+                "cell_start"=>{host.cells=host.cells.max(p["cell"].as_u64().ok_or("invalid session cell number")? as usize);},
+                "cell_end"=>host.last_cell=p.clone(),
+                "stream"=>{
+                    let list=host.history.get_mut(p["collection"].as_str().unwrap()).ok_or("invalid stream collection")?;
+                    let index=p["index"].as_u64().ok_or("missing stream index")? as usize;
+                    while list.len()<=index{list.push(json!({"$chunks":[]}));}
+                    list[index]["$chunks"].as_array_mut().unwrap().push(json!(sequence));
+                },
+                "say"=>{host.history.get_mut("say").unwrap().push(json!({"$event":sequence}));},
+                "accepted"=>{if let Some(s)=p["command_id"].as_str(){host.ids.insert(s.into());}},
+                "context_add"=>{
+                    host.context.push(parse_item(p));host.revision+=1;
+                },
+                "context_replace"=>{host.context=p["items"].as_array().ok_or("invalid context journal")?
+                    .iter().map(parse_item).collect();host.revision+=1;},
+                "usage"=>{
+                    host.usage=p.clone();host.history.get_mut("usage").unwrap().push(json!({"$event":sequence}));
+                    if host.usage.get("cache_usage_complete").is_none(){
+                        // Legacy totals may have lost a prefix after an
+                        // unmeasured request. Preserve only a lower bound.
+                        host.usage["reported_cache_hit_tokens"]=json!(host.usage["cache_hit_tokens"].as_u64().unwrap_or(0));
+                        host.usage["cache_hit_tokens"]=Value::Null;host.usage["cache_usage_complete"]=json!(false);
+                    }
+                },
+                "request"=>{host.history.get_mut("requests").unwrap().push(json!({"$event":sequence}));},
+                "response"=>{host.history.get_mut("responses").unwrap().push(json!({"$event":sequence}));},
+                "raw"=>{host.history.get_mut("raw").unwrap().push(json!({"$event":sequence}));},
+                "attachment"=>{host.attachments.insert(p["context_id"].as_str().unwrap().into(),p["raw_index"].as_u64().unwrap() as usize);},
+                _=>{}
+            }
+        }
+        host.config_defaults=config.clone();host.config=config;
+        host.auth=load_json(&host.home.join("auth.json"))?;
+        match load_model_catalog(&host.home.join("models.json")){
+            Ok(cache)=>host.catalog=cache,Err(_)=>host.event("notice",json!({"text":"Invalid model catalog cache ignored; using offline inventory until refresh."}))
+        }
+        host.configure()?;
+        if let Some(settings)=settings{
+            host.set_model(settings["model"].as_str().ok_or("invalid session model")?.into())?;
+            host.effort=settings["effort"].as_str().ok_or("invalid session effort")?.into();
+            host.validate_effort(&host.effort)?;
+        }
+        if let Some(model)=model_override{host.choose_model(model)?;}
+        if !resumed&&model_override.is_none()&&host.config["model"].is_null()&&std::env::var("PY_MODEL").is_err()
+            &&host.auth["openai-codex"].is_object(){host.select_model_after_login("openai-codex");}
+        if let Some(effort)=effort_override{host.change_effort(effort)?;}
+        host.validate_effort(&host.effort)?;
+        host.check_system_budget(host.context_limit)?;
+        if !resumed{host.journal.append("settings_initial",json!({"model":host.model,"effort":host.effort}))?;}
+        if resumed {
+            host.bg_recover()?;
+            host.generation+=1;
+            let notice="Session loaded into fresh Python. Previous variables are undefined; H and context are restored.";
+            host.journal.append("worker_reset",json!({"generation":host.generation}))?;
+            host.add_context("user",notice.into(),false,vec![])?;
+            host.event("notice",json!({"text":notice}));
+            let recovery=host.recovery_status()?;
+            if recovery["operations"].as_array().is_some_and(|ops|ops.iter().any(|v|v["state"]=="unknown")){
+                host.event("notice",json!({"text":"Interrupted session has unknown operation outcomes. No execution was replayed; /recovery shows captured partial streams."}));
+            }
+        }
+        if resumed&&unfinished_startup{
+            host.event("notice",json!({"text":"Previous startup failed or has unknown side effects. Startup was not replayed. Inspect /recovery; /reset explicitly authorizes a fresh initialization attempt."}));
+        }else{host.initialize_skills()?;}
+        Ok(host)
+    }
+    fn user(&mut self,text:&str,visible:bool)->Result<usize>{
+        let index=self.hist_push("user",json!(text));
+        let n=self.journal.append("user",json!({"index":index,"text":text,"visible":visible}))?;
+        if visible{
+            let selected=text.chars().take(8000).collect::<String>();
+            let rendered=format!("{}\n[{} chars; {} lines; omitted {} chars; H.user[{}]]",
+                selected,text.chars().count(),text.lines().count(),text.chars().count().saturating_sub(8000),index);
+            self.add_context("user",rendered,false,vec![(n,n+1)])?;
+        }
+        Ok(index)
+    }
+    fn dispatch(&mut self,v:Value)->Result<bool>{
+        self.reload_auth()?;
+        let id=v["id"].as_str().unwrap_or("").to_string();
+        if id.is_empty(){self.event("rejected",json!({"command_id":id,"error":"command ID required"}));return Ok(true);}
+        if v["kind"]=="stdin_reply"{
+            self.event("rejected",json!({"command_id":id,"error":"no matching active input prompt"}));return Ok(true);
+        }
+        let queued=self.queued.remove(&id);
+        if queued.is_none()&&self.ids.contains(&id){self.event("rejected",json!({"command_id":id,"error":"duplicate command ID"}));return Ok(true);}
+        let recorded=redacted_command(v.clone())?;
+        if queued.is_some(){
+            self.journal.append("queue_dispatched",json!({"command_id":id,"state":"dispatched"}))?;
+        }else{
+            self.journal.append("accepted",json!({"command_id":id,"command":recorded}))?;
+            self.ids.insert(id.clone());self.event("accepted",json!({"command_id":id}));
+        }
+        match v["kind"].as_str().unwrap_or("") {
+            "python"=>{
+                let source=v["source"].as_str().ok_or("source required")?;
+                let visible=v["visible"].as_bool().unwrap_or(false);
+                if queued.is_none(){self.user(source,false)?;}
+                let result=self.execute(&id,source,false)?;
+                if visible{
+                    let message=format!("@@{}\n[stdout]\n{}\n[stderr]\n{}",source,
+                        self.history_last("stdout")?,
+                        self.history_last("stderr")?);
+                    self.user(&message,true)?;
+                }
+                if self.stop{self.commit_stop()?;}
+                self.event("completed",result);
+            },
+            "bg_run"=>{
+                let result=self.bg_run(&json!({"kind":v.get("task_kind").unwrap_or(&json!("shell")),"source":v["source"],"options":v["options"]}))?;
+                self.event("completed",json!({"command_id":id,"status":"ok","result":result}));
+            },
+            "task_list"|"task_get"|"task_logs"|"task_kill"|"wakeup_list"|"wakeup_cancel"|"wakeup_run"=>{
+                self.finish_background_control(&v)?;
+            },
+            "shell"=>{
+                let command=v["command"].as_str().ok_or("command required")?;
+                if queued.is_none(){self.user(command,false)?;}
+                let r=self.shell(&json!({"command":command,"options":v["options"],
+                    "terminal_controls":v["terminal_controls"]==true}))?;
+                if v["visible"].as_bool().unwrap_or(false){
+                    let message=format!("!!{}\n[stdout]\n{}\n[stderr]\n{}",command,
+                        self.history_last("stdout")?,
+                        self.history_last("stderr")?);
+                    self.user(&message,true)?;
+                }
+                self.event("completed",json!({"command_id":id,"status":r["status"],"stdout":r["stdout"],"stderr":r["stderr"]}));
+            },
+            "submit"=>{
+                let text=v["text"].as_str().ok_or("text required")?;
+                if let Some(Some((index,sequence)))=queued{self.select_user(text,index,sequence)?;}
+                else{self.user(text,true)?;}
+                if !self.no_model{self.run_agent()?;}
+                self.event("completed",json!({"command_id":id,"status":"ok"}));
+            },
+            "interrupt"=>{
+                INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
+                self.event("completed",json!({"command_id":id,"status":"ok","active":false}));
+            },
+            "reset"=>{self.reset_worker()?;self.event("completed",json!({"command_id":id,"status":"ok"}));},
+            "login"=>{
+                let provider=v["provider"].as_str().ok_or("provider required")?;
+                match v["method"].as_str(){
+                    Some("browser")=>self.browser_login(provider,false)?,
+                    Some("manual")=>self.browser_login(provider,true)?,
+                    Some("oauth"|"device")=>self.oauth_login(provider)?,
+                    Some("api-key")|None=>self.key_login(provider,v["key"].as_str().ok_or("key required")?)?,
+                    _=>return Err("Unsupported login method: browser, manual, device, oauth or api-key".into())
+                }
+                let provider=self.resolve_provider(provider)?;
+                self.select_model_after_login(&provider);
+                self.event("completed",json!({"command_id":id,"status":"ok"}));
+            },
+            "logout"=>{
+                self.logout(v["provider"].as_str().ok_or("provider required")?)?;
+                self.event("completed",json!({"command_id":id,"status":"ok"}));
+            },
+            "auth"=>self.event("auth",json!({"command_id":id,"providers":self.auth_status()})),
+            "models"=>{
+                let refresh=v.get("refresh").map(|r|r.as_bool().ok_or("refresh must be boolean")).transpose()?.unwrap_or(false);
+                if refresh{
+                    let provider=v["provider"].as_str().unwrap_or_else(||self.model.split_once('/').map_or("openai",|p|p.0)).to_string();
+                    self.refresh_model_catalog(&provider,true)?;
+                }
+                self.event("models",json!({"command_id":id,"models":self.models()}));
+            },
+            "recovery"=>self.event("recovery",{
+                let mut status=self.recovery_status()?;status["command_id"]=json!(id);status
+            }),
+            "status"=>self.event("status",self.status()),
+            "context"=>self.event("context",json!({"command_id":id,"usage":self.context_usage(),
+                "items":self.context.iter().map(item_json).collect::<Vec<_>>()})),
+            "new"|"resume"=>{
+                let cancel=v.get("cancel_tasks").map(|x|x.as_bool().ok_or("cancel_tasks must be boolean")).transpose()?.unwrap_or(false);
+                let query=if v["kind"]=="resume"{Some(v["session"].as_str().filter(|s|!s.is_empty()).ok_or("session path/query required")?)}else{None};
+                self.switch_session(query,cancel)?;
+                self.journal.append("accepted",json!({"command_id":id,"command":v}))?;self.ids.insert(id.clone());
+                self.event("completed",json!({"command_id":id,"status":"ok","session":self.journal.path}));
+            },
+            "quit"=>{self.bg_guard(v.get("cancel_tasks").map(|x|x.as_bool().ok_or("cancel_tasks must be boolean")).transpose()?.unwrap_or(false))?;return Ok(false);},
+            _=>self.event("rejected",json!({"command_id":id,"error":"unknown command kind"}))
+        }
+        self.evict()?;Ok(true)
+    }
+}
+fn parse_item(p:&Value)->Item{
+    let ranges=p["ranges"].as_array().map(|a|a.iter().filter_map(|v|Some((v[0].as_u64()? as usize,v[1].as_u64()? as usize))).collect()).unwrap_or_default();
+    Item{id:p["id"].as_str().unwrap_or("").into(),role:p["role"].as_str().unwrap_or("user").into(),
+        text:p["text"].as_str().unwrap_or("").into(),output:p["output"].as_bool().unwrap_or(false),ranges}
+}
+
+const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences. Persistent CPython exposes agent and H. H.cells[n] is the canonical record for presented cell n and links its source, output, context and helper histories; H.code/user/stdout/stderr retain full collection histories. Only metadata is automatically observed. Payload enters model context only by explicit selection. agent.context.read_text(text, *, max_chars=8000, start=0, stop=None) accepts a string, selects text[start:stop], returns a boundary ID, and rejects oversized selections or next-request-budget overflow without truncation. Example: agent.context.read_text(H.stderr[i][:4000]). agent.context.read_raw(data) accepts PNG/JPEG bytes, a base64 dictionary, or a file-path string (not literal image text); max 512000 file bytes, 1536 pixels per axis, 4 active attachments; returns a boundary ID. agent.say(text) sends an intermediate user-only UI message and continues. Use agent.final(text) for every final response: it sends the strong final answer without stdout/context duplication and implicitly ends the turn after the successful cell. Never split a final answer and stopping across cells. Put agent.final last: final/stop do not return or exit Python; subsequent statements run, and a failed cell cancels the staged stop. Final publication is not transactional. agent.sh(command, cwd=None, env=None, timeout=None) runs /bin/sh -c with null stdin and no timeout by default; returns status/exit code and H stream metadata/refs, not text. agent.llm(prompt, model=..., system=..., max_tokens=2048, images=..., effort=...) returns a string; defaults to session model/effort and a helpful-assistant system. agent.llm.list() lists model metadata; agent.llm.image(prompt, model='openai/gpt-image-1') returns raw_index/ref/bytes; image bytes remain in H.raw until explicitly selected. input(prompt) asks the user. agent.loop.reset_python() stages a fresh worker with the frozen startup snapshot; previous variables are lost. agent.context.items()/usage() inspect context metadata. agent.loop.stop(wakeup=None) ends this turn after a successful cell; optional wakeup=(seconds,reason) schedules one continuation. agent.bgtasks.run(source,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None) returns task metadata immediately; kind='python' uses a fresh isolated interpreter without agent or main variables. bgtasks.list(state=None),get(task_id),kill(task_id,force=False) manage jobs. Outputs stay in H; only explicit context reads select them. Completion wakeups are opt-in. Does not kill foreground Python. Collapse must be one standalone call with three literal strings: agent.context.collapse('start','end','summary'); successful output is silent. Use distinct ordered boundary IDs: provenance covers [start,end), replacement removes through end, preserving end text only for user/summary items. It must reduce rendered context size. In forced mode only standalone collapse or one standalone stderr-read expression is allowed, e.g. agent.context.read_text(H.stderr[44][:4000]); 44 is an example, not a required index. Index/slice bounds must be literal nonnegative integers: no variables, negative indices, keywords, slice steps or additional statements. No replay after resume. Execution is unrestricted except bridge restrictions during startup: ordinary definitions/imports and H reads are allowed, other agent bridges are disabled. Worker failure requires an explicit reset before repeating core startup. Outer requests request/reserve 4096 output tokens; nested LLM requests default to 2048. Reservation is accounting, not enforcement. Codex currently transmits no output-token cap; other providers receive a cap parameter that reasoning may adjust. H.requests metadata distinguishes requested_output_tokens, transmitted_output_limit (null if absent), and reserved_output_tokens.";
+// Reasoning request fields follow the pinned Pi provider transformations, not
+// generic OpenAI-compatible guesses. This is a pure body-layout helper: it never
+// reads credentials, starts I/O or changes session state. A false/absent reasoning
+// flag means no fields. `off` means unset for APIs/models without verified disable
+// semantics, NOT a promise that the provider's default stops internal reasoning.
+fn model_input_budget(context_limit:usize,meta:&Value,reserved_output:usize)->usize{
+    let combined=context_limit.saturating_sub(reserved_output);
+    meta["max_input_tokens"].as_u64().map_or(combined,|cap|combined.min(cap as usize))
+}
+fn reasoning_fields(api:&str,provider:&str,id:&str,meta:&Value,effort:&str,max:usize)->Result<Value>{
+    if !["off","minimal","low","medium","high","xhigh","max"].contains(&effort){
+        return Err("effort must be off/minimal/low/medium/high/xhigh/max".into());
+    }
+    if max==0{return Err("max_tokens must be positive".into());}
+    let mut fields=json!({});
+    if meta["reasoning"]!=true{return Ok(fields);}
+    let adaptive=id.contains("opus-4-6")||id.contains("opus-4.6");
+    let supported=meta["reasoning_efforts"].as_array();
+    if supported.is_some_and(|levels|!levels.iter().any(|level|level==effort)){
+        return Err(format!("Effort {effort} unsupported by {id}; supported: {}",meta["reasoning_efforts"]).into());
+    }
+    if effort=="max" && !(api=="anthropic-messages"&&adaptive) && !supported.is_some_and(|levels|levels.iter().any(|level|level=="max")){
+        return Err("max effort requires explicit model capability metadata (or Anthropic Messages Opus 4.6); use high or xhigh".into());
+    }
+    let xhigh=id.contains("gpt-5.2")||id.contains("gpt-5.3")||supported.is_some_and(|levels|levels.iter().any(|level|level=="xhigh"));
+    let clamped=if effort=="xhigh"&&!xhigh{"high"}else{effort};
+    match api{
+        "openai-responses" if effort!="off"||supported.is_some()=>{
+            fields["reasoning"]=json!({"effort":if effort=="off"{"none"}else{clamped},"summary":"auto"});
+            fields["include"]=json!(["reasoning.encrypted_content"]);
+        },
+        "openai-completions"=>{
+            let compat=&meta["compat"];
+            let format=compat["thinkingFormat"].as_str().or(compat["thinking_format"].as_str())
+                .unwrap_or(if provider=="zai"{"zai"}else{"openai"});
+            if format=="zai"{fields["thinking"]=json!({"type":if effort=="off"{"disabled"}else{"enabled"}});}
+            else if format=="qwen"{fields["enable_thinking"]=json!(effort!="off");}
+            else{
+                let verified=compat["supportsReasoningEffort"].as_bool()
+                    .or(compat["supports_reasoning_effort"].as_bool())
+                    .unwrap_or(matches!(provider,"openai"|"github-copilot"|"groq"|"cerebras"|"openrouter"));
+                if verified&&effort!="off"{fields["reasoning_effort"]=json!(clamped);}
+            }
+        },
+        "anthropic-messages" if effort!="off"=>{
+            if adaptive{
+                fields["thinking"]=json!({"type":"adaptive"});
+                fields["output_config"]=json!({"effort":match effort{
+                    "minimal"|"low"=>"low","medium"=>"medium","xhigh"|"max"=>"max",_=>"high"}});
+            }else{
+                // Pi's pinned adaptive test is Opus-only; Sonnet 4.6 stays on
+                // its verified budget path. Reserve >=1024 output and >=1024
+                // thinking tokens, refusing caps that cannot satisfy both.
+                let desired=match effort{"minimal"=>1024,"low"=>2048,"medium"=>8192,_=>16384};
+                let cap=meta["max_tokens"].as_u64().unwrap_or(64000).min(usize::MAX as u64) as usize;
+                if cap<2048{return Err("reasoning output cap must allow 1024 thinking and 1024 output tokens".into());}
+                let output=max.max(1024).saturating_add(desired).min(cap);
+                let budget=desired.min(output-1024);
+                fields["max_tokens"]=json!(output);
+                fields["thinking"]=json!({"type":"enabled","budget_tokens":budget});
+            }
+        },
+        "google-generative-ai"=>{
+            if effort=="off"{
+                // 2.5 Flash explicitly permits zero. Pro/3 families cannot
+                // uniformly disable thinking, so leave their default untouched.
+                if id.contains("2.5-flash"){
+                    fields["thinkingConfig"]=json!({"includeThoughts":false,"thinkingBudget":0});
+                }
+            }else if id.contains("3-pro")||id.contains("3-flash"){
+                let level=if id.contains("3-pro"){
+                    if matches!(effort,"minimal"|"low"){"LOW"}else{"HIGH"}
+                }else{match effort{"minimal"=>"MINIMAL","low"=>"LOW","medium"=>"MEDIUM",_=>"HIGH"}};
+                fields["thinkingConfig"]=json!({"includeThoughts":true,"thinkingLevel":level});
+            }else{
+                let budget=if id.contains("2.5-pro")||id.contains("2.5-flash"){
+                    match effort{"minimal"=>128,"low"=>2048,"medium"=>8192,
+                        _=>if id.contains("2.5-pro"){32768}else{24576}}
+                }else{-1};
+                fields["thinkingConfig"]=json!({"includeThoughts":true,"thinkingBudget":budget});
+            }
+        },
+        _=>{}
+    }
+    Ok(fields)
+}
+fn merge_reasoning_fields(body:&mut Value,fields:&Value){
+    for (k,v) in fields.as_object().unwrap(){body[k]=v.clone();}
+}
+impl Host {
+    fn provider_config(&self,model:&str)->Result<(String,String,String)>{
+        let (provider,id)=model.split_once('/').unwrap_or(("openai",model));
+        let provider=provider_alias(provider);
+        let known=PROVIDERS.iter().find(|p|p.0==provider);
+        let cfg=&self.config["providers"][provider];
+        let mut url=cfg["base_url"].as_str()
+            .or(if provider=="github-copilot"{self.auth[provider]["base_url"].as_str().or(Some("https://api.githubcopilot.com"))}else{None})
+            .or(if provider=="openai-codex"{Some("https://chatgpt.com/backend-api")}else{None})
+            .or(known.map(|p|p.1)).ok_or("unknown provider; configure its base_url")?.to_string();
+        if provider=="openai"{if let Ok(custom)=std::env::var("OPENAI_BASE_URL"){url=custom;}}
+        let env=cfg["key_env"].as_str().or(known.map(|p|p.2)).unwrap_or("");
+        let mut key=self.credential(provider,env);
+        if key.is_empty()&&provider=="google"{key=std::env::var("GOOGLE_API_KEY").unwrap_or_default();}
+        if provider=="openai-codex"&&key.is_empty(){return Err("Codex subscription login required: /login codex".into());}
+        if key.is_empty() && !url.starts_with("http://127.0.0.1") {return Err(format!("missing API credential for {provider}").into());}
+        Ok((url.trim_end_matches('/').into(),key,id.into()))
+    }
+    fn models(&self)->Value{
+        let mut models:Vec<Value>=serde_json::from_str(CATALOG).unwrap();
+        // Official Codex/API model docs checked 2026-10-10. Availability remains
+        // account/workspace dependent; this is offline metadata, not an access probe.
+        for (id,name,aliases,off) in [
+            ("gpt-6.1-sol","GPT-6.1 Sol",vec!["sol61","sol6.1"],false),
+            ("gpt-6-astra","GPT-6 Astra",vec!["astra6"],false),
+            ("gpt-6-sol","GPT-6 Sol",vec!["sol6"],true),
+            ("gpt-6-luna","GPT-6 Luna",vec!["luna6"],true),
+            ("gpt-5.6-sol","GPT-5.6 Sol",vec!["sol56","sol5.6"],true),
+            ("gpt-5.6-terra","GPT-5.6 Terra",vec!["terra56","terra5.6"],true),
+            ("gpt-5.6-luna","GPT-5.6 Luna",vec!["luna56","luna5.6"],true),
+        ]{
+            let mut efforts=vec!["low","medium","high","xhigh","max"];
+            if off{efforts.insert(0,"off");}
+            for (provider,api) in [("openai","openai-responses"),("openai-codex","openai-codex-responses")]{
+                models.push(json!({"id":format!("{provider}/{id}"),"name":name,"aliases":aliases,"provider":provider,
+                    "api":api,"context_limit":if provider=="openai-codex"{272000}else{1050000},
+                    "max_input_tokens":if provider=="openai-codex"{258400}else{922000},"max_tokens":128000,
+                    "image_input":true,"reasoning":true,"image_output":false,"reasoning_efforts":efforts}));
+            }
+        }
+        for id in ["gpt-5.2","gpt-5.2-codex","gpt-5.3-codex"]{
+            models.push(json!({"id":format!("openai-codex/{id}"),"name":id,"provider":"openai-codex",
+                "api":"openai-codex-responses","context_limit":400000,"max_tokens":128000,
+                "image_input":true,"reasoning":true,"image_output":false,"deprecated":true}));
+        }
+        for provider in ["openai","openai-codex"]{
+            let record=&self.catalog["providers"][provider];
+            if self.catalog_identity(provider).is_some_and(|identity|record["identity"]==identity){
+                if let Some(discovered)=record["models"].as_array(){
+                    for model in models.iter_mut().filter(|m|m["provider"]==provider){
+                        model["catalog_listed"]=json!(discovered.iter().any(|d|d["id"]==model["id"]));
+                    }
+                    for model in discovered{
+                        models.retain(|m|m["id"]!=model["id"]);models.push(model.clone());
+                    }
+                }
+            }
+        }
+        if let Some(providers)=self.config["providers"].as_object(){
+            for (provider,cfg) in providers{
+                if let Some(list)=cfg["models"].as_array(){
+                    for item in list{
+                        let mut item=item.clone();
+                        item["id"]=json!(format!("{provider}/{}",item["id"].as_str().unwrap_or("")));
+                        item["provider"]=json!(provider);item["configured"]=json!(true);item["user_declared"]=json!(true);
+                        models.retain(|v|v["id"]!=item["id"]);models.push(item);
+                    }
+                }
+            }
+        }
+        for item in &mut models{
+            let provider=item["provider"].as_str().unwrap_or("").to_string();
+            item["known"]=json!(true);
+            item["configured"]=json!(self.config["providers"][&provider].is_object());
+            let provider=provider_alias(&provider);
+            let cfg=&self.config["providers"][provider];
+            let env=cfg["key_env"].as_str().or(PROVIDERS.iter().find(|p|p.0==provider).map(|p|p.2)).unwrap_or("");
+            item["credential_backed"]=json!(!self.credential(provider,env).trim().is_empty());
+            item["ready"]=json!(self.provider_config(item["id"].as_str().unwrap()).is_ok()
+                &&item["metadata_complete"]!=false);
+        }
+        json!(models)
+    }
+    fn model_api(&self,model:&str)->String{
+        let (provider,id)=model.split_once('/').unwrap_or(("openai",model));
+        let provider=provider_alias(provider);
+        if provider=="openai-codex"{return "openai-codex-responses".into();}
+        let cfg=&self.config["providers"][provider];
+        if let Some(models)=cfg["models"].as_array(){
+            if let Some(item)=models.iter().find(|m|m["id"]==id){
+                if let Some(api)=item["api"].as_str(){return api.into();}
+            }
+        }
+        if let Some(api)=cfg["api"].as_str(){return api.into();}
+        let catalog:Vec<Value>=serde_json::from_str(CATALOG).unwrap();
+        if let Some(item)=catalog.iter().find(|m|m["id"]==model){
+            if let Some(api)=item["api"].as_str(){return api.into();}
+        }
+        match provider{"anthropic"=>"anthropic-messages","google"=>"google-generative-ai",_=>"openai-completions"}.into()
+    }
+    fn reasoning_metadata(&self,model:&str)->Value{
+        let (provider,id)=model.split_once('/').unwrap_or(("openai",model));
+        let provider=provider_alias(provider);
+        let canonical=format!("{provider}/{id}");
+        let mut meta=self.models().as_array().unwrap().iter().find(|m|m["id"]==canonical).cloned().unwrap_or(json!({}));
+        if let Some(item)=self.config["providers"][provider]["models"].as_array()
+            .and_then(|list|list.iter().find(|m|m["id"]==id)){
+            if let Some(fields)=item.as_object(){for (k,v) in fields{meta[k]=v.clone();}}
+        }
+        meta
+    }
+    fn invoke(&mut self,model:&str,messages:Vec<Value>,max:usize)->Result<String>{
+        self.with_state(UiState::Thinking,Some(model),|host|host.invoke_inner(model,messages,max))
+    }
+    fn invoke_inner(&mut self,model:&str,messages:Vec<Value>,max:usize)->Result<String>{
+        let (provider,id)=model.split_once('/').unwrap_or(("openai",model));
+        let api=self.model_api(model);
+        let meta=self.reasoning_metadata(model);
+        if meta["metadata_complete"]==false{return Err("model capabilities are incomplete; declare this model's API/context/capabilities in config.json before selecting or invoking it".into());}
+        // Validate before an operation intent or network request. Unsupported
+        // capability metadata is deliberately not inferred from API compatibility.
+        let fields=reasoning_fields(&api,provider_alias(provider),id,&meta,&self.effort,max)?;
+        if meta["max_input_tokens"].is_u64(){
+            let input=serde_json::to_string(&messages)?.chars().count().div_ceil(3);
+            let available=model_input_budget(self.model_limit(model)?,&meta,max);
+            if input>available{return Err(format!("estimated request input {input} exceeds model input budget {available}; reduce the prompt/context before retrying").into());}
+        }
+        self.reload_auth()?;
+        if model.starts_with("github-copilot/"){self.refresh_copilot()?;}
+        let codex=model.starts_with("openai-codex/")||model.starts_with("codex/");
+        if codex{self.refresh_codex()?;}
+        let anthropic_oauth=provider_alias(provider)=="anthropic"&&self.auth["anthropic"]["type"]=="oauth";
+        if anthropic_oauth{self.refresh_anthropic()?;}
+        let (url,key,id)=self.provider_config(model)?;
+        let mut request=json!({"model":model,"messages":messages,"max_tokens":max,"effort":self.effort,
+            "requested_output_tokens":max,"reserved_output_tokens":4096});
+        let operation=format!("req{}",self.journal.seq);
+        self.journal.append("intent",json!({"operation":operation,"type":"provider"}))?;
+        let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(180))
+            .redirect(if codex||anthropic_oauth{reqwest::redirect::Policy::none()}else{reqwest::redirect::Policy::limited(10)}).build()?;
+        let request_builder=if codex{
+            self.codex_request(&client,&url,&key,&id,&messages)?
+        }else if api=="openai-responses"{
+            let mut input=messages.clone();
+            for message in &mut input{
+                if let Some(parts)=message["content"].as_array_mut(){
+                    for part in parts{
+                        match part["type"].as_str(){
+                            Some("text")=>part["type"]=json!("input_text"),
+                            Some("image_url")=>{
+                                let url=part["image_url"]["url"].clone();
+                                *part=json!({"type":"input_image","image_url":url});
+                            },
+                            _=>{}
+                        }
+                    }
+                }
+            }
+            let mut body=json!({"model":id,"input":input,"max_output_tokens":max,"store":false});
+            merge_reasoning_fields(&mut body,&fields);
+            client.post(format!("{url}/responses")).bearer_auth(key).json(&body)
+        }else if api=="anthropic-messages"{
+            let system=messages.iter().filter(|m|m["role"]=="system").filter_map(|m|m["content"].as_str()).collect::<Vec<_>>().join("\n");
+            let mut msgs:Vec<_>=messages.into_iter().filter(|m|m["role"]!="system").collect();
+            for message in &mut msgs{
+                if let Some(parts)=message["content"].as_array_mut(){
+                    for part in parts{
+                        if part["type"]=="image_url"{
+                            let url=part["image_url"]["url"].as_str().ok_or("image URL missing")?;
+                            let(mime,data)=image_data_url(url)?;
+                            *part=json!({"type":"image","source":{"type":"base64","media_type":mime,"data":data}});
+                        }
+                    }
+                }
+            }
+            let mut body=json!({"model":id,"system":system,"messages":msgs,"max_tokens":max});
+            merge_reasoning_fields(&mut body,&fields);
+            let mut request=client.post(format!("{url}/messages")).header("anthropic-version","2023-06-01");
+            if anthropic_oauth{
+                // Explicit subscription-protocol compatibility, not a change to
+                // stored context or harness instructions. Announced during login.
+                body["system"]=json!([
+                    {"type":"text","text":ANTHROPIC_OAUTH_SYSTEM},
+                    {"type":"text","text":system}
+                ]);
+                let mut beta="claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14".to_string();
+                if body.get("thinking").is_some(){beta.push_str(",interleaved-thinking-2025-05-14");}
+                request=request.bearer_auth(key).header("anthropic-beta",beta)
+                    .header("x-app","cli").header("User-Agent","claude-cli/2.1.2 (external, cli) py-rust/0.1.0")
+                    .header("Accept","application/json");
+            }else{
+                request=request.header("x-api-key",key);
+                if body.get("thinking").is_some(){request=request.header("anthropic-beta","interleaved-thinking-2025-05-14");}
+            }
+            request.json(&body)
+        }else if api=="google-generative-ai"{
+            let system=messages.iter().filter(|m|m["role"]=="system").filter_map(|m|m["content"].as_str()).collect::<Vec<_>>().join("\n");
+            let mut contents=Vec::new();
+            for message in messages.iter().filter(|m|m["role"]!="system"){
+                let mut parts=Vec::new();
+                if let Some(text)=message["content"].as_str(){parts.push(json!({"text":text}));}
+                else if let Some(items)=message["content"].as_array(){
+                    for item in items{
+                        if item["type"]=="text"{parts.push(json!({"text":item["text"]}));}
+                        else if item["type"]=="image_url"{
+                            let(mime,data)=image_data_url(item["image_url"]["url"].as_str().ok_or("image URL missing")?)?;
+                            parts.push(json!({"inlineData":{"mimeType":mime,"data":data}}));
+                        }
+                    }
+                }
+                contents.push(json!({"role":if message["role"]=="assistant"{"model"}else{"user"},"parts":parts}));
+            }
+            let mut body=json!({"contents":contents,"systemInstruction":{"parts":[{"text":system}]},
+                "generationConfig":{"maxOutputTokens":max}});
+            if let Some(config)=fields.get("thinkingConfig"){body["generationConfig"]["thinkingConfig"]=config.clone();}
+            client.post(format!("{url}/models/{id}:generateContent")).header("x-goog-api-key",key).json(&body)
+        }else{
+            let mut body=json!({"model":id,"messages":messages,"max_tokens":max});
+            merge_reasoning_fields(&mut body,&fields);
+            client.post(format!("{url}/chat/completions")).bearer_auth(key).json(&body)
+        };
+        // Inspect only serialized JSON, never auth headers, so metadata reflects
+        // the actual transmitted parameter (including reasoning adjustments).
+        let wire=request_builder.try_clone().ok_or("provider request cannot be cloned")?.build()?;
+        let wire_body:Value=serde_json::from_slice(wire.body().and_then(|body|body.as_bytes()).ok_or("provider request JSON missing")?)?;
+        request["transmitted_output_limit"]=wire_body["max_output_tokens"].as_u64()
+            .or(wire_body["max_tokens"].as_u64()).or(wire_body["generationConfig"]["maxOutputTokens"].as_u64()).map_or(Value::Null,|limit|json!(limit));
+        self.journal.append("request",request.clone())?;self.hist_push("requests",request);
+        let body=if codex{self.codex_sse(request_builder,&operation)?}else{self.http_json(request_builder,&operation)?};
+        self.journal.append("response",json!({"operation":operation,"status":200,"body":body}))?;
+        self.hist_push("responses",body.clone());
+        self.journal.append("operation_complete",json!({"operation":operation,"type":"provider"}))?;
+        let raw=&body["usage"];
+        let input=raw["prompt_tokens"].as_u64().or(raw["input_tokens"].as_u64())
+            .or(body["usageMetadata"]["promptTokenCount"].as_u64());
+        let output=raw["completion_tokens"].as_u64().or(raw["output_tokens"].as_u64())
+            .or(body["usageMetadata"]["candidatesTokenCount"].as_u64());
+        let cache=raw["prompt_tokens_details"]["cached_tokens"].as_u64()
+            .or(raw["input_tokens_details"]["cached_tokens"].as_u64()).or(raw["cache_read_input_tokens"].as_u64())
+            .or(body["usageMetadata"]["cachedContentTokenCount"].as_u64());
+        let cumulative=|name:&str,amount:Option<u64>|->Value{
+            match amount{Some(n)=>json!(self.usage[name].as_u64().unwrap_or(0)+n),None=>Value::Null}
+        };
+        let reported_cache=self.usage["reported_cache_hit_tokens"].as_u64()
+            .or(self.usage["cache_hit_tokens"].as_u64()).unwrap_or(0).saturating_add(cache.unwrap_or(0));
+        let cache_complete=self.usage["cache_usage_complete"]!=false&&cache.is_some();
+        self.usage=json!({"input_tokens":cumulative("input_tokens",input),"output_tokens":cumulative("output_tokens",output),
+            "cache_hit_tokens":if cache_complete{Some(reported_cache)}else{None},
+            "reported_cache_hit_tokens":reported_cache,"cache_usage_complete":cache_complete,
+            "last_input_tokens":input,"operation":operation});
+        self.journal.append("usage",self.usage.clone())?;self.hist_push("usage",self.usage.clone());
+        validate_provider_completion(&body)?;
+        let text=if let Some(text)=body["choices"][0]["message"]["content"].as_str(){
+            text.to_string()
+        }else if let Some(output)=body["output"].as_array(){
+            responses_final_text(output)?
+        }else if let Some(parts)=body["content"].as_array(){
+            parts.iter().filter(|p|p["type"]=="text").filter_map(|p|p["text"].as_str()).collect::<String>()
+        }else if let Some(parts)=body["candidates"][0]["content"]["parts"].as_array(){
+            parts.iter().filter(|p|p["thought"]!=true).filter_map(|p|p["text"].as_str()).collect::<String>()
+        }else{return Err("provider response contains no text".into());};
+        if text.is_empty(){return Err("provider response contains no text".into());}
+        Ok(text)
+    }
+    fn inner_llm(&mut self,v:&Value)->Result<Value>{
+        let model=v["options"]["model"].as_str().unwrap_or(&self.model).to_string();
+        let prompt=v["prompt"].as_str().ok_or("prompt required")?;
+        let max=v["options"]["max_tokens"].as_u64().unwrap_or(2048) as usize;
+        let mut parts=vec![json!({"type":"text","text":prompt})];
+        if let Some(images)=v["options"]["images"].as_array(){
+            if images.len()>4{return Err("at most four images per request".into());}
+            let mut total=0;
+            for image in images{
+                let data=image["base64"].as_str().ok_or("image base64 required")?;
+                let(mime,size)=validate_image(data)?;total+=size;
+                if total>512000{return Err("combined image bytes exceed 512000".into());}
+                parts.push(json!({"type":"image_url","image_url":{"url":format!("data:{mime};base64,{data}")}}));
+            }
+        }
+        let content=if parts.len()==1{json!(prompt)}else{json!(parts)};
+        let system=v["options"]["system"].as_str().unwrap_or("You are a helpful assistant.");
+        // A call-local effort override must not alter the session default, even
+        // when request validation, networking or cancellation returns an error.
+        let override_effort=v["options"].get("effort").filter(|e|!e.is_null())
+            .map(|e|e.as_str().ok_or("effort must be a level string")).transpose()?;
+        let previous=override_effort.map(|e|std::mem::replace(&mut self.effort,e.to_string()));
+        let result=self.invoke(&model,vec![json!({"role":"system","content":system}),
+            json!({"role":"user","content":content})],max);
+        if let Some(previous)=previous{self.effort=previous;}
+        Ok(json!(result?))
+    }
+    fn flush_deferred_say(&mut self,cell:Option<usize>){
+        let pending=std::mem::take(&mut self.deferred_say);
+        for (owner,text) in pending{
+            if cell.is_none()||cell==Some(owner){self.event("final",json!({"text":text,"cell":owner}));}
+            else{self.deferred_say.push((owner,text));}
+        }
+    }
+    fn run_agent(&mut self)->Result<()>{
+        self.agent_turn=true;
+        let started=self.start_busy_input();
+        let result=self.run_agent_inner();
+        self.agent_turn=false;
+        self.flush_deferred_say(None);
+        let stopped=if started{self.stop_busy_input()}else{Ok(())};
+        stopped?;result
+    }
+    fn run_agent_inner(&mut self)->Result<()>{
+        for _ in 0..100{
+            if !self.startup_ready{return Err("Python initialization is incomplete; inspect /recovery and explicitly /reset to retry startup".into());}
+            self.check_system_budget(self.context_limit)?;
+            self.evict()?;
+            let mut messages=vec![json!({"role":"system","content":self.system_prompt()})];
+            messages.extend(self.context.iter().map(|i|{
+                let text=format!("[boundary {}]\n{}",i.id,i.text);
+                let content=if let Some(index)=self.attachments.get(&i.id){
+                    let raw=self.history_value("raw",*index).unwrap_or(Value::Null);
+                    json!([{"type":"text","text":text},{"type":"image_url","image_url":
+                        {"url":format!("data:{};base64,{}",raw["mime"].as_str().unwrap_or("image/png"),raw["base64"].as_str().unwrap_or(""))}}])
+                }else{json!(text)};
+                json!({"role":if i.role=="assistant"{"assistant"}else{"user"},"content":content})
+            }));
+            messages.push(json!({"role":"user","content":format!("Context usage: {}{}",
+                self.context_usage(),if self.forced(){" FORCED COLLAPSE MODE: collapse or literal stderr read only."}else{""})}));
+            let model=self.model.clone();let code=self.invoke(&model,messages,4096)?;
+            let id=format!("agent{}",self.journal.seq);
+            let result=self.execute(&id,&code,true)?;
+            let cancelled=result["status"]=="cancelled";
+            self.event("completed",result);
+            if cancelled{return Ok(());}
+            if self.deliver_steering()?{continue;}
+            if self.stop{self.commit_stop()?;return Ok(());}
+        }
+        Err("outer loop reached safety limit; return to user".into())
+    }
+}
+
+impl Host {
+    fn image(&mut self,v:&Value)->Result<Value>{
+        let model=v["options"]["model"].as_str().unwrap_or("openai/gpt-image-1");
+        self.with_state(UiState::Thinking,Some(model),|host|host.image_inner(v))
+    }
+    fn image_inner(&mut self,v:&Value)->Result<Value>{
+        self.reload_auth()?;
+        let model=v["options"]["model"].as_str().unwrap_or("openai/gpt-image-1");
+        let (url,key,id)=self.provider_config(model)?;
+        if !model.starts_with("openai/"){return Err("image generation currently requires openai-compatible provider".into());}
+        let prompt=v["prompt"].as_str().ok_or("prompt required")?;
+        let operation=format!("img{}",self.journal.seq);
+        self.journal.append("intent",json!({"operation":operation,"type":"image"}))?;
+        self.journal.append("request",json!({"model":model,"prompt":prompt}))?;
+        let request=reqwest::Client::new().post(format!("{url}/images/generations"))
+            .bearer_auth(key).json(&json!({"model":id,"prompt":prompt,"size":"1024x1024","n":1}));
+        let body=self.http_json(request,&operation)?;
+        self.journal.append("response",json!({"operation":operation,"body":body}))?;
+        let data=body["data"][0]["b64_json"].as_str().ok_or("image response missing base64")?;
+        let bytes=B64.decode(data)?;
+        let index=self.history["raw"].len();
+        self.journal.append("raw",json!({"index":index,"base64":data,"mime":"image/png","operation":operation}))?;
+        self.hist_push("raw",json!({"base64":data,"mime":"image/png"}));
+        self.journal.append("operation_complete",json!({"operation":operation,"type":"image"}))?;
+        Ok(json!({"raw_index":index,"ref":format!("H.raw[{index}]"),"bytes":bytes.len()}))
+    }
+    fn read_raw(&mut self,v:&Value)->Result<Value>{
+        let data=v["base64"].as_str().ok_or("image bytes required")?;
+        let bytes=B64.decode(data)?;
+        if bytes.len()>512000{return Err("image exceeds 512000-byte limit".into());}
+        let mime=if bytes.starts_with(b"\x89PNG\r\n\x1a\n"){"image/png"}
+            else if bytes.starts_with(b"\xff\xd8\xff"){"image/jpeg"}
+            else{return Err("only PNG/JPEG images supported".into());};
+        let decoded=image::load_from_memory_with_format(&bytes,
+            if mime=="image/png"{image::ImageFormat::Png}else{image::ImageFormat::Jpeg})?;
+        if decoded.width()>1536||decoded.height()>1536{return Err("image dimensions exceed 1536 pixels".into());}
+        let active=self.context.iter().filter(|i|self.attachments.contains_key(&i.id)).count();
+        if active>=4{return Err("at most four active images per context".into());}
+        let index=self.history["raw"].len();
+        self.journal.append("raw",json!({"index":index,"base64":data,"mime":mime}))?;
+        self.hist_push("raw",json!({"base64":data,"mime":mime}));
+        let id=self.add_context("user",format!("[image H.raw[{index}]]"),true,vec![])?;
+        self.journal.append("attachment",json!({"context_id":id,"raw_index":index}))?;
+        self.attachments.insert(id.clone(),index);
+        Ok(json!(id))
+    }
+}
+fn redacted_command(mut command:Value)->Result<Value>{
+    if let Some(object)=command.as_object_mut(){object.remove("terminal_controls");}
+    if command["kind"]=="login"{
+        command.as_object_mut().ok_or("command must be an object")?.retain(|name,value|match name.as_str(){
+            "id"|"kind"|"provider"=>true,
+            "method"=>value.as_str().is_some_and(|s|["browser","manual","device","oauth","api-key"].contains(&s)),
+            _=>false
+        });
+    }
+    Ok(command)
+}
+fn unique_id()->u64{
+    static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)
+}
+// =============================================================================
+// Commands and status rendering
+// =============================================================================
+
+// Styling is added only after sanitization and column layout; payload escape
+// bytes never become executable control sequences. NO_COLOR presence wins.
+fn terminal_color_for(fd:i32)->bool{
+    std::env::var_os("NO_COLOR").is_none()&&!std::env::var("TERM").is_ok_and(|t|t=="dumb")&&unsafe{libc::isatty(fd)==1}
+}
+fn terminal_styled_for(text:&str,style:&str,fd:i32)->String{
+    if text.is_empty()||!terminal_color_for(fd){text.into()}else{format!("\x1b[{style}m{text}\x1b[0m")}
+}
+fn terminal_table_styled(lines:Vec<String>)->Vec<String>{
+    if !terminal_color_for(1){return lines;}
+    let mut header=true;
+    lines.into_iter().map(|line|{
+        if line.starts_with('├'){header=false;}
+        if header&&line.starts_with('│'){return terminal_styled(&line,"1");}
+        let mut out=String::new();
+        for c in line.chars(){if "│┌┐└┘├┤┬┴┼─".contains(c){out.push_str(&format!("\x1b[2m{c}\x1b[0m"));}else{out.push(c);}}
+        out
+    }).collect()
+}
+fn terminal_styled(text:&str,style:&str)->String{terminal_styled_for(text,style,1)}
+fn terminal_style_lines(lines:Vec<String>,style:&str)->Vec<String>{lines.into_iter().map(|s|terminal_styled(&s,style)).collect()}
+fn terminal_result_style(status:&str)->&'static str{match status{"ok"=>"32","error"=>"31",_=>"33"}}
+fn ui_text(text:&str){for line in terminal_wrap(text,terminal_width()).0{println!("{line}");}}
+fn terminal_state(v:&Value,width:usize)->Vec<String>{
+    let state=v["state"].as_str().unwrap_or("idle");
+    let text=if state=="thinking"{
+        let mut text=format!("› thinking · {} [{}]",v["model"].as_str().unwrap_or(""),v["effort"].as_str().unwrap_or(""));
+        if let Some(ms)=v["elapsed_ms"].as_u64(){text.push_str(&format!(" · {:.1}s",ms as f64/1000.0));}
+        if let Some(retry)=v["retry"].as_u64().filter(|retry|*retry>0){text.push_str(&format!(" · retry {retry}"));}
+        text
+    }else{format!("› {state}")};
+    terminal_style_lines(terminal_wrap(&text,width).0,match state{"thinking"=>"35","idle"=>"2","input"|"login"=>"33",_=>"36"})
+}
+fn terminal_queue(v:&Value,width:usize)->Vec<String>{
+    let action=if v["kind"]=="queue_sent"{"sent"}else{"queued"};
+    let mode=v["mode"].as_str().unwrap_or("steering");
+    let text=terminal_safe(v["text"].as_str().unwrap_or(""));
+    terminal_style_lines(terminal_prefixed(&text,&format!("{action} {mode} › "),width),"2")
+}
+fn terminal_tokens(tokens:u64)->String{
+    if tokens<1000{tokens.to_string()}else if tokens<10000{format!("{:.1}k",tokens as f64/1000.0)}else{format!("{:.0}k",tokens as f64/1000.0)}
+}
+fn terminal_metrics(v:&Value)->String{
+    let mut parts=Vec::new();let usage=&v["context_usage"];
+    if let (Some(used),Some(budget))=(usage["estimated_input_tokens"].as_u64(),usage["input_token_budget"].as_u64()){
+        let percent=if budget>0{100.0*used as f64/budget as f64}else{0.0};
+        parts.push(format!("ctx ~{}/{} ({percent:.0}%)",terminal_tokens(used),terminal_tokens(budget)));
+    }
+    let cache=if let Some(total)=v["cache_hit_tokens"].as_u64(){terminal_tokens(total)}
+        else if let Some(known)=v["reported_cache_hit_tokens"].as_u64().filter(|known|*known>0){format!("{}+?",terminal_tokens(known))}
+        else{"?".into()};
+    parts.push(format!("cache hit ∑{cache}"));
+    let model=v["model"].as_str().or(v["selected_model"].as_str()).unwrap_or("");
+    if !model.is_empty(){parts.push(format!("{} [{}]",model,v["effort"].as_str().unwrap_or("")));}
+    parts.join(" · ")
+}
+fn terminal_status(v:&Value,width:usize)->Vec<String>{
+    let state=v["state"].as_str().unwrap_or("idle");
+    let cell=v["cell"].as_u64().or(v["last_cell"]["cell"].as_u64());
+    let identity=if state=="thinking"&&v["cell"].is_null(){
+        v["cells"].as_u64().and_then(|cells|cells.checked_add(1)).map(|cell|format!("next cell {cell} · ")).unwrap_or_default()
+    }else{cell.map(|cell|format!("cell {cell} · ")).unwrap_or_default()};
+    let mut label=format!("{identity}{state}");
+    if state=="idle"{
+        if let Some(result)=v["last_cell"]["status"].as_str(){label.push_str(&format!(" · {result}"));}
+        if let Some(ms)=v["last_cell"]["elapsed_ms"].as_u64(){
+            label.push_str(&format!(" · {} {ms}ms",v["last_cell"]["language"].as_str().unwrap_or("cell")));
+        }
+    }else{
+        if state!="running"{if let Some(ms)=v["elapsed_ms"].as_u64(){label.push_str(&format!(" {:.1}s",ms as f64/1000.0));}}
+        if let (Some(language),Some(ms))=(v["language"].as_str(),v["cell_elapsed_ms"].as_u64()){
+            label.push_str(&format!(" · {language} {:.1}s",ms as f64/1000.0));
+        }
+    }
+    label.push_str(" · ");label.push_str(&terminal_metrics(v));
+    terminal_style_lines(terminal_wrap(&label,width).0,"2")
+}
+fn terminal_cell_end(v:&Value,width:usize)->Vec<String>{
+    let status=v["status"].as_str().unwrap_or("error");
+    let identity=if let Some(parent)=v["parent_cell"].as_u64(){format!("cell {parent} › {}",v["cell"])}else{format!("cell {}",v["cell"])};
+    let label=format!("── {identity} · {} {}ms · status: {} · {} ",
+        v["language"].as_str().unwrap_or(""),v["elapsed_ms"],status,terminal_metrics(v));
+    let text=format!("{label}{}","─".repeat(width.saturating_sub(terminal_columns(&label))));
+    terminal_style_lines(terminal_wrap(&text,width).0,terminal_result_style(status))
+}
+fn ui_json(title:&str,value:&Value){
+    ui_text(title);ui_text(&serde_json::to_string_pretty(value).unwrap_or_default());
+}
+impl Host{
+    fn ui_text(&self,text:&str){self.event("notice",json!({"text":text}));}
+    fn ui_json(&self,title:&str,value:&Value){
+        if self.json{self.event("info",json!({"title":title,"value":value}));}else{ui_json(title,value);}
+    }
+    fn announce_ready(&self){
+        self.event(if self.startup_ready{"ready"}else{"initialization_blocked"},json!({"session":self.journal.path,"model":self.model,"effort":self.effort,"startup_ready":self.startup_ready,"context_usage":self.context_usage()}));
+        self.event("state",self.state_payload());
+    }
+    fn state_payload(&self)->Value{
+        let mut payload=json!({"state":self.state.label(),"cell":self.active_cell,"cells":self.cells,
+            "language":self.active_language,"cell_elapsed_ms":self.active_started.map(|start|start.elapsed().as_millis().min(u64::MAX as u128) as u64),
+            "selected_model":self.model,"effort":self.effort,
+            "context_usage":self.context_usage(),"cache_hit_tokens":self.usage["cache_hit_tokens"],
+            "reported_cache_hit_tokens":self.usage["reported_cache_hit_tokens"],"last_cell":self.last_cell});
+        if self.state==UiState::Thinking{payload["model"]=json!(self.thinking_model.as_deref().unwrap_or(&self.model));}
+        payload
+    }
+    fn start_busy_input(&mut self)->bool{
+        if self.busy_input.is_some()||self.json||self.incoming.is_some()||!terminal_editor_available(false){return false;}
+        match BusyInput::start(self.state_payload(),self.busy_draft.clone()){
+            Ok(busy)=>{self.busy_draft=EditBuffer::default();self.busy_input=Some(busy);true},
+            Err(_)=>false
+        }
+    }
+    fn poll_busy_input(&mut self)->Result<()>{
+        let lines=self.busy_input.as_ref().map(|busy|busy.lines.try_iter().collect::<Vec<_>>()).unwrap_or_default();
+        for (text,mode) in lines{self.queue_busy_line(text,mode)?;}
+        Ok(())
+    }
+    fn queue_busy_line(&mut self,text:String,mode:String)->Result<()>{
+        // Include the durable sequence and check restored IDs: a process-local
+        // counter alone can reuse an accepted steering ID after resume.
+        let id=loop{
+            let id=format!("steer{}-{}",self.journal.seq,unique_id());
+            if !self.ids.contains(&id){break id;}
+        };
+        self.queue_arrival(json!({"id":id,"kind":"submit","text":text,"mode":mode}))
+    }
+    fn stop_busy_input(&mut self)->Result<()>{
+        if let Some(busy)=self.busy_input.take(){
+            let (lines,draft)=busy.finish();self.busy_draft=draft;
+            for (text,mode) in lines{self.queue_busy_line(text,mode)?;}
+        }
+        Ok(())
+    }
+    fn set_state(&mut self,state:UiState,model:Option<&str>){
+        let model=if state==UiState::Thinking{Some(model.unwrap_or(&self.model).to_string())}else{None};
+        if self.state==state&&self.thinking_model==model{return;}
+        self.state=state;self.thinking_model=model;
+        self.event("state",self.state_payload());
+    }
+    fn with_state<T>(&mut self,state:UiState,model:Option<&str>,action:impl FnOnce(&mut Self)->Result<T>)->Result<T>{
+        let previous=self.state;let previous_model=self.thinking_model.clone();
+        self.set_state(state,model);
+        let started=state==UiState::Thinking&&self.start_busy_input();
+        let result=action(self);
+        let stopped=if started{self.stop_busy_input()}else{Ok(())};
+        self.set_state(previous,previous_model.as_deref());
+        stopped?;result
+    }
+    fn with_cell(&mut self,language:&str,operation:&str,source_ref:&str,action:impl FnOnce(&mut Self)->Result<Value>)->Result<Value>{
+        let cell=self.cells.checked_add(1).ok_or("session cell counter exhausted")?;
+        let parent=self.active_cell;let parent_language=self.active_language.clone();let parent_started=self.active_started;
+        let start=json!({"cell":cell,"parent_cell":parent,"language":language,"operation":operation,"source_ref":source_ref});
+        self.journal.append("cell_start",start.clone())?;
+        self.cells=cell;self.active_cell=Some(cell);self.active_language=Some(language.into());
+        let began=std::time::Instant::now();self.active_started=Some(began);self.event("cell_start",start);
+        let result=self.with_state(UiState::Running,None,|host|{
+            let result=action(host);
+            let value=result.as_ref().ok();
+            let status=value.and_then(|v|v["status"].as_str()).unwrap_or("error");
+            let end=json!({"cell":cell,"parent_cell":parent,"language":language,"operation":operation,"source_ref":source_ref,
+                "status":status,"elapsed_ms":began.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                "context_usage":host.context_usage(),"cache_hit_tokens":host.usage["cache_hit_tokens"],
+                "reported_cache_hit_tokens":host.usage["reported_cache_hit_tokens"],"model":host.model,"effort":host.effort,
+                "stdout_ref":value.and_then(|v|v["stdout"]["ref"].as_str()),
+                "stderr_ref":value.and_then(|v|v["stderr"]["ref"].as_str())});
+            let committed=host.journal.append("cell_end",end.clone());
+            if committed.is_ok(){host.last_cell=end.clone();host.event("cell_end",end);}
+            host.active_cell=parent;host.active_language=parent_language.clone();host.active_started=parent_started;
+            committed?;result
+        });
+        // Also restore attribution if a durable-end write failed.
+        self.active_cell=parent;self.active_language=parent_language;self.active_started=parent_started;result
+    }
+    fn login_providers(&self)->Vec<String>{
+        let mut names:Vec<String>=PROVIDERS.iter().map(|p|p.0.to_string()).collect();
+        names.extend(["openai-codex".into(),"github-copilot".into()]);
+        if let Some(config)=self.config["providers"].as_object(){names.extend(config.keys().cloned());}
+        names.sort();names.dedup();names
+    }
+    fn resolve_provider(&self,query:&str)->Result<String>{
+        let query=provider_alias(query);
+        let names=self.login_providers();
+        if let Some(name)=names.iter().find(|n|n.eq_ignore_ascii_case(query)){return Ok(name.clone());}
+        let found:Vec<_>=names.into_iter().filter(|n|fuzzy_score(query,n).is_some()).collect();
+        if found.len()==1{return Ok(found[0].clone());}
+        if found.is_empty(){return Err(format!("Unknown provider {query}; /login lists supported providers").into());}
+        Err(format!("Provider query is ambiguous: {}",found.join(", ")).into())
+    }
+    fn matching_models(&self,query:&str)->Vec<Value>{
+        let models=self.models();
+        let mut found:Vec<(i64,Value)>=vec![];
+        let (provider,needle)=query.split_once('/').map(|(p,n)|(Some(provider_alias(p)),n)).unwrap_or((None,query));
+        for model in models.as_array().unwrap(){
+            let id=model["id"].as_str().unwrap_or("");
+            if model["image_output"]==true{continue;}
+            if provider.is_some_and(|p|!model["provider"].as_str().unwrap_or("").eq_ignore_ascii_case(p)){continue;}
+            let candidate=if provider.is_some(){id.split_once('/').map_or(id,|(_,id)|id)}else{id};
+            let score=fuzzy_score(needle,candidate).or_else(||fuzzy_score(needle,model["name"].as_str().unwrap_or("")))
+                .or_else(||model["aliases"].as_array().and_then(|aliases|aliases.iter().filter_map(|a|a.as_str().and_then(|a|fuzzy_score(needle,a))).max()));
+            if let Some(score)=score{found.push((score,model.clone()));}
+        }
+        found.sort_by(|a,b|b.0.cmp(&a.0).then_with(||a.1["id"].as_str().cmp(&b.1["id"].as_str())));
+        found.into_iter().map(|p|p.1).collect()
+    }
+    fn choose_model(&mut self,query:&str)->Result<()>{
+        let query=query.trim();
+        let canonical=query.split_once('/').map(|(p,id)|format!("{}/{id}",provider_alias(p))).unwrap_or(query.into());
+        let models=self.models();
+        let exact:Vec<_>=models.as_array().unwrap().iter().filter(|m|m["image_output"]!=true&&
+            (m["id"].as_str().is_some_and(|id|id.eq_ignore_ascii_case(&canonical)||
+                (!query.contains('/')&&id.split_once('/').is_some_and(|(_,id)|id.eq_ignore_ascii_case(query))))
+             ||m["aliases"].as_array().is_some_and(|aliases|aliases.iter().any(|alias|alias.as_str().is_some_and(|alias|
+                if let Some((provider,needle))=canonical.split_once('/'){
+                    m["provider"].as_str().is_some_and(|p|p.eq_ignore_ascii_case(provider))&&alias.eq_ignore_ascii_case(needle)
+                }else{alias.eq_ignore_ascii_case(query)}))))).collect();
+        let found=if exact.is_empty(){self.matching_models(query)}else{exact.into_iter().cloned().collect()};
+        if found.is_empty(){return Err(format!("No model matches {query}; /model list shows known/configured models").into());}
+        if found.len()!=1{
+            return Err(format!("Model query is ambiguous: {}. Use a full provider/model ID.",
+                found.iter().take(16).filter_map(|m|m["id"].as_str()).collect::<Vec<_>>().join(", ")).into());
+        }
+        if found[0]["metadata_complete"]==false{return Err("model discovered without capability metadata; declare its API/context/capabilities in config.json first".into());}
+        let model=found[0]["id"].as_str().unwrap();
+        self.check_model_system_budget(model,self.model_limit(model)?)?;
+        self.set_model(model.into())?;
+        if self.validate_effort(&self.effort).is_err(){
+            self.effort=found[0]["default_effort"].as_str().unwrap_or("medium").into();
+            self.event("notice",json!({"text":format!("Previous effort unsupported by this model; reset to {}.",self.effort)}));
+        }
+        self.save_session_settings()?;
+        self.event("notice",json!({"text":format!("Model: {} [{}]",self.model,self.effort)}));
+        if found[0]["deprecated"]==true{self.event("notice",json!({"text":"This legacy Codex model is deprecated for ChatGPT sign-in. Try /model codex/sol61 or /model codex/luna6; availability depends on your account/workspace."}));}
+        Ok(())
+    }
+    fn validate_effort(&self,effort:&str)->Result<()>{
+        if !["off","minimal","low","medium","high","xhigh","max"].contains(&effort){
+            return Err("Unsupported effort: choose off, minimal, low, medium, high, xhigh or max (model-dependent)".into());
+        }
+        let meta=self.reasoning_metadata(&self.model);
+        if let Some(levels)=meta["reasoning_efforts"].as_array(){
+            if !levels.iter().any(|level|level==effort){return Err(format!("Effort {effort} unsupported by this model; supported: {}",meta["reasoning_efforts"]).into());}
+        }else if effort=="max"&&!(meta["reasoning"]==true&&meta["api"]=="anthropic-messages"&&self.model.contains("claude-opus-4-6")){
+            return Err("Effort max unsupported by this model; requires explicit capability metadata or Opus 4.6".into());
+        }
+        Ok(())
+    }
+    fn change_effort(&mut self,effort:&str)->Result<()>{
+        let effort=effort.to_lowercase();self.validate_effort(&effort)?;
+        self.effort=effort;self.save_session_settings()?;
+        self.event("notice",json!({"text":format!("Effort: {}",self.effort)}));Ok(())
+    }
+    fn save_session_settings(&mut self)->Result<()>{
+        self.journal.append("settings_change",json!({"model":self.model,"effort":self.effort}))?;Ok(())
+    }
+    fn list_models(&self,query:&str){
+        let found=self.matching_models(query);
+        let mut table="## Models (built-in/configured/cached inventory)\n\n| Model | Status | Context |\n| --- | --- | ---: |\n".to_string();
+        let unlisted=found.iter().any(|m|m["catalog_listed"]==false);
+        for model in found{
+            let ready=if model["metadata_complete"]==false{"needs capability metadata"}
+                else if model["credential_backed"]==true&&model["catalog_listed"]==false{"credentials present; not listed"}
+                else if model["credential_backed"]==true{"credentials present"}
+                else if model["ready"]==true{"local/anonymous"}else{"login needed"};
+            table.push_str(&format!("| {}{} | {} | {} |\n",model["id"].as_str().unwrap_or(""),
+                if model["deprecated"]==true{" (deprecated for subscription)"}else{""},ready,model["context_limit"]));
+        }
+        if unlisted{table.push_str("\nNot listed is advisory, not an access denial. Known models remain selectable; the provider confirms access.\n");}
+        self.event("say",json!({"text":table}));
+    }
+    fn session_paths(&self)->Result<Vec<PathBuf>>{
+        let mut paths=fs::read_dir(self.home.join("sessions"))?.filter_map(|p|p.ok().map(|p|p.path()))
+            .filter(|p|p.extension().is_some_and(|e|e=="jsonl")).collect::<Vec<_>>();
+        paths.sort();paths.reverse();Ok(paths)
+    }
+    fn switch_session(&mut self,query:Option<&str>,cancel_tasks:bool)->Result<()>{
+        if !self.pending.is_empty(){return Err("Pending accepted commands must be handled before switching sessions".into());}
+        self.bg_guard(cancel_tasks)?;
+        let path=if let Some(query)=query{
+            let query=query.trim_matches(|c|c=='\''||c=='"');
+            let direct=PathBuf::from(query);
+            let paths=self.session_paths()?;
+            if direct.is_file(){Some(fs::canonicalize(direct)?)}else{
+                let found:Vec<_>=paths.into_iter().filter(|p|fuzzy_score(query,p.file_name().unwrap_or_default().to_string_lossy().as_ref()).is_some()).collect();
+                if found.len()!=1{return Err(format!("Session query matches {} sessions; use /sessions and an exact path",found.len()).into());}
+                Some(found[0].clone())
+            }
+        }else{None};
+        if path.as_ref().is_some_and(|p|fs::canonicalize(&self.journal.path).ok().as_ref()==Some(p)){
+            self.ui_text("Already in this session.");return Ok(());
+        }
+        let defaults=if path.is_none(){load_json(&self.home.join("config.json"))?}else{Value::Null};
+        let model_override=if path.is_none()&&defaults["model"]==self.config["model"]{Some(self.model.as_str())}else{None};
+        let effort_override=if path.is_none()&&defaults["effort"]==self.config["effort"]{Some(self.effort.as_str())}else{None};
+        let mut next=Host::new(self.home.clone(),path.clone(),self.json,self.no_model,model_override,effort_override)?;
+        next.announce_ready();
+        self.ui_text(&format!("Session: {}",next.journal.path.display()));
+        next.incoming=self.incoming.take();next.input_closed=self.input_closed;
+        *self=next;Ok(())
+    }
+    fn ui_command(&mut self,line:&str)->Result<bool>{
+        self.reload_auth()?;
+        let (command,args)=line.split_once(char::is_whitespace).map(|(c,a)|(c,a.trim())).unwrap_or((line,""));
+        match command{
+            "/quit"|"/exit"=>{self.bg_guard(transition_cancel(args)?)?;return Ok(false);},
+            "/tasks"|"/task"|"/bg"|"/wakeups"|"/wakeup"=>self.ui_background_command(command,args)?,
+            "/help"|"/hotkeys"=>self.ui_text("py — ordinary persistent Python, unrestricted execution.\nOrdinary Python. No sandbox.\n! shell / @ Python: hidden from the model; !! / @@: visible.\nTab: fuzzy picker for commands, arguments, Python names, executables and files.\nType to filter; arrows/Tab move, Enter selects (not submits); Esc cancels.\nShift+Enter inserts newline on supported terminals; Ctrl-J is a fallback.\nContinuation lines align after the two-column > prompt.\nPython brackets/suites and bracketed multiline paste form a single cell.\nCtrl-D: exit idle editor. Ctrl-C: clear editor / cancel active operation.\n/model list [query] /models [query]: cached inventory, refreshed when stale\n/model list refresh [provider] /models refresh [provider]: force refresh\n/model <provider/id or fuzzy query>: select, rejecting ambiguity\n/effort <off|minimal|low|medium|high|xhigh> (/think, /thinking)\n/login [provider] [browser|manual|device|api-key] /logout [provider] /auth\n/status /context /config /recovery /session /sessions\n/config get <key> | set <key> <JSON-value> | unset <key> | reload\nDurable entries: ~/.py/skills/*.md (or PY_HOME); ordinary file editing, no skills API.\nCore entries and inventory freeze on /new; reset/resume preserve that snapshot.\nCore Python repeats on authorized startup/reset, not automatically after a worker crash.\nStartup bridges are limited to H history/cell reads; prefer definitions/imports.\n/new /resume <path or fuzzy session> /reset /compact [instructions]\n/tasks [state] /task <id> /task logs <id> [stdout|stderr|both]\n/task kill <id> [--force] /bg shell|python <source>\n/wakeups /wakeup cancel|run <id>\n/quit, /new and /resume require --cancel-tasks while jobs run.\nH stores full history; previews show at most 12 original lines.\nSession resume restores H/context/settings, never Python variables or execution.\n/quit: exit. Browser OAuth: Codex callback, Anthropic hidden code paste.\nUnsupported provider protocols and live subscription parity are not claimed."),
+            "/model" if args.is_empty()=>self.ui_text(&self.model),
+            "/model" if args=="list"||args.starts_with("list ")=>self.model_list_command(args.strip_prefix("list").unwrap().trim())?,
+            "/model"=>{
+                let provider=args.split_once('/').map(|p|provider_alias(p.0).to_string()).unwrap_or_else(||self.model.split_once('/').map_or("openai",|p|provider_alias(p.0)).to_string());
+                let cancel_revision=self.cancel_revision;self.maybe_refresh_model_catalog(&provider);
+                if self.cancel_revision!=cancel_revision{return Err("model selection cancelled; previous selection retained".into());}
+                self.choose_model(args)?;
+            },
+            "/models"=>self.model_list_command(args)?,
+            "/effort"|"/think"|"/thinking"=>if args.is_empty(){self.ui_text(&self.effort);}else{self.change_effort(args)?;},
+            "/login"=>self.interactive_login(args)?,
+            "/logout"=>if args.is_empty(){
+                let stored=self.auth.as_object().map(|m|m.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+                if stored.is_empty(){self.ui_text("No stored credentials. Environment variables are unchanged.");}
+                else{self.ui_text(&format!("Use /logout <provider>: {}. Environment credentials are not removed.",stored.join(", ")));}
+            }else{let provider=self.resolve_provider(args)?;self.logout(&provider)?;self.ui_text(&format!("Removed stored credentials for {provider}; environment credentials unchanged."));},
+            "/auth"=>self.ui_json("Authentication (no secrets)",&self.auth_status()),
+            "/status"=>self.ui_json("Status",&self.status()),
+            "/context"=>self.ui_json("Context metadata",&self.context_usage()),
+            "/config"=>self.config_command(args)?,
+            "/recovery"=>self.ui_json("Recovery: no automatic replay",&self.recovery_status()?),
+            "/session"=>self.ui_text(&format!("Session: {}",self.journal.path.display())),
+            "/sessions"|"/resume" if args.is_empty()=>{self.ui_text("Sessions — /resume <path or fuzzy filename>");for path in self.session_paths()?{self.ui_text(&path.to_string_lossy());}},
+            "/resume"=>{let (query,cancel)=transition_query(args)?;self.switch_session(Some(query),cancel)?;},
+            "/new"=>self.switch_session(None,transition_cancel(args)?)?,
+            "/reset"=>self.reset_worker()?,
+            "/interrupt"=>self.ui_text("No operation is running. Ctrl-C cancels an active operation."),
+            "/compact"=>{
+                if self.no_model{return Err("Compaction requires an authenticated model; local mode never silently discards context".into());}
+                let id=format!("compact{}",self.journal.seq);
+                self.dispatch(json!({"id":id,"kind":"submit","text":format!("Compact the context using a standalone agent.context.collapse call, preserve task constraints, unfinished work and original-range references, then agent.loop.stop(). Additional instructions: {args}")}))?;
+            },
+            _=>return Err(format!("Unknown command {command}; /help lists implemented commands").into())
+        }
+        Ok(true)
+    }
+}
+fn transition_cancel(args:&str)->Result<bool>{
+    match args.trim(){""=>Ok(false),"--cancel-tasks"=>Ok(true),_=>Err("Only --cancel-tasks is accepted here".into())}
+}
+fn transition_query(args:&str)->Result<(&str,bool)>{
+    let (query,cancel)=if let Some(query)=args.strip_suffix("--cancel-tasks"){
+        if !query.ends_with(char::is_whitespace){return Err("Separate --cancel-tasks from the session path".into());}
+        (query.trim(),true)
+    }else{(args.trim(),false)};
+    if query.is_empty(){return Err("Usage: /resume <path or fuzzy session> [--cancel-tasks]".into());}
+    Ok((query,cancel))
+}
+impl Host{
+    fn ui_background_command(&mut self,command:&str,args:&str)->Result<()>{
+        let id=format!("ui{}",self.journal.seq);let words:Vec<_>=args.split_whitespace().collect();
+        let mut v=match command{
+            "/tasks" if words.len()<=1=>json!({"kind":"task_list","state":words.first()}),
+            "/task"=>match words.as_slice(){
+                [task]=>json!({"kind":"task_get","task_id":task}),
+                ["logs",task]=>json!({"kind":"task_logs","task_id":task,"stream":"both"}),
+                ["logs",task,stream] if ["stdout","stderr","both"].contains(stream)=>json!({"kind":"task_logs","task_id":task,"stream":stream}),
+                ["kill",task]=>json!({"kind":"task_kill","task_id":task,"force":false}),
+                ["kill",task,"--force"]=>json!({"kind":"task_kill","task_id":task,"force":true}),
+                _=>return Err("Usage: /task <id> | /task logs <id> [stdout|stderr|both] | /task kill <id> [--force]".into())
+            },
+            "/bg"=>{
+                let (kind,source)=args.split_once(char::is_whitespace).ok_or("Usage: /bg shell|python <source>")?;
+                if !["shell","python"].contains(&kind)||source.trim().is_empty(){return Err("Usage: /bg shell|python <source>".into());}
+                json!({"kind":"bg_run","task_kind":kind,"source":source.trim_start()})
+            },
+            "/wakeups" if words.is_empty()=>json!({"kind":"wakeup_list"}),
+            "/wakeup"=>match words.as_slice(){
+                ["cancel",wake]=>json!({"kind":"wakeup_cancel","wakeup_id":wake}),
+                ["run",wake]=>json!({"kind":"wakeup_run","wakeup_id":wake}),
+                _=>return Err("Usage: /wakeup cancel|run <id>".into())
+            },
+            _=>return Err("Unexpected arguments; /help lists background commands".into())
+        };
+        let previous:HashSet<_>=self.bg_tasks.keys().cloned().collect();
+        v["id"]=json!(id);self.dispatch(v.clone())?;
+        let result=match v["kind"].as_str().unwrap(){
+            "task_list"=>self.bg_list(v["state"].as_str())?,
+            "bg_run"=>self.bg_tasks.iter().find(|(id,_)|!previous.contains(*id)).map(|(_,task)|task.metadata.clone()).ok_or("background launch did not create a task")?,
+            "task_get"|"task_kill"=>self.bg_get(v["task_id"].as_str().unwrap())?,
+            "task_logs"=>{
+                let metadata=self.bg_get(v["task_id"].as_str().unwrap())?;
+                for stream in ["stdout","stderr"]{
+                    if v["stream"]!="both"&&v["stream"]!=stream{continue;}
+                    let index=metadata[stream]["index"].as_u64().ok_or("task has no output reference")? as usize;
+                    self.ui_text(&format!("{} — {}\n{}\n[{} bytes; preview only; full output in H]",stream,metadata[stream]["ref"].as_str().unwrap_or(""),self.ui_stream_preview(stream,index)?,metadata[stream]["bytes"]));
+                }
+                return Ok(());
+            },
+            _=>self.wakeup_list()?
+        };
+        self.ui_json("Background management",&result);Ok(())
+    }
+    fn ui_stream_preview(&self,stream:&str,index:usize)->Result<String>{
+        let value=self.history.get(stream).and_then(|values|values.get(index)).ok_or("missing task stream")?;
+        let mut bytes=Vec::new();
+        if let Some(chunks)=value["$chunks"].as_array(){
+            for seq in chunks{
+                let event=self.journal.event(seq.as_u64().ok_or("invalid stream chunk")? as usize)?;
+                let chunk=B64.decode(event["payload"]["base64"].as_str().ok_or("missing stream bytes")?)?;
+                bytes.extend_from_slice(&chunk[..chunk.len().min(16384-bytes.len())]);
+                if bytes.len()>=16384||bytes.iter().filter(|b|**b==b'\n').count()>=12{break;}
+            }
+        }else if let Some(text)=value.as_str(){bytes.extend_from_slice(&text.as_bytes()[..text.len().min(16384)]);}
+        else{return Err("invalid task stream".into());}
+        Ok(String::from_utf8_lossy(&bytes).lines().take(12).collect::<Vec<_>>().join("\n").chars().take(4000).collect())
+    }
+}
+// =============================================================================
+// CLI and interactive terminal
+// =============================================================================
+
+fn main(){
+    if let Err(e)=cli(){
+        for line in terminal_wrap(&e.to_string(),terminal_width()).0{eprintln!("{line}");}
+        std::process::exit(1);
+    }
+}
+fn cli()->Result<()>{
+    // Parse every option before touching storage or starting Python. There are
+    // deliberately no positional prompts, key arguments or extension flags.
+    let args:Vec<String>=std::env::args().skip(1).collect();
+    let (mut help,mut version,mut spec,mut json_mode,mut json_input,mut no_model)=(false,false,false,false,false,false);
+    let (mut model,mut effort,mut resume):(Option<String>,Option<String>,Option<PathBuf>)=(None,None,None);
+    let mut i=0;
+    while i<args.len(){
+        let flag=args[i].as_str();
+        match flag{
+            "--help"|"-h"=>help=true,"--version"|"-V"=>version=true,"--spec"=>spec=true,
+            "--json"=>json_mode=true,"--json-input"=>json_input=true,"--no-model"=>no_model=true,
+            "--model"|"--effort"|"--session"|"--resume"=>{
+                let value=args.get(i+1).filter(|v|!v.is_empty()&&!v.starts_with('-'))
+                    .ok_or_else(||format!("{flag} requires a value; run --help for usage"))?;
+                match flag{
+                    "--model"=>{if model.replace(value.clone()).is_some(){return Err("--model specified more than once".into());}},
+                    "--effort"=>{
+                        let value=value.to_lowercase();
+                        if !["off","minimal","low","medium","high","xhigh","max"].contains(&value.as_str()){
+                            return Err("Unsupported effort: off, minimal, low, medium, high, xhigh or max (model-dependent)".into());
+                        }
+                        if effort.replace(value).is_some(){return Err("--effort specified more than once".into());}
+                    },
+                    _=>{if resume.replace(PathBuf::from(value)).is_some(){return Err("Use only one --session or --resume path".into());}}
+                }
+                i+=1;
+            },
+            _=>return Err(format!("Unexpected argument {flag}; run --help for supported options (no positional prompts)").into())
+        }
+        i+=1;
+    }
+    if help{
+        ui_text("Usage: py [options]\nPersistent ordinary Python + a Python-writing model. No sandbox.\n\n--model <provider/id or unique fuzzy query>: choose a known/configured model\n--effort <off|minimal|low|medium|high|xhigh|max>: reasoning preference (supported levels depend on the model)\n--session <path>, --resume <path>: restore an existing journal; fresh Python, no replay\n--no-model: local Python/shell mode, no automatic model turns\n--json: write versioned JSONL events to stdout instead of human previews\n--json-input: read JSONL commands from stdin instead of the editor\n--spec: print the embedded specification and coverage ledger\n--help, -h: show this help without starting Python or creating files\n--version, -V: show the version without creating files\n\nJSON input and output are independent; combine --json --json-input for automation.\nPY_HOME chooses global state storage (default ~/.py); PY_MODEL/config.json choose defaults.\nCLI model/effort override restored session settings and are saved in that session, not global defaults.\nInteractive: /help, /login, /model list, /new, /resume. Tab fuzzily completes.\n! / @: hidden shell / Python; !! / @@: visible. Empty prompts are ignored.\nThere are no positional prompts or CLI API-key flags; use hidden /login entry.");
+        return Ok(());
+    }
+    if version{println!("py {} (transition)",env!("CARGO_PKG_VERSION"));return Ok(());}
+    if spec{print!("{SPEC}");return Ok(());}
+    if let Some(path)=&resume{if !path.is_file(){return Err(format!("Session file does not exist: {}",path.display()).into());}}
+    install_signals();
+    let home=std::env::var_os("PY_HOME").map(PathBuf::from).unwrap_or_else(||
+        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".py"));
+    let mut host=Host::new(home,resume,json_mode,no_model,model.as_deref(),effort.as_deref())?;
+    host.announce_ready();
+    if json_input{
+        let (tx,rx)=std::sync::mpsc::channel();
+        std::thread::spawn(move||{
+            for line in io::stdin().lock().lines(){
+                match line{
+                    Ok(s)=>match serde_json::from_str::<Value>(&s){
+                        Ok(v)=>if tx.send(v).is_err(){break;},
+                        Err(e)=>{let _=tx.send(json!({"id":format!("bad{}",now_ms()),"kind":"invalid","error":e.to_string()}));}
+                    },
+                    Err(_)=>break
+                }
+            }
+        });
+        host.incoming=Some(rx);
+        loop{
+            INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
+            host.service_background()?;
+            let mut command=if let Some(v)=host.pending.pop_front(){v}else{
+                match host.incoming.as_ref().unwrap().recv_timeout(std::time::Duration::from_millis(25)){
+                    Ok(v)=>v,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected)=>break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)=>{
+                        if let Err(e)=host.dispatch_wakeups(){host.event("error",json!({"error":e.to_string()}));}
+                        continue;
+                    }
+                }
+            };
+            INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
+            // Terminal control replay is a capability of explicit editor !/!!
+            // commands, not a client-controlled JSON field.
+            if let Some(object)=command.as_object_mut(){object.remove("terminal_controls");}
+            let command_id=command["id"].as_str().unwrap_or("").to_string();
+            match host.dispatch(command){
+                Ok(false)=>break,Ok(true)=>{},Err(e)=>host.event("error",json!({"command_id":command_id,"error":e.to_string()}))
+            }
+        }
+    }else{
+        let mut editor=rustyline::Editor::<Completion,rustyline::history::DefaultHistory>::new()?;
+        bind_multiline_keys(&mut editor);
+        let history=host.home.join("editor-history");
+        let _=editor.load_history(&history);
+        loop{
+            // Steering captured by the busy prompt is dispatched here if the
+            // active turn ended before consuming it at a cell boundary.
+            if let Some(command)=host.pending.pop_front(){
+                let id=command["id"].as_str().unwrap_or("").to_string();
+                if let Err(error)=host.dispatch(command){host.event("error",json!({"command_id":id,"error":error.to_string()}));}
+                continue;
+            }
+            // Idle interrupts clear the editor, never cancel a future operation.
+            INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
+            host.reload_auth()?;
+            let prompt=if host.json{""}else{"> "};
+            let models=host.models();let providers=host.login_providers();let current_model=host.model.clone();
+            let mut helper=Completion::from_worker(&mut host.worker,models,host.home.clone(),current_model,providers)?;
+            helper.catalog.task_ids=host.bg_tasks.keys().cloned().collect();
+            helper.catalog.wakeup_ids=host.wakeups.keys().cloned().collect();
+            editor.set_helper(Some(helper));
+            editor.bind_sequence(rustyline::KeyEvent::from('\t'),editor.helper().unwrap().picker_handler());
+            let line=match if terminal_editor_available(host.json){
+                terminal_readline(editor.helper().unwrap(),&editor.history().iter().cloned().collect::<Vec<_>>(),if host.json{2}else{1},&mut host)
+            }else{serviceable_readline(editor.helper().unwrap(),prompt,&mut host)}{
+                Ok(s)=>s,Err(rustyline::error::ReadlineError::Interrupted)=>{
+                    INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);continue;
+                },
+                Err(rustyline::error::ReadlineError::Eof)=>break,Err(e)=>return Err(e.into())
+            };
+            INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
+            if line.trim().is_empty(){continue;}
+            // Never persist authentication commands, let alone an accidentally
+            // pasted credential. Keys are accepted only by the hidden tty prompt.
+            if !line.trim_start().starts_with("/login")&&!line.trim_start().starts_with("/config"){
+                editor.add_history_entry(&line)?;
+            }
+            if line.starts_with('/'){
+                match host.ui_command(line.trim()){
+                    Ok(false)=>break,Ok(true)=>{},Err(e)=>host.event("error",json!({"error":e.to_string()}))
+                }
+                continue;
+            }
+            let id=format!("ui{}",host.journal.seq);
+            let v=if let Some(s)=line.strip_prefix("!!"){json!({"id":id,"kind":"shell","command":s,"visible":true,"terminal_controls":true})}
+                else if let Some(s)=line.strip_prefix("!"){json!({"id":id,"kind":"shell","command":s,"terminal_controls":true})}
+                else if let Some(s)=line.strip_prefix("@@"){json!({"id":id,"kind":"python","source":s,"visible":true})}
+                else if let Some(s)=line.strip_prefix("@"){json!({"id":id,"kind":"python","source":s})}
+                else{json!({"id":id,"kind":"submit","text":line})};
+            if let Err(e)=host.dispatch(v){host.event("error",json!({"error":e.to_string()}));}
+        }
+        editor.save_history(&history)?;
+        if history.exists(){fs::set_permissions(&history,std::os::unix::fs::PermissionsExt::from_mode(0o600))?;}
+    }
+    host.bg_shutdown()?;
+    Ok(())
+}
+
+fn bind_multiline_keys(editor:&mut rustyline::Editor<Completion,rustyline::history::DefaultHistory>){
+    // Ctrl-J is a newline, never accept-or-validate. Native backends that report
+    // Shift-Enter can use the same action. Rustyline 15's Unix byte parser does
+    // not decode CSI-u / modifyOtherKeys Enter: do not enable those protocols or
+    // map UnknownEscSeq to newline (it would reinterpret unrelated responses).
+    editor.bind_sequence(rustyline::KeyEvent::ctrl('J'),rustyline::Cmd::Newline);
+    editor.bind_sequence(rustyline::KeyEvent(rustyline::KeyCode::Enter,rustyline::Modifiers::SHIFT),rustyline::Cmd::Newline);
+}
+
+// One renderer owns the working footer. Agent events are inserted above it;
+// keyboard edits and status ticks share its lock, never an opaque canonical
+// tty buffer. The full draft (including cursor/undo) survives every transition.
+struct BusyDisplay{terminal:EditTerminal,buffer:EditBuffer,status:Value,began:std::time::Instant,sampled:std::time::Instant}
+impl BusyDisplay{
+    fn status(&mut self,status:Value){
+        if self.status["state"]!=status["state"]{self.began=std::time::Instant::now();}
+        self.status=status;self.sampled=std::time::Instant::now();
+    }
+    fn hide(&mut self)->io::Result<()>{
+        self.terminal.output.write_all(b"\r")?;
+        if self.terminal.cursor_row>0{write!(self.terminal.output,"\x1b[{}A",self.terminal.cursor_row)?;}
+        self.terminal.output.write_all(b"\x1b[K\x1b[J")?;
+        self.terminal.cursor_row=0;self.terminal.rows=1;Ok(())
+    }
+    fn draw(&mut self)->io::Result<()>{
+        let mut status=self.status.clone();
+        status["elapsed_ms"]=json!(self.began.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        if let Some(base)=status["cell_elapsed_ms"].as_u64(){
+            status["cell_elapsed_ms"]=json!(base.saturating_add(self.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64));
+        }
+        let lines=terminal_status(&status,self.terminal.width());
+        self.terminal.draw_footer(&lines,&self.buffer.line,self.buffer.cursor)
+    }
+}
+struct BusyInput{
+    stop:std::sync::Arc<std::sync::atomic::AtomicBool>,
+    lines:std::sync::mpsc::Receiver<(String,String)>,
+    display:std::sync::Arc<std::sync::Mutex<BusyDisplay>>,
+    thread:std::thread::JoinHandle<()>,
+}
+impl BusyInput{
+    fn start(status:Value,buffer:EditBuffer)->io::Result<Self>{
+        let mut terminal=EditTerminal::open(1)?;
+        // The reader never renders and never holds the display lock while
+        // waiting for a key or a paste; agent output can continue independently.
+        let mut reader=EditTerminal{input:terminal.input.try_clone()?,output:terminal.output.try_clone()?,
+            previous:terminal.previous,cursor_row:0,rows:1,keyboard:false,display:false,headers:vec![]};
+        terminal.output.write_all(b"\x1b[?2004h")?;terminal.keyboard(true)?;
+        let display=std::sync::Arc::new(std::sync::Mutex::new(BusyDisplay{terminal,buffer,status,began:std::time::Instant::now(),sampled:std::time::Instant::now()}));
+        display.lock().unwrap().draw()?;
+        let stop=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_stop=stop.clone();let thread_display=display.clone();
+        let (line_tx,line_rx)=std::sync::mpsc::channel();
+        let thread=std::thread::spawn(move||{
+            let mut painted=std::time::Instant::now();
+            while !thread_stop.load(std::sync::atomic::Ordering::SeqCst){
+                // Finish an in-flight bracketed paste before handing stdin to
+                // another editor or Python input(). Never reinterpret its tail
+                // as ordinary Enter keys or a Python input reply.
+                let key=match editor_key_with(&mut reader,&mut ||Ok(()),true){Ok(key)=>key,Err(_)=>break};
+                let edited=key.is_some();let followup=sequence_is_followup(&key);
+                let submitted=matches!(&key,Some(EditKey::Byte(13)))||followup;
+                let mut display=thread_display.lock().unwrap();let buffer=&mut display.buffer;
+                match key{
+                    Some(_) if submitted=>{
+                        if !buffer.line.trim().is_empty(){
+                            let mode=if followup{"followup"}else{"steering"};
+                            let _=line_tx.send((std::mem::take(&mut buffer.line),mode.into()));
+                            *buffer=EditBuffer::default();
+                        }
+                    },
+                    Some(EditKey::Byte(3))=>{
+                        *buffer=EditBuffer::default();INTERRUPT.store(true,std::sync::atomic::Ordering::SeqCst);
+                    },
+                    Some(key)=>{buffer.edit(key);},None=>{}
+                }
+                if !reader.input_ready()&&(edited||painted.elapsed()>=std::time::Duration::from_millis(100)){
+                    let _=display.draw();painted=std::time::Instant::now();
+                }
+            }
+        });
+        Ok(Self{stop,lines:line_rx,display,thread})
+    }
+    fn event(&self,event:&Value,status:Value){
+        let mut display=self.display.lock().unwrap();display.status(status);
+        let kind=event["kind"].as_str().unwrap_or("");
+        let lines=match kind{
+            "source"|"preview"=>terminal_preview(event,display.terminal.width()),
+            "cell_end"=>terminal_cell_end(event,display.terminal.width()),
+            "say"=>terminal_markdown(event["text"].as_str().unwrap_or(""),display.terminal.width()),
+            "final"=>terminal_style_lines(terminal_markdown(event["text"].as_str().unwrap_or(""),display.terminal.width()),"1;97"),
+            "queued"|"queue_sent"=>terminal_queue(event,display.terminal.width()),
+            "notice"=>terminal_style_lines(terminal_wrap(event["text"].as_str().unwrap_or(""),display.terminal.width()).0,"2"),
+            "rejected"|"error"=>terminal_style_lines(terminal_wrap(event["error"].as_str().unwrap_or("operation rejected"),display.terminal.width()).0,"31"),
+            _=>Vec::new()
+        };
+        if !lines.is_empty(){
+            let _=display.hide();
+            for line in lines{let _=write!(display.terminal.output,"{line}\r\n");}
+        }
+        let _=display.draw();
+    }
+    fn finish(self)->(Vec<(String,String)>,EditBuffer){
+        self.stop.store(true,std::sync::atomic::Ordering::SeqCst);let _=self.thread.join();
+        let mut display=self.display.lock().unwrap();let _=display.hide();
+        let _=display.terminal.output.write_all(b"\x1b[?2004l");let _=display.terminal.keyboard(false);
+        let _=display.terminal.output.flush();display.terminal.display=false;
+        (self.lines.try_iter().collect(),std::mem::take(&mut display.buffer))
+    }
+}
+fn sequence_is_followup(key:&Option<EditKey>)->bool{matches!(key,Some(EditKey::Sequence(sequence)) if sequence=="alt:enter")}
+
+// The tty editor is deliberately a direct reader + buffer + renderer. Rustyline
+// still owns non-tty input/history and the shared idle validation/completion API.
+fn terminal_editor_available(json:bool)->bool{
+    (unsafe{libc::isatty(0)==1&&(json||libc::isatty(1)==1)})&&(json||!std::env::var("TERM").is_ok_and(|t|t=="dumb"))
+}
+struct EditTerminal{input:File,output:File,previous:libc::termios,cursor_row:usize,rows:usize,keyboard:bool,display:bool,headers:Vec<String>}
+impl EditTerminal{
+    fn open(output_fd:i32)->io::Result<Self>{
+        use std::os::fd::FromRawFd;
+        let mut previous=unsafe{std::mem::zeroed::<libc::termios>()};
+        if unsafe{libc::tcgetattr(0,&mut previous)}<0{return Err(io::Error::last_os_error());}
+        let input=unsafe{libc::dup(0)};if input<0{return Err(io::Error::last_os_error());}
+        let input=unsafe{File::from_raw_fd(input)};
+        let output=unsafe{libc::dup(output_fd)};if output<0{return Err(io::Error::last_os_error());}
+        let output=unsafe{File::from_raw_fd(output)};
+        let mut raw=previous;unsafe{libc::cfmakeraw(&mut raw);}
+        raw.c_cc[libc::VMIN]=1;raw.c_cc[libc::VTIME]=0;
+        if unsafe{libc::tcsetattr(0,libc::TCSANOW,&raw)}<0{return Err(io::Error::last_os_error());}
+        let display=unsafe{libc::isatty(output_fd)==1}&&!std::env::var("TERM").is_ok_and(|t|t=="dumb");
+        Ok(Self{input,output,previous,cursor_row:0,rows:1,keyboard:false,display,headers:vec![]})
+    }
+    fn keyboard(&mut self,enabled:bool)->io::Result<()>{
+        if self.display&&enabled!=self.keyboard{
+            // Push/pop, not a blind mode reset, preserves the invoking terminal.
+            self.keyboard=enabled;
+            self.output.write_all(if enabled{b"\x1b[>1u"}else{b"\x1b[<u"})?;
+            self.output.flush()?;
+        }Ok(())
+    }
+    fn byte(&mut self,timeout:i32)->io::Result<Option<u8>>{
+        let mut poll=libc::pollfd{fd:self.input.as_raw_fd(),events:libc::POLLIN,revents:0};
+        let ready=unsafe{libc::poll(&mut poll,1,timeout)};
+        if ready<0{let e=io::Error::last_os_error();return if e.kind()==io::ErrorKind::Interrupted{Ok(None)}else{Err(e)};}
+        if ready==0{return Ok(None);}
+        let mut byte=[0];match std::io::Read::read(&mut self.input,&mut byte){
+            Ok(0)=>Err(io::Error::new(io::ErrorKind::UnexpectedEof,"editor input closed")),
+            Ok(_)=>Ok(Some(byte[0])),Err(e) if e.kind()==io::ErrorKind::Interrupted=>Ok(None),Err(e)=>Err(e)
+        }
+    }
+    fn input_ready(&self)->bool{
+        let mut poll=libc::pollfd{fd:self.input.as_raw_fd(),events:libc::POLLIN,revents:0};
+        unsafe{libc::poll(&mut poll,1,0)>0&&poll.revents&libc::POLLIN!=0}
+    }
+    fn width(&self)->usize{terminal_width_for(self.output.as_raw_fd())}
+    fn height(&self)->usize{
+        let mut size=unsafe{std::mem::zeroed::<libc::winsize>()};
+        if unsafe{libc::ioctl(self.output.as_raw_fd(),libc::TIOCGWINSZ,&mut size)}==0&&size.ws_row>0{size.ws_row as usize}else{24}
+    }
+    fn draw(&mut self,line:&str,cursor:usize)->io::Result<()>{self.draw_footer(&self.headers.clone(),line,cursor)}
+    fn draw_footer(&mut self,headers:&[String],line:&str,cursor:usize)->io::Result<()>{
+        if !self.display{return Ok(());}
+        // Keep space for the draft and completion picker even on tiny screens.
+        let headers=&headers[..headers.len().min(self.height().saturating_sub(4).min(2))];
+        let width=self.width();let pad=if width>=4{2}else{width.saturating_sub(2)};
+        let layout=editor_rows(line,width.saturating_sub(pad+1).max(1));
+        let row=layout.iter().rposition(|r|r.start<=cursor).unwrap_or(0);
+        let visible=self.height().saturating_sub(headers.len()+2).clamp(1,24);
+        let first=row.saturating_sub(visible/2).min(layout.len().saturating_sub(visible));
+        let shown=&layout[first..(first+visible).min(layout.len())];
+        self.output.write_all(b"\r")?;if self.cursor_row>0{write!(self.output,"\x1b[{}A",self.cursor_row)?;}
+        self.output.write_all(b"\x1b[K\x1b[J")?;
+        for header in headers{write!(self.output,"{header}\r\n")?;}
+        for (i,item) in shown.iter().enumerate(){
+            if i>0{self.output.write_all(b"\r\n")?;}
+            let prefix=if i==0{if pad==2{"> "}else if pad==1{">"}else{""}}else if pad==2{"  "}else if pad==1{" "}else{""};
+            if i==0{self.output.write_all(terminal_styled_for(prefix,"1;36",self.output.as_raw_fd()).as_bytes())?;}
+            else{self.output.write_all(prefix.as_bytes())?;}
+            self.output.write_all(item.text.as_bytes())?;
+        }
+        let local=row-first+headers.len();let columns=(pad+terminal_columns(&terminal_safe(&line[layout[row].start..cursor.min(layout[row].end)])))
+            .min(width.saturating_sub(1));
+        self.output.write_all(b"\r")?;
+        let rows=headers.len()+shown.len();let up=rows-1-local;if up>0{write!(self.output,"\x1b[{up}A")?;}
+        if columns>0{write!(self.output,"\x1b[{columns}C")?;}
+        self.output.flush()?;self.cursor_row=local;self.rows=rows;Ok(())
+    }
+}
+impl Drop for EditTerminal{
+    fn drop(&mut self){
+        if self.display{
+            let _=self.output.write_all(b"\r");
+            let down=self.rows.saturating_sub(self.cursor_row+1);if down>0{let _=write!(self.output,"\x1b[{down}B");}
+            let _=self.output.write_all(b"\r\n\x1b[?2004l");let _=self.keyboard(false);let _=self.output.flush();
+        }
+        unsafe{libc::tcsetattr(0,libc::TCSANOW,&self.previous);}
+    }
+}
+struct EditRow{start:usize,end:usize,text:String}
+fn editor_rows(line:&str,width:usize)->Vec<EditRow>{
+    let mut rows=vec![];let mut offset=0;
+    for logical in line.split('\n'){
+        let clusters=terminal_clusters(logical);let mut starts=Vec::with_capacity(clusters.len()+1);let mut n=offset;
+        for (text,_) in &clusters{starts.push(n);n+=text.len();}starts.push(n);
+        if clusters.is_empty(){rows.push(EditRow{start:offset,end:offset,text:String::new()});}
+        let mut a=0;
+        while a<clusters.len(){
+            let mut b=a;let mut used=0;let mut space=None;
+            while b<clusters.len(){
+                let safe=terminal_safe(&clusters[b].0);let columns=terminal_columns(&safe).min(width);
+                if used+columns>width&&b>a{break;}
+                used+=columns;b+=1;if clusters[b-1].0.chars().all(char::is_whitespace){space=Some(b);}
+            }
+            if b<clusters.len(){if let Some(split)=space.filter(|s|*s>a){b=split;}}
+            let start=starts[a];let end=starts[b];let safe=terminal_safe(&line[start..end]);
+            let safe=terminal_clusters(&safe).into_iter().map(|(s,w)|if w>width{"?".into()}else{s}).collect::<String>();
+            rows.push(EditRow{start,end,text:picker_clip(&safe,width)});a=b;
+        }
+        offset=n+1;
+    }
+    rows
+}
+fn editor_previous(line:&str,cursor:usize)->usize{
+    let mut offset=0;let mut previous=0;
+    for (cluster,_) in terminal_clusters(line){if offset>=cursor{break;}previous=offset;offset+=cluster.len();}
+    previous
+}
+fn editor_next(line:&str,cursor:usize)->usize{
+    let mut offset=0;for (cluster,_) in terminal_clusters(line){offset+=cluster.len();if offset>cursor{return offset;}}line.len()
+}
+fn editor_line_start(line:&str,cursor:usize)->usize{line[..cursor].rfind('\n').map_or(0,|n|n+1)}
+fn editor_line_end(line:&str,cursor:usize)->usize{line[cursor..].find('\n').map_or(line.len(),|n|cursor+n)}
+fn editor_word_left(line:&str,cursor:usize)->usize{
+    let prefix=line[..cursor].trim_end_matches(char::is_whitespace);
+    prefix.char_indices().rev().find(|(_,c)|c.is_whitespace()).map_or(0,|(n,c)|n+c.len_utf8())
+}
+fn editor_word_right(line:&str,cursor:usize)->usize{
+    let mut word=false;for (offset,c) in line[cursor..].char_indices(){
+        if c.is_whitespace(){if word{return cursor+offset;}}else{word=true;}
+    }line.len()
+}
+#[derive(Clone,Default)]
+struct EditBuffer{line:String,cursor:usize,undo:std::collections::VecDeque<(String,usize)>,killed:String,
+    history:Option<usize>,draft:(String,usize)}
+impl EditBuffer{
+    fn edit(&mut self,key:EditKey){
+        match key{
+            EditKey::Text(text)|EditKey::Paste(text)=>self.replace(self.cursor,self.cursor,&text),
+            EditKey::Byte(10)=>self.replace(self.cursor,self.cursor,"\n"),
+            EditKey::Byte(4)=>self.replace(self.cursor,editor_next(&self.line,self.cursor),""),
+            EditKey::Byte(8|127)=>self.replace(editor_previous(&self.line,self.cursor),self.cursor,""),
+            EditKey::Byte(1)=>self.cursor=editor_line_start(&self.line,self.cursor),
+            EditKey::Byte(5)=>self.cursor=editor_line_end(&self.line,self.cursor),
+            EditKey::Byte(2)=>self.cursor=editor_previous(&self.line,self.cursor),
+            EditKey::Byte(6)=>self.cursor=editor_next(&self.line,self.cursor),
+            EditKey::Byte(code @ (21|23|11))=>{
+                let (start,end)=match code{21=>(editor_line_start(&self.line,self.cursor),self.cursor),
+                    23=>(editor_word_left(&self.line,self.cursor),self.cursor),
+                    _=>(self.cursor,editor_line_end(&self.line,self.cursor))};
+                self.killed=self.line[start..end].into();self.replace(start,end,"");
+            },
+            EditKey::Byte(25)=>{let text=self.killed.clone();self.replace(self.cursor,self.cursor,&text);},
+            EditKey::Byte(31)=>if let Some((line,cursor))=self.undo.pop_back(){self.line=line;self.cursor=cursor;},
+            EditKey::Sequence(sequence)=>match sequence.as_str(){
+                "[D"|"OD"=>self.cursor=editor_previous(&self.line,self.cursor),
+                "[C"|"OC"=>self.cursor=editor_next(&self.line,self.cursor),
+                "[1;5D"|"alt:b"=>self.cursor=editor_word_left(&self.line,self.cursor),
+                "[1;5C"|"alt:f"=>self.cursor=editor_word_right(&self.line,self.cursor),
+                "[H"|"OH"|"[1~"|"[7~"=>self.cursor=editor_line_start(&self.line,self.cursor),
+                "[F"|"OF"|"[4~"|"[8~"=>self.cursor=editor_line_end(&self.line,self.cursor),
+                "[3~"=>self.replace(self.cursor,editor_next(&self.line,self.cursor),""),_=>{}
+            },_=>{}
+        }
+    }
+    fn checkpoint(&mut self){
+        if self.line.len()>65536{return;}
+        self.undo.push_back((self.line.clone(),self.cursor));
+        while self.undo.len()>32||self.undo.iter().map(|s|s.0.len()).sum::<usize>()>1_048_576{self.undo.pop_front();}
+    }
+    fn replace(&mut self,start:usize,end:usize,text:&str){
+        if self.line.len().saturating_sub(end-start)+text.len()>1_048_576{return;}
+        self.checkpoint();self.line.replace_range(start..end,text);self.cursor=start+text.len();
+    }
+    fn history(&mut self,old:&[String],up:bool){
+        if old.is_empty(){return;}
+        if self.history.is_none(){if !up{return;}self.draft=(self.line.clone(),self.cursor);self.history=Some(old.len());}
+        let n=self.history.unwrap();let next=if up{n.saturating_sub(1)}else{(n+1).min(old.len())};
+        self.checkpoint();
+        if next==old.len(){self.line=self.draft.0.clone();self.cursor=self.draft.1;self.history=None;}
+        else{self.line=old[next].clone();self.cursor=self.line.len();self.history=Some(next);}
+    }
+    fn vertical(&mut self,old:&[String],up:bool){
+        let rows=editor_rows(&self.line,terminal_width().saturating_sub(3).max(1));
+        let n=rows.iter().rposition(|r|r.start<=self.cursor).unwrap_or(0);
+        if (up&&n==0)||(!up&&n+1==rows.len()){self.history(old,up);return;}
+        let target=&rows[if up{n-1}else{n+1}];let goal=terminal_columns(&terminal_safe(&self.line[rows[n].start..self.cursor.min(rows[n].end)]));
+        let mut used=0;let mut cursor=target.start;
+        for (cluster,_) in terminal_clusters(&self.line[target.start..target.end]){
+            let columns=terminal_columns(&terminal_safe(&cluster));if used+columns>goal{break;}
+            used+=columns;cursor+=cluster.len();
+        }self.cursor=cursor;
+    }
+}
+enum EditKey{Byte(u8),Text(String),Sequence(String),Paste(String),Ignore}
+fn editor_report(code:u32,modifier:u32)->EditKey{
+    if code==13{return match modifier{1=>EditKey::Byte(13),2=>EditKey::Byte(10),3|4=>EditKey::Sequence("alt:enter".into()),_=>EditKey::Ignore};}
+    if matches!(modifier,3|4)&&matches!(code,8|127){return EditKey::Byte(23);}
+    if matches!(modifier,5|6)&&code<128{
+        let c=code as u8;if c.is_ascii_alphabetic(){return EditKey::Byte(c.to_ascii_uppercase()-b'@');}
+        if code==127{return EditKey::Byte(23);}
+    }
+    if modifier<=2{match code{
+        9|27|127=>return EditKey::Byte(code as u8),
+        57350=>return EditKey::Sequence("[D".into()),57351=>return EditKey::Sequence("[C".into()),
+        57352=>return EditKey::Sequence("[A".into()),57353=>return EditKey::Sequence("[B".into()),
+        _=>if let Some(c)=char::from_u32(code).filter(|c|!c.is_control()&&!(57344..=63743).contains(&(*c as u32))){return EditKey::Text(c.to_string());}
+    }}EditKey::Ignore
+}
+fn editor_key(terminal:&mut EditTerminal,host:&mut Host)->rustyline::Result<Option<EditKey>>{
+    editor_key_with(terminal,&mut ||host.service_background().map_err(|e|io::Error::other(e.to_string()).into()),false)
+}
+fn editor_key_with(terminal:&mut EditTerminal,service:&mut impl FnMut()->rustyline::Result<()>,finish_paste:bool)->rustyline::Result<Option<EditKey>>{
+    let Some(byte)=terminal.byte(50)?else{return Ok(None);};
+    if byte==27{
+        let Some(first)=terminal.byte(35)?else{return Ok(Some(EditKey::Ignore));};
+        if first==b'\r'{return Ok(Some(EditKey::Byte(10)));}
+        if matches!(first,8|127){return Ok(Some(EditKey::Byte(23)));}
+        if first!=b'['&&first!=b'O'{return Ok(Some(EditKey::Sequence(format!("alt:{}",first as char))));}
+        let mut bytes=vec![first];for _ in 0..256{
+            let Some(b)=terminal.byte(35)?else{return Ok(Some(EditKey::Ignore));};bytes.push(b);
+            if (0x40..=0x7e).contains(&b){break;}
+        }
+        if !bytes.last().is_some_and(|b|(0x40..=0x7e).contains(b)){
+            return Err(io::Error::new(io::ErrorKind::InvalidData,"oversized terminal key report").into());
+        }
+        if bytes.len()>64{return Ok(Some(EditKey::Ignore));}
+        let sequence=String::from_utf8_lossy(&bytes).into_owned();
+        if sequence=="[13;2~"{return Ok(Some(EditKey::Byte(10)));}
+        if sequence=="[200~"{
+            let mut paste=vec![];let mut overflow=false;
+            loop{
+                service()?;
+                if !finish_paste&&INTERRUPT.load(std::sync::atomic::Ordering::SeqCst){return Err(rustyline::error::ReadlineError::Interrupted);}
+                let Some(b)=terminal.byte(50)?else{continue;};paste.push(b);
+                if paste.ends_with(b"\x1b[201~"){
+                    paste.truncate(paste.len()-6);
+                    return Ok(Some(if overflow{EditKey::Ignore}else{match String::from_utf8(paste){Ok(text)=>EditKey::Paste(text),Err(_)=>EditKey::Ignore}}));
+                }
+                if paste.len()>1_048_576+6{overflow=true;paste.drain(..paste.len()-6);}
+            }
+        }
+        if let Some(parameters)=sequence.strip_prefix('[').and_then(|s|s.strip_suffix('u')){
+            let mut values=parameters.split(';');
+            let mut codes=values.next().unwrap_or("").split(':');let code=codes.next().unwrap_or("").parse::<u32>();
+            let shifted=codes.next().and_then(|c|c.parse::<u32>().ok());
+            let modifier=values.next().unwrap_or("1");
+            if modifier.split(':').nth(1)==Some("3"){return Ok(Some(EditKey::Ignore));}
+            return Ok(Some(match (code,modifier.split(':').next().unwrap_or("").parse::<u32>()){
+                (Ok(code),Ok(modifier))=>editor_report(if modifier==2{shifted.unwrap_or(code)}else{code},modifier),_=>EditKey::Ignore
+            }));
+        }
+        if let Some(parameters)=sequence.strip_prefix("[27;").and_then(|s|s.strip_suffix('~')){
+            let mut values=parameters.split(';');let modifier=values.next().unwrap_or("").parse::<u32>();let code=values.next().unwrap_or("").parse::<u32>();
+            return Ok(Some(match (code,modifier){(Ok(c),Ok(m))=>editor_report(c,m),_=>EditKey::Ignore}));
+        }
+        return Ok(Some(EditKey::Sequence(sequence)));
+    }
+    if byte<32||byte==127{return Ok(Some(EditKey::Byte(byte)));}
+    let length=if byte<128{1}else if byte&0xe0==0xc0{2}else if byte&0xf0==0xe0{3}else if byte&0xf8==0xf0{4}else{0};
+    if length==0{return Ok(Some(EditKey::Ignore));}
+    let mut bytes=vec![byte];for _ in 1..length{if let Some(b)=terminal.byte(100)?{bytes.push(b);}else{return Ok(Some(EditKey::Ignore));}}
+    Ok(Some(match String::from_utf8(bytes){Ok(text)=>EditKey::Text(text),Err(_)=>EditKey::Ignore}))
+}
+fn editor_complete(helper:&Completion,terminal:&mut EditTerminal,buffer:&mut EditBuffer,host:&mut Host)->rustyline::Result<()>{
+    let (start,matching)=helper.catalog.candidates(&buffer.line,buffer.cursor,false)?;
+    let selected=if matching.len()==1{Some(matching[0].replacement.clone())}
+        else if matching.is_empty()||!terminal.display{None}else{
+            let (_,choices)=helper.catalog.candidates(&buffer.line,buffer.cursor,true)?;
+            let prefix=&buffer.line[..buffer.cursor];let python=prefix.starts_with('@');
+            let offset=if prefix.starts_with("@@")||prefix.starts_with("!!"){2}else if python||prefix.starts_with('!'){1}else{0};
+            let (_,quote)=completion_token(prefix,offset);let query=completion_unescape(&prefix[start..],python,quote);
+            // Picker has its own legacy decoder; temporarily restore the prior
+            // keyboard protocol rather than feeding it reports it cannot parse.
+            // A queued typing burst may not have been painted yet. Anchor below
+            // the complete visible input, not below the caret's current line.
+            terminal.draw(&buffer.line,buffer.cursor)?;
+            terminal.keyboard(false)?;
+            let choice=picker_select_service(&choices,&query,terminal.output.as_raw_fd(),terminal.rows,
+                terminal.rows.saturating_sub(terminal.cursor_row),||host.service_background());
+            terminal.keyboard(true)?;
+            choice.map_err(|_|io::Error::other("selection failed"))?
+        };
+    if let Some(value)=selected{buffer.replace(start,buffer.cursor,&value);}
+    terminal.draw(&buffer.line,buffer.cursor)?;
+    if terminal.display{terminal.output.write_all(b"\x1b[?25h")?;terminal.output.flush()?;}
+    Ok(())
+}
+fn serviceable_readline(helper:&Completion,prompt:&str,host:&mut Host)->rustyline::Result<String>{
+    use rustyline::error::ReadlineError;
+    if unsafe{libc::isatty(0)==1}{print!("{prompt}");io::stdout().flush()?;}
+    let mut bytes=Vec::new();
+    let mut refreshed=None;
+    loop{
+        host.service_background().map_err(|e|io::Error::other(e.to_string()))?;
+        if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err(ReadlineError::Interrupted);}
+        let mut poll=libc::pollfd{fd:0,events:libc::POLLIN,revents:0};
+        let ready=unsafe{libc::poll(&mut poll,1,25)};
+        if ready<0{let error=io::Error::last_os_error();if error.kind()==io::ErrorKind::Interrupted{continue;}return Err(error.into());}
+        if ready==0{
+            let pending=host.wakeups.values().any(|w|w.metadata["state"]=="ready");
+            if let Err(e)=host.dispatch_wakeups(){host.event("error",json!({"error":e.to_string()}));}
+            if pending{refreshed=Some(editor_completion(host).map_err(|e|io::Error::other(e.to_string()))?);}
+            continue;
+        }
+        let helper=refreshed.as_ref().unwrap_or(helper);
+        // Never read ahead: foreground Python input() owns subsequent lines.
+        let mut byte=0u8;let size=unsafe{libc::read(0,(&mut byte as *mut u8).cast(),1)};
+        if size<0{let error=io::Error::last_os_error();if error.kind()==io::ErrorKind::Interrupted{continue;}return Err(error.into());}
+        if size==0{return if bytes.is_empty(){Err(ReadlineError::Eof)}else{String::from_utf8(bytes).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e).into())};}
+        if byte==b'\n'{
+            if bytes.last()==Some(&b'\r'){bytes.pop();}
+            let source=std::str::from_utf8(&bytes).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e))?;
+            if helper.incomplete(source)?{bytes.push(b'\n');}else{return Ok(source.into());}
+        }else{bytes.push(byte);}
+        if bytes.len()>1_048_576{return Err(io::Error::new(io::ErrorKind::InvalidData,"editor input exceeds one MiB").into());}
+    }
+}
+fn terminal_readline(helper:&Completion,history:&[String],output_fd:i32,host:&mut Host)->rustyline::Result<String>{
+    use rustyline::error::ReadlineError;
+    let mut terminal=EditTerminal::open(output_fd)?;
+    terminal.headers=terminal_status(&host.state_payload(),terminal.width());
+    let mut buffer=std::mem::take(&mut host.busy_draft);
+    terminal.draw(&buffer.line,buffer.cursor)?;terminal.keyboard(true)?;
+    // This readiness marker is last: callers cannot race a half-configured tty.
+    if terminal.display{terminal.output.write_all(b"\x1b[?2004h")?;terminal.output.flush()?;}
+    let mut width=terminal.width();let mut height=terminal.height();
+    let mut refreshed=None;
+    loop{
+        host.service_background().map_err(|e|io::Error::other(e.to_string()))?;
+        if host.wakeups.values().any(|w|w.metadata["state"]=="ready")&&!terminal.input_ready(){
+            // The entire edit state remains in buffer while the model owns the tty.
+            drop(terminal);
+            host.busy_draft=buffer;
+            if let Err(e)=host.dispatch_wakeups(){host.event("error",json!({"error":e.to_string()}));}
+            buffer=std::mem::take(&mut host.busy_draft);
+            refreshed=Some(editor_completion(host).map_err(|e|io::Error::other(e.to_string()))?);
+            terminal=EditTerminal::open(output_fd)?;
+            terminal.headers=terminal_status(&host.state_payload(),terminal.width());
+            terminal.draw(&buffer.line,buffer.cursor)?;terminal.keyboard(true)?;
+            if terminal.display{terminal.output.write_all(b"\x1b[?2004h")?;terminal.output.flush()?;}
+            width=terminal.width();height=terminal.height();
+        }
+        let helper=refreshed.as_ref().unwrap_or(helper);
+        if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err(ReadlineError::Interrupted);}
+        if width!=terminal.width()||height!=terminal.height(){
+            width=terminal.width();height=terminal.height();terminal.headers=terminal_status(&host.state_payload(),width);
+            terminal.draw(&buffer.line,buffer.cursor)?;
+        }
+        let key=match editor_key(&mut terminal,host){Err(ReadlineError::Io(e)) if e.kind()==io::ErrorKind::UnexpectedEof=>return Err(ReadlineError::Eof),other=>other?};
+        let Some(key)=key else{continue;};
+        match key{
+            EditKey::Text(text)|EditKey::Paste(text)=>buffer.replace(buffer.cursor,buffer.cursor,&text),
+            EditKey::Byte(13)=>{
+                if buffer.line.trim().is_empty(){continue;}
+                let incomplete=helper.incomplete(&buffer.line)?;
+                if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err(ReadlineError::Interrupted);}
+                if incomplete{buffer.replace(buffer.cursor,buffer.cursor,"\n");}
+                else{terminal.draw(&buffer.line,buffer.cursor)?;return Ok(buffer.line);}
+            },
+            EditKey::Byte(10)=>buffer.replace(buffer.cursor,buffer.cursor,"\n"),
+            EditKey::Byte(3)=>return Err(ReadlineError::Interrupted),
+            EditKey::Byte(4) if buffer.line.is_empty()=>return Err(ReadlineError::Eof),
+            EditKey::Byte(4)=>{let next=editor_next(&buffer.line,buffer.cursor);buffer.replace(buffer.cursor,next,"");},
+            EditKey::Byte(8|127)=>{let previous=editor_previous(&buffer.line,buffer.cursor);buffer.replace(previous,buffer.cursor,"");},
+            EditKey::Byte(1)=>buffer.cursor=editor_line_start(&buffer.line,buffer.cursor),
+            EditKey::Byte(5)=>buffer.cursor=editor_line_end(&buffer.line,buffer.cursor),
+            EditKey::Byte(2)=>buffer.cursor=editor_previous(&buffer.line,buffer.cursor),
+            EditKey::Byte(6)=>buffer.cursor=editor_next(&buffer.line,buffer.cursor),
+            EditKey::Byte(9)=>editor_complete(helper,&mut terminal,&mut buffer,host)?,
+            EditKey::Byte(16)=>buffer.history(history,true),EditKey::Byte(14)=>buffer.history(history,false),
+            EditKey::Byte(21|23|11)=>{
+                let (start,end)=match key{EditKey::Byte(21)=>(editor_line_start(&buffer.line,buffer.cursor),buffer.cursor),
+                    EditKey::Byte(23)=>(editor_word_left(&buffer.line,buffer.cursor),buffer.cursor),
+                    _=>(buffer.cursor,if buffer.cursor==editor_line_end(&buffer.line,buffer.cursor){editor_next(&buffer.line,buffer.cursor)}else{editor_line_end(&buffer.line,buffer.cursor)})};
+                buffer.killed=buffer.line[start..end].into();buffer.replace(start,end,"");
+            },
+            EditKey::Byte(25)=>{let text=buffer.killed.clone();buffer.replace(buffer.cursor,buffer.cursor,&text);},
+            EditKey::Byte(31)=>if let Some((line,cursor))=buffer.undo.pop_back(){buffer.line=line;buffer.cursor=cursor;},
+            EditKey::Sequence(ref sequence)=>match sequence.as_str(){
+                "[A"|"OA"=>buffer.vertical(history,true),"[B"|"OB"=>buffer.vertical(history,false),
+                "[C"|"OC"=>buffer.cursor=editor_next(&buffer.line,buffer.cursor),"[D"|"OD"=>buffer.cursor=editor_previous(&buffer.line,buffer.cursor),
+                "[1;5D"|"alt:b"=>buffer.cursor=editor_word_left(&buffer.line,buffer.cursor),
+                "[1;5C"|"alt:f"=>buffer.cursor=editor_word_right(&buffer.line,buffer.cursor),
+                "[H"|"OH"|"[1~"|"[7~"=>buffer.cursor=editor_line_start(&buffer.line,buffer.cursor),
+                "[F"|"OF"|"[4~"|"[8~"=>buffer.cursor=editor_line_end(&buffer.line,buffer.cursor),
+                "[3~"=>{let next=editor_next(&buffer.line,buffer.cursor);buffer.replace(buffer.cursor,next,"");},_=>{}
+            },_=>{}
+        }
+        // A queued burst is one visual edit, not an O(n²) repaint per byte.
+        // Submit explicitly draws the final buffer before leaving; completion
+        // draws its chosen/restored buffer once selection has finished.
+        if !terminal.input_ready(){terminal.draw(&buffer.line,buffer.cursor)?;}
+    }
+}
+
+impl Host {
+    fn poll_commands(&mut self)->Result<bool>{
+        self.poll_target(self.worker.child.id() as i32,libc::SIGINT)
+    }
+    fn poll_target(&mut self,pid:i32,signal:i32)->Result<bool>{
+        self.service_background()?;
+        let mut cancelled=false;
+        if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){
+            self.journal.append("cancel",json!({"generation":self.generation,"source":"SIGINT"}))?;
+            self.cancel_revision=self.cancel_revision.wrapping_add(1);
+            unsafe{libc::kill(-pid,signal);}
+            cancelled=true;
+        }
+        loop{
+            let command=match self.incoming.as_ref().map(|r|r.try_recv()){
+                Some(Ok(v))=>v,
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected))=>{self.input_closed=true;break;},
+                _=>break
+            };
+            if command["kind"]=="interrupt"{
+                if !self.accept_input_control(&command)?{continue;}
+                let id=command["id"].as_str().unwrap();
+                self.journal.append("cancel",json!({"command_id":id,"generation":self.generation}))?;
+                self.cancel_revision=self.cancel_revision.wrapping_add(1);
+                unsafe{libc::kill(-pid,signal);}
+                self.event("completed",json!({"command_id":id,"status":"ok"}));
+                cancelled=true;
+            }else if !self.background_control(&command)?{self.queue_arrival(command)?;}
+        }
+        Ok(cancelled)
+    }
+    fn accept_input_control(&mut self,command:&Value)->Result<bool>{
+        let id=command["id"].as_str().unwrap_or("");
+        if id.is_empty()||self.ids.contains(id){
+            self.event("rejected",json!({"command_id":id,"error":"missing or duplicate command ID"}));return Ok(false);
+        }
+        self.journal.append("accepted",json!({"command_id":id,"command":command}))?;
+        self.ids.insert(id.into());self.event("accepted",json!({"command_id":id}));Ok(true)
+    }
+    fn begin_input(&mut self,operation:&str,text:&str)->Result<InputPrompt>{
+        // Python input() exclusively owns stdin until its prompt closes.
+        self.input_busy_paused=self.busy_input.is_some();self.stop_busy_input()?;
+        let p=InputPrompt{id:format!("input{}",self.journal.seq),operation:operation.into(),
+            generation:self.generation,text:text.into(),buffer:vec![]};
+        let payload=p.payload();self.journal.append("input_prompt",payload.clone())?;
+        self.set_state(UiState::Input,None);
+        self.event("input_prompt",payload);Ok(p)
+    }
+    fn close_input(&mut self,p:&InputPrompt,action:&str,text:Option<&str>)->Result<Value>{
+        let mut payload=p.payload();payload["action"]=json!(action);
+        let response=if let Some(text)=text{
+            let index=self.history["stdin"].len();
+            payload["index"]=json!(index);payload["text"]=json!(text);
+            self.journal.append("stdin",payload.clone())?;self.hist_push("stdin",json!(text));
+            json!({"ok":true,"value":text})
+        }else{input_exception(action)};
+        payload.as_object_mut().unwrap().remove("text");
+        self.journal.append("input_closed",payload)?;
+        self.set_state(UiState::Running,None);
+        if std::mem::take(&mut self.input_busy_paused){self.start_busy_input();}
+        Ok(response)
+    }
+    fn reply_input(&mut self,p:&InputPrompt,command:&Value)->Result<Option<(Value,bool)>>{
+        let action=match command.get("action"){None=>"text",Some(v)=>v.as_str().unwrap_or("")};
+        let text=command["value"].as_str();
+        let id=command["id"].as_str().unwrap_or("");
+        let error=if id.is_empty()||self.ids.contains(id){Some("missing or duplicate command ID")}
+            else if command["prompt_id"]!=p.id||command["operation"]!=p.operation||command["worker_generation"]!=p.generation{
+                Some("reply does not match the active prompt, operation and generation")
+            }else if !["text","eof","cancel"].contains(&action)||(action=="text"&&text.is_none()){
+                Some("stdin_reply requires text value or eof/cancel action")
+            }else{None};
+        if let Some(error)=error{self.event("rejected",json!({"command_id":id,"error":error}));return Ok(None);}
+        if !self.accept_input_control(command)?{return Ok(None);}
+        if action=="cancel"{self.journal.append("cancel",json!({"command_id":id,
+            "operation":p.operation,"prompt_id":p.id,"generation":p.generation}))?;}
+        let response=self.close_input(p,action,if action=="text"{text}else{None})?;
+        self.event("completed",json!({"command_id":id,"status":"ok"}));Ok(Some((response,action=="cancel")))
+    }
+    fn terminal_input(&mut self,p:&mut InputPrompt)->Result<Option<Value>>{
+        let mut fd=libc::pollfd{fd:0,events:libc::POLLIN,revents:0};
+        if unsafe{libc::poll(&mut fd,1,0)}<=0{return Ok(None);}
+        // Canonical terminals can release a partial line on Ctrl-D. Read bounded
+        // nonblocking bytes, retaining the partial line while the event loop runs.
+        let flags=unsafe{libc::fcntl(0,libc::F_GETFL)};
+        if flags<0||unsafe{libc::fcntl(0,libc::F_SETFL,flags|libc::O_NONBLOCK)}<0{
+            return Err(io::Error::last_os_error().into());
+        }
+        let result=(||->Result<Option<Value>>{
+            for _ in 0..512{
+                let mut byte=0u8;let count=unsafe{libc::read(0,(&mut byte as *mut u8).cast(),1)};
+                if count<0{
+                    let error=io::Error::last_os_error();
+                    if [io::ErrorKind::WouldBlock,io::ErrorKind::Interrupted].contains(&error.kind()){return Ok(None);}
+                    return Err(error.into());
+                }
+                if count==0&&p.buffer.is_empty(){return Ok(Some(self.close_input(p,"eof",None)?));}
+                if count==0||byte==b'\n'{
+                    let text=std::str::from_utf8(&p.buffer)?;
+                    return Ok(Some(self.close_input(p,"text",Some(text))?));
+                }
+                p.buffer.push(byte);
+            }
+            Ok(None)
+        })();
+        if unsafe{libc::fcntl(0,libc::F_SETFL,flags)}<0{return Err(io::Error::last_os_error().into());}
+        result
+    }
+}
+
+struct InputPrompt {id:String,operation:String,generation:usize,text:String,buffer:Vec<u8>}
+impl InputPrompt {
+    fn payload(&self)->Value{json!({"prompt_id":self.id,"operation":self.operation,
+        "worker_generation":self.generation,"prompt":self.text})}
+}
+fn input_exception(action:&str)->Value{
+    json!({"ok":false,"exception":if action=="cancel"{"KeyboardInterrupt"}else{"EOFError"}})
+}
+
+// Idle editor IPC is separate from cell execution. The cached names are never
+// queried while a cell is running; only validation uses this cloned socket.
+#[derive(Clone)]
+// =============================================================================
+// Completion and picker
+// =============================================================================
+
+struct CompletionCatalog{
+    names:Vec<String>,models:Value,home:PathBuf,python_cwd:PathBuf,
+    current_model:String,configured_providers:Vec<String>,task_ids:Vec<String>,wakeup_ids:Vec<String>,
+}
+struct Completion {
+    catalog:CompletionCatalog,
+    selection:std::sync::Arc<std::sync::Mutex<Option<(usize,String)>>>,
+    ipc:std::cell::RefCell<(BufReader<UnixStream>,UnixStream)>,
+}
+impl Completion {
+    fn from_worker(worker:&mut Worker,models:Value,home:PathBuf,current_model:String,configured_providers:Vec<String>)->Result<Self>{
+        worker.send(&json!({"kind":"ide_inspect"}))?;
+        worker.reader.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+        let response=worker.recv();
+        worker.reader.get_ref().set_read_timeout(None)?;
+        let response=response?;
+        if response["kind"]!="ide_names"{return Err("invalid idle worker inspection response".into());}
+        let names=response["names"].as_array().map(|a|a.iter().filter_map(|v|v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        let python_cwd=response["cwd"].as_str().map(PathBuf::from).unwrap_or(std::env::current_dir()?);
+        Ok(Self{catalog:CompletionCatalog{names,models,home,python_cwd,current_model,configured_providers,task_ids:vec![],wakeup_ids:vec![]},
+            selection:std::sync::Arc::new(std::sync::Mutex::new(None)),ipc:std::cell::RefCell::new((
+            BufReader::new(worker.reader.get_ref().try_clone()?),worker.writer.try_clone()?))})
+    }
+    fn picker_handler(&self)->rustyline::EventHandler{
+        rustyline::EventHandler::Conditional(Box::new(PickerTab{catalog:self.catalog.clone(),selection:self.selection.clone()}))
+    }
+}
+fn editor_completion(host:&mut Host)->Result<Completion>{
+    let models=host.models();let providers=host.login_providers();
+    let mut helper=Completion::from_worker(&mut host.worker,models,host.home.clone(),host.model.clone(),providers)?;
+    helper.catalog.task_ids=host.bg_tasks.keys().cloned().collect();
+    helper.catalog.wakeup_ids=host.wakeups.keys().cloned().collect();
+    Ok(helper)
+}
+impl CompletionCatalog{
+    fn providers(&self)->Vec<String>{
+        let mut providers:Vec<_>=PROVIDERS.iter().map(|p|p.0.to_string()).collect();
+        providers.extend(["github-copilot".into(),"openai-codex".into(),"codex".into()]);
+        providers.extend(self.configured_providers.iter().cloned());
+        if let Some(models)=self.models.as_array(){for model in models{
+            if let Some(provider)=model["provider"].as_str(){providers.push(provider.into());}
+        }}
+        providers.sort();providers.dedup();providers
+    }
+}
+impl rustyline::Helper for Completion{}
+impl rustyline::hint::Hinter for Completion{type Hint=String;}
+impl rustyline::highlight::Highlighter for Completion{}
+impl rustyline::validate::Validator for Completion{
+    fn validate(&self,ctx:&mut rustyline::validate::ValidationContext<'_>)
+        ->rustyline::Result<rustyline::validate::ValidationResult>{
+        use rustyline::validate::ValidationResult;
+        Ok(if self.incomplete(ctx.input())?{ValidationResult::Incomplete}else{ValidationResult::Valid(None)})
+    }
+}
+impl Completion{
+    fn incomplete(&self,input:&str)->rustyline::Result<bool>{
+        use rustyline::error::ReadlineError;
+        let Some(source)=input.strip_prefix("@@").or_else(||input.strip_prefix('@')) else{
+            return Ok(input.ends_with('\\'));
+        };
+        // A huge paste is accepted as a cell without blocking editor validation.
+        if source.len()>65536{return Ok(false);}
+        let mut ipc=self.ipc.borrow_mut();
+        ipc.0.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+        let result=(||->rustyline::Result<bool>{
+            writeln!(ipc.1,"{}",json!({"kind":"ide_validate","source":source}))?;
+            let mut line=String::new();
+            if ipc.0.read_line(&mut line)?==0{return Err(ReadlineError::Eof);}
+            let v:Value=serde_json::from_str(&line).map_err(|_|ReadlineError::Io(io::Error::new(io::ErrorKind::InvalidData,"invalid idle validation response")))?;
+            if v["kind"]!="ide_validation"{return Err(ReadlineError::Io(io::Error::new(io::ErrorKind::InvalidData,"unexpected idle validation response")));}
+            Ok(v["incomplete"]==true)
+        })();
+        ipc.0.get_ref().set_read_timeout(None)?;
+        result
+    }
+}
+// Larger scores win. Categories deliberately dominate all within-category
+// bonuses: exact > prefix > contiguous substring > ordered subsequence.
+fn fuzzy_score(query:&str,candidate:&str)->Option<i64>{
+    let query=query.to_lowercase();let candidate=candidate.to_lowercase();
+    if query==candidate{return Some(1_000_000);}
+    if candidate.starts_with(&query){return Some(800_000-candidate.chars().count().min(10_000) as i64);}
+    if let Some(at)=candidate.find(&query){return Some(600_000-at.min(10_000) as i64*2-candidate.chars().count().min(10_000) as i64);}
+    let q:Vec<_>=query.chars().collect();let c:Vec<_>=candidate.chars().collect();
+    if q.len()>c.len(){return None;}
+    let mut next=0;let mut score=400_000;let mut last=None;
+    for (i,ch) in c.iter().enumerate(){
+        if next<q.len()&&*ch==q[next]{
+            if i==0||matches!(c[i-1],'.'|'/'|'_'|'-'|' '){score+=20;}
+            if last==Some(i.saturating_sub(1)){score+=10;}
+            score-=i.min(1000) as i64;last=Some(i);next+=1;
+        }
+    }
+    if next==q.len(){Some(score-c.len().min(10_000) as i64)}else{None}
+}
+fn completion_rank(mut items:Vec<(i64,String,String)>)->Vec<rustyline::completion::Pair>{
+    items.sort_by(|a,b|b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let mut seen=HashSet::new();items.into_iter().filter(|(_,display,_)|seen.insert(display.clone())).take(4096)
+        .map(|(_,display,replacement)|rustyline::completion::Pair{display:terminal_safe(&display),replacement}).collect()
+}
+// Return the token offset and open quote without splitting a quoted/spaced path.
+fn completion_token(prefix:&str,offset:usize)->(usize,Option<char>){
+    let mut start=offset;let mut quoted_start=offset;let mut quote=None;let mut escaped=false;
+    for (i,ch) in prefix[offset..].char_indices(){let at=offset+i;
+        if escaped{escaped=false;continue;}
+        if ch=='\\'&&quote!=Some('\''){escaped=true;continue;}
+        if let Some(q)=quote{if ch==q{quote=None;}continue;}
+        if ch=='\''||ch=='"'{quote=Some(ch);quoted_start=at+1;}
+        else if ch.is_whitespace()||matches!(ch,';'|'|'|'&'){start=at+ch.len_utf8();}
+    }
+    (if quote.is_some(){quoted_start}else{start},quote)
+}
+fn completion_unescape(s:&str,python:bool,initial_quote:Option<char>)->String{
+    let mut out=String::new();let mut chars=s.chars().peekable();let mut quote=initial_quote;
+    while let Some(c)=chars.next(){
+        if !python&&matches!(c,'\''|'"'){
+            if quote==Some(c){quote=None;continue;}
+            if quote.is_none(){quote=Some(c);continue;}
+        }
+        if c=='\\'{if let Some(&next)=chars.peek(){
+            if (python&&matches!(next,'\\'|'\''|'"'))||(!python&&quote!=Some('\'')&&
+                (quote.is_none()||matches!(next,'\\'|'"'|'$'|'`'))){
+                out.push(chars.next().unwrap());continue;
+            }
+        }}out.push(c);
+    }out
+}
+fn completion_path_word(path:&str,quote:Option<char>,python:bool)->String{
+    if let Some(q)=quote{
+        if !python&&q=='\''{return path.replace('\'',"'\\''");}
+        let mut value=String::new();for c in path.chars(){
+            if c=='\\'||c==q||(!python&&q=='"'&&matches!(c,'$'|'`')){value.push('\\');}
+            value.push(c);
+        }return value;
+    }
+    // Keep the unquoted tilde separate from the quoted filename so the shell
+    // still expands HOME even when the completed basename contains spaces.
+    if !python{if let Some(rest)=path.strip_prefix("~/"){
+        return format!("~/{}",completion_path_word(rest,None,true));
+    }}
+    if path.chars().all(|c|c.is_alphanumeric()||matches!(c,'/'|'.'|'_'|'-'|'~')){return path.into();}
+    format!("'{}'",path.replace('\'',"'\\''"))
+}
+fn completion_files(word:&str,quote:Option<char>,python:bool,cwd:&Path,command:bool)->Vec<(i64,String,String)>{
+    use std::os::unix::fs::PermissionsExt;
+    let word=completion_unescape(word,python,quote);
+    let (directory,query)=word.rsplit_once('/').map_or(("",word.as_str()),|(d,q)|(&word[..d.len()+1],q));
+    let expanded=if directory=="~/"||directory.starts_with("~/"){
+        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(&directory[2..])
+    }else{PathBuf::from(directory)};
+    let search=if expanded.is_absolute(){expanded}else{cwd.join(expanded)};
+    let mut items=Vec::new();
+    if let Ok(entries)=fs::read_dir(search){for entry in entries.take(4096).flatten(){
+        let Some(name)=entry.file_name().to_str().map(str::to_string)else{continue;};
+        if name.starts_with('.')&&!query.starts_with('.'){continue;}
+        if name.chars().any(char::is_control){continue;}
+        let Ok(meta)=entry.metadata()else{continue;};
+        if command&&!meta.is_dir()&&(!meta.is_file()||meta.permissions().mode()&0o111==0){continue;}
+        let Some(score)=fuzzy_score(query,&name)else{continue;};
+        let suffix=if meta.is_dir(){"/"}else{""};
+        let value=if command&&directory.is_empty()&&!meta.is_dir(){format!("./{name}{suffix}")}else{format!("{directory}{name}{suffix}")};
+        items.push((score,format!("{directory}{name}{suffix}"),completion_path_word(&value,quote,python)));
+    }}items
+}
+fn completion_executables(query:&str,quote:Option<char>)->Vec<(i64,String,String)>{
+    use std::os::unix::fs::PermissionsExt;
+    let mut items=Vec::new();let mut visited=HashSet::new();let mut count=0;
+    // POSIX shell builtins are useful even when they have no PATH executable.
+    for name in ["cd","echo","printf","pwd","command","export","unset","alias","unalias","umask",
+        "read","test","true","false","exec","exit","wait","kill","jobs","fg","bg","set","shift","trap"]{
+        if let Some(score)=fuzzy_score(query,name){items.push((score+1,name.into(),completion_path_word(name,quote,false)));}
+    }
+    if let Some(path)=std::env::var_os("PATH"){for dir in std::env::split_paths(&path).take(64){
+        if !visited.insert(dir.clone()){continue;}
+        if let Ok(entries)=fs::read_dir(dir){for entry in entries.take(4096).flatten(){
+            count+=1;if count>16384{return items;}
+            let Some(name)=entry.file_name().to_str().map(str::to_string)else{continue;};
+            if name.chars().any(char::is_control){continue;}
+            let Some(score)=fuzzy_score(query,&name)else{continue;};
+            if entry.metadata().is_ok_and(|m|m.is_file()&&m.permissions().mode()&0o111!=0){
+                items.push((score+1,name.clone(),completion_path_word(&name,quote,false)));
+            }
+        }}
+    }}items
+}
+impl rustyline::completion::Completer for Completion{
+    type Candidate=rustyline::completion::Pair;
+    fn complete(&self,line:&str,pos:usize,_ctx:&rustyline::Context<'_>)
+        ->rustyline::Result<(usize,Vec<Self::Candidate>)>{
+        if let Some((start,value))=self.selection.lock().unwrap().take(){
+            return Ok((start,vec![rustyline::completion::Pair{display:terminal_safe(&value),replacement:value}]));
+        }
+        self.catalog.candidates(line,pos,false)
+    }
+}
+impl CompletionCatalog{
+    fn candidates(&self,line:&str,pos:usize,all:bool)
+        ->rustyline::Result<(usize,Vec<rustyline::completion::Pair>)>{
+        const COMMANDS:&[&str]=&["/help","/hotkeys","/model","/models","/effort","/think","/thinking","/status",
+            "/context","/config","/login","/logout","/auth","/session","/sessions","/resume","/recovery",
+            "/reset","/new","/compact","/interrupt","/quit","/exit","/tasks","/task","/bg","/wakeups","/wakeup"];
+        let Some(prefix)=line.get(..pos)else{return Ok((pos,vec![]));};
+        let mut items=Vec::new();
+        if prefix.starts_with('/'){
+            let Some(space)=prefix.find(char::is_whitespace)else{
+                for command in COMMANDS{if let Some(score)=fuzzy_score(if all{""}else{prefix},command){items.push((score,command.to_string(),command.to_string()));}}
+                return Ok((0,completion_rank(items)));
+            };
+            let command=&prefix[..space];let args=prefix[space..].trim_start();let arg_start=prefix.len()-args.len();
+            let (start,_)=completion_token(prefix,arg_start);let raw_word=&prefix[start..];let word=if all{""}else{raw_word};
+            if command=="/model"||command=="/models"{
+                if command=="/model"&&start==arg_start{if let Some(score)=fuzzy_score(word,"list"){items.push((score,"list".into(),"list".into()));}}
+                if line[..start].trim_end()=="/model list"||line[..start].trim_end()=="/models"{
+                    if let Some(score)=fuzzy_score(word,"refresh"){items.push((score,"refresh".into(),"refresh".into()));}
+                }
+                if let Some(models)=self.models.as_array(){for model in models{
+                    if model["image_output"]==true{continue;}
+                    let Some(id)=model["id"].as_str()else{continue;};
+                    let name=model["name"].as_str().unwrap_or("");
+                    // Provider aliases are alternate spellings, not additional
+                    // picker options. Preserve the user's explicit alias.
+                    let mut value=id.to_string();
+                    if let Some((provider,model_id))=id.split_once('/'){
+                        for (alias,canonical) in [("codex","openai-codex"),("copilot","github-copilot"),("google","google-gemini-cli")]{
+                            if provider==canonical&&raw_word.split_once('/').is_some_and(|(typed,_)|typed.eq_ignore_ascii_case(alias)){
+                                value=format!("{alias}/{model_id}");break;
+                            }
+                        }
+                    }
+                    let score=fuzzy_score(word,&value).or_else(||fuzzy_score(word,name).map(|s|s-100))
+                        .or_else(||model["aliases"].as_array().and_then(|aliases|aliases.iter().filter_map(|a|a.as_str().and_then(|a|{
+                            let alias=if raw_word.contains('/'){format!("{}/{a}",value.split_once('/').unwrap().0)}else{a.into()};fuzzy_score(word,&alias)
+                        })).max()));
+                    if let Some(score)=score{
+                        let aliases=model["aliases"].as_array().map(|a|a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+                        let display=if aliases.is_empty(){format!("{value}  {name}")}else{format!("{value}  {name}  [{aliases}]")};
+                        items.push((score,display,value));
+                    }
+                }}
+            }else if matches!(command,"/effort"|"/think"|"/thinking"){
+                let model=self.models.as_array().and_then(|models|models.iter().find(|m|m["id"]==self.current_model));
+                let supported=model.and_then(|m|m["reasoning_efforts"].as_array());
+                let max=model.is_some_and(|m|m["reasoning"]==true&&m["api"]=="anthropic-messages"&&self.current_model.contains("claude-opus-4-6"));
+                for effort in ["off","minimal","low","medium","high","xhigh","max"]{
+                    if supported.map_or(effort=="max"&&!max,|levels|!levels.iter().any(|level|level==effort)){continue;}
+                    if let Some(score)=fuzzy_score(word,effort){items.push((score,effort.into(),effort.into()));}
+                }
+            }else if matches!(command,"/login"|"/logout"|"/auth"){
+                let provider=prefix[arg_start..].split_whitespace().next().unwrap_or("");
+                let providers=if start==arg_start{self.providers()}else if command=="/login"{
+                    // Mirror execution's exact/unique-fuzzy provider resolution
+                    // using only the immutable idle snapshot, never host IPC.
+                    let known=self.providers();let query=provider_alias(provider);
+                    let exact=known.iter().find(|p|p.eq_ignore_ascii_case(query)).cloned();
+                    let resolved=exact.or_else(||{
+                        let matches:Vec<_>=known.into_iter().filter(|p|fuzzy_score(query,p).is_some()).collect();
+                        if matches.len()==1{matches.into_iter().next()}else{None}
+                    });
+                    match resolved.as_deref(){
+                        Some("anthropic")=>vec!["browser","manual","api-key","oauth"],
+                        Some("openai-codex")=>vec!["browser","manual","device","oauth"],
+                        Some("github-copilot")=>vec!["device","oauth"],
+                        Some(_)=>vec!["api-key"],
+                        None=>vec![]
+                    }.into_iter().map(str::to_string).collect()
+                }else{vec![]};
+                for provider in providers{if let Some(score)=fuzzy_score(word,&provider){items.push((score,provider.clone(),provider));}}
+            }else if matches!(command,"/tasks"|"/task"|"/bg"|"/wakeup"|"/quit"|"/exit"|"/new"){
+                let tokens:Vec<_>=args.split_whitespace().collect();
+                let at_new=args.ends_with(char::is_whitespace);
+                let slot=tokens.len().saturating_sub(usize::from(!at_new));
+                let task_slot=command=="/task"&&(slot==0||slot==1&&tokens.first().is_some_and(|s|["logs","kill"].contains(s)));
+                let wakeup_slot=command=="/wakeup"&&slot==1;
+                if task_slot||wakeup_slot{
+                    for id in if task_slot{&self.task_ids}else{&self.wakeup_ids}{
+                        if let Some(score)=fuzzy_score(word,id){items.push((score,id.clone(),id.clone()));}
+                    }
+                }
+                let suggestions:&[&str]=match command{
+                    "/tasks"=>&["all","running","finished","succeeded","failed","timed_out","cancelled","killed","outcome_unknown"],
+                    "/task" if args.starts_with("logs ")&&slot>=2=>&["stdout","stderr","both"],
+                    "/task" if args.starts_with("kill ")&&slot>=2=>&["--force"],
+                    "/task" if slot==0=>&["logs","kill"],"/task"=>&[],
+                    "/bg" if slot==0=>&["shell","python"],"/bg"=>&[],
+                    "/wakeup" if slot==0=>&["cancel","run"],"/wakeup"=>&[],
+                    _=>&["--cancel-tasks"]
+                };
+                for suggestion in suggestions{if let Some(score)=fuzzy_score(word,suggestion){items.push((score,suggestion.to_string(),suggestion.to_string()));}}
+            }else if command=="/resume"{
+                let directory=self.home.join("sessions");
+                if let Ok(entries)=fs::read_dir(directory){for entry in entries.take(4096).flatten(){
+                    let name=entry.file_name().to_string_lossy().into_owned();
+                    if let Some(score)=fuzzy_score(word,&name){items.push((score,name,entry.path().to_string_lossy().into_owned()));}
+                }}
+            }else{items=completion_files(completion_file_query(raw_word,all),None,false,&std::env::current_dir()?,false);}
+            return Ok((start,completion_rank(items)));
+        }
+        if prefix.starts_with('@'){
+            let offset=if prefix.starts_with("@@"){2}else{1};
+            let (quoted_start,quote)=completion_token(prefix,offset);
+            if quote.is_some(){return Ok((quoted_start,completion_rank(completion_files(completion_file_query(&prefix[quoted_start..],all),quote,true,&self.python_cwd,false))));}
+            let start=prefix[offset..].char_indices().rev().find(|(_,c)|!c.is_alphanumeric()&&!matches!(c,'_'|'.'))
+                .map_or(offset,|(i,c)|offset+i+c.len_utf8());
+            let word=if all{""}else{&prefix[start..]};let qualifier=word.rsplit_once('.').map(|p|p.0);
+            for name in &self.names{
+                let score=if let Some(qualifier)=qualifier{
+                    name.rsplit_once('.').filter(|(q,_)|*q==qualifier)
+                        .and_then(|(_,n)|fuzzy_score(word.rsplit_once('.').unwrap().1,n))
+                        .or_else(||fuzzy_score(word,name).map(|s|s-50_000))
+                }else{fuzzy_score(word,name).map(|s|if name.contains('.'){s-100_000}else{s})};
+                if let Some(score)=score{items.push((score,name.clone(),name.clone()));}
+            }
+            return Ok((start,completion_rank(items)));
+        }
+        let offset=if prefix.starts_with("!!"){2}else if prefix.starts_with('!'){1}else{0};
+        let (start,quote)=completion_token(prefix,offset);let word=&prefix[start..];
+        let before=prefix[offset..start].trim().trim_end_matches(['\'','"']).trim_end();
+        let command=offset>0&&(before.is_empty()||before.ends_with([';','|','&']));
+        items=completion_files(completion_file_query(word,all),quote,false,&std::env::current_dir()?,command);
+        if command&&!word.contains('/'){
+            let query=if all{String::new()}else{completion_unescape(word,false,quote)};
+            items.extend(completion_executables(&query,quote));
+        }
+        Ok((start,completion_rank(items)))
+    }
+}
+
+fn completion_file_query(word:&str,all:bool)->&str{
+    if all{word.rfind('/').map_or("",|i|&word[..i+1])}else{word}
+}
+// Only this immutable, between-cell snapshot enters the key handler. Python IPC
+// and the worker are deliberately absent from selection and query filtering.
+struct PickerTab{catalog:CompletionCatalog,selection:std::sync::Arc<std::sync::Mutex<Option<(usize,String)>> >}
+impl rustyline::ConditionalEventHandler for PickerTab{
+    fn handle(&self,_event:&rustyline::Event,_count:rustyline::RepeatCount,_positive:bool,ctx:&rustyline::EventContext<'_>)->Option<rustyline::Cmd>{
+        let (start,matching)=self.catalog.candidates(ctx.line(),ctx.pos(),false).ok()?;
+        let selected=if matching.len()==1{Some(matching[0].replacement.clone())}
+        else if matching.is_empty(){None}else{
+            let (_,choices)=self.catalog.candidates(ctx.line(),ctx.pos(),true).ok()?;
+            let prefix=&ctx.line()[..ctx.pos()];
+            let python=prefix.starts_with('@');
+            let offset=if prefix.starts_with("@@")||prefix.starts_with("!!"){2}else if python||prefix.starts_with('!'){1}else{0};
+            let (_,quote)=completion_token(prefix,offset);
+            let query=completion_unescape(&prefix[start..],python,quote);
+            picker_select(&choices,&query,1,1,1).ok().flatten()
+        };
+        Some(if let Some(value)=selected{
+            // Cmd::Replace is unsuitable here: Emacs redo overrides its count,
+            // and insert_str leaves the cursor before inserted text. Complete
+            // delegates atomic range replacement + cursor placement to rustyline.
+            *self.selection.lock().unwrap()=Some((start,value));rustyline::Cmd::Complete
+        }else{rustyline::Cmd::Repaint})
+    }
+}
+struct PickerTerminal{
+    input:File,tty:File,previous:libc::termios,active:bool,
+    slots:usize,cursor_row:usize,origin_up:usize,prompt_rows:usize,
+}
+impl PickerTerminal{
+    fn open(output_fd:i32,prompt_rows:usize,origin_up:usize)->Result<Option<Self>>{
+        use std::os::fd::FromRawFd;
+        let input=unsafe{libc::dup(0)};if input<0{return Err(io::Error::last_os_error().into());}
+        let input=unsafe{File::from_raw_fd(input)};
+        let tty=unsafe{libc::dup(output_fd)};if tty<0{return Err(io::Error::last_os_error().into());}
+        let tty=unsafe{File::from_raw_fd(tty)};
+        let mut size=unsafe{std::mem::zeroed::<libc::winsize>()};
+        let height=if unsafe{libc::ioctl(tty.as_raw_fd(),libc::TIOCGWINSZ,&mut size)}==0&&size.ws_row>0{size.ws_row as usize}else{24};
+        // At most half the screen: reserve room for the source and recent output.
+        // Multiline input can consume that room; a tiny screen declines the menu.
+        let slots=height.saturating_sub(prompt_rows).min((height/2).max(2)).min(8);
+        if slots<2{return Ok(None);}
+        let mut previous=unsafe{std::mem::zeroed::<libc::termios>()};
+        if unsafe{libc::tcgetattr(input.as_raw_fd(),&mut previous)}<0{return Err(io::Error::last_os_error().into());}
+        let mut raw=previous;raw.c_lflag&=!(libc::ICANON|libc::ECHO|libc::ISIG);
+        raw.c_cc[libc::VMIN]=1;raw.c_cc[libc::VTIME]=0;
+        if unsafe{libc::tcsetattr(input.as_raw_fd(),libc::TCSANOW,&raw)}<0{return Err(io::Error::last_os_error().into());}
+        let mut guard=Self{input,tty,previous,active:false,slots:0,cursor_row:0,origin_up:origin_up.max(1),prompt_rows};
+        guard.tty.write_all(b"\r")?;
+        if guard.origin_up>1{write!(guard.tty,"\x1b[{}B",guard.origin_up-1)?;}
+        // Newlines reserve owned rows and naturally scroll at the bottom. The
+        // source scrolls with them; no saved absolute cursor becomes stale.
+        for _ in 0..slots{
+            guard.tty.write_all(b"\r\n")?;
+            if guard.active{guard.cursor_row+=1;}guard.active=true;guard.slots+=1;
+        }
+        guard.top()?;guard.tty.flush()?;Ok(Some(guard))
+    }
+    fn top(&mut self)->io::Result<()>{
+        self.tty.write_all(b"\r")?;
+        if self.cursor_row>0{write!(self.tty,"\x1b[{}A",self.cursor_row)?;}
+        self.cursor_row=0;Ok(())
+    }
+    fn byte(&mut self,timeout:i32)->Result<Option<u8>>{
+        use std::os::fd::AsRawFd;
+        let mut poll=libc::pollfd{fd:self.input.as_raw_fd(),events:libc::POLLIN,revents:0};
+        let ready=unsafe{libc::poll(&mut poll,1,timeout)};
+        if ready<0{
+            let error=io::Error::last_os_error();
+            if error.kind()==io::ErrorKind::Interrupted{return Ok(None);}
+            return Err(error.into());
+        }
+        if ready==0{return Ok(None);}
+        let mut byte=[0];if std::io::Read::read(&mut self.input,&mut byte)?==0{return Err("selection input closed".into());}
+        Ok(Some(byte[0]))
+    }
+    fn size(&self)->(usize,usize){
+        use std::os::fd::AsRawFd;
+        let mut size=unsafe{std::mem::zeroed::<libc::winsize>()};
+        let rows=if unsafe{libc::ioctl(self.tty.as_raw_fd(),libc::TIOCGWINSZ,&mut size)}==0&&size.ws_row>0{size.ws_row as usize}else{24};
+        (terminal_width_for(self.tty.as_raw_fd()).max(1),rows.max(1))
+    }
+}
+impl Drop for PickerTerminal{
+    fn drop(&mut self){
+        use std::os::fd::AsRawFd;
+        if self.active{
+            let _=self.top();
+            // Clear only below the prompt, return to its original caret row.
+            let _=self.tty.write_all(b"\x1b[0J");
+            let _=write!(self.tty,"\x1b[{}A\r\x1b[?25h",self.origin_up);
+            let _=self.tty.flush();
+        }
+        unsafe{libc::tcsetattr(self.input.as_raw_fd(),libc::TCSANOW,&self.previous);}
+    }
+}
+fn picker_clip(text:&str,width:usize)->String{
+    let mut result=String::new();let mut used=0;
+    for (cluster,columns) in terminal_clusters(&terminal_safe(text)){
+        if used+columns>width{break;}result.push_str(&cluster);used+=columns;
+    }result
+}
+fn picker_filter(choices:&[rustyline::completion::Pair],query:&str)->Vec<usize>{
+    let mut ranked:Vec<_>=choices.iter().enumerate().filter_map(|(index,pair)|{
+        if pair.replacement.chars().any(char::is_control){return None;}
+        fuzzy_score(query,&pair.replacement).or_else(||fuzzy_score(query,&pair.display).map(|score|score-100))
+            .map(|score|(score+if pair.replacement.starts_with(query){50}else{0},index))
+    }).collect();
+    ranked.sort_by(|a,b|b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    ranked.into_iter().map(|p|p.1).collect()
+}
+fn picker_draw(terminal:&mut PickerTerminal,choices:&[rustyline::completion::Pair],query:&str,filtered:&[usize],selected:usize)->Result<()>{
+    let (width,_)=terminal.size();let slots=terminal.slots;
+    let mut lines=if slots==2{vec![format!("Fuzzy select · {query}")]}
+        else{vec!["Fuzzy select — Enter picks".into(),format!("Find: {query}")]};
+    if slots>=6{lines.push("↑↓/Tab move · Esc cancels".into());}
+    let footer=usize::from(slots>=5);let available=slots.saturating_sub(lines.len()+footer).max(1);
+    let start=selected.saturating_sub(available/2).min(filtered.len().saturating_sub(available));
+    if filtered.is_empty(){lines.push("No matches — edit query".into());}
+    else{for (position,index) in filtered.iter().enumerate().skip(start).take(available){
+        lines.push(format!("{}{}",if position==selected{"→ "}else{"  "},choices[*index].display));
+    }}
+    if footer>0{lines.push(format!("{}/{}",if filtered.is_empty(){0}else{selected+1},filtered.len()));}
+    terminal.top()?;terminal.tty.write_all(b"\x1b[?25l")?;
+    for index in 0..slots{
+        if index>0{terminal.tty.write_all(b"\r\n")?;terminal.cursor_row+=1;}
+        terminal.tty.write_all(b"\x1b[2K")?;
+        if let Some(line)=lines.get(index){
+            let clipped=picker_clip(line,width.saturating_sub(1).max(1));
+            let style=if index==0{"1;36"}else if index==1&&slots>2{"36"}else if line.starts_with("→ "){"1;7"}else if line.starts_with("  "){"0"}else{"2"};
+            terminal.tty.write_all(terminal_styled_for(&clipped,style,terminal.tty.as_raw_fd()).as_bytes())?;
+        }
+    }
+    let query_row=usize::from(slots>2);
+    let query_line=if slots==2{format!("Fuzzy select · {}",terminal_safe(query))}else{format!("Find: {}",terminal_safe(query))};
+    let cursor=terminal_columns(&query_line).min(width.saturating_sub(1));
+    terminal.tty.write_all(b"\r")?;
+    let up=terminal.cursor_row-query_row;if up>0{write!(terminal.tty,"\x1b[{up}A")?;}
+    terminal.cursor_row=query_row;
+    if cursor>0{write!(terminal.tty,"\x1b[{cursor}C")?;}
+    terminal.tty.write_all(b"\x1b[?25h")?;terminal.tty.flush()?;Ok(())
+}
+// Nested selection keeps bracketed paste enabled. Consume it atomically so
+// pasted Enter/Escape/control bytes can never select, navigate or submit cells.
+fn picker_paste_service(terminal:&mut PickerTerminal,service:&mut impl FnMut()->Result<()>)->Result<Option<String>>{
+    let mut paste=Vec::new();let mut overflow=false;
+    loop{
+        service()?;
+        if INTERRUPT.load(std::sync::atomic::Ordering::SeqCst){
+            unsafe{libc::tcflush(terminal.input.as_raw_fd(),libc::TCIFLUSH);}
+            return Ok(None);
+        }
+        let Some(byte)=terminal.byte(50)?else{continue;};paste.push(byte);
+        if paste.ends_with(b"\x1b[201~"){
+            paste.truncate(paste.len()-6);
+            if overflow{return Ok(None);}
+            let Ok(text)=String::from_utf8(paste)else{return Ok(None);};
+            // Pasted multiline text is one query edit. Collapse whitespace and
+            // drop other controls; they are data, never picker key commands.
+            let text:String=text.chars().map(|c|if c.is_whitespace(){' '}else{c})
+                .filter(|c|!c.is_control()).collect();
+            return Ok(Some(text.split_whitespace().collect::<Vec<_>>().join(" ")));
+        }
+        if paste.len()>1_048_576+6{overflow=true;paste.drain(..paste.len()-6);}
+    }
+}
+fn picker_select(choices:&[rustyline::completion::Pair],initial_query:&str,output_fd:i32,prompt_rows:usize,origin_up:usize)->Result<Option<String>>{
+    picker_select_service(choices,initial_query,output_fd,prompt_rows,origin_up,||Ok(()))
+}
+fn picker_select_service(choices:&[rustyline::completion::Pair],initial_query:&str,output_fd:i32,prompt_rows:usize,origin_up:usize,mut service:impl FnMut()->Result<()>)->Result<Option<String>>{
+    if unsafe{libc::isatty(0)}!=1||unsafe{libc::isatty(output_fd)}!=1||std::env::var("TERM").is_ok_and(|t|t=="dumb"){return Ok(None);}
+    let Some(mut terminal)=PickerTerminal::open(output_fd,prompt_rows,origin_up)?else{return Ok(None);};
+    let mut query:String=initial_query.chars().take(512).collect();let mut filtered=picker_filter(choices,&query);
+    let mut selected=0usize;let mut dirty=true;let mut size=terminal.size();
+    loop{
+        service()?;
+        if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Ok(None);}
+        if size!=terminal.size(){
+            size=terminal.size();
+            if size.1.saturating_sub(terminal.prompt_rows)<terminal.slots{return Ok(None);}
+            dirty=true;
+        }
+        if dirty{picker_draw(&mut terminal,choices,&query,&filtered,selected)?;dirty=false;}
+        let Some(byte)=terminal.byte(50)?else{continue;};
+        let mut edit=false;
+        match byte{
+            3|4=>{INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);return Ok(None);},
+            b'\r'|b'\n'=>if let Some(index)=filtered.get(selected){return Ok(Some(choices[*index].replacement.clone()));},
+            b'\t'|14=>{if !filtered.is_empty(){selected=(selected+1)%filtered.len();dirty=true;}},
+            16=>{if !filtered.is_empty(){selected=if selected==0{filtered.len()-1}else{selected-1};dirty=true;}},
+            8|127=>{query.pop();edit=true;},
+            21=>{query.clear();edit=true;},
+            23=>{while query.ends_with(char::is_whitespace){query.pop();}while !query.is_empty()&&!query.ends_with(char::is_whitespace){query.pop();}edit=true;},
+            27=>{
+                let Some(next)=terminal.byte(35)?else{return Ok(None);};
+                if next!=b'['&&next!=b'O'{return Ok(None);}
+                let mut sequence=vec![next];
+                for _ in 0..256{
+                    let Some(key)=terminal.byte(35)?else{return Ok(None);};sequence.push(key);
+                    if (0x40..=0x7e).contains(&key){break;}
+                }
+                if !sequence.last().is_some_and(|b|(0x40..=0x7e).contains(b)){
+                    return Err("oversized picker terminal key report".into());
+                }
+                match sequence.as_slice(){
+                    b"[A"|b"[Z"|b"OA" if !filtered.is_empty()=>{
+                        selected=if selected==0{filtered.len()-1}else{selected-1};dirty=true;
+                    },
+                    b"[B"|b"OB" if !filtered.is_empty()=>{selected=(selected+1)%filtered.len();dirty=true;},
+                    b"[200~"=>if let Some(text)=picker_paste_service(&mut terminal,&mut service)?{
+                        if query.len()+text.len()<=2048{query.push_str(&text);edit=true;}
+                    },
+                    _=>{}
+                }
+            },
+            c if c>=32=>{
+                let length=if c<128{1}else if c&0xe0==0xc0{2}else if c&0xf0==0xe0{3}else if c&0xf8==0xf0{4}else{0};
+                if length>0{
+                    let mut bytes=vec![c];for _ in 1..length{if let Some(c)=terminal.byte(100)?{bytes.push(c);}else{break;}}
+                    if let Ok(text)=std::str::from_utf8(&bytes){
+                        if query.len()+text.len()<=2048&&!text.chars().any(char::is_control){query.push_str(text);edit=true;}
+                    }
+                }
+            },
+            _=>{}
+        }
+        if edit{filtered=picker_filter(choices,&query);selected=0;dirty=true;}
+    }
+}
+
+impl Host {
+    fn deliver_steering(&mut self)->Result<bool>{
+        self.poll_commands()?;
+        let Some(pos)=self.pending.iter().position(|v|
+            v["kind"]=="submit" && v["mode"].as_str().unwrap_or("steering")=="steering")
+            else{return Ok(false)};
+        let command=self.pending.remove(pos).unwrap();
+        let id=command["id"].as_str().ok_or("queued command ID required")?;
+        let record=self.queued.remove(id).ok_or("missing accepted queue arrival")?;
+        let (index,sequence)=record.ok_or("queued steering has no user record")?;
+        self.select_user(command["text"].as_str().ok_or("queued text required")?,index,sequence)?;
+        let text=command["text"].as_str().ok_or("queued text required")?;
+        self.journal.append("queue_delivered",json!({"command_id":id,"mode":"steering"}))?;
+        self.event("queue_sent",json!({"command_id":id,"mode":"steering","text":text}));
+        self.event("completed",json!({"command_id":id,"status":"delivered"}));
+        self.stop=false;self.stop_wakeup=None;
+        Ok(true)
+    }
+}
+
+static INTERRUPT:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+extern "C" fn handle_sigint(_:libc::c_int){
+    INTERRUPT.store(true,std::sync::atomic::Ordering::SeqCst);
+}
+fn install_signals(){
+    unsafe{libc::signal(libc::SIGINT,handle_sigint as *const () as libc::sighandler_t);}
+}
+
+impl Host {
+    fn http_json(&mut self,request:reqwest::RequestBuilder,operation:&str)->Result<Value>{
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        rt.block_on(async{
+            let future=async{
+                let response=request.send().await?;
+                let status=response.status();
+                let body:Value=response.json().await?;
+                if !status.is_success(){
+                    let detail=if operation=="auth"{String::new()}else{format!(": {body}")};
+                    return Err::<Value,Box<dyn std::error::Error>>(format!("provider HTTP {status}{detail}").into());
+                }
+                Ok(body)
+            };
+            tokio::pin!(future);
+            loop{
+                tokio::select!{
+                    response=&mut future=>return response,
+                    _=tokio::time::sleep(std::time::Duration::from_millis(15))=>{
+                        self.service_background()?;
+                        let mut cancel=INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst);
+                        while let Some(command)=self.incoming.as_ref().and_then(|r|r.try_recv().ok()){
+                            if command["kind"]=="interrupt"{
+                                if !self.accept_input_control(&command)?{continue;}
+                                self.event("completed",json!({"command_id":command["id"],"status":"ok"}));cancel=true;
+                            }else if !self.background_control(&command)?{self.queue_arrival(command)?;}
+                        }
+                        if cancel{
+                            self.journal.append("provider_cancelled",json!({"operation":operation,"billing":"unknown"}))?;
+                            self.cancel_revision=self.cancel_revision.wrapping_add(1);
+                            return Err("provider request cancelled; outcome/billing may be unknown".into());
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
+impl Host {
+    fn cell_view(&self,cell:usize)->Result<Value>{
+        if cell==0{return Err("cell numbers start at 1".into());}
+        let mut view:Option<Value>=None;let mut active=Vec::<usize>::new();
+        let mut indices=HashMap::<&str,usize>::new();
+        for sequence in 0..self.journal.seq{
+            let event=self.journal.event(sequence)?;let kind=event["kind"].as_str().unwrap_or("");let payload=&event["payload"];
+            match kind{
+                "cell_start"=>{
+                    let number=payload["cell"].as_u64().unwrap_or(0) as usize;active.push(number);
+                    if number==cell{view=Some(json!({"cell":cell,"parent_cell":payload["parent_cell"],
+                        "language":payload["language"],"operation":payload["operation"],"source_ref":payload["source_ref"],
+                        "status":"running","complete":false,"say_refs":[],"request_refs":[],"response_refs":[],"usage_refs":[],"context_ids":[]}));}
+                },
+                "cell_end"=>{
+                    if payload["cell"].as_u64()==Some(cell as u64){if let Some(value)=view.as_mut(){
+                        for key in ["status","elapsed_ms","stdout_ref","stderr_ref","context_usage","cache_hit_tokens","reported_cache_hit_tokens","model","effort"]{
+                            value[key]=payload[key].clone();
+                        }value["complete"]=json!(true);
+                    }}
+                    if let Some(number)=payload["cell"].as_u64().map(|n|n as usize){
+                        if let Some(position)=active.iter().rposition(|n|*n==number){active.remove(position);}
+                    }
+                },
+                "intent" if payload["type"]=="shell"=>if let Some(value)=view.as_mut().filter(|value|value["operation"]==payload["operation"]){
+                    value["source"]=payload["source"].clone();
+                },
+                "code"=>if let Some(value)=view.as_mut().filter(|value|value["operation"]==payload["operation"]){
+                    value["source_ref"]=json!(format!("H.code[{}]",payload["index"]));value["source"]=payload["source"].clone();
+                },
+                "stream_complete"|"stream_closed"=>if let Some(value)=view.as_mut().filter(|value|value["operation"]==payload["operation"]){
+                    if let (Some(collection),Some(index))=(payload["collection"].as_str(),payload["metadata"]["index"].as_u64()){
+                        value[format!("{collection}_ref")]=json!(format!("H.{collection}[{index}]"));
+                        value[collection]=self.history_value(collection,index as usize)?;
+                    }
+                },
+                "context_add" if active.last()==Some(&cell)=>if let Some(value)=view.as_mut(){value["context_ids"].as_array_mut().unwrap().push(payload["id"].clone());},
+                "say"|"request"|"response"|"usage"=>{
+                    let collection=match kind{"say"=>"say","request"=>"requests","response"=>"responses",_=>"usage"};
+                    let index=*indices.entry(collection).or_insert(0);*indices.get_mut(collection).unwrap()+=1;
+                    if active.last()==Some(&cell){if let Some(value)=view.as_mut(){
+                        let key=match kind{"say"=>"say_refs","request"=>"request_refs","response"=>"response_refs",_=>"usage_refs"};
+                        value[key].as_array_mut().unwrap().push(json!(format!("H.{collection}[{index}]")));
+                    }}
+                },
+                _=>{}
+            }
+        }
+        view.ok_or_else(||"cell does not exist".into())
+    }
+    fn history_value(&self,name:&str,index:usize)->Result<Value>{
+        if name=="events"{return self.journal.event(index);}
+        let value=self.history.get(name).and_then(|v|v.get(index)).ok_or("history index missing")?;
+        if let Some(seq)=value["$event"].as_u64(){
+            let ev=self.journal.event(seq as usize)?;
+            let p=&ev["payload"];
+            return Ok(match name{
+                "code"=>p["source"].clone(),
+                "user"|"stdin"|"say"=>p["text"].clone(),
+                _=>p.clone()
+            });
+        }
+        if let Some(chunks)=value["$chunks"].as_array(){
+            let mut bytes=Vec::new();
+            for chunk in chunks{
+                let ev=self.journal.event(chunk.as_u64().ok_or("invalid chunk")? as usize)?;
+                bytes.extend(B64.decode(ev["payload"]["base64"].as_str().ok_or("missing stream bytes")?)?);
+            }
+            return Ok(json!(String::from_utf8_lossy(&bytes)));
+        }
+        Ok(value.clone())
+    }
+    fn history_last(&self,name:&str)->Result<String>{
+        let n=self.history.get(name).ok_or("unknown stream")?.len().checked_sub(1).ok_or("empty stream")?;
+        Ok(self.history_value(name,n)?.as_str().unwrap_or("").into())
+    }
+
+}
+
+// =============================================================================
+// Providers and model metadata
+// =============================================================================
+
+const PROVIDERS:&[(&str,&str,&str)]=&[
+ ("openai","https://api.openai.com/v1","OPENAI_API_KEY"),
+ ("anthropic","https://api.anthropic.com/v1","ANTHROPIC_API_KEY"),
+ ("google","https://generativelanguage.googleapis.com/v1beta","GEMINI_API_KEY"),
+ ("groq","https://api.groq.com/openai/v1","GROQ_API_KEY"),
+ ("cerebras","https://api.cerebras.ai/v1","CEREBRAS_API_KEY"),
+ ("mistral","https://api.mistral.ai/v1","MISTRAL_API_KEY"),
+ ("xai","https://api.x.ai/v1","XAI_API_KEY"),
+ ("openrouter","https://openrouter.ai/api/v1","OPENROUTER_API_KEY"),
+ ("zai","https://api.z.ai/api/paas/v4","ZAI_API_KEY"),
+ ("opencode","https://opencode.ai/zen/v1","OPENCODE_API_KEY"),
+ ("huggingface","https://router.huggingface.co/v1","HF_TOKEN"),
+ ("minimax","https://api.minimax.io/v1","MINIMAX_API_KEY"),
+ ("minimax-cn","https://api.minimaxi.com/v1","MINIMAX_API_KEY")
+];
+fn load_json(path:&Path)->Result<Value>{
+    if !path.exists(){return Ok(json!({}));}
+    Ok(serde_json::from_reader(File::open(path)?)?)
+}
+fn write_private_json(path:&Path,value:&Value)->Result<()>{
+    let tmp=path.with_extension(format!("tmp-{}",std::process::id()));
+    let mut file=OpenOptions::new().create_new(true).write(true).mode(0o600).open(&tmp)?;
+    file.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;file.sync_all()?;
+    fs::rename(&tmp,path)?;
+    File::open(path.parent().ok_or("missing directory")?)?.sync_all()?;Ok(())
+}
+impl Host{
+    fn credential(&self,provider:&str,env:&str)->String{
+        let stored=&self.auth[provider];
+        stored["key"].as_str().filter(|s|!s.trim().is_empty())
+            .or(stored["access"].as_str().filter(|s|!s.trim().is_empty())).map(str::to_string)
+            .unwrap_or_else(||std::env::var(env).unwrap_or_default())
+    }
+    fn configure(&mut self)->Result<()>{
+        if let Some(model)=self.config["model"].as_str(){self.model=model.into();}
+        if let Ok(model)=std::env::var("PY_MODEL"){self.model=model;}
+        if let Some(effort)=self.config["effort"].as_str(){self.effort=effort.into();}
+        self.set_model(self.model.clone())?;
+        Ok(())
+    }
+    fn model_limit(&self,model:&str)->Result<usize>{
+        let canonical=model.split_once('/').map(|(p,id)|format!("{}/{id}",provider_alias(p))).unwrap_or(model.into());
+        let models=self.models();
+        let mut limit=models.as_array().unwrap().iter().find(|v|v["id"]==canonical)
+            .and_then(|descriptor|descriptor["context_limit"].as_u64()).map_or(self.context_limit,|n|n as usize);
+        if let Ok(value)=std::env::var("PY_CONTEXT_LIMIT"){limit=value.parse()?;}
+        Ok(limit)
+    }
+    fn set_model(&mut self,model:String)->Result<()>{
+        let limit=self.model_limit(&model)?;
+        if self.startup_ready{self.check_model_system_budget(&model,limit)?;}
+        self.context_limit=limit;self.model=model;Ok(())
+    }
+    fn status(&self)->Value{json!({"state":self.state.label(),"cells":self.cells,"active_cell":self.active_cell,
+        "model":self.model,"effort":self.effort,
+        "context_usage":self.context_usage(),"usage":self.usage,"queue_depth":self.pending.len(),
+        "worker_generation":self.generation,"startup_ready":self.startup_ready,"session":self.journal.path,
+        "background_tasks":self.bg_tasks.len(),"active_background_tasks":self.bg_tasks.values().filter(|t|t.child.is_some()).count(),
+        "pending_wakeups":self.wakeups.values().filter(|w|matches!(w.metadata["state"].as_str(),Some("scheduled"|"ready"|"pending_confirmation"))).count()})}
+}
+const CATALOG:&str=r####"[{"id":"anthropic/claude-haiku-4-5","name":"Claude Haiku 4.5 (latest)","provider":"anthropic","base_url":"https://api.anthropic.com","api":"anthropic-messages","context_limit":200000,"max_tokens":64000,"image_input":true,"reasoning":true,"image_output":false},{"id":"anthropic/claude-opus-4-6","name":"Claude Opus 4.6","provider":"anthropic","base_url":"https://api.anthropic.com","api":"anthropic-messages","context_limit":200000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"anthropic/claude-sonnet-4-6","name":"Claude Sonnet 4.6","provider":"anthropic","base_url":"https://api.anthropic.com","api":"anthropic-messages","context_limit":200000,"max_tokens":64000,"image_input":true,"reasoning":true,"image_output":false},{"id":"cerebras/gpt-oss-120b","name":"GPT OSS 120B","provider":"cerebras","base_url":"https://api.cerebras.ai/v1","api":"openai-completions","context_limit":131072,"max_tokens":32768,"image_input":false,"reasoning":true,"image_output":false},{"id":"google/gemini-2.5-flash","name":"Gemini 2.5 Flash","provider":"google","base_url":"https://generativelanguage.googleapis.com/v1beta","api":"google-generative-ai","context_limit":1048576,"max_tokens":65536,"image_input":true,"reasoning":true,"image_output":false},{"id":"google/gemini-2.5-pro","name":"Gemini 2.5 Pro","provider":"google","base_url":"https://generativelanguage.googleapis.com/v1beta","api":"google-generative-ai","context_limit":1048576,"max_tokens":65536,"image_input":true,"reasoning":true,"image_output":false},{"id":"google/gemini-3-pro-preview","name":"Gemini 3 Pro Preview","provider":"google","base_url":"https://generativelanguage.googleapis.com/v1beta","api":"google-generative-ai","context_limit":1000000,"max_tokens":64000,"image_input":true,"reasoning":true,"image_output":false},{"id":"groq/llama-3.3-70b-versatile","name":"Llama 3.3 70B Versatile","provider":"groq","base_url":"https://api.groq.com/openai/v1","api":"openai-completions","context_limit":131072,"max_tokens":32768,"image_input":false,"reasoning":false,"image_output":false},{"id":"mistral/mistral-large-latest","name":"Mistral Large","provider":"mistral","base_url":"https://api.mistral.ai/v1","api":"openai-completions","context_limit":262144,"max_tokens":262144,"image_input":true,"reasoning":false,"image_output":false},{"id":"openai/gpt-4.1","name":"GPT-4.1","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":1047576,"max_tokens":32768,"image_input":true,"reasoning":false,"image_output":false},{"id":"openai/gpt-4o","name":"GPT-4o","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":128000,"max_tokens":16384,"image_input":true,"reasoning":false,"image_output":false},{"id":"openai/gpt-5","name":"GPT-5","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":400000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"openai/gpt-5.2","name":"GPT-5.2","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":400000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"openai/o3","name":"o3","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":200000,"max_tokens":100000,"image_input":true,"reasoning":true,"image_output":false},{"id":"openrouter/anthropic/claude-sonnet-4.6","name":"Anthropic: Claude Sonnet 4.6","provider":"openrouter","base_url":"https://openrouter.ai/api/v1","api":"openai-completions","context_limit":1000000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"xai/grok-4","name":"Grok 4","provider":"xai","base_url":"https://api.x.ai/v1","api":"openai-completions","context_limit":256000,"max_tokens":64000,"image_input":false,"reasoning":true,"image_output":false},{"id":"zai/glm-4.7","name":"GLM-4.7","provider":"zai","base_url":"https://api.z.ai/api/coding/paas/v4","api":"openai-completions","context_limit":204800,"max_tokens":131072,"image_input":false,"reasoning":true,"image_output":false},{"id":"openai/gpt-image-1","provider":"openai","name":"GPT Image 1","api":"image-generation","image_input":true,"image_output":true,"context_limit":128000}]"####;
+
+/* Curated model metadata, provider effort mappings and browser OAuth compatibility
+adapted from Pi (pinned in SPEC).
+MIT License
+
+Copyright (c) 2025 Mario Zechner
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
+impl Host {
+    fn auth_status(&self)->Value{
+        json!(self.login_providers().into_iter().map(|name|{
+            let env=self.config["providers"][&name]["key_env"].as_str()
+                .or(PROVIDERS.iter().find(|p|p.0==name).map(|p|p.2)).unwrap_or("");
+            json!({"provider":name,"stored":self.auth[&name].is_object(),
+                "environment":std::env::var(env).is_ok_and(|s|!s.trim().is_empty()),
+                "method":self.auth[&name]["type"],"secret":Value::Null})
+        }).collect::<Vec<_>>())
+    }
+    fn key_login(&mut self,provider:&str,key:&str)->Result<()>{
+        self.with_state(UiState::Login,None,|host|host.key_login_inner(provider,key))
+    }
+    fn key_login_inner(&mut self,provider:&str,key:&str)->Result<()>{
+        if key.trim().is_empty(){return Err("empty API key".into());}
+        let provider=self.resolve_provider(provider)?;
+        if provider=="openai-codex"{return Err("Codex requires subscription browser/device login, not an API key".into());}
+        self.store_credential(&provider,Some(json!({"type":"api_key","key":key})))
+    }
+    fn logout(&mut self,provider:&str)->Result<()>{self.store_credential(provider,None)}
+    fn select_model_after_login(&mut self,provider:&str){
+        // Login must never disguise selection failures as authentication failures,
+        // override a usable model, or write a global model default.
+        let cancel_revision=self.cancel_revision;self.maybe_refresh_model_catalog(provider);
+        if self.cancel_revision!=cancel_revision{return;}
+        if self.provider_config(&self.model).is_ok(){return;}
+        let models=self.models();
+        let candidates:Vec<_>=models.as_array().unwrap().iter().filter(|m|m["provider"]==provider
+            &&m["ready"]==true&&m["image_output"]!=true&&m["deprecated"]!=true
+            &&(m["catalog_listed"]!=false||m["user_declared"]==true)).collect();
+        let selected=candidates.iter().find(|m|m["id"]=="openai-codex/gpt-6.1-sol").or_else(||candidates.first());
+        if let Some(model)=selected.and_then(|m|m["id"].as_str()){
+            if let Err(error)=self.choose_model(model){self.event("notice",json!({"text":format!("Credentials stored, but model selection failed: {error}. Use /model to select a usable model.")}));}
+        }else{self.event("notice",json!({"text":"Credentials stored; no usable known/configured model for this provider. Use /model to select a model."}));}
+    }
+    fn interactive_login(&mut self,arguments:&str)->Result<()>{
+        if arguments.is_empty(){return self.interactive_login_inner(arguments);}
+        self.with_state(UiState::Login,None,|host|host.interactive_login_inner(arguments))
+    }
+    fn interactive_login_inner(&mut self,arguments:&str)->Result<()>{
+        if arguments.is_empty(){
+            self.ui_text("Login: /login <provider> [browser|manual|device|api-key]\nNo Pi/Pig credentials are imported. Browser login opens the provider's sign-in page; manual uses hidden callback/code paste. Live subscription compatibility is not verified by login alone.");
+            for provider in self.login_providers(){
+                let methods=match provider.as_str(){
+                    "openai-codex"=>"OAuth browser (default), manual redirect paste, device login",
+                    "anthropic"=>"OAuth browser (default, hidden authorization-code paste), API key",
+                    "github-copilot"=>"OAuth device login (headless/browser verification)",
+                    _=>"API key (hidden terminal entry)"
+                };
+                self.ui_text(&format!("{provider}: {methods}"));
+            }
+            return Ok(());
+        }
+        let words:Vec<_>=arguments.split_whitespace().collect();
+        if words.len()>2{return Err("Usage: /login <provider> [browser|manual|device|api-key]; never paste credentials into the command".into());}
+        let provider=self.resolve_provider(words[0])?;
+        let browser=matches!(provider.as_str(),"openai-codex"|"anthropic");
+        let device=matches!(provider.as_str(),"openai-codex"|"github-copilot");
+        let method=words.get(1).copied().unwrap_or(if browser{"browser"}else if device{"device"}else{"api-key"});
+        match method{
+            "browser"|"oauth" if browser=>self.browser_login(&provider,false)?,
+            "manual"|"--manual" if browser=>self.browser_login(&provider,true)?,
+            "device"|"oauth" if device=>self.oauth_login(&provider)?,
+            "api-key"|"--api-key" if provider!="openai-codex"&&provider!="github-copilot"=>{
+                let key=terminal_secret_service("API key (hidden): ",None,||{if self.codex_cancel("auth")?{Err("login cancelled".into())}else{Ok(())}})?;self.key_login(&provider,&key)?;
+            },
+            _=>return Err(format!("Unsupported login method for {provider}; /login lists available methods (never put a credential in the command)").into())
+        }
+        self.ui_text(&format!("Stored credentials for {provider}. Live provider compatibility is not verified by login alone."));
+        self.select_model_after_login(&provider);Ok(())
+    }
+}
+
+impl Host{
+    fn auth_http(&mut self,request:reqwest::RequestBuilder)->Result<Value>{
+        // Auth bodies/tokens are deliberately never journaled.
+        self.http_json(request,"auth")
+    }
+    fn oauth_login(&mut self,provider:&str)->Result<()>{
+        self.with_state(UiState::Login,None,|host|host.oauth_login_inner(provider))
+    }
+    fn oauth_login_inner(&mut self,provider:&str)->Result<()>{
+        let provider=provider_alias(provider);
+        if provider=="openai-codex"{return self.codex_login();}
+        if provider=="anthropic"{return self.browser_login(provider,false);}
+        if provider!="github-copilot"{return Err(format!("OAuth flow for {provider} not yet implemented; API-key login is available").into());}
+        let base=std::env::var("PY_GITHUB_AUTH_URL").unwrap_or_else(|_|"https://github.com".into());
+        let client=reqwest::Client::new();
+        let device=self.auth_http(client.post(format!("{base}/login/device/code")).header("Accept","application/json")
+            .json(&json!({"client_id":"Iv1.b507a08c87ecfe98","scope":"read:user"})))?;
+        let code=device["device_code"].as_str().ok_or("device flow missing device code")?;
+        self.event("login_prompt",json!({"provider":provider,
+            "url":device["verification_uri"],"user_code":device["user_code"]}));
+        if !self.json{ui_text(&format!("Open {} and enter {}",device["verification_uri"].as_str().unwrap_or(""),device["user_code"].as_str().unwrap_or("")));}
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(device["expires_in"].as_u64().unwrap_or(600));
+        let mut interval=device["interval"].as_u64().unwrap_or(5);
+        loop{
+            if std::time::Instant::now()>=deadline{return Err("device login expired".into());}
+            for _ in 0..interval*10{
+                if self.codex_cancel("auth")?{return Err("login cancelled".into());}
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let token=self.auth_http(client.post(format!("{base}/login/oauth/access_token")).header("Accept","application/json")
+                .json(&json!({"client_id":"Iv1.b507a08c87ecfe98","device_code":code,
+                    "grant_type":"urn:ietf:params:oauth:grant-type:device_code"})))?;
+            if let Some(access)=token["access_token"].as_str(){
+                self.store_credential(provider,Some(json!({"type":"oauth","refresh":access,"access":access,"expires":0})))?;
+                return Ok(());
+            }
+            match token["error"].as_str(){
+                Some("authorization_pending")=>{},
+                Some("slow_down")=>interval+=5,
+                _=>return Err("device login failed or authorization was denied".into())
+            }
+        }
+    }
+    fn refresh_copilot(&mut self)->Result<()>{
+        let _lock=self.auth_lock()?;
+        self.auth=load_json(&self.home.join("auth.json"))?;
+        let refresh=self.auth["github-copilot"]["refresh"].as_str().ok_or("Copilot login required")?.to_string();
+        if self.auth["github-copilot"]["expires"].as_u64().unwrap_or(0)>now_ms() as u64+60000{return Ok(());}
+        let url=std::env::var("PY_COPILOT_TOKEN_URL").unwrap_or_else(|_|"https://api.github.com/copilot_internal/v2/token".into());
+        let body=self.auth_http(reqwest::Client::new().get(url).header("Authorization",format!("token {refresh}"))
+            .header("User-Agent","GitHubCopilotChat/0.35.0").header("Editor-Version","vscode/1.104.3"))?;
+        let access=body["token"].as_str().ok_or("Copilot token exchange missing token")?;
+        let expires=body["expires_at"].as_u64().ok_or("Copilot exchange missing expiry")?*1000;
+        self.auth["github-copilot"]=json!({"type":"oauth","refresh":refresh,"access":access,
+            "expires":expires,"base_url":body["endpoints"]["api"]});
+        write_private_json(&self.home.join("auth.json"),&self.auth)
+    }
+}
+
+fn image_data_url(url:&str)->Result<(&str,&str)>{
+    let(mime,data)=url.strip_prefix("data:").ok_or("only inline image URLs allowed")?
+        .split_once(";base64,").ok_or("invalid image data URL")?;
+    if mime!="image/png"&&mime!="image/jpeg"{return Err("unsupported image MIME".into());}
+    Ok((mime,data))
+}
+fn validate_image(data:&str)->Result<(&'static str,usize)>{
+    let bytes=B64.decode(data)?;
+    if bytes.len()>512000{return Err("image exceeds 512000-byte limit".into());}
+    let mime=if bytes.starts_with(b"\x89PNG\r\n\x1a\n"){"image/png"}
+        else if bytes.starts_with(b"\xff\xd8\xff"){"image/jpeg"}
+        else{return Err("only PNG/JPEG images supported".into());};
+    let format=if mime=="image/png"{image::ImageFormat::Png}else{image::ImageFormat::Jpeg};
+    let reader=image::ImageReader::with_format(std::io::Cursor::new(&bytes),format);
+    let(width,height)=reader.into_dimensions()?;
+    if width>1536||height>1536{return Err("image dimensions exceed 1536 pixels".into());}
+    image::load_from_memory_with_format(&bytes,format)?;
+    Ok((mime,bytes.len()))
+}
+
+impl Host{
+    fn recovery_status(&self)->Result<Value>{
+        let mut operations=std::collections::BTreeMap::<String,Value>::new();
+        let mut queues=std::collections::BTreeMap::<String,Value>::new();
+        let mut streams=std::collections::BTreeMap::<(String,String,usize),Value>::new();
+        for sequence in 0..self.journal.seq{
+            let event=self.journal.event(sequence)?;
+            let p=&event["payload"];
+            match event["kind"].as_str().unwrap_or(""){
+                "intent"=>{
+                    if let Some(id)=p["operation"].as_str(){
+                        operations.insert(id.into(),json!({"operation":id,"type":p["type"],
+                            "state":"unknown","replay_allowed":false,"intent_event":sequence}));
+                    }
+                },
+                "completion"|"shell_completion"|"operation_complete"|"task_settled"|"provider_cancelled"=>{
+                    if let Some(id)=p["operation"].as_str().or(p["command_id"].as_str()){
+                        if let Some(op)=operations.get_mut(id){
+                            op["state"]=json!(if p["stdout"]["complete"]==false||p["status"]=="worker_crashed"{
+                                "unknown"
+                            }else if event["kind"]=="provider_cancelled"{"cancelled"}else{"completed"});
+                            op["completion_event"]=json!(sequence);
+                        }
+                    }
+                },
+                "stream"=>{
+                    let id=p["operation"].as_str().ok_or("stream operation missing")?;
+                    let name=p["collection"].as_str().ok_or("stream collection missing")?;
+                    let index=p["index"].as_u64().ok_or("stream index missing")? as usize;
+                    let stream=streams.entry((id.into(),name.into(),index)).or_insert_with(||
+                        json!({"operation":id,"collection":name,"index":index,"complete":false,"chunks":0}));
+                    stream["chunks"]=json!(stream["chunks"].as_u64().unwrap_or(0)+1);
+                },
+                "queue_arrival"=>{
+                    if let Some(id)=p["command_id"].as_str(){
+                        queues.insert(id.into(),json!({"command_id":id,"command":p["command"],
+                            "user_index":p["user_index"],"state":"pending","auto_dispatch":false}));
+                    }
+                },
+                "queue_delivered"|"queue_dispatched"|"queue_restored"|"queue_cancelled"=>{
+                    if let Some(queue)=p["command_id"].as_str().and_then(|id|queues.get_mut(id)){
+                        queue["state"]=json!(event["kind"].as_str().unwrap().strip_prefix("queue_").unwrap());
+                    }
+                },
+                "stream_complete"|"stream_closed"=>{
+                    let key=(p["operation"].as_str().ok_or("stream operation missing")?.into(),
+                        p["collection"].as_str().ok_or("stream collection missing")?.into(),
+                        p["metadata"]["index"].as_u64().ok_or("stream index missing")? as usize);
+                    if let Some(stream)=streams.get_mut(&key){
+                        stream["complete"]=p["metadata"]["complete"].clone();stream["counts"]=p["metadata"].clone();
+                    }
+                },
+                _=>{}
+            }
+        }
+        Ok(json!({"operations":operations.into_values().collect::<Vec<_>>(),
+            "streams":streams.into_values().collect::<Vec<_>>(),
+            "queues":queues.into_values().collect::<Vec<_>>(),
+            "policy":"Unknown outcome is never permission to replay. Fresh Python; captured chunks only."}))
+    }
+}
+
+impl Host{
+    fn queue_arrival(&mut self,command:Value)->Result<()>{
+        if command["kind"]=="stdin_reply"{self.pending.push_back(command);return Ok(());}
+        let id=command["id"].as_str().unwrap_or("").to_string();
+        if id.is_empty()||self.ids.contains(&id){
+            self.event("rejected",json!({"command_id":id,"error":"missing or duplicate command ID"}));
+            return Ok(());
+        }
+        let recorded=redacted_command(command.clone())?;
+        self.journal.append("accepted",json!({"command_id":id,"command":recorded}))?;
+        self.ids.insert(id.clone());
+        let text=match command["kind"].as_str(){
+            Some("submit")=>command["text"].as_str(),
+            Some("python")=>command["source"].as_str(),
+            Some("shell")=>command["command"].as_str(),
+            _=>None
+        };
+        let record=if let Some(text)=text{
+            let sequence=self.journal.seq;
+            Some((self.user(text,false)?,sequence))
+        }else{None};
+        self.journal.append("queue_arrival",json!({"command_id":id,"command":recorded,
+            "user_index":record.map(|p|p.0),"state":"pending"}))?;
+        self.queued.insert(id.clone(),record);
+        let queued=json!({"command_id":id,"queue_depth":self.pending.len()+1,
+            "mode":command["mode"].as_str().unwrap_or("steering"),
+            "text":if command["kind"]=="submit"{command["text"].clone()}else{Value::Null}});
+        self.pending.push_back(command);
+        self.event("queued",queued);
+        Ok(())
+    }
+    fn select_user(&mut self,text:&str,index:usize,sequence:usize)->Result<()>{
+        let selected=text.chars().take(8000).collect::<String>();
+        let rendered=format!("{}\n[{} chars; {} lines; omitted {} chars; H.user[{}]]",
+            selected,text.chars().count(),text.lines().count(),text.chars().count().saturating_sub(8000),index);
+        self.add_context("user",rendered,false,vec![(sequence,sequence+1)])?;
+        Ok(())
+    }
+}
+
+
+// =============================================================================
+// Terminal Markdown rendering
+// =============================================================================
+
+// Terminal rendering is deliberately independent of history and JSON events.
+// POSIX wcwidth gives locale-aware columns without a second UI dependency.
+fn terminal_char_width(c:char)->usize{
+    static LOCALE:std::sync::Once=std::sync::Once::new();
+    LOCALE.call_once(||unsafe{
+        libc::setlocale(libc::LC_CTYPE,c"".as_ptr());
+        // Rust starts in the C locale; prefer a UTF-8 locale if the environment
+        // selected C. This changes only character classification, not numbers.
+        let name=libc::setlocale(libc::LC_CTYPE,std::ptr::null());
+        if !name.is_null()&&[b"C".as_slice(),b"POSIX".as_slice()].contains(&std::ffi::CStr::from_ptr(name).to_bytes()){
+            libc::setlocale(libc::LC_CTYPE,c"C.UTF-8".as_ptr());
+        }
+    });
+    unsafe extern "C"{fn wcwidth(c:libc::wchar_t)->libc::c_int;}
+    let width=unsafe{wcwidth(c as libc::wchar_t)};
+    if width>=0{width as usize}else{1}
+}
+fn terminal_clusters(text:&str)->Vec<(String,usize)>{
+    let mut clusters:Vec<(String,usize)>=vec![];
+    let mut joined=false;let mut regional=false;let mut emoji=false;
+    for c in text.chars(){
+        let width=terminal_char_width(c);
+        let is_regional=('\u{1f1e6}'..='\u{1f1ff}').contains(&c);
+        let modifier=('\u{1f3fb}'..='\u{1f3ff}').contains(&c);
+        // This is a conservative emoji-style join, not arbitrary grapheme
+        // shaping: ASCII/CJK around a ZWJ still consume their own columns.
+        let is_emoji=!modifier&&(('\u{1f300}'..='\u{1faff}').contains(&c)||
+            ('\u{2600}'..='\u{27bf}').contains(&c));
+        if let Some((text,total))=clusters.last_mut(){
+            let emoji_join=joined&&emoji&&is_emoji;
+            if width==0||emoji_join||(is_regional&&regional)||(modifier&&emoji){
+                text.push(c);
+                if emoji_join||is_regional||(modifier&&emoji){*total=(*total).max(width).max(2);}
+                if (c=='\u{fe0f}'&&emoji)||(c=='\u{20e3}'&&text.starts_with(|c:char|c.is_ascii_digit()||c=='#'||c=='*')){
+                    *total=(*total).max(2);emoji=true;
+                }
+                joined=c=='\u{200d}'&&emoji;regional=false;continue;
+            }
+        }
+        clusters.push((c.to_string(),width));joined=false;regional=is_regional;emoji=is_emoji;
+    }
+    clusters
+}
+fn terminal_columns(text:&str)->usize{terminal_clusters(text).iter().map(|(_,w)|w).sum()}
+fn terminal_width()->usize{terminal_width_for(1)}
+fn terminal_width_for(fd:i32)->usize{
+    let mut size:libc::winsize=unsafe{std::mem::zeroed()};
+    if unsafe{libc::ioctl(fd,libc::TIOCGWINSZ,&mut size)}==0&&size.ws_col>0{return (size.ws_col as usize).min(512);}
+    std::env::var("COLUMNS").ok().and_then(|v|v.parse::<usize>().ok()).filter(|v|*v>0).unwrap_or(80).min(512)
+}
+fn terminal_safe(text:&str)->String{
+    let mut safe=String::new();
+    for c in text.chars(){match c{
+        '\n'=>safe.push(c),'\t'=>safe.push_str("    "),
+        c if c.is_control()||('\u{202a}'..='\u{202e}').contains(&c)||('\u{2066}'..='\u{2069}').contains(&c)=>{
+            if (c as u32)<256{safe.push_str(&format!("\\x{:02x}",c as u32));}
+            else{safe.push_str(&format!("\\u{{{:x}}}",c as u32));}
+        },
+        _=>safe.push(c)
+    }}safe
+}
+// Return physical lines and the number of forced long-word breaks. The latter
+// is also a cost in table layout: a broken word is not a free height reduction.
+fn terminal_wrap(text:&str,width:usize)->(Vec<String>,usize){
+    let width=width.max(1);let safe=terminal_safe(text);let mut lines=vec![];let mut breaks=0;
+    for logical in safe.split('\n'){
+        let mut line=String::new();let mut columns=0;let mut whitespace=String::new();
+        for piece in logical.split_inclusive(char::is_whitespace){
+            let word=piece.trim_end_matches(char::is_whitespace);
+            let spaces=&piece[word.len()..];
+            if word.is_empty(){whitespace.push_str(spaces);continue;}
+            let word_width=terminal_columns(word);let ws=terminal_columns(&whitespace);
+            if columns>0&&columns+ws+word_width>width{
+                lines.push(line.trim_end().to_string());line.clear();columns=0;whitespace.clear();
+            }
+            // Preserve indentation and intra-word spaces where they fit. Excess
+            // indentation cannot consume the entire visible content width.
+            if !whitespace.is_empty(){
+                let available=width.saturating_sub(columns+word_width.min(width));
+                let count=ws.min(available);line.push_str(&" ".repeat(count));columns+=count;whitespace.clear();
+            }
+            let clusters=terminal_clusters(word);
+            for (i,(cluster,size)) in clusters.iter().enumerate(){
+                if columns+size>width&&!line.is_empty(){
+                    lines.push(std::mem::take(&mut line));columns=0;if i>0{breaks+=1;}
+                }
+                if *size>width{line.push('?');columns+=1;}else{line.push_str(cluster);columns+=size;}
+            }
+            whitespace.push_str(spaces);
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    (lines,breaks)
+}
+fn terminal_prefixed(text:&str,prefix:&str,width:usize)->Vec<String>{
+    let prefix=terminal_safe(prefix);let indent=terminal_columns(&prefix);
+    if indent>=width{return terminal_wrap(&format!("{prefix}{text}"),width).0;}
+    terminal_wrap(text,width-indent).0.into_iter().enumerate().map(|(i,line)|
+        format!("{}{line}",if i==0{prefix.clone()}else{" ".repeat(indent)})).collect()
+}
+fn terminal_inline(text:&str)->String{
+    let mut result=String::new();let mut rest=text;
+    while !rest.is_empty(){
+        if let Some(after)=rest.strip_prefix('\\'){
+            if let Some(c)=after.chars().next(){if "\\`*_{}[]()#+-.!|>~".contains(c){result.push(c);rest=&after[c.len_utf8()..];continue;}}
+        }
+        let mut consumed=false;
+        for marker in ["**","__","~~","`","*","_"]{
+            if let Some(after)=rest.strip_prefix(marker){
+                if let Some(end)=after.find(marker){result.push_str(&after[..end]);rest=&after[end+marker.len()..];consumed=true;break;}
+            }
+        }
+        if consumed{continue;}
+        if let Some(after)=rest.strip_prefix('['){
+            if let Some(close)=after.find("]("){
+                if let Some(end)=after[close+2..].find(')'){
+                    result.push_str(&after[..close]);result.push_str(" (");
+                    result.push_str(&after[close+2..close+2+end]);result.push(')');
+                    rest=&after[close+3+end..];continue;
+                }
+            }
+        }
+        let c=rest.chars().next().unwrap();result.push(c);rest=&rest[c.len_utf8()..];
+    }result
+}
+fn terminal_table_cells(line:&str)->Vec<String>{
+    let mut cells=vec![];let mut cell=String::new();let mut escaped=false;let mut code=false;
+    for c in line.trim().chars(){
+        if escaped{if c!='|'&&c!='\\'{cell.push('\\');}cell.push(c);escaped=false;continue;}
+        match c{'\\'=>escaped=true,'`'=>{code= !code;cell.push(c);},'|' if !code=>{cells.push(std::mem::take(&mut cell));},_=>cell.push(c)}
+    }
+    if escaped{cell.push('\\');}cells.push(cell);
+    if line.trim_start().starts_with('|'){cells.remove(0);}
+    if line.trim_end().ends_with('|')&&cells.last().is_some_and(String::is_empty){cells.pop();}
+    cells.into_iter().map(|c|terminal_inline(c.trim())).collect()
+}
+fn terminal_table_separator(line:&str,columns:usize)->Option<Vec<i8>>{
+    let cells=terminal_table_cells(line);if cells.len()!=columns{return None;}
+    cells.iter().map(|cell|{
+        let trimmed=cell.trim_matches(':');
+        if trimmed.len()<3||!trimmed.chars().all(|c|c=='-'){return None;}
+        Some(if cell.starts_with(':')&&cell.ends_with(':'){0}else if cell.ends_with(':'){1}else{-1})
+    }).collect()
+}
+// Word costs use prefix sums, not rendered strings for every possible width.
+// A uniform-width word (the common ASCII/CJK case) is constant-time; mixed
+// widths find each physical line by binary search. Zero-width marks are kept.
+struct TerminalWordCost{spaces:usize,prefix:Vec<usize>,uniform:Option<usize>}
+fn terminal_cell_costs(cell:&str,available:usize)->Vec<(usize,usize)>{
+    let safe=terminal_safe(cell);
+    let logical:Vec<Vec<TerminalWordCost>>=safe.split('\n').map(|line|{
+        let mut words=vec![];let mut spaces=0;
+        for piece in line.split_inclusive(char::is_whitespace){
+            let word=piece.trim_end_matches(char::is_whitespace);
+            if word.is_empty(){spaces+=terminal_columns(piece);continue;}
+            let widths:Vec<_>=terminal_clusters(word).into_iter().map(|(_,w)|w).collect();
+            let mut prefix=vec![0];for width in &widths{prefix.push(prefix.last().unwrap()+width);}
+            let uniform=widths.first().copied().filter(|w|*w>0&&widths.iter().all(|x|x==w));
+            words.push(TerminalWordCost{spaces,prefix,uniform});
+            spaces=terminal_columns(&piece[word.len()..]);
+        }
+        words
+    }).collect();
+    let mut costs=vec![(usize::MAX,0)];
+    for width in 1..=available{
+        let mut height=logical.len();let mut breaks=0;
+        for words in &logical{
+            let mut columns=0;let mut nonempty=false;
+            for word in words{
+                let total=*word.prefix.last().unwrap();let count=word.prefix.len()-1;
+                let mut spaces=word.spaces;
+                if columns>0&&columns+spaces+total>width{height+=1;columns=0;nonempty=false;spaces=0;}
+                columns+=spaces.min(width.saturating_sub(columns+total.min(width)));
+                nonempty|=columns>0;
+                if columns+total<=width{columns+=total;nonempty|=count>0;continue;}
+                if let Some(unit)=word.uniform.filter(|unit|*unit<=width){
+                    let fit=((width-columns)/unit).min(count);columns+=fit*unit;
+                    let remaining=count-fit;
+                    if remaining>0{
+                        if nonempty||fit>0{height+=1;if fit>0{breaks+=1;}}
+                        let per_line=width/unit;let extra=(remaining-1)/per_line;
+                        height+=extra;breaks+=extra;columns=((remaining-1)%per_line+1)*unit;
+                    }
+                }else{
+                    let mut at=0;
+                    while at<count{
+                        let end=word.prefix.partition_point(|sum|*sum<=word.prefix[at]+width-columns)
+                            .saturating_sub(1).min(count);
+                        if end>at{columns+=word.prefix[end]-word.prefix[at];at=end;nonempty=true;}
+                        else if !nonempty{
+                            // Matches the wrapper's unavoidable replacement at
+                            // width one; normal table minima prevent this path.
+                            columns+=1;at+=1;nonempty=true;
+                        }
+                        if at<count{height+=1;if at>0{breaks+=1;}columns=0;nonempty=false;}
+                    }
+                }
+                nonempty=true;
+            }
+        }
+        costs.push((height,breaks));
+    }
+    costs
+}
+fn terminal_table_widths(rows:&[Vec<String>],available:usize)->Vec<usize>{
+    let columns=rows[0].len();
+    let natural:Vec<_>=(0..columns).map(|c|rows.iter().map(|r|terminal_columns(&r[c])).max().unwrap_or(1).max(1)).collect();
+    // A CJK/emoji cluster cannot occupy a one-column cell. Do not let a cheap
+    // replacement glyph distort the optimizer when the real glyph can fit.
+    let minimum:Vec<_>=(0..columns).map(|c|rows.iter().flat_map(|r|terminal_clusters(&r[c]))
+        .map(|(_,w)|w).max().unwrap_or(1).max(1)).collect();
+    if natural.iter().sum::<usize>()<=available{return natural;}
+    // Sample at most 128 rows/512 cells, 512 chars/cell and 16,384 total
+    // characters, evenly across the table. Cache equal cells and pre-tokenize
+    // widths once, so preprocessing is not repeated wrapping
+    // and allocation of 131 million characters at a wide terminal. Rendering
+    // below still uses every character of every row, not the optimization sample.
+    let mut unique=HashMap::new();let mut costs=vec![];let mut sample=vec![];
+    let chars_per_cell=512.min((16_384/columns).max(1));
+    let row_limit=rows.len().min(128).min((512/columns).max(1))
+        .min((16_384/(columns*chars_per_cell)).max(1));
+    for at in 0..row_limit{
+        let index=if row_limit==1{0}else{at*(rows.len()-1)/(row_limit-1)};
+        let mut indices=vec![];
+        for cell in &rows[index]{
+            let cell:String=cell.chars().take(chars_per_cell).collect();
+            let index=*unique.entry(cell.clone()).or_insert_with(||{
+                let index=costs.len();costs.push(terminal_cell_costs(&cell,available));index
+            });
+            indices.push(index);
+        }
+        sample.push(indices);
+    }
+    // Bound objective search separately: no more than two million sampled-cell
+    // probes, in addition to the character-bounded prefix-sum cost construction.
+    let evaluations=std::cell::Cell::new(0usize);
+    let max_evaluations=(2_000_000/(sample.len()*columns).max(1)).max(1);
+    let score=|widths:&[usize]|->usize{
+        if evaluations.get()>=max_evaluations{return usize::MAX;}
+        evaluations.set(evaluations.get()+1);
+        sample.iter().map(|row|{
+            let mut height=0;let mut breaks=0;
+            for (&cell,&width) in row.iter().zip(widths){let cost=costs[cell][width];height=height.max(cost.0);breaks+=cost.1;}
+            height+breaks
+        }).sum()
+    };
+    let mut best=minimum.clone();
+    for _ in minimum.iter().sum::<usize>()..available{
+        let candidate=if evaluations.get()+columns<max_evaluations{
+            (0..columns).filter(|&c|best[c]<natural[c]).min_by_key(|&c|{
+                let mut widths=best.clone();widths[c]+=1;(score(&widths),std::cmp::Reverse(natural[c]-best[c]),c)
+            })
+        }else{
+            // Even with an exhausted objective budget, fill available space
+            // deterministically rather than rendering an unnecessarily tall table.
+            (0..columns).filter(|&c|best[c]<natural[c]).max_by_key(|&c|(natural[c]-best[c],std::cmp::Reverse(c)))
+        };
+        if let Some(c)=candidate{best[c]+=1;}else{break;}
+    }
+    let mut best_score=score(&best);
+    // Pair moves can cross one-column plateaus which ordinary width greed cannot.
+    for _ in 0..available.min(128){
+        let mut improvement=None;
+        for from in 0..columns{for to in 0..columns{
+            if evaluations.get()>=max_evaluations||from==to||best[from]<=minimum[from]||best[to]>=natural[to]{continue;}
+            let mut widths=best.clone();widths[from]-=1;widths[to]+=1;let value=score(&widths);
+            if value<best_score&&improvement.as_ref().is_none_or(|(v,_)|value<*v){improvement=Some((value,widths));}
+        }}
+        if let Some((value,widths))=improvement{best_score=value;best=widths;}else{break;}
+    }
+    // Enumerate bounded compositions for <=4 columns. Ties prefer less skewed
+    // widths, then lexical order, making every redraw deterministic.
+    if columns<=4{
+        // Keep bounded recursion state explicit and local, not a layout framework.
+        #[allow(clippy::too_many_arguments)]
+        fn search<F:Fn(&[usize])->usize>(at:usize,budget:usize,natural:&[usize],minimum:&[usize],current:&mut Vec<usize>,
+            best:&mut Vec<usize>,best_score:&mut usize,states:&mut usize,score:&F,
+            evaluations:&std::cell::Cell<usize>,max_evaluations:usize){
+            if *states>=50_000||evaluations.get()>=max_evaluations{return;}
+            if at+1==natural.len(){
+                current.push(budget.min(natural[at]).max(minimum[at]));*states+=1;let value=score(current);
+                let spread=|w:&[usize]|w.iter().max().unwrap()-w.iter().min().unwrap();
+                if value<*best_score||(value==*best_score&&(spread(current),&*current)<(spread(best),&*best)){
+                    *best_score=value;*best=current.clone();
+                }current.pop();return;
+            }
+            let remaining:usize=minimum[at+1..].iter().sum();
+            for width in minimum[at]..=natural[at].min(budget.saturating_sub(remaining)){
+                current.push(width);search(at+1,budget-width,natural,minimum,current,best,best_score,states,score,evaluations,max_evaluations);current.pop();
+                if *states>=50_000||evaluations.get()>=max_evaluations{break;}
+            }
+        }
+        search(0,available,&natural,&minimum,&mut vec![],&mut best,&mut best_score,&mut 0,&score,&evaluations,max_evaluations);
+    }best
+}
+fn terminal_table(rows:&[Vec<String>],align:&[i8],width:usize)->Vec<String>{
+    let columns=rows[0].len();let overhead=3*columns+1;
+    if width<overhead+4*columns{
+        let mut lines=vec![];
+        for row in rows.iter().skip(1){
+            if !lines.is_empty(){lines.push(String::new());}
+            for (header,cell) in rows[0].iter().zip(row){lines.extend(terminal_prefixed(cell,&format!("{header}: "),width));}
+        }
+        if rows.len()==1{for cell in &rows[0]{lines.extend(terminal_wrap(cell,width).0);}}return lines;
+    }
+    let widths=terminal_table_widths(rows,width-overhead);
+    let border=|left:&str,middle:&str,right:&str|format!("{left}{}{right}",
+        widths.iter().map(|w|"─".repeat(w+2)).collect::<Vec<_>>().join(middle));
+    let mut lines=vec![border("┌","┬","┐")];
+    for (index,row) in rows.iter().enumerate(){
+        let wrapped:Vec<_>=row.iter().zip(&widths).map(|(c,&w)|terminal_wrap(c,w).0).collect();
+        for physical in 0..wrapped.iter().map(Vec::len).max().unwrap_or(0){
+            let mut cells=vec![];
+            for (c,&w) in widths.iter().enumerate(){
+                let text=wrapped[c].get(physical).map(String::as_str).unwrap_or("");let padding=w.saturating_sub(terminal_columns(text));
+                let left=if align[c]>0{padding}else if align[c]==0{padding/2}else{0};
+                cells.push(format!(" {}{text}{} "," ".repeat(left)," ".repeat(padding-left)));
+            }
+            lines.push(format!("│{}│",cells.join("│")));
+        }
+        if index+1<rows.len(){lines.push(border("├","┼","┤"));}
+    }
+    lines.push(border("└","┴","┘"));lines
+}
+fn terminal_markdown(text:&str,width:usize)->Vec<String>{
+    let safe=terminal_safe(text);let logical:Vec<_>=safe.lines().collect();let mut lines=vec![];let mut at=0;let mut fence=false;
+    while at<logical.len(){
+        let line=logical[at];let trim=line.trim();
+        if trim.starts_with("```")||trim.starts_with("~~~"){fence= !fence;at+=1;continue;}
+        if fence{
+            lines.extend(terminal_style_lines(terminal_prefixed(line,"  ",width),"36"));at+=1;continue;
+        }
+        if trim.is_empty(){lines.push(String::new());at+=1;continue;}
+        if at+1<logical.len()&&line.contains('|'){
+            let header=terminal_table_cells(line);
+            if !header.is_empty(){if let Some(align)=terminal_table_separator(logical[at+1],header.len()){
+                let columns=header.len();let mut rows=vec![header];at+=2;
+                while at<logical.len()&&logical[at].contains('|')&&!logical[at].trim().is_empty(){
+                    let mut row=terminal_table_cells(logical[at]);row.resize(columns,String::new());row.truncate(columns);rows.push(row);at+=1;
+                }
+                lines.extend(terminal_table_styled(terminal_table(&rows,&align,width)));continue;
+            }}
+        }
+        let heading=trim.chars().take_while(|c|*c=='#').count();
+        if (1..=6).contains(&heading)&&trim[heading..].starts_with(' '){
+            let title=terminal_inline(trim[heading..].trim().trim_end_matches('#').trim());
+            lines.extend(terminal_style_lines(terminal_wrap(&title,width).0,"1;36"));
+            lines.push(terminal_styled(&if heading==1{"═"}else{"─"}.repeat(terminal_columns(&title).min(width)),"2"));at+=1;continue;
+        }
+        if trim.len()>=3&&(trim.chars().all(|c|c=='-')||trim.chars().all(|c|c=='*')||trim.chars().all(|c|c=='_')){
+            lines.push(terminal_styled(&"─".repeat(width),"2"));at+=1;continue;
+        }
+        if let Some(quote)=trim.strip_prefix("> "){
+            let quote=terminal_inline(quote);let available=width.saturating_sub(2).max(1);
+            if width<=2{lines.extend(terminal_wrap(&quote,width).0);}else{
+                lines.extend(terminal_wrap(&quote,available).0.into_iter().map(|l|terminal_styled(&format!("│ {l}"),"2;3")));
+            }at+=1;continue;
+        }
+        let bullet=trim.strip_prefix("- ").or_else(||trim.strip_prefix("* ")).or_else(||trim.strip_prefix("+ "));
+        if let Some(item)=bullet{lines.extend(terminal_prefixed(&terminal_inline(item),"• ",width));at+=1;continue;}
+        let digits=trim.chars().take_while(char::is_ascii_digit).count();
+        if digits>0&&trim[digits..].starts_with(". "){
+            lines.extend(terminal_prefixed(&terminal_inline(&trim[digits+2..]),&trim[..digits+2],width));at+=1;continue;
+        }
+        // Soft paragraph newlines are Markdown spaces; explicit blank lines are
+        // retained. Block starts are kept separate instead of swallowed.
+        let mut paragraph=trim.to_string();at+=1;
+        while at<logical.len(){let next=logical[at].trim();
+            if next.is_empty()||next.starts_with(['#','>','-','*','+','`','~'])||next.contains('|'){break;}
+            paragraph.push(' ');paragraph.push_str(next);at+=1;
+        }
+        lines.extend(terminal_wrap(&terminal_inline(&paragraph),width).0);
+    }lines
+}
+fn terminal_preview(v:&Value,width:usize)->Vec<String>{
+    let mut lines=vec![String::new()];
+    let id=v["command_id"].as_str().unwrap_or("?");
+    if v["cell"].as_u64().is_none(){
+        lines.extend(terminal_style_lines(terminal_wrap(&format!("── cell {id} {}",if v["code"]["ref"].as_str().unwrap_or("").starts_with("H.code"){"python"}else{"shell"}),width).0,"1;36"));
+    }
+    for stream in ["code","stdout","stderr"]{
+        if !v[stream].is_object()||stream!="code"&&v[stream]["bytes"].as_u64()==Some(0){continue;}
+        if stream!="code"{lines.extend(terminal_style_lines(terminal_wrap(&format!("── {stream}"),width).0,"2;36"));}
+        if let Some(preview)=v[stream]["preview"].as_str(){if !preview.is_empty(){
+            let raw=stream!="code"&&v["terminal_controls"]==true&&unsafe{libc::isatty(1)==1}
+                &&!std::env::var("TERM").is_ok_and(|term|term=="dumb");
+            let content=if raw{preview.split('\n').map(str::to_owned).collect()}else{terminal_wrap(preview,width).0};
+            lines.extend(terminal_style_lines(content,"2"));
+        }}
+        if v[stream]["preview_truncated"]==true{
+            let total=v[stream]["lines"].as_u64().unwrap_or(0);
+            let shown=v[stream]["preview"].as_str().map(|text|text.lines().count()).unwrap_or(0);
+            let reference=if let Some(cell)=v["cell"].as_u64(){
+                format!("H.cells[{cell}].{}",if stream=="code"{"source"}else{stream})
+            }else{v[stream]["ref"].as_str().unwrap_or("?").to_string()};
+            let info=if v[stream]["omitted_lines"].as_u64().unwrap_or(0)>0{
+                format!("{shown} lines shown out of {total} · {reference}")
+            }else{format!("preview truncated · {reference}")};
+            lines.extend(terminal_style_lines(terminal_wrap(&info,width).0,"2"));
+        }
+    }
+    lines.push(String::new());lines
+}
+
+
+// =============================================================================
+// Provider authentication and transport
+// =============================================================================
+
+/* Codex device/protocol reference: Pig, revision pinned in SPEC.
+MIT License
+
+Copyright Hewlett Packard Enterprise Development LP
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+// Codex device/protocol constants follow the Pig pin in SPEC; own client identity.
+// Browser OAuth uses the Pi pin; WebSocket transport and implicit retries are not provided.
+const CODEX_CLIENT_ID:&str="app_EMoamEEZ73f0CkXaXp7hrann";
+fn provider_alias(provider:&str)->&str{if provider=="codex"{"openai-codex"}else{provider}}
+fn codex_token_value(body:&Value)->Result<Value>{
+    let access=oauth_token(body,"access_token")?;
+    let refresh=oauth_token(body,"refresh_token")?;
+    let seconds=body["expires_in"].as_f64().filter(|s|s.is_finite()&&*s>0.0&&*s<=31536000.0).ok_or("Codex token response has invalid expiry")?;
+    let pieces:Vec<_>=access.split('.').collect();
+    if pieces.len()!=3{return Err("Codex access token has invalid account metadata".into());}
+    let bytes=base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(pieces[1].trim_end_matches('='))
+        .map_err(|_|"Codex access token has invalid account metadata")?;
+    let claims:Value=serde_json::from_slice(&bytes).map_err(|_|"Codex access token has invalid account metadata")?;
+    // Decode for account routing only, not JWT signature verification.
+    let account=claims["https://api.openai.com/auth"]["chatgpt_account_id"].as_str()
+        .filter(|s|!s.is_empty()&&s.len()<=512&&s.bytes().all(|c|(33..=126).contains(&c)))
+        .ok_or("Codex access token lacks valid account ID")?;
+    Ok(json!({"type":"oauth","access":access,"refresh":refresh,
+        "expires":now_ms() as u64+(seconds*1000.0) as u64,"accountId":account}))
+}
+impl Host{
+    fn auth_lock(&mut self)->Result<File>{self.auth_lock_until(None)}
+    fn auth_checkpoint(&mut self,deadline:Option<std::time::Instant>)->Result<()>{
+        if self.codex_cancel("auth")?{return Err("authentication cancelled; credentials unchanged".into());}
+        if deadline.is_some_and(|until|std::time::Instant::now()>=until){
+            return Err("browser login timed out; credentials unchanged".into());
+        }
+        Ok(())
+    }
+    fn auth_lock_until(&mut self,deadline:Option<std::time::Instant>)->Result<File>{
+        let file=OpenOptions::new().create(true).read(true).write(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC).open(self.home.join("auth.lock"))?;
+        loop{
+            if deadline.is_some(){self.auth_checkpoint(deadline)?;}
+            if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0{
+                if deadline.is_some(){self.auth_checkpoint(deadline)?;}
+                return Ok(file);
+            }
+            let error=io::Error::last_os_error();
+            if error.kind()!=io::ErrorKind::WouldBlock&&error.kind()!=io::ErrorKind::Interrupted{return Err(error.into());}
+            self.auth_checkpoint(deadline)?;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    }
+    fn reload_auth(&mut self)->Result<()>{
+        let _lock=self.auth_lock()?;
+        self.auth=load_json(&self.home.join("auth.json"))?;Ok(())
+    }
+    fn store_credential(&mut self,provider:&str,credential:Option<Value>)->Result<()>{
+        self.store_credential_until(provider,credential,None)
+    }
+    fn store_credential_until(&mut self,provider:&str,credential:Option<Value>,deadline:Option<std::time::Instant>)->Result<()>{
+        let _lock=self.auth_lock_until(deadline)?;
+        let path=self.home.join("auth.json");let mut auth=load_json(&path)?;
+        let map=auth.as_object_mut().ok_or("invalid auth config")?;
+        let provider=provider_alias(provider);
+        if let Some(value)=credential{map.insert(provider.into(),value);}else{map.remove(provider);}
+        if deadline.is_some(){self.auth_checkpoint(deadline)?;}
+        // Successful atomic write is the commit boundary. Cancellation arriving
+        // after this checkpoint cannot promise rollback of an already-saved login.
+        write_private_json(&path,&auth)?;self.auth=auth;Ok(())
+    }
+    fn codex_cancel(&mut self,operation:&str)->Result<bool>{
+        self.service_background()?;
+        let mut cancel=INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst);
+        loop{
+            let command=match self.incoming.as_ref().map(|r|r.try_recv()){
+                Some(Ok(v))=>v,
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected))=>{self.input_closed=true;break;},
+                _=>break
+            };
+            if command["kind"]=="interrupt"{
+                if self.accept_input_control(&command)?{
+                    self.event("completed",json!({"command_id":command["id"],"status":"ok"}));cancel=true;
+                }
+            }else if !self.background_control(&command)?{self.queue_arrival(command)?;}
+        }
+        if cancel{
+            self.journal.append("provider_cancelled",json!({"operation":operation,"billing":"unknown"}))?;
+            self.cancel_revision=self.cancel_revision.wrapping_add(1);
+        }
+        Ok(cancel)
+    }
+    fn codex_wait<T>(&mut self,future:impl std::future::Future<Output=Result<T>>,operation:&str)->Result<T>{
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        rt.block_on(async{
+            tokio::pin!(future);
+            loop{
+                if self.codex_cancel(operation)?{return Err("Codex operation cancelled; request outcome may be unknown".into());}
+                tokio::select!{
+                    response=&mut future=>return response,
+                    _=tokio::time::sleep(std::time::Duration::from_millis(15))=>{}
+                }
+            }
+        })
+    }
+    fn codex_http(&mut self,request:reqwest::RequestBuilder)->Result<(u16,Value)>{
+        self.codex_wait(async{
+            let mut response=request.send().await.map_err(|_|"Codex authentication network error")?;
+            let status=response.status().as_u16();let mut bytes=Vec::new();
+            while let Some(chunk)=response.chunk().await.map_err(|_|"Codex authentication network error")?{
+                if bytes.len()+chunk.len()>1048576{return Err("Codex authentication response exceeds limit".into());}
+                bytes.extend_from_slice(&chunk);
+            }
+            let body=match serde_json::from_slice(&bytes){
+                Ok(body)=>body,
+                // Pig treats device polling 403/404 as pending even with an
+                // empty/non-JSON body. Other callers still reject these statuses.
+                Err(_)if status==403||status==404=>Value::Null,
+                Err(_)=>return Err("Codex authentication returned invalid JSON".into())
+            };
+            Ok((status,body))
+        },"auth")
+    }
+    fn codex_auth_base()->String{std::env::var("PY_CODEX_AUTH_BASE_URL").unwrap_or_else(|_|"https://auth.openai.com".into()).trim_end_matches('/').into()}
+    fn codex_login(&mut self)->Result<()>{
+        let base=Self::codex_auth_base();
+        let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build()?;
+        let (status,device)=self.codex_http(client.post(format!("{base}/api/accounts/deviceauth/usercode")).json(&json!({"client_id":CODEX_CLIENT_ID})))?;
+        if status!=200{return Err(format!("Codex device login unavailable (HTTP {status}); enable device-code login in ChatGPT settings if required").into());}
+        let device_id=device["device_auth_id"].as_str().filter(|s|!s.is_empty()).ok_or("Codex device response missing device ID")?;
+        let code=device["user_code"].as_str().filter(|s|!s.is_empty()&&s.len()<=128&&!s.chars().any(char::is_control)).ok_or("Codex device response missing user code")?;
+        let mut interval=device["interval"].as_f64().or_else(||device["interval"].as_str()?.trim().parse().ok())
+            .filter(|n|n.is_finite()&&*n>=0.0&&*n<=60.0).ok_or("Codex device response has invalid interval")?.max(0.01);
+        self.event("login_prompt",json!({"provider":"openai-codex","method":"device_code","url":"https://auth.openai.com/codex/device","user_code":code}));
+        if !self.json{ui_text(&format!("Open https://auth.openai.com/codex/device and enter {code}. Ctrl-C cancels."));}
+        let seconds=std::env::var("PY_CODEX_DEVICE_TIMEOUT_SECONDS").ok().map(|s|s.parse::<f64>()).transpose()?
+            .unwrap_or(900.0);
+        if !seconds.is_finite()||seconds<=0.0||seconds>900.0{return Err("invalid Codex device timeout (0–900 seconds)".into());}
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs_f64(seconds);
+        loop{
+            let left=deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero(){return Err("Codex device login expired; try /login codex again".into());}
+            let pause=std::time::Duration::from_secs_f64(interval).min(left);
+            self.codex_wait(async{tokio::time::sleep(pause).await;Ok(())},"auth")?;
+            if std::time::Instant::now()>=deadline{return Err("Codex device login expired; try /login codex again".into());}
+            let (status,token)=self.codex_http(client.post(format!("{base}/api/accounts/deviceauth/token"))
+                .timeout(deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_secs(30)))
+                .json(&json!({"device_auth_id":device_id,"user_code":code})))?;
+            if status==200{
+                let authorization=token["authorization_code"].as_str().filter(|s|!s.is_empty()).ok_or("Codex device token response missing authorization code")?;
+                let verifier=token["code_verifier"].as_str().filter(|s|!s.is_empty()).ok_or("Codex device token response missing verifier")?;
+                let (status,body)=self.codex_http(client.post(format!("{base}/oauth/token")).header("Accept","application/json")
+                    .form(&[("grant_type","authorization_code"),("client_id",CODEX_CLIENT_ID),("code",authorization),
+                        ("code_verifier",verifier),("redirect_uri","https://auth.openai.com/deviceauth/callback")]))?;
+                if status!=200{return Err(format!("Codex token exchange failed (HTTP {status}); try /login codex again").into());}
+                return self.store_credential("openai-codex",Some(codex_token_value(&body)?));
+            }
+            let error=token["error"].as_str().or(token["error"]["code"].as_str()).unwrap_or("");
+            if status==403||status==404||error=="deviceauth_authorization_pending"{continue;}
+            if error=="slow_down"{interval=(interval+5.0).min(60.0);continue;}
+            return Err(format!("Codex device authorization denied or failed (HTTP {status})").into());
+        }
+    }
+    fn refresh_codex(&mut self)->Result<()>{
+        // Lock spans reload/check/exchange/write: rotating refresh tokens are used once.
+        let _lock=self.auth_lock()?;
+        self.auth=load_json(&self.home.join("auth.json"))?;
+        let credential=&self.auth["openai-codex"];
+        let refresh=oauth_token(credential,"refresh").map_err(|_|"Codex stored credential invalid; /login codex again")?.to_string();
+        if credential["expires"].as_u64().unwrap_or(0)>now_ms() as u64{
+            oauth_token(credential,"access").map_err(|_|"Codex stored credential invalid; /login codex again")?;
+            credential["accountId"].as_str().filter(|s|!s.is_empty()&&s.len()<=512&&s.bytes().all(|c|(33..=126).contains(&c)))
+                .ok_or("Codex stored credential has invalid account ID; /login codex again")?;
+            return Ok(());
+        }
+        let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build()?;
+        let (status,body)=self.codex_http(client.post(format!("{}/oauth/token",Self::codex_auth_base())).header("Accept","application/json")
+            .form(&[("grant_type","refresh_token"),("client_id",CODEX_CLIENT_ID),("refresh_token",refresh.as_str())]))?;
+        if status!=200{return Err(format!("Codex token refresh failed (HTTP {status}); /login codex again").into());}
+        let next=codex_token_value(&body)?;
+        let mut auth=self.auth.clone();auth["openai-codex"]=next;
+        write_private_json(&self.home.join("auth.json"),&auth)?;self.auth=auth;Ok(())
+    }
+    fn codex_request(&self,client:&reqwest::Client,url:&str,key:&str,id:&str,messages:&[Value])->Result<reqwest::RequestBuilder>{
+        let mut instructions=Vec::new();let mut input=Vec::new();
+        for message in messages{
+            let role=message["role"].as_str().unwrap_or("user");
+            if role=="system"||role=="developer"{
+                if let Some(text)=message["content"].as_str(){instructions.push(text.to_string());}
+                else if let Some(parts)=message["content"].as_array(){for p in parts{if let Some(text)=p["text"].as_str(){instructions.push(text.to_string());}}}
+                continue;
+            }
+            let mut item=message.clone();
+            if let Some(text)=item["content"].as_str(){item["content"]=json!([{"type":if role=="assistant"{"output_text"}else{"input_text"},"text":text}]);}
+            else if let Some(parts)=item["content"].as_array_mut(){for part in parts{
+                if part["type"]=="text"{part["type"]=json!(if role=="assistant"{"output_text"}else{"input_text"});}
+                else if part["type"]=="image_url"{*part=json!({"type":"input_image","image_url":part["image_url"]["url"]});}
+            }}
+            input.push(item);
+        }
+        let session=self.journal.path.file_stem().and_then(|s|s.to_str()).unwrap_or("py-session");
+        let mut body=json!({"model":id,"store":false,"stream":true,"instructions":instructions.join("\n"),"input":input,
+            "text":{"verbosity":"medium"},"include":["reasoning.encrypted_content"],"prompt_cache_key":session});
+        let effort=self.effort.as_str();
+        let meta=self.reasoning_metadata(&format!("openai-codex/{id}"));
+        reasoning_fields("openai-codex-responses","openai-codex",id,&meta,effort,4096)?;
+        if effort!="off"||meta["reasoning_efforts"].is_array(){body["reasoning"]=json!({"effort":if effort=="off"{"none"}else if effort=="minimal"&&(id.starts_with("gpt-5.2")||id.starts_with("gpt-5.3")){"low"}else{effort},"summary":"auto"});}
+        let endpoint=if url.ends_with("/codex/responses"){url.to_string()}else if url.ends_with("/codex"){format!("{url}/responses")}else{format!("{url}/codex/responses")};
+        Ok(client.post(endpoint).bearer_auth(key).header("chatgpt-account-id",self.auth["openai-codex"]["accountId"].as_str().ok_or("Codex account ID missing")?)
+            .header("OpenAI-Beta","responses=experimental").header("Accept","text/event-stream").header("originator","py")
+            .header("User-Agent","py-rust/0.1.0").header("session-id",session).header("x-client-request-id",session).json(&body))
+    }
+    fn codex_sse(&mut self,request:reqwest::RequestBuilder,operation:&str)->Result<Value>{
+        let mut secrets=Vec::new();credential_secret_values(&self.auth,&mut secrets);
+        if let Ok((_,key,_))=self.provider_config("openai-codex/gpt-6.1-sol"){if !key.is_empty(){secrets.push(key);}}
+        self.codex_wait(async{
+            let mut response=request.send().await.map_err(|_|"Codex provider network error; outcome/billing unknown. No automatic retry; previous cell outputs remain available in H.cells.")?;
+            let status=response.status();
+            if !status.is_success(){
+                let mut bytes=Vec::new();
+                while let Some(chunk)=response.chunk().await.map_err(|_|"Codex error response disconnected")?{
+                    if bytes.len()+chunk.len()>65536{return Err(format!("Codex provider HTTP {status}; error body exceeds 64 KiB; no automatic retry").into());}
+                    bytes.extend_from_slice(&chunk);
+                }
+                let detail=codex_error_detail(&bytes,&secrets);
+                return Err(format!("Codex provider HTTP {status}{detail}; no automatic retry").into());
+            }
+            codex_read_sse(response).await
+        },operation)
+    }
+}
+fn credential_secret_values(value:&Value,out:&mut Vec<String>){
+    if let Some(object)=value.as_object(){for (key,value) in object{
+        if matches!(key.as_str(),"key"|"access"|"refresh"|"access_token"|"refresh_token"|"id_token"|"accountId"){
+            if let Some(value)=value.as_str().filter(|v|!v.is_empty()){out.push(value.into());}
+        }else{credential_secret_values(value,out);}
+    }}else if let Some(values)=value.as_array(){for value in values{credential_secret_values(value,out);}}
+}
+fn codex_error_detail(bytes:&[u8],secrets:&[String])->String{
+    let Ok(text)=std::str::from_utf8(bytes)else{return ": unreadable error response".into();};
+    let mut detail=if let Ok(body)=serde_json::from_str::<Value>(text){
+        let error=&body["error"];
+        [error["message"].as_str().or(error.as_str()).or(body["message"].as_str()).or(body["detail"].as_str()),
+            error["code"].as_str(),error["param"].as_str()].into_iter().flatten().collect::<Vec<_>>().join("; ")
+    }else{text.to_string()};
+    // Redact before truncation so a token crossing the preview boundary cannot
+    // leak a partial prefix. Never store the raw rejection body in the journal.
+    let mut secrets:Vec<_>=secrets.iter().filter(|s|!s.is_empty()).collect();secrets.sort_by_key(|s|std::cmp::Reverse(s.len()));
+    for secret in secrets{detail=detail.replace(secret,"[redacted]");}
+    let truncated=detail.chars().count()>1024;
+    let mut safe:String=detail.chars().take(1024).map(|c|if c.is_control()||matches!(c,'\u{2028}'|'\u{2029}'){ ' ' }else{c}).collect();
+    if truncated{safe.push_str(" [truncated]");}
+    if safe.trim().is_empty(){String::new()}else{format!(": {}",safe.trim())}
+}
+fn validate_provider_completion(body:&Value)->Result<()>{
+    let reason=if body["choices"][0]["finish_reason"]=="length"{Some("finish_reason=length")}
+        else if body["stop_reason"]=="max_tokens"{Some("stop_reason=max_tokens")}
+        else if body["candidates"][0]["finishReason"]=="MAX_TOKENS"{Some("finishReason=MAX_TOKENS")}
+        else if body["status"]=="incomplete"{Some("status=incomplete")}else{None};
+    if let Some(reason)=reason{return Err(format!("provider response truncated/incomplete ({reason}); no generated code was executed, no automatic retry").into());}
+    if matches!(body["status"].as_str(),Some("failed"|"cancelled")){
+        return Err("provider response did not complete successfully; no generated code was executed".into());
+    }
+    Ok(())
+}
+
+
+// Responses can contain draft/commentary messages as well as the finalized
+// program. Executing their concatenation repeats side effects. Select by phase,
+// not text equality: intentional repetition in the final program must survive.
+fn responses_final_text(output:&[Value])->Result<String>{
+    let final_phase=output.iter().any(|item|item["type"]=="message"&&item["phase"]=="final_answer");
+    let text=output.iter().filter(|item|item["type"]=="message"&&
+        if final_phase{item["phase"]=="final_answer"}else{item["phase"].is_null()})
+        .filter_map(|item|item["content"].as_array()).flatten()
+        .filter(|part|part["type"]=="output_text").filter_map(|part|part["text"].as_str()).collect::<String>();
+    if text.is_empty(){return Err("provider response contains no final answer text; intermediate messages were not executed".into());}
+    Ok(text)
+}
+#[derive(Default)]
+struct CodexStreamText{
+    items:std::collections::BTreeMap<u64,Value>,
+    deltas:std::collections::BTreeMap<u64,String>,
+    completed_items:HashSet<u64>,
+    completed_text:std::collections::BTreeMap<u64,std::collections::BTreeMap<u64,String>>,
+}
+impl CodexStreamText{
+    fn index(&self,event:&Value)->Result<u64>{
+        let index=event["output_index"].as_u64().or_else(||
+            event["item_id"].as_str().and_then(|id|self.items.iter().find(|(_,item)|item["id"]==id).map(|(index,_)|*index)));
+        match index{Some(index)=>Ok(index),None if self.items.is_empty()=>Ok(0),
+            None=>Err("Codex text event has no output item identity; no automatic retry".into())}
+    }
+    fn observe(&mut self,event:&Value)->Result<()>{
+        match event["type"].as_str().unwrap_or(""){
+            "response.output_item.added"|"response.output_item.done"=>{
+                if let (Some(index),Some(item))=(event["output_index"].as_u64(),event["item"].as_object()){
+                    let stored=self.items.entry(index).or_insert_with(||json!({}));
+                    for (key,value) in item{stored[key]=value.clone();}
+                    if event["type"]=="response.output_item.done"{self.completed_items.insert(index);}
+                }
+            },
+            "response.output_text.delta"=>if let Some(text)=event["delta"].as_str(){
+                self.deltas.entry(self.index(event)?).or_default().push_str(text);
+            },
+            "response.output_text.done"=>if let Some(text)=event["text"].as_str(){
+                self.completed_text.entry(self.index(event)?).or_default()
+                    .insert(event["content_index"].as_u64().unwrap_or(0),text.into());
+            },
+            _=>{}
+        }
+        Ok(())
+    }
+    fn output(mut self)->Value{
+        let mut authoritative=HashSet::new();
+        for index in &self.completed_items{
+            if self.items[index]["content"].as_array().is_some_and(|parts|
+                parts.iter().any(|part|part["type"]=="output_text"&&part["text"].is_string())){
+                authoritative.insert(*index);
+            }
+        }
+        for (index,parts) in self.completed_text{
+            if authoritative.contains(&index){continue;}
+            let item=self.items.entry(index).or_insert_with(||json!({"type":"message"}));
+            item["content"]=json!(parts.into_values().map(|text|json!({"type":"output_text","text":text})).collect::<Vec<_>>());
+            authoritative.insert(index);
+        }
+        for (index,text) in self.deltas{
+            if authoritative.contains(&index){continue;}
+            let item=self.items.entry(index).or_insert_with(||json!({"type":"message"}));
+            item["content"]=json!([{"type":"output_text","text":text}]);
+        }
+        json!(self.items.into_values().collect::<Vec<_>>())
+    }
+}
+async fn codex_read_sse(mut response:reqwest::Response)->Result<Value>{
+    let mut bytes=Vec::new();let mut data=Vec::new();let mut text_items=CodexStreamText::default();let mut total=0usize;
+    while let Some(chunk)=response.chunk().await.map_err(|_|"Codex stream disconnected; outcome/billing unknown. No automatic retry; previous cell outputs remain available in H.cells.")?{
+        total+=chunk.len();if total>16*1024*1024{return Err("Codex stream exceeds 16 MiB; outcome unknown".into());}
+        bytes.extend_from_slice(&chunk);
+        let mut consumed=0usize;
+        while let Some(offset)=bytes[consumed..].iter().position(|b|*b==b'\n'){
+            let end=consumed+offset;let line=&bytes[consumed..end];consumed=end+1;
+            let line=line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty(){
+                if data.is_empty(){continue;}
+                let text=std::str::from_utf8(&data).map_err(|_|"Codex SSE has invalid UTF-8")?;
+                if text.trim()=="[DONE]"{data.clear();continue;}
+                let event:Value=serde_json::from_str(text).map_err(|_|"Codex SSE has invalid JSON")?;data.clear();
+                text_items.observe(&event)?;
+                match event["type"].as_str().unwrap_or(""){
+                    "error"|"response.failed"|"response.incomplete"=>return Err("Codex response failed or incomplete; no automatic retry".into()),
+                    "response.done"|"response.completed"=>{
+                        let mut body=event["response"].clone();
+                        if body["status"]!="completed"{return Err("Codex response did not complete successfully; no automatic retry".into());}
+                        if body["output"].is_null()||body["output"].as_array().is_some_and(Vec::is_empty){
+                            body["output"]=text_items.output();
+                        }
+                        return Ok(body);
+                    },
+                    _=>{}
+                }
+            }else if let Some(part)=line.strip_prefix(b"data:"){
+                if !data.is_empty(){data.push(b'\n');}
+                data.extend_from_slice(part.strip_prefix(b" ").unwrap_or(part));
+                if data.len()>2*1024*1024{return Err("Codex SSE frame exceeds 2 MiB; outcome unknown".into());}
+            }
+        }
+        bytes.drain(..consumed);
+        if bytes.len()>2*1024*1024{return Err("Codex SSE line exceeds 2 MiB; outcome unknown".into());}
+        tokio::task::yield_now().await;
+    }
+    Err("Codex stream ended without successful terminal event; outcome/billing unknown. No automatic retry; previous cell outputs remain available in H.cells.".into())
+}
+
+
+// No getpass subprocess or echoed stdin fallback: secrets belong only to the
+// foreground controlling terminal. The guard restores terminal state on errors
+// and unwinding; cancellation also discards any unfinished canonical line.
+struct SecretTerminal {
+    tty:File,
+    original:libc::termios,
+    active:bool,
+}
+impl SecretTerminal {
+    fn restore(&mut self,discard:bool)->io::Result<()> {
+        if !self.active{return Ok(());}
+        if discard{unsafe{libc::tcflush(self.tty.as_raw_fd(),libc::TCIFLUSH);}}
+        if unsafe{libc::tcsetattr(self.tty.as_raw_fd(),libc::TCSANOW,&self.original)}!=0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.active=false;Ok(())
+    }
+}
+impl Drop for SecretTerminal {
+    fn drop(&mut self){let _=self.restore(true);}
+}
+struct SecretBytes(Vec<u8>);
+impl Drop for SecretBytes {
+    fn drop(&mut self){
+        for byte in &mut self.0{unsafe{std::ptr::write_volatile(byte,0);}}
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+fn terminal_secret_service(prompt:&str,deadline:Option<std::time::Instant>,mut service:impl FnMut()->Result<()>)->Result<String> {
+    let tty=OpenOptions::new().read(true).write(true)
+        .custom_flags(libc::O_NOCTTY|libc::O_CLOEXEC|libc::O_NONBLOCK).open("/dev/tty")
+        .map_err(|_|"API-key entry requires a controlling terminal; use an environment variable or JSON login for automation")?;
+    let fd=tty.as_raw_fd();
+    if unsafe{libc::tcgetpgrp(fd)}!=unsafe{libc::getpgrp()} {
+        return Err("API-key entry requires the foreground terminal".into());
+    }
+    let mut original=unsafe{std::mem::zeroed::<libc::termios>()};
+    if unsafe{libc::tcgetattr(fd,&mut original)}!=0 {
+        return Err("API-key entry requires a terminal with controllable echo".into());
+    }
+    let mut secret_mode=original;
+    secret_mode.c_lflag|=libc::ICANON|libc::ISIG;
+    secret_mode.c_lflag&=!(libc::ECHO|libc::ECHONL|libc::ECHOCTL);
+    if unsafe{libc::tcsetattr(fd,libc::TCSAFLUSH,&secret_mode)}!=0 {
+        return Err("could not disable terminal echo; API key was not read".into());
+    }
+    let mut guard=SecretTerminal{tty,original,active:true};
+    let result=(||->Result<String>{
+        guard.tty.write_all(terminal_safe(prompt).as_bytes())?;
+        guard.tty.flush()?;
+        // Canonical read preserves the terminal's native erase/kill bindings.
+        // A partial line returned by Ctrl-D is cancellation, never a stored key.
+        let mut bytes=SecretBytes(vec![0;65536]);
+        loop {
+            service()?;
+            if deadline.is_some_and(|d|std::time::Instant::now()>=d){return Err("browser login timed out; retry /login <provider> manual".into());}
+            if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err("login cancelled".into());}
+            let mut poll=libc::pollfd{fd,events:libc::POLLIN,revents:0};
+            let ready=unsafe{libc::poll(&mut poll,1,100)};
+            if ready<0 {
+                let error=io::Error::last_os_error();
+                if error.kind()==io::ErrorKind::Interrupted{continue;}
+                return Err("could not poll terminal for API key".into());
+            }
+            if ready==0{continue;}
+            if poll.revents&(libc::POLLERR|libc::POLLNVAL)!=0 {
+                return Err("terminal disconnected during API-key entry".into());
+            }
+            let count=unsafe{libc::read(fd,bytes.0.as_mut_ptr().cast(),bytes.0.len())};
+            if count<0 {
+                let error=io::Error::last_os_error();
+                if matches!(error.kind(),io::ErrorKind::Interrupted|io::ErrorKind::WouldBlock){continue;}
+                return Err("could not read API key from terminal".into());
+            }
+            if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err("login cancelled".into());}
+            if count==0{return Err("login cancelled".into());}
+            let length=count as usize;
+            if length==bytes.0.len(){return Err("API key exceeds the input limit".into());}
+            if bytes.0[length-1]!=b'\n'{return Err("login cancelled".into());}
+            let mut length=length-1;
+            if length>0&&bytes.0[length-1]==b'\r'{length-=1;}
+            let text=std::str::from_utf8(&bytes.0[..length]).map_err(|_|"API key must be valid UTF-8")?;
+            if text.trim().is_empty(){return Err("empty API key; login cancelled".into());}
+            return Ok(text.to_owned());
+        }
+    })();
+    guard.restore(result.is_err()).map_err(|_|"could not restore terminal after API-key entry")?;
+    guard.tty.write_all(b"\n")?;guard.tty.flush()?;
+    result
+}
+
+
+// Browser authorization constants and subscription compatibility follow the Pi
+// revision pinned in SPEC (not installed newer docs, and not Pig's newer endpoints).
+const ANTHROPIC_CLIENT_ID:&str="9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const ANTHROPIC_REDIRECT:&str="https://console.anthropic.com/oauth/code/callback";
+const ANTHROPIC_OAUTH_SYSTEM:&str="You are Claude Code, Anthropic's official CLI for Claude.";
+fn oauth_random(length:usize)->Result<Vec<u8>>{
+    use std::io::Read as _;
+    let mut bytes=vec![0;length];File::open("/dev/urandom")?.read_exact(&mut bytes)?;Ok(bytes)
+}
+fn oauth_pkce()->Result<(String,String)>{
+    let verifier=base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(oauth_random(32)?);
+    let digest=ring::digest::digest(&ring::digest::SHA256,verifier.as_bytes());
+    let challenge=base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref());
+    Ok((verifier,challenge))
+}
+fn oauth_token<'a>(body:&'a Value,name:&str)->Result<&'a str>{
+    body[name].as_str().filter(|s|!s.is_empty()&&s.len()<=32768&&s.bytes().all(|c|(33..=126).contains(&c)))
+        .ok_or_else(||"OAuth response contains an invalid or missing token".into())
+}
+fn anthropic_token_value(body:&Value)->Result<Value>{
+    let access=oauth_token(body,"access_token")?;let refresh=oauth_token(body,"refresh_token")?;
+    let seconds=body["expires_in"].as_f64().filter(|s|s.is_finite()&&*s>300.0&&*s<=31536000.0)
+        .ok_or("Anthropic OAuth response has invalid token expiry")?;
+    Ok(json!({"type":"oauth","access":access,"refresh":refresh,
+        "expires":now_ms() as u64+(seconds*1000.0) as u64-300000}))
+}
+fn oauth_query(url:&reqwest::Url,name:&str)->Result<Option<String>>{
+    let values:Vec<_>=url.query_pairs().filter(|(key,_)|key==name).map(|(_,v)|v.into_owned()).collect();
+    if values.len()>1{return Err("OAuth callback contains duplicate parameters".into());}
+    Ok(values.into_iter().next())
+}
+fn oauth_code(url:&reqwest::Url,state:&str)->Result<String>{
+    if oauth_query(url,"state")?.as_deref()!=Some(state){return Err("OAuth callback state mismatch; login not saved".into());}
+    if oauth_query(url,"error")?.is_some(){return Err("OAuth authorization denied; login not saved".into());}
+    let code=oauth_query(url,"code")?.filter(|s|!s.is_empty()&&s.len()<=32768&&s.bytes().all(|c|(33..=126).contains(&c)))
+        .ok_or("OAuth callback has no valid authorization code")?;
+    Ok(code)
+}
+fn oauth_pasted_code(input:&str,redirect:&str,state:&str)->Result<String>{
+    let input=input.trim();
+    if input.contains("://"){
+        let url=reqwest::Url::parse(input).map_err(|_|"Invalid OAuth redirect URL")?;
+        let expected=reqwest::Url::parse(redirect).map_err(|_|"Invalid OAuth callback configuration")?;
+        if url.origin()!=expected.origin()||url.path()!=expected.path()||!url.username().is_empty()||url.password().is_some(){
+            return Err("OAuth redirect URL does not match this login's callback".into());
+        }
+        return oauth_code(&url,state);
+    }
+    let (code,received)=input.split_once('#').ok_or("Paste the full redirect URL or code#state from this login")?;
+    if received!=state{return Err("OAuth callback state mismatch; login not saved".into());}
+    if code.is_empty()||code.len()>32768||!code.bytes().all(|c|(33..=126).contains(&c)){
+        return Err("OAuth callback has no valid authorization code".into());
+    }
+    Ok(code.into())
+}
+fn oauth_browser_open(url:&str){
+    // Browser processes may outlive login; launch without waiting, reap in a
+    // detached thread, and never route their output/arguments through H.
+    let program=std::env::var("PY_OAUTH_BROWSER").unwrap_or_else(|_|if cfg!(target_os="macos"){"open"}else{"xdg-open"}.into());
+    if program.is_empty(){return;}
+    if let Ok(mut child)=Command::new(program).arg(url).stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn(){
+        std::thread::spawn(move||{let _=child.wait();});
+    }
+}
+impl Host{
+    fn anthropic_auth_base()->String{
+        std::env::var("PY_ANTHROPIC_AUTH_BASE_URL").unwrap_or_else(|_|"https://console.anthropic.com".into()).trim_end_matches('/').into()
+    }
+    fn browser_deadline()->Result<std::time::Instant>{
+        let seconds=std::env::var("PY_OAUTH_TIMEOUT_SECONDS").ok().map(|s|s.parse::<f64>()).transpose()?
+            .unwrap_or(300.0);
+        if !seconds.is_finite()||seconds<=0.0||seconds>900.0{return Err("Invalid browser OAuth timeout (0–900 seconds)".into());}
+        Ok(std::time::Instant::now()+std::time::Duration::from_secs_f64(seconds))
+    }
+    fn browser_callback(&mut self,listener:&std::net::TcpListener,state:&str,deadline:std::time::Instant)->Result<String>{
+        use std::io::Read as _;
+        listener.set_nonblocking(true)?;
+        loop{
+            if self.codex_cancel("auth")?{return Err("browser login cancelled".into());}
+            if std::time::Instant::now()>=deadline{return Err("browser login timed out; use /login codex manual for remote callback paste".into());}
+            let (mut stream,peer)=match listener.accept(){
+                Ok(v)=>v,
+                Err(e)if matches!(e.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::Interrupted)=>{std::thread::sleep(std::time::Duration::from_millis(15));continue;},
+                Err(_)=>return Err("Could not receive browser OAuth callback".into())
+            };
+            if !peer.ip().is_loopback(){continue;}
+            stream.set_nonblocking(true)?;
+            let until=(std::time::Instant::now()+std::time::Duration::from_secs(1)).min(deadline);
+            let mut bytes=SecretBytes(Vec::new());let mut complete=false;
+            loop{
+                if self.codex_cancel("auth")?{return Err("browser login cancelled".into());}
+                if std::time::Instant::now()>=until{break;}
+                let mut buffer=[0;1024];
+                match stream.read(&mut buffer){
+                    Ok(0)=>break,
+                    Ok(n)=>{bytes.0.extend_from_slice(&buffer[..n]);if bytes.0.len()>8192{break;}
+                        if bytes.0.windows(4).any(|w|w==b"\r\n\r\n"){complete=true;break;}},
+                    Err(e)if matches!(e.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::Interrupted)=>std::thread::sleep(std::time::Duration::from_millis(15)),
+                    Err(_)=>break
+                }
+            }
+            let parsed=if complete&&bytes.0.len()<=8192{
+                std::str::from_utf8(&bytes.0).ok().and_then(|text|text.lines().next()).and_then(|line|{
+                    let parts:Vec<_>=line.split(' ').collect();
+                    if parts.len()!=3||parts[0]!="GET"||!parts[1].starts_with('/')||!matches!(parts[2],"HTTP/1.0"|"HTTP/1.1"){return None;}
+                    reqwest::Url::parse(&format!("http://localhost{}",parts[1])).ok()
+                })
+            }else{None};
+            let outcome=parsed.as_ref().filter(|url|url.path()=="/auth/callback").map(|url|oauth_code(url,state));
+            let status=if parsed.as_ref().is_some_and(|url|url.path()!="/auth/callback"){"404 Not Found"}
+                else if outcome.as_ref().is_some_and(|result|result.is_ok()){ "200 OK" }else{"400 Bad Request"};
+            let body=if status=="200 OK"{"Authorization received. Return to py."}else{"Invalid authorization callback."};
+            let response=format!("HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+            let _=stream.write_all(response.as_bytes());let _=stream.shutdown(std::net::Shutdown::Both);
+            if let Some(Ok(code))=outcome{return Ok(code);}
+            // A provider denial with the valid state ends the flow. Invalid
+            // requests never consume the valid callback or reveal credentials.
+            if parsed.as_ref().is_some_and(|url|url.path()=="/auth/callback"
+                &&oauth_query(url,"state").ok().flatten().as_deref()==Some(state)
+                &&oauth_query(url,"error").ok().flatten().is_some()){
+                return Err("OAuth authorization denied; login not saved".into());
+            }
+        }
+    }
+    fn browser_login(&mut self,provider:&str,manual:bool)->Result<()>{
+        self.with_state(UiState::Login,None,|host|host.browser_login_inner(provider,manual))
+    }
+    fn browser_login_inner(&mut self,provider:&str,manual:bool)->Result<()>{
+        let provider=provider_alias(provider);
+        if !matches!(provider,"anthropic"|"openai-codex"){return Err("Browser OAuth unsupported for this provider; /login lists methods".into());}
+        let deadline=Self::browser_deadline()?;
+        let (verifier,challenge)=oauth_pkce()?;
+        let state=if provider=="anthropic"{verifier.clone()}else{base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(oauth_random(24)?)};
+        let port=std::env::var("PY_OAUTH_CALLBACK_PORT").ok().map(|s|s.parse::<u16>()).transpose()?.unwrap_or(1455);
+        let listener=if provider=="openai-codex"&&!manual{
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,port)).ok()
+        }else{None};
+        if listener.is_none()&&provider=="openai-codex"&&!manual&&self.json{
+            return Err("Could not bind Codex callback; use a free callback port, device method, or interactive manual paste".into());
+        }
+        let callback_port=listener.as_ref().map(|l|l.local_addr().map(|addr|addr.port())).transpose()?.unwrap_or(port);
+        let redirect=if provider=="anthropic"{ANTHROPIC_REDIRECT.to_string()}
+            else{format!("http://localhost:{callback_port}/auth/callback")};
+        let authorize=if provider=="anthropic"{
+            std::env::var("PY_ANTHROPIC_AUTHORIZE_URL").unwrap_or_else(|_|"https://claude.ai/oauth/authorize".into())
+        }else{format!("{}/oauth/authorize",Self::codex_auth_base())};
+        let mut url=reqwest::Url::parse(&authorize).map_err(|_|"Invalid OAuth authorize endpoint")?;
+        {
+            let mut query=url.query_pairs_mut();
+            query.append_pair("client_id",if provider=="anthropic"{ANTHROPIC_CLIENT_ID}else{CODEX_CLIENT_ID})
+                .append_pair("response_type","code").append_pair("redirect_uri",&redirect)
+                .append_pair("scope",if provider=="anthropic"{"org:create_api_key user:profile user:inference"}else{"openid profile email offline_access"})
+                .append_pair("code_challenge",&challenge).append_pair("code_challenge_method","S256").append_pair("state",&state);
+            if provider=="anthropic"{query.append_pair("code","true");}
+            else{query.append_pair("id_token_add_organizations","true").append_pair("codex_cli_simplified_flow","true").append_pair("originator","py");}
+        }
+        self.event("login_prompt",json!({"provider":provider,"method":if manual{"manual"}else{"browser"},"url":url.as_str()}));
+        if !self.json{
+            ui_text(&format!("Open this URL in your browser (automatic opener is best-effort):\n{url}\nCtrl-C cancels; authorization codes are entered only in the hidden prompt."));
+            if provider=="anthropic"{ui_text("Anthropic subscription compatibility uses the provider's Claude Code protocol marker/headers; py identity is also sent. Your original system instructions follow unchanged. Live compatibility is unverified; API-key login is available.");}
+            if provider=="openai-codex"&&listener.is_none()&&!manual{ui_text("Callback port unavailable; paste this login's full redirect URL in the hidden prompt instead.");}
+        }
+        oauth_browser_open(url.as_str());
+        let code=if let Some(listener)=listener.as_ref(){self.browser_callback(listener,&state,deadline)?}
+            else{let pasted=terminal_secret_service("Authorization code (hidden): ",Some(deadline),||{if self.codex_cancel("auth")?{Err("login cancelled".into())}else{Ok(())}})?;
+                oauth_pasted_code(&pasted,&redirect,&state)?};
+        // Drop the loopback listener before any exchange: no second callback can
+        // influence an exchange or be falsely acknowledged as another login.
+        drop(listener);
+        if std::time::Instant::now()>=deadline{return Err("browser login timed out; credentials unchanged".into());}
+        let client=reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+            .timeout(deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_secs(30))).build()?;
+        let request=if provider=="anthropic"{
+            client.post(format!("{}/v1/oauth/token",Self::anthropic_auth_base())).json(&json!({
+                "grant_type":"authorization_code","client_id":ANTHROPIC_CLIENT_ID,"code":code,"state":state,
+                "redirect_uri":redirect,"code_verifier":verifier}))
+        }else{
+            client.post(format!("{}/oauth/token",Self::codex_auth_base())).form(&[
+                ("grant_type","authorization_code"),("client_id",CODEX_CLIENT_ID),("code",code.as_str()),
+                ("code_verifier",verifier.as_str()),("redirect_uri",redirect.as_str())])
+        };
+        let (status,body)=self.codex_http(request).map_err(|e|e.to_string().replace("Codex","OAuth"))?;
+        if status!=200{return Err(format!("OAuth token exchange rejected (HTTP {status}); login not saved").into());}
+        let credential=if provider=="anthropic"{anthropic_token_value(&body)?}else{codex_token_value(&body)?};
+        if self.codex_cancel("auth")?{return Err("browser login cancelled; credentials unchanged".into());}
+        self.store_credential_until(provider,Some(credential),Some(deadline))
+    }
+    fn refresh_anthropic(&mut self)->Result<()>{
+        let _lock=self.auth_lock()?;self.auth=load_json(&self.home.join("auth.json"))?;
+        let credential=&self.auth["anthropic"];
+        if credential["type"]!="oauth"{return Err("Anthropic subscription credential changed; retry operation without replaying code".into());}
+        if credential["expires"].as_u64().unwrap_or(0)>now_ms() as u64{
+            oauth_token(credential,"access")?;oauth_token(credential,"refresh")?;return Ok(());
+        }
+        let refresh=oauth_token(credential,"refresh")?.to_string();
+        let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build()?;
+        let (status,body)=self.codex_http(client.post(format!("{}/v1/oauth/token",Self::anthropic_auth_base()))
+            .json(&json!({"grant_type":"refresh_token","client_id":ANTHROPIC_CLIENT_ID,"refresh_token":refresh})))
+            .map_err(|e|e.to_string().replace("Codex","Anthropic OAuth"))?;
+        if status!=200{return Err(format!("Anthropic OAuth refresh rejected (HTTP {status}); stored credential unchanged").into());}
+        let next=anthropic_token_value(&body)?;let mut auth=self.auth.clone();auth["anthropic"]=next;
+        if self.codex_cancel("auth")?{return Err("Anthropic OAuth refresh cancelled; stored credential unchanged".into());}
+        write_private_json(&self.home.join("auth.json"),&auth)?;self.auth=auth;Ok(())
+    }
+}
+
+
+// =============================================================================
+// Background tasks and wakeups
+// =============================================================================
+
+// Session-owned isolated processes. All capture/journal mutation remains on Host's thread.
+struct BgTask {
+    child:Option<Child>, stdout:Option<Capture>, stderr:Option<Capture>, dir:PathBuf,
+    metadata:Value, deadline:Option<std::time::Instant>,
+    cancel_at:Option<std::time::Instant>, terminal_status:Option<String>,
+    reaped:Option<std::process::ExitStatus>,
+}
+impl Drop for BgTask {
+    fn drop(&mut self){
+        if let Some(mut child)=self.child.take(){
+            if self.reaped.is_none(){
+                unsafe{libc::kill(-(child.id() as i32),libc::SIGKILL);}
+                let _=child.kill();let _=child.wait();
+            }
+        }
+        if !self.dir.as_os_str().is_empty(){let _=fs::remove_dir_all(&self.dir);}
+    }
+}
+struct Wakeup { metadata:Value, deadline:Option<std::time::Instant> }
+impl Host {
+    fn commit_stop(&mut self)->Result<()> {
+        if let Some((seconds,reason))=self.stop_wakeup.take(){
+            // One durable event commits both settled stop and its timer.
+            self.schedule_wakeup(seconds,&reason,None)?;
+        }
+        Ok(())
+    }
+    fn background_control(&mut self,v:&Value)->Result<bool>{
+        if !matches!(v["kind"].as_str(),Some("task_list"|"task_get"|"task_logs"|"task_kill"|"wakeup_list"|"wakeup_cancel"|"wakeup_run")){return Ok(false);}
+        if !self.accept_input_control(v)?{return Ok(true);}
+        if let Err(e)=self.finish_background_control(v){self.event("error",json!({"command_id":v["id"],"error":e.to_string()}));}
+        Ok(true)
+    }
+    fn finish_background_control(&mut self,v:&Value)->Result<()> {
+        let result=match v["kind"].as_str().unwrap_or(""){
+            "task_list"=>self.bg_list(v.get("state").filter(|x|!x.is_null()).map(|x|x.as_str().ok_or("state must be a string")).transpose()?)?,
+            "task_get"|"task_logs"=>{
+                let metadata=self.bg_get(v["task_id"].as_str().ok_or("task_id required")?)?;
+                if v["kind"]=="task_logs"{
+                    let stream=v.get("stream").map(|x|x.as_str().ok_or("stream must be a string")).transpose()?.unwrap_or("both");
+                    if !["both","stdout","stderr"].contains(&stream){return Err("stream must be stdout, stderr or both".into());}
+                    let mut logs=json!({"task":metadata});
+                    for name in ["stdout","stderr"]{if stream=="both"||stream==name{
+                        logs[name]=json!({"ref":logs["task"][name]["ref"],"preview":self.ui_stream_preview(name,logs["task"][name]["index"].as_u64().ok_or("missing stream index")? as usize)?});
+                    }}
+                    logs
+                }else{metadata}
+            },
+            "task_kill"=>self.bg_kill(v["task_id"].as_str().ok_or("task_id required")?,v.get("force").map(|x|x.as_bool().ok_or("force must be boolean")).transpose()?.unwrap_or(false))?,
+            "wakeup_list"=>self.wakeup_list()?,
+            "wakeup_cancel"=>self.wakeup_cancel(v["wakeup_id"].as_str().ok_or("wakeup_id required")?)?,
+            "wakeup_run"=>self.wakeup_run(v["wakeup_id"].as_str().ok_or("wakeup_id required")?)?,
+            _=>return Err("unknown background control".into())
+        };
+        self.event("completed",json!({"command_id":v["id"],"status":"ok","result":result}));Ok(())
+    }
+}
+fn bg_text<'a>(v:&'a Value,key:&str,max:usize)->Result<Option<&'a str>>{
+    match v.get(key){
+        None|Some(Value::Null)=>Ok(None),
+        Some(Value::String(s)) if !s.trim().is_empty()&&s.chars().count()<=max=>Ok(Some(s)),
+        _=>Err(format!("{key} must be a nonempty string of at most {max} characters").into())
+    }
+}
+fn bg_seconds(v:&Value,max:f64)->Result<Option<f64>>{
+    if v.is_null(){return Ok(None);}
+    let seconds=v.as_f64().ok_or("duration must be a number")?;
+    if !seconds.is_finite()||seconds<=0.0||seconds>max{return Err(format!("duration must be finite, positive and at most {max} seconds").into());}
+    Ok(Some(seconds))
+}
+impl Host {
+    fn bg_save_task(&mut self,metadata:&Value)->Result<()>{
+        self.journal.append("task_state",metadata.clone())?;
+        self.event("task_state",metadata.clone());Ok(())
+    }
+    fn bg_save_wakeup(&mut self,metadata:&Value)->Result<()>{
+        self.journal.append("wakeup_state",metadata.clone())?;
+        self.event("wakeup_state",metadata.clone());Ok(())
+    }
+    fn bg_run(&mut self,v:&Value)->Result<Value>{
+        self.service_background()?;
+        if self.bg_tasks.values().filter(|t|t.child.is_some()).count()>=4{return Err("at most four active background jobs".into());}
+        let source=v["source"].as_str().ok_or("background source required")?;
+        if source.trim().is_empty(){return Err("background source must not be empty".into());}
+        let kind=match v.get("task_kind").or_else(||v.get("kind")){None=>"shell",Some(value)=>value.as_str().ok_or("background kind must be a string")?};
+        if !["shell","python"].contains(&kind){return Err("background kind must be shell or python".into());}
+        let options=v.get("options").filter(|p|!p.is_null()).unwrap_or(v);
+        if !options.is_object(){return Err("background options must be an object".into());}
+        let name=bg_text(options,"name",128)?.map(str::to_owned);
+        let wakeup_reason=bg_text(options,"wakeup_reason",512)?.map(str::to_owned);
+        let timeout=bg_seconds(&options["timeout"],604800.0)?;
+        let cwd=match options.get("cwd"){
+            None|Some(Value::Null)=>None,
+            Some(Value::String(s))=>Some(s.clone()),
+            _=>return Err("cwd must be a string".into())
+        };
+        let mut env=Vec::new();
+        if let Some(value)=options.get("env").filter(|p|!p.is_null()){
+            for (key,value) in value.as_object().ok_or("env must be an object")?{
+                if key.is_empty()||key.contains(['=','\0']){return Err("invalid environment key".into());}
+                let value=value.as_str().ok_or("environment values must be strings")?;
+                if value.contains('\0'){return Err("invalid environment value".into());}
+                env.push((key.clone(),value.to_owned()));
+            }
+        }
+        let id=format!("task{}",self.journal.seq);
+        let dir=self.home.join(format!("background-{}-{}",std::process::id(),unique_id()));
+        fs::create_dir(&dir)?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir,fs::Permissions::from_mode(0o700))?;
+        let out=dir.join("stdout");let err=dir.join("stderr");
+        let outfile=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&out)?;
+        let errfile=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&err)?;
+        let mut stdout=Capture::open(&out,"stdout",&id)?;
+        let mut stderr=Capture::open(&err,"stderr",&id)?;
+        // Commit empty chunks now so all running jobs have stable, distinct refs.
+        stdout.commit(self,&[])?;stderr.commit(self,&[])?;
+        let mut metadata=json!({"id":id,"kind":kind,"name":name,"status":"starting",
+            "created_ms":now_ms(),"wakeup_reason":wakeup_reason,
+            "stdout":{"ref":format!("H.stdout[{}]",stdout.index.unwrap()),"index":stdout.index,"bytes":0,"complete":false},
+            "stderr":{"ref":format!("H.stderr[{}]",stderr.index.unwrap()),"index":stderr.index,"bytes":0,"complete":false}});
+        self.bg_save_task(&metadata)?;
+        self.journal.append("intent",json!({"operation":id,"type":"background","kind":kind,"source":source,"cwd":cwd}))?;
+        let mut task=BgTask{child:None,stdout:Some(stdout),stderr:Some(stderr),dir,
+            metadata:metadata.clone(),deadline:timeout.map(|s|std::time::Instant::now()+std::time::Duration::from_secs_f64(s)),
+            cancel_at:None,terminal_status:None,reaped:None};
+        let mut command=if kind=="shell"{let mut c=Command::new("/bin/sh");c.args(["-c",source]);c}
+            else{let mut c=Command::new(std::env::var("PY_PYTHON").unwrap_or_else(|_|"python3".into()));c.args(["-u","-c",source]);c};
+        if let Some(cwd)=cwd{command.current_dir(cwd);}
+        command.envs(env).stdin(std::process::Stdio::null()).stdout(outfile).stderr(errfile);
+        unsafe{command.pre_exec(||{if libc::setsid()<0{return Err(io::Error::last_os_error());}Ok(())});}
+        match command.spawn(){
+            Ok(child)=>{metadata["status"]=json!("running");metadata["pid"]=json!(child.id());task.child=Some(child);},
+            Err(error)=>{
+                metadata["status"]=json!("failed");
+                task.stderr.as_mut().unwrap().commit(self,format!("Background launch failed: {error}\n").as_bytes())?;
+                metadata["stdout"]=task.stdout.take().unwrap().finish(self,true)?;
+                metadata["stderr"]=task.stderr.take().unwrap().finish(self,true)?;
+                for key in ["stdout","stderr"]{metadata[key].as_object_mut().unwrap().remove("preview");}
+                metadata["finished_ms"]=json!(now_ms());
+            }
+        }
+        task.metadata=metadata.clone();self.bg_tasks.insert(id.clone(),task);
+        if metadata["status"]=="failed"{self.bg_settle(&metadata)?;}else{self.bg_save_task(&metadata)?;}
+        Ok(metadata)
+    }
+    fn bg_list(&mut self,state:Option<&str>)->Result<Value>{
+        self.service_background()?;
+        if state.is_some_and(|s|!["all","starting","running","cancelling","finished","succeeded","failed","cancelled","killed","timed_out","outcome_unknown"].contains(&s)){return Err("unknown task state filter".into());}
+        let mut tasks:Vec<_>=self.bg_tasks.values().map(|t|t.metadata.clone())
+            .filter(|m|state.is_none_or(|s|s=="all"||m["status"]==s||s=="finished"&&!matches!(m["status"].as_str(),Some("starting"|"running"|"cancelling")))) .collect();
+        tasks.sort_by_key(|m|m["created_ms"].as_u64().unwrap_or(0));Ok(json!(tasks))
+    }
+    fn bg_get(&mut self,id:&str)->Result<Value>{
+        self.service_background()?;Ok(self.bg_tasks.get(id).ok_or("unknown task ID")?.metadata.clone())
+    }
+    fn bg_kill(&mut self,id:&str,force:bool)->Result<Value>{
+        self.service_background()?;
+        let task=self.bg_tasks.get_mut(id).ok_or("unknown task ID")?;
+        if let Some(child)=task.child.as_ref().filter(|_|task.reaped.is_none()){
+            let signal=if force{libc::SIGKILL}else{libc::SIGTERM};
+            if unsafe{libc::kill(-(child.id() as i32),signal)}<0&&io::Error::last_os_error().raw_os_error()!=Some(libc::ESRCH){return Err(io::Error::last_os_error().into());}
+            if task.cancel_at.is_none(){task.cancel_at=Some(std::time::Instant::now());task.terminal_status=Some(if force{"killed"}else{"cancelled"}.into());}
+            else if force&&task.terminal_status.as_deref()!=Some("timed_out"){task.terminal_status=Some("killed".into());}
+            task.metadata["status"]=json!("cancelling");
+            let metadata=task.metadata.clone();self.bg_save_task(&metadata)?;
+        }
+        Ok(self.bg_tasks.get(id).unwrap().metadata.clone())
+    }
+    fn bg_settle(&mut self,metadata:&Value)->Result<()>{
+        let wakeup=metadata["wakeup_reason"].as_str().map(|reason|json!({
+            "id":format!("wake{}",self.journal.seq),"reason":reason,"due_ms":now_ms(),
+            "state":"ready","task":metadata}));
+        // Terminal status and opt-in wakeup creation are one durable transition.
+        self.journal.append("task_settled",json!({"operation":metadata["id"],"status":metadata["status"],"task":metadata,"wakeup":wakeup}))?;
+        self.event("task_state",metadata.clone());
+        if let Some(w)=wakeup{
+            self.event("wakeup_state",w.clone());
+            self.wakeups.insert(w["id"].as_str().unwrap().into(),Wakeup{metadata:w,deadline:None});
+        }
+        Ok(())
+    }
+    fn service_background(&mut self)->Result<()>{
+        if self.journal.failed{
+            self.bg_abort();return Err("session journal failed; owned background jobs terminated, capture may be partial".into());
+        }
+        if self.servicing{return Ok(());}
+        self.poll_busy_input()?;
+        self.servicing=true;
+        let result=self.service_background_inner();self.servicing=false;
+        if result.is_err(){self.bg_abort();}
+        result
+    }
+    fn bg_abort(&mut self){
+        // No more journal writes after a persistence failure, not even cleanup.
+        for task in self.bg_tasks.values_mut(){
+            if let Some(mut child)=task.child.take(){
+                if task.reaped.is_none(){
+                    unsafe{libc::kill(-(child.id() as i32),libc::SIGKILL);}
+                    let _=child.kill();let _=child.wait();
+                }
+                task.metadata["status"]=json!("outcome_unknown");
+                task.metadata.as_object_mut().unwrap().remove("pid");
+                for name in ["stdout","stderr"]{task.metadata[name]["complete"]=json!(false);}
+            }
+        }
+    }
+    fn service_background_inner(&mut self)->Result<()>{
+        let ids:Vec<_>=self.bg_tasks.iter().filter_map(|(id,t)|t.child.as_ref().map(|_|id.clone())).collect();
+        for id in ids{
+            let mut task=self.bg_tasks.remove(&id).unwrap();
+            let result=(||->Result<bool>{
+                let more_out=if let Some(out)=task.stdout.as_mut(){let more=out.drain(self)?;task.metadata["stdout"]["bytes"]=json!(out.bytes);more}else{false};
+                let more_err=if let Some(err)=task.stderr.as_mut(){let more=err.drain(self)?;task.metadata["stderr"]["bytes"]=json!(err.bytes);more}else{false};
+                let now=std::time::Instant::now();
+                let child=task.child.as_mut().unwrap();
+                let mut exit=if let Some(exit)=task.reaped{Some(exit)}else{child.try_wait()?};
+                if exit.is_none(){
+                    if task.cancel_at.is_none()&&task.deadline.is_some_and(|d|now>=d){
+                        unsafe{libc::kill(-(child.id() as i32),libc::SIGTERM);}
+                        task.cancel_at=Some(now);task.terminal_status=Some("timed_out".into());task.metadata["status"]=json!("cancelling");
+                        self.bg_save_task(&task.metadata)?;
+                    }
+                    if task.cancel_at.is_some_and(|t|now.duration_since(t)>=std::time::Duration::from_millis(500)){
+                        unsafe{libc::kill(-(child.id() as i32),libc::SIGKILL);}
+                        exit=child.try_wait()?;
+                    }
+                }
+                if let Some(exit)=exit{
+                    // Reap once, then finish the backlog across bounded pump ticks.
+                    if task.reaped.is_none(){
+                        unsafe{libc::kill(-(child.id() as i32),libc::SIGKILL);}
+                        task.reaped=Some(exit);
+                        return Ok(false);
+                    }
+                    if more_out||more_err{return Ok(false);}
+                    task.child.take();
+                    task.metadata["stdout"]=task.stdout.take().unwrap().finish_metadata(self,true)?;
+                    task.metadata["stderr"]=task.stderr.take().unwrap().finish_metadata(self,true)?;
+                    for key in ["stdout","stderr"]{task.metadata[key].as_object_mut().unwrap().remove("preview");}
+                    task.metadata["status"]=json!(task.terminal_status.clone().unwrap_or_else(||if exit.success(){"succeeded"}else{"failed"}.into()));
+                    task.metadata["exit_code"]=json!(exit.code());task.metadata["finished_ms"]=json!(now_ms());
+                    self.bg_settle(&task.metadata)?;
+                    return Ok(true);
+                }
+                Ok(false)
+            })();
+            self.bg_tasks.insert(id,task);
+            result?;
+        }
+        let mut ready=Vec::new();
+        for wakeup in self.wakeups.values_mut(){
+            if wakeup.metadata["state"]=="scheduled"&&wakeup.deadline.is_some_and(|due|due<=std::time::Instant::now()){
+                wakeup.metadata["state"]=json!("ready");ready.push(wakeup.metadata.clone());
+            }
+        }
+        for metadata in ready{self.bg_save_wakeup(&metadata)?;}
+        Ok(())
+    }
+    fn schedule_wakeup(&mut self,seconds:f64,reason:&str,task:Option<Value>)->Result<Value>{
+        bg_seconds(&json!(seconds),604800.0)?;
+        bg_text(&json!({"reason":reason}),"reason",512)?;
+        let metadata=json!({"id":format!("wake{}",self.journal.seq),"reason":reason,
+            "due_ms":now_ms()+(seconds*1000.0).ceil() as u128,"state":"scheduled","task":task,"stop_settled":task.is_none()});
+        self.bg_save_wakeup(&metadata)?;
+        self.wakeups.insert(metadata["id"].as_str().unwrap().into(),Wakeup{metadata:metadata.clone(),
+            deadline:Some(std::time::Instant::now()+std::time::Duration::from_secs_f64(seconds))});Ok(metadata)
+    }
+    fn wakeup_list(&mut self)->Result<Value>{
+        self.service_background()?;let mut entries:Vec<_>=self.wakeups.values().map(|w|w.metadata.clone()).collect();
+        entries.sort_by_key(|m|m["due_ms"].as_u64().unwrap_or(0));Ok(json!(entries))
+    }
+    fn wakeup_cancel(&mut self,id:&str)->Result<Value>{
+        let w=self.wakeups.get_mut(id).ok_or("unknown wakeup ID")?;
+        if w.metadata["state"]=="cancelled"{return Ok(w.metadata.clone());}
+        if !matches!(w.metadata["state"].as_str(),Some("scheduled"|"ready"|"pending_confirmation")){return Err("wakeup is already settled".into());}
+        w.metadata["state"]=json!("cancelled");let metadata=w.metadata.clone();self.bg_save_wakeup(&metadata)?;Ok(metadata)
+    }
+    fn wakeup_run(&mut self,id:&str)->Result<Value>{
+        let w=self.wakeups.get_mut(id).ok_or("unknown wakeup ID")?;
+        if !matches!(w.metadata["state"].as_str(),Some("scheduled"|"ready"|"pending_confirmation")){return Err("wakeup is already settled".into());}
+        w.metadata["state"]=json!("ready");let metadata=w.metadata.clone();self.bg_save_wakeup(&metadata)?;Ok(metadata)
+    }
+    // Called only at an idle/safe boundary, never from servicing a busy operation.
+    fn dispatch_wakeups(&mut self)->Result<bool>{
+        self.service_background()?;
+        if !self.pending.is_empty(){return Ok(false);}
+        if let Some(command)=self.incoming.as_ref().and_then(|r|r.try_recv().ok()){
+            if !self.background_control(&command)?{self.queue_arrival(command)?;}
+            return Ok(false);
+        }
+        let mut ids:Vec<_>=self.wakeups.iter().filter_map(|(id,w)|(w.metadata["state"]=="ready").then_some(id.clone())).collect();
+        ids.sort();if ids.is_empty(){return Ok(false);}
+        let mut batch=Vec::new();
+        for id in &ids{
+            let w=self.wakeups.get_mut(id).unwrap();w.metadata["state"]=json!("dispatching");
+            let metadata=w.metadata.clone();self.bg_save_wakeup(&metadata)?;batch.push(metadata);
+        }
+        let notice=json!({"wakeups":batch});
+        if self.no_model{self.event("notice",json!({"text":format!("Wakeup: {notice}")}));}
+        else{
+            self.add_context("user",format!("Scheduled continuation (metadata only): {notice}"),false,vec![])?;
+        }
+        // A crash while dispatched remains outcome_unknown on resume, never replayed.
+        let result=if self.no_model{Ok(())}else{self.run_agent()};
+        for id in ids{
+            let w=self.wakeups.get_mut(&id).unwrap();w.metadata["state"]=json!("consumed");
+            let metadata=w.metadata.clone();self.bg_save_wakeup(&metadata)?;
+        }
+        result?;Ok(true)
+    }
+    fn bg_restore(&mut self,kind:&str,p:&Value)->Result<()>{
+        if kind=="task_settled"{
+            self.bg_restore("task_state",&p["task"])?;
+            if !p["wakeup"].is_null(){self.bg_restore("wakeup_state",&p["wakeup"])?;}
+            return Ok(());
+        }
+        let id=p["id"].as_str().ok_or("invalid background journal ID")?.to_owned();
+        match kind{
+            "task_state"=>{self.bg_tasks.insert(id,BgTask{child:None,stdout:None,stderr:None,dir:PathBuf::new(),
+                metadata:p.clone(),deadline:None,cancel_at:None,terminal_status:None,reaped:None});},
+            "wakeup_state"=>{self.wakeups.insert(id,Wakeup{metadata:p.clone(),deadline:None});},_=>{}
+        }
+        Ok(())
+    }
+    fn bg_recover(&mut self)->Result<()>{
+        let mut tasks=Vec::new();let mut wakeups=Vec::new();
+        for task in self.bg_tasks.values_mut(){
+            if matches!(task.metadata["status"].as_str(),Some("starting"|"running"|"cancelling")){
+                task.metadata["status"]=json!("outcome_unknown");task.metadata["replay_allowed"]=json!(false);
+                task.metadata.as_object_mut().unwrap().remove("pid");
+                for name in ["stdout","stderr"]{
+                    let mut bytes=0usize;
+                    if let Some(index)=task.metadata[name]["index"].as_u64(){
+                        if let Some(chunks)=self.history[name].get(index as usize).and_then(|v|v["$chunks"].as_array()){
+                            for seq in chunks{
+                                let event=self.journal.event(seq.as_u64().ok_or("invalid stream chunk")? as usize)?;
+                                let data=event["payload"]["base64"].as_str().ok_or("invalid stream bytes")?;
+                                bytes+=data.len()/4*3-data.bytes().rev().take_while(|b|*b==b'=').count();
+                            }
+                        }
+                    }
+                    task.metadata[name]["bytes"]=json!(bytes);task.metadata[name]["complete"]=json!(false);
+                }
+                tasks.push(task.metadata.clone());
+            }
+        }
+        for w in self.wakeups.values_mut(){
+            if matches!(w.metadata["state"].as_str(),Some("scheduled"|"ready"|"dispatching")){
+                w.metadata["state"]=json!(if w.metadata["state"]=="dispatching"{"outcome_unknown"}else{"pending_confirmation"});wakeups.push(w.metadata.clone());
+            }
+        }
+        for metadata in tasks{self.bg_save_task(&metadata)?;}
+        for metadata in wakeups{self.bg_save_wakeup(&metadata)?;}
+        Ok(())
+    }
+    fn bg_guard(&mut self,cancel:bool)->Result<()>{
+        self.service_background()?;
+        if self.bg_tasks.values().any(|t|t.child.is_some()){
+            if !cancel{return Err("background jobs are running; kill them first or request --cancel-tasks".into());}
+            self.bg_shutdown()?;
+        }
+        Ok(())
+    }
+    fn bg_shutdown(&mut self)->Result<()>{
+        let ids:Vec<_>=self.bg_tasks.iter().filter_map(|(id,t)|t.child.as_ref().map(|_|id.clone())).collect();
+        for id in &ids{self.bg_kill(id,false)?;}
+        let deadline=std::time::Instant::now()+std::time::Duration::from_millis(750);
+        while self.bg_tasks.values().any(|t|t.child.is_some())&&std::time::Instant::now()<deadline{
+            self.service_background()?;std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for id in &ids{
+            if self.bg_tasks.get(id).is_some_and(|t|t.child.is_some()){
+                self.bg_kill(id,true)?;
+            }
+        }
+        let deadline=std::time::Instant::now()+std::time::Duration::from_millis(250);
+        while self.bg_tasks.values().any(|t|t.child.is_some())&&std::time::Instant::now()<deadline{
+            self.service_background()?;std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // A large backlog or escaped writer must not make shutdown unbounded.
+        // Preserve captured bytes explicitly as partial rather than claiming EOF.
+        for id in ids{
+            let mut task=self.bg_tasks.remove(&id).unwrap();
+            let result=(||->Result<()>{
+                if let Some(mut child)=task.child.take(){
+                    if task.reaped.is_none(){child.wait()?;}
+                    task.metadata["stdout"]=task.stdout.take().unwrap().finish_metadata(self,false)?;
+                    task.metadata["stderr"]=task.stderr.take().unwrap().finish_metadata(self,false)?;
+                    for name in ["stdout","stderr"]{task.metadata[name].as_object_mut().unwrap().remove("preview");}
+                    task.metadata["status"]=json!(task.terminal_status.clone().unwrap_or_else(||"cancelled".into()));
+                    task.metadata["finished_ms"]=json!(now_ms());self.bg_settle(&task.metadata)?;
+                }
+                Ok(())
+            })();
+            self.bg_tasks.insert(id,task);result?;
+        }
+        Ok(())
+    }
+}
+
+
+// =============================================================================
+// Model catalog normalization and refresh
+// =============================================================================
+
+// Pure, bounded catalog normalization. Remote instructions and tool metadata
+// are intentionally never copied into normalized descriptors.
+fn catalog_safe_id(id:&str)->bool{
+    !id.is_empty()&&id.len()<=128&&id.bytes().all(|c|c.is_ascii_alphanumeric()||matches!(c,b'.'|b'_'|b'-'))
+}
+// OpenAI fine-tuned model IDs contain colons; Codex native slugs do not.
+fn catalog_api_id(id:&str)->bool{
+    !id.is_empty()&&id.len()<=128&&id.bytes().all(|c|c.is_ascii_alphanumeric()||matches!(c,b'.'|b'_'|b'-'|b':'))
+}
+fn catalog_safe_label(text:&str,max:usize)->bool{
+    !text.trim().is_empty()&&text.chars().count()<=max
+        &&!text.chars().any(|c|c.is_control()||matches!(c,'\u{2028}'|'\u{2029}'))
+}
+fn catalog_optional_limit(item:&Value,key:&str)->Result<Option<u64>>{
+    match item.get(key){
+        None|Some(Value::Null)=>Ok(None),
+        Some(value)=>{
+            let n=value.as_u64().filter(|n|(1..=16777216).contains(n))
+                .ok_or_else(||format!("Invalid model catalog {key}: expected an integer in 1..=16777216"))?;
+            Ok(Some(n))
+        }
+    }
+}
+fn catalog_effort(effort:&str)->Option<&str>{
+    match effort{
+        "none"=>Some("off"),
+        "off"|"minimal"|"low"|"medium"|"high"|"xhigh"|"max"=>Some(effort),
+        _=>None,
+    }
+}
+fn catalog_aliases(slug:&str,base:Option<&Value>)->Vec<String>{
+    let mut aliases=base.and_then(|m|m["aliases"].as_array()).map(|values|values.iter()
+        .filter_map(Value::as_str).filter(|s|catalog_safe_id(s)).map(str::to_string).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some((version,kind))=slug.strip_prefix("gpt-").and_then(|s|s.rsplit_once('-')){
+        if ["sol","astra","luna","terra"].contains(&kind)&&!version.is_empty()
+            &&!version.starts_with('.')&&!version.ends_with('.')
+            &&version.bytes().all(|c|c.is_ascii_digit()||c==b'.'){
+            let alias=format!("{kind}{}",version.replace('.',""));
+            if catalog_safe_id(&alias)&&!aliases.contains(&alias){aliases.push(alias);}
+        }
+    }
+    aliases
+}
+fn normalize_codex_catalog(body:&Value,base:&[Value])->Result<Vec<Value>>{
+    let entries=body["models"].as_array().ok_or("Codex model catalog requires a models array")?;
+    if entries.len()>2048{return Err("Codex model catalog exceeds 2048 entries".into());}
+    let mut seen=std::collections::HashSet::new();
+    let mut normalized=Vec::new();
+    for item in entries{
+        let slug=item["slug"].as_str().filter(|id|catalog_safe_id(id)).ok_or("Invalid Codex catalog model slug")?;
+        if !seen.insert(slug){return Err(format!("Duplicate Codex catalog model slug: {slug}").into());}
+        let name=item["display_name"].as_str().filter(|s|catalog_safe_label(s,256))
+            .ok_or("Invalid Codex catalog model display_name")?;
+        let visibility=item["visibility"].as_str().filter(|s|matches!(*s,"list"|"hide"|"none"))
+            .ok_or("Invalid Codex catalog model visibility")?;
+        let context=catalog_optional_limit(item,"context_window")?;
+        let maximum=catalog_optional_limit(item,"max_context_window")?;
+        let context=context.or(maximum);
+        let percent=match item.get("effective_context_window_percent"){
+            None=>95,
+            Some(value)=>value.as_u64().filter(|n|(1..=100).contains(n))
+                .ok_or("Invalid Codex effective_context_window_percent")?,
+        };
+        let input=context.map(|n|n*percent/100);
+        if input==Some(0){return Err("Codex effective input limit must be positive".into());}
+        let priority=match item.get("priority"){
+            None=>i32::MAX as i64,
+            Some(value)=>value.as_i64().filter(|n|(i32::MIN as i64..=i32::MAX as i64).contains(n))
+                .ok_or("Invalid Codex catalog priority")?,
+        };
+        let mut levels=Vec::new();
+        match item.get("supported_reasoning_levels"){
+            None=>{},
+            Some(value)=>{
+                for level in value.as_array().filter(|a|a.len()<=32).ok_or("Invalid Codex supported_reasoning_levels")?{
+                    let effort=level["effort"].as_str().filter(|s|catalog_safe_id(s)&&s.len()<=32)
+                        .ok_or("Invalid Codex reasoning effort preset")?;
+                    if let Some(effort)=catalog_effort(effort){
+                        if !levels.contains(&effort){levels.push(effort);}
+                    }
+                }
+            }
+        }
+        let preferred=match item.get("default_reasoning_level"){
+            None|Some(Value::Null)=>None,
+            Some(value)=>Some(value.as_str().filter(|s|catalog_safe_id(s)&&s.len()<=32)
+                .ok_or("Invalid Codex default_reasoning_level")?),
+        };
+        let default=preferred.and_then(catalog_effort).filter(|s|levels.contains(s))
+            .or_else(||if levels.contains(&"medium"){Some("medium")}else{levels.first().copied()});
+        let image_input=match item.get("input_modalities"){
+            None=>true, // The native schema's documented default.
+            Some(value)=>{
+                let modalities=value.as_array().filter(|a|a.len()<=32).ok_or("Invalid Codex input_modalities")?;
+                for modality in modalities{
+                    if !modality.as_str().is_some_and(|s|catalog_safe_id(s)&&s.len()<=32){
+                        return Err("Invalid Codex input modality".into());
+                    }
+                }
+                modalities.iter().any(|v|v=="image")
+            }
+        };
+        // Validate hidden descriptors too: never accept a partial malformed catalog.
+        if visibility!="list"{continue;}
+        let id=format!("openai-codex/{slug}");
+        let known=base.iter().find(|m|m["id"]==id);
+        normalized.push(json!({"id":id,"name":name,"provider":"openai-codex",
+            "api":"openai-codex-responses","aliases":catalog_aliases(slug,known),
+            "context_limit":context,"max_input_tokens":input,"reasoning":!levels.is_empty(),
+            "reasoning_efforts":levels,"default_effort":default,"image_input":image_input,
+            "image_output":false,"deprecated":false,"priority":priority,
+            "metadata_complete":context.is_some()&&!levels.is_empty(),
+            "catalog_listed":true,"source":"provider-discovery"}));
+    }
+    normalized.sort_by(|a,b|a["priority"].as_i64().cmp(&b["priority"].as_i64())
+        .then_with(||a["id"].as_str().cmp(&b["id"].as_str())));
+    Ok(normalized)
+}
+fn normalize_openai_catalog(body:&Value,base:&[Value],provider:&str)->Result<Vec<Value>>{
+    if !catalog_safe_id(provider){return Err("Invalid model catalog provider ID".into());}
+    let entries=body["data"].as_array().ok_or("API model catalog requires a data array")?;
+    if entries.len()>2048{return Err("API model catalog exceeds 2048 entries".into());}
+    let mut seen=std::collections::HashSet::new();
+    let mut normalized=Vec::new();
+    for entry in entries{
+        let slug=entry["id"].as_str().filter(|id|catalog_api_id(id)).ok_or("Invalid API catalog model ID")?;
+        if !seen.insert(slug){return Err(format!("Duplicate API catalog model ID: {slug}").into());}
+        let id=format!("{provider}/{slug}");
+        let known=base.iter().find(|m|m["id"]==id);
+        let mut model=json!({"id":id,"name":slug,"provider":provider,"context_limit":null,
+            "metadata_complete":false,"catalog_listed":true,"source":"provider-discovery"});
+        if let Some(known)=known{
+            // /models proves availability only, not protocol or capabilities.
+            for key in ["name","api","context_limit","max_input_tokens","max_tokens","image_input",
+                "image_output","reasoning","reasoning_efforts","default_effort","aliases","deprecated"]{
+                if let Some(value)=known.get(key){model[key]=value.clone();}
+            }
+            model["metadata_complete"]=json!(known["metadata_complete"]!=false
+                &&known["context_limit"].as_u64().is_some_and(|n|(1..=16777216).contains(&n))
+                &&known["api"].as_str().is_some_and(|s|!s.is_empty()));
+        }
+        normalized.push(model);
+    }
+    normalized.sort_by(|a,b|a["id"].as_str().cmp(&b["id"].as_str()));
+    Ok(normalized)
+}
+
+const MODEL_CATALOG_MAX_BYTES:u64=8*1024*1024;
+// Native catalog compatibility revision, not this harness's package version.
+// Current upstream metadata requires 0.153/0.155 for the GPT-6 family.
+fn model_catalog_defaults()->Value{json!({"auto_refresh":true,"refresh_interval_seconds":3600,"retry_interval_seconds":300,"codex_client_version":"0.155.0"})}
+fn model_catalog_options(config:&Value)->Result<Value>{
+    let mut options=model_catalog_defaults();
+    if let Some(value)=config.get("model_catalog"){
+        for (key,value) in value.as_object().ok_or("model_catalog must be an object")?{
+            if options.get(key).is_none(){return Err(format!("unknown model_catalog option {key}").into());}
+            if key=="auto_refresh"{if !value.is_boolean(){return Err("model_catalog.auto_refresh must be boolean".into());}}
+            else if key=="codex_client_version"{
+                if !value.as_str().is_some_and(|s|s.len()<=32&&s.split('.').count()==3&&s.split('.').all(|p|!p.is_empty()&&p.bytes().all(|b|b.is_ascii_digit())&&p.parse::<u32>().is_ok())){return Err("model_catalog.codex_client_version must be a numeric major.minor.patch string".into());}
+            }
+            else if !value.as_u64().is_some_and(|n|(1..=604800).contains(&n)){return Err(format!("model_catalog.{key} must be an integer in 1..=604800").into());}
+            options[key]=value.clone();
+        }
+    }
+    Ok(options)
+}
+fn catalog_contains_secret(value:&Value,secrets:&[String])->bool{
+    match value{
+        Value::String(text)=>secrets.iter().any(|s|!s.is_empty()&&text.contains(s)),
+        Value::Array(values)=>values.iter().any(|v|catalog_contains_secret(v,secrets)),
+        Value::Object(values)=>values.values().any(|v|catalog_contains_secret(v,secrets)),_=>false
+    }
+}
+fn empty_model_catalog()->Value{json!({"version":1,"providers":{}})}
+fn load_model_catalog(path:&Path)->Result<Value>{
+    let file=match OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path){
+        Ok(file)=>file,Err(error)if error.kind()==io::ErrorKind::NotFound=>return Ok(empty_model_catalog()),Err(error)=>return Err(error.into())
+    };
+    if !file.metadata()?.is_file()||file.metadata()?.len()>MODEL_CATALOG_MAX_BYTES{return Err("model catalog cache must be a regular file of at most 8 MiB".into());}
+    let mut cache:Value=serde_json::from_reader(file)?;
+    if cache["version"]!=1||!cache["providers"].is_object(){return Err("invalid model catalog cache".into());}
+    for (provider,record) in cache["providers"].as_object_mut().unwrap(){
+        if !["openai","openai-codex"].contains(&provider.as_str())||!record["identity"].as_str().is_some_and(|s|s.len()==64&&s.bytes().all(|c|c.is_ascii_hexdigit())){
+            return Err("invalid model catalog cache identity".into());
+        }
+        for key in ["fetched_at_ms","attempted_at_ms"]{if record.get(key).is_some_and(|v|!v.is_u64()){return Err("invalid model catalog timestamp".into());}}
+        if let Some(models)=record.get_mut("models"){
+            let models=models.as_array_mut().filter(|m|m.len()<=2048).ok_or("invalid model catalog cache entries")?;
+            let mut seen=HashSet::new();
+            for model in models{
+                let id=model["id"].as_str().ok_or("invalid cached model ID")?;
+                let (p,slug)=id.split_once('/').ok_or("invalid cached model ID")?;
+                let valid_slug=if provider=="openai-codex"{catalog_safe_id(slug)}else{catalog_api_id(slug)};
+                if p!=provider.as_str()||!valid_slug||!seen.insert(id.to_string()){return Err("invalid cached model identity".into());}
+                if !model["name"].as_str().is_some_and(|s|catalog_safe_label(s,256))||!model["metadata_complete"].is_boolean(){return Err("invalid cached model metadata".into());}
+                for key in ["context_limit","max_input_tokens","max_tokens"]{catalog_optional_limit(model,key)?;}
+                if let Some(levels)=model.get("reasoning_efforts"){
+                    if !levels.as_array().is_some_and(|a|a.len()<=7&&a.iter().all(|v|v.as_str().is_some_and(|s|catalog_effort(s)==Some(s)))){return Err("invalid cached model effort metadata".into());}
+                }
+                for key in ["reasoning","image_input","image_output","deprecated"]{if model.get(key).is_some_and(|v|!v.is_boolean()){return Err("invalid cached model capability".into());}}
+                if model["metadata_complete"]==true&&(!model["context_limit"].is_u64()
+                    ||!model["api"].as_str().is_some_and(|s|["openai-codex-responses","openai-responses","openai-completions","image-generation"].contains(&s))
+                    ||(provider=="openai-codex"&&(!model["reasoning_efforts"].as_array().is_some_and(|a|!a.is_empty())||model["api"]!="openai-codex-responses"))){return Err("inconsistent cached model capabilities".into());}
+                if let Some(aliases)=model.get("aliases"){
+                    if !aliases.as_array().is_some_and(|a|a.len()<=32&&a.iter().all(|v|v.as_str().is_some_and(catalog_safe_id))){return Err("invalid cached model aliases".into());}
+                }
+                let mut safe=json!({});
+                for key in ["id","name","api","context_limit","max_input_tokens","max_tokens","reasoning","reasoning_efforts","default_effort","image_input","image_output","deprecated","priority","aliases","metadata_complete"]{
+                    if let Some(value)=model.get(key){safe[key]=value.clone();}
+                }
+                safe["provider"]=json!(provider);safe["source"]=json!("provider-discovery");safe["catalog_listed"]=json!(true);*model=safe;
+            }
+        }
+    }
+    Ok(cache)
+}
+impl Host{
+    fn catalog_endpoint(&self,provider:&str)->Result<(String,String)>{
+        let provider=provider_alias(provider);
+        if !["openai","openai-codex"].contains(&provider){return Err("catalog refresh currently supports codex and openai; other providers retain offline/configured inventory".into());}
+        let (base,key,_)=self.provider_config(&format!("{provider}/catalog-discovery"))?;
+        let endpoint=if provider=="openai-codex"{
+            let base=base.strip_suffix("/codex/responses").map(|s|format!("{s}/codex")).unwrap_or(base);
+            if base.ends_with("/codex"){format!("{base}/models")}else{format!("{base}/codex/models")}
+        }else{format!("{}/models",base.trim_end_matches('/'))};
+        Ok((endpoint,key))
+    }
+    fn catalog_identity(&self,provider:&str)->Option<String>{
+        let provider=provider_alias(provider);
+        let (endpoint,key)=self.catalog_endpoint(provider).ok()?;
+        // Credential/account/endpoint-bound; no plaintext identity or token is cached.
+        let principal=if provider=="openai-codex"{
+            key.split('.').nth(1).and_then(|part|base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(part.trim_end_matches('=')).ok())
+                .and_then(|bytes|serde_json::from_slice::<Value>(&bytes).ok())
+                .filter(|claims|claims["https://api.openai.com/auth"]["chatgpt_account_id"]==self.auth[provider]["accountId"])
+                .map(|claims|json!({"auth":claims["https://api.openai.com/auth"],"profile":claims["https://api.openai.com/profile"],"subject":claims["sub"],"email":claims["email"]}).to_string()).unwrap_or(key)
+        }else{key};
+        let revision=if provider=="openai-codex"{model_catalog_options(&self.config_defaults).ok()?["codex_client_version"].as_str()?.to_string()}else{String::new()};
+        let scope=format!("{provider}\0{endpoint}\0{principal}\0{revision}\0{}",self.auth[provider]["accountId"].as_str().unwrap_or(""));
+        Some(ring::digest::digest(&ring::digest::SHA256,scope.as_bytes()).as_ref().iter().map(|b|format!("{b:02x}")).collect())
+    }
+    fn catalog_auto_enabled(&self)->bool{
+        match std::env::var("PY_MODEL_CATALOG_AUTO_REFRESH").ok().as_deref(){Some("0"|"false")=>false,Some("1"|"true")=>true,_=>model_catalog_options(&self.config_defaults).map_or(false,|v|v["auto_refresh"]==true)}
+    }
+    fn maybe_refresh_model_catalog(&mut self,provider:&str){
+        if !self.catalog_auto_enabled()||self.catalog_identity(provider).is_none(){return;}
+        if let Err(error)=self.refresh_model_catalog(provider,false){
+            self.event("notice",json!({"text":format!("Model catalog refresh failed: {error}. Keeping cached/offline inventory; /model list refresh retries explicitly.")}));
+        }
+    }
+    fn refresh_model_catalog(&mut self,provider:&str,force:bool)->Result<bool>{
+        let provider=provider_alias(provider).to_string();
+        self.reload_auth()?;
+        self.catalog_endpoint(&provider)?;
+        let before=self.catalog_identity(&provider).ok_or("catalog refresh requires credentials; /login the provider first")?;
+        let record=&self.catalog["providers"][&provider];let now=now_ms() as u64;
+        let options=model_catalog_options(&self.config_defaults)?;
+        if !force&&record["identity"]==before{
+            let recent=|key:&str,seconds:u64|record[key].as_u64().is_some_and(|t|t<=now&&now-t<seconds*1000);
+            if recent("fetched_at_ms",options["refresh_interval_seconds"].as_u64().unwrap())||recent("attempted_at_ms",options["retry_interval_seconds"].as_u64().unwrap()){return Ok(false);}
+        }
+        self.event("notice",json!({"text":format!("Refreshing {provider} model catalog…")}));
+        let cancel_revision=self.cancel_revision;
+        let result=self.with_state(UiState::Running,None,|host|{
+            if provider=="openai-codex"{host.refresh_codex()?;}
+            let (endpoint,key)=host.catalog_endpoint(&provider)?;
+            let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).build()?;
+            let mut request=client.get(endpoint).bearer_auth(&key).header("Accept","application/json").header("originator","py").header("User-Agent","py-rust/0.1.0");
+            if provider=="openai-codex"{
+                request=request.query(&[("client_version",options["codex_client_version"].as_str().unwrap())]).header("chatgpt-account-id",host.auth["openai-codex"]["accountId"].as_str().ok_or("Codex account ID missing")?);
+            }
+            let mut secrets=Vec::new();credential_secret_values(&host.auth,&mut secrets);secrets.push(key);
+            let body=host.codex_wait(async{
+                let mut response=request.send().await.map_err(|_|"model catalog network error")?;let status=response.status();let mut bytes=Vec::new();
+                while let Some(chunk)=response.chunk().await.map_err(|_|"model catalog response disconnected")?{
+                    if bytes.len() as u64+chunk.len() as u64>MODEL_CATALOG_MAX_BYTES{return Err("model catalog response exceeds 8 MiB".into());}bytes.extend_from_slice(&chunk);
+                }
+                if !status.is_success(){return Err(format!("model catalog HTTP {status}{}",codex_error_detail(&bytes,&secrets)).into());}
+                Ok(serde_json::from_slice::<Value>(&bytes).map_err(|_|"model catalog returned invalid JSON")?)
+            },"model_catalog")?;
+            let base=host.models();
+            if provider=="openai-codex"{normalize_codex_catalog(&body,base.as_array().unwrap())}else{normalize_openai_catalog(&body,base.as_array().unwrap(),&provider)}
+        });
+        // Metadata/validation failures may echo a credential in an ID or label too.
+        let mut secrets=Vec::new();credential_secret_values(&self.auth,&mut secrets);
+        if let Ok((_,key))=self.catalog_endpoint(&provider){secrets.push(key);}
+        let mut result:Result<Vec<Value>>=result.map_err(|error|format!("model catalog refresh{}",codex_error_detail(error.to_string().as_bytes(),&secrets)).into());
+        if result.as_ref().is_ok_and(|models|catalog_contains_secret(&json!(models),&secrets)){
+            result=Err("model catalog contained reflected credential data; update rejected".into());
+        }
+        // Tokens can rotate during refresh; bind the response to the actual principal.
+        let identity=self.catalog_identity(&provider).unwrap_or(before);
+        let mut record=if self.catalog["providers"][&provider]["identity"]==identity{self.catalog["providers"][&provider].clone()}else{json!({"identity":identity})};
+        record["attempted_at_ms"]=json!(now_ms() as u64);
+        if self.cancel_revision!=cancel_revision{return Err("model catalog refresh cancelled; previous cache retained".into());}
+        if let Ok(models)=&result{record["models"]=json!(models);record["fetched_at_ms"]=json!(now_ms() as u64);}
+        self.commit_model_catalog(&provider,record)?;
+        self.context_limit=self.model_limit(&self.model)?;
+        match result{
+            Ok(models)=>{
+                self.journal.append("model_catalog_refresh",json!({"provider":provider,"count":models.len(),"fetched_at_ms":now_ms() as u64}))?;
+                self.event("notice",json!({"text":format!("Updated {provider} model catalog: {} entries. Active model and session prompt unchanged.",models.len())}));Ok(true)
+            },Err(error)=>Err(error)
+        }
+    }
+    fn commit_model_catalog(&mut self,provider:&str,mut record:Value)->Result<()>{
+        let lock=OpenOptions::new().create(true).read(true).write(true).truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(self.home.join("models.lock"))?;
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        loop{
+            if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0{break;}
+            let error=io::Error::last_os_error();if error.raw_os_error()!=Some(libc::EWOULDBLOCK){return Err(error.into());}
+            if std::time::Instant::now()>=deadline||self.codex_cancel("model_catalog")?{return Err("model catalog cache busy/cancelled; previous cache retained".into());}
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let path=self.home.join("models.json");
+        let mut cache=load_model_catalog(&path).unwrap_or_else(|_|empty_model_catalog());
+        let latest=&cache["providers"][provider];
+        // A failed/older concurrent request must not replace a newer good snapshot.
+        if latest["identity"]==record["identity"]&&latest["models"].is_array()
+            &&latest["fetched_at_ms"].as_u64().unwrap_or(0)>record["fetched_at_ms"].as_u64().unwrap_or(0){
+            record["models"]=latest["models"].clone();record["fetched_at_ms"]=latest["fetched_at_ms"].clone();
+        }
+        record["attempted_at_ms"]=json!(record["attempted_at_ms"].as_u64().unwrap_or(0).max(latest["attempted_at_ms"].as_u64().unwrap_or(0)));
+        cache["providers"][provider]=record;
+        if serde_json::to_vec(&cache)?.len() as u64>MODEL_CATALOG_MAX_BYTES{return Err("normalized model cache exceeds 8 MiB".into());}
+        write_private_json(&path,&cache)?;self.catalog=cache;Ok(())
+    }
+    fn model_list_command(&mut self,args:&str)->Result<()>{
+        let (verb,rest)=args.split_once(char::is_whitespace).map(|(a,b)|(a,b.trim())).unwrap_or((args,""));
+        let provider=self.model.split_once('/').map(|p|provider_alias(p.0)).unwrap_or("openai").to_string();
+        if verb=="refresh"{
+            let target=if rest.is_empty(){provider}else{self.resolve_provider(rest)?};
+            let result=self.refresh_model_catalog(&target,true);
+            self.list_models(&format!("{target}/"));result.map(|_|())
+        }else{self.maybe_refresh_model_catalog(&provider);self.list_models(args);Ok(())}
+    }
+}
+
+
+// =============================================================================
+// Durable skills and configuration
+// =============================================================================
+
+// Durable entries remain ordinary files; only initialization interprets them.
+fn skills_defaults()->Value{json!({"enabled":true,"max_system_tokens":8000,"max_core_entry_tokens":2000,
+    "max_inventory_entry_tokens":128,"max_entries":128,"max_file_bytes":65536})}
+fn skills_options(config:&Value)->Result<Value>{
+    if !config.is_object(){return Err("config.json must contain an object".into());}
+    let mut result=skills_defaults();
+    if let Some(options)=config.get("skills"){
+        for (key,value) in options.as_object().ok_or("skills config must be an object")?{
+            if result.get(key).is_none(){return Err(format!("unknown skills setting: {key}").into());}
+            if key=="enabled"{if !value.is_boolean(){return Err("skills.enabled must be boolean".into());}}
+            else if !value.as_u64().is_some_and(|n|n>0&&n<=16_777_216){return Err(format!("skills.{key} must be an integer in 1..=16777216").into());}
+            result[key]=value.clone();
+        }
+    }
+    Ok(result)
+}
+fn config_secret_key(key:&str)->bool{
+    matches!(key.to_ascii_lowercase().replace('-',"_").as_str(),"auth"|"credentials"|"key"|"api_key"|"apikey"|"access"|"refresh"|"token"|"password"|"access_token"|"refresh_token"|"secret"|"client_secret"|"authorization")
+}
+fn config_has_secrets(value:&Value)->bool{
+    match value{
+        Value::Object(object)=>object.iter().any(|(key,value)|config_secret_key(key)||config_has_secrets(value)),
+        Value::Array(values)=>values.iter().any(config_has_secrets),_=>false
+    }
+}
+fn validate_config(config:&Value)->Result<()>{
+    if config_has_secrets(config){return Err("credentials belong in auth.json and /login, not config.json".into());}
+    skills_options(config)?;model_catalog_options(config)?;
+    for key in ["model","effort"]{if let Some(value)=config.get(key){
+        if !value.as_str().is_some_and(|s|!s.trim().is_empty()){return Err(format!("{key} must be a nonempty string").into());}
+    }}
+    if let Some(effort)=config["effort"].as_str(){if !["off","minimal","low","medium","high","xhigh","max"].contains(&effort){return Err("invalid configured effort".into());}}
+    if let Some(providers)=config.get("providers"){if !providers.is_object(){return Err("providers must be an object".into());}}
+    Ok(())
+}
+fn effective_config(config:&Value)->Result<Value>{let mut value=config.clone();value["skills"]=skills_options(config)?;value["model_catalog"]=model_catalog_options(config)?;Ok(value)}
+fn skills_tokens(text:&str)->usize{text.chars().count().div_ceil(3)}
+fn valid_skill_date(date:&str)->bool{
+    if date.len()!=20||!date.is_ascii(){return false;}
+    let b=date.as_bytes();if b[4]!=b'-'||b[7]!=b'-'||b[10]!=b'T'||b[13]!=b':'||b[16]!=b':'||b[19]!=b'Z'{return false;}
+    if b.iter().enumerate().any(|(i,c)|![4,7,10,13,16,19].contains(&i)&&!c.is_ascii_digit()){return false;}
+    let number=|a,b|date[a..b].parse::<u32>().ok();
+    let (Some(y),Some(m),Some(d),Some(h),Some(min),Some(s))=(number(0,4),number(5,7),number(8,10),number(11,13),number(14,16),number(17,19)) else{return false};
+    let days=match m{1|3|5|7|8|10|12=>31,4|6|9|11=>30,2=>if y%4==0&&(y%100!=0||y%400==0){29}else{28},_=>0};
+    y>0&&d>0&&d<=days&&h<24&&min<60&&s<60
+}
+fn parse_skill(name:&str,text:&str)->Result<Value>{
+    let mut lines=text.split_inclusive('\n');
+    if lines.next().map(str::trim_end)!=Some("---"){return Err("missing --- front matter".into());}
+    let mut metadata=json!({});let mut closed=false;
+    for line in lines.by_ref(){
+        let line=line.trim_end();if line=="---"{closed=true;break;}
+        if line.trim().is_empty(){continue;}
+        let (key,raw)=line.split_once(':').ok_or("expected key: value front matter")?;
+        if !["kind","created","updated","origin","description","core"].contains(&key){return Err(format!("unknown metadata field {key}").into());}
+        if metadata.get(key).is_some(){return Err(format!("duplicate metadata field {key}").into());}
+        let raw=raw.trim();
+        metadata[key]=if key=="core"{match raw{"true"=>json!(true),"false"=>json!(false),_=>return Err("core must be true or false".into())}}
+            else if raw.starts_with('"'){let s:String=serde_json::from_str(raw)?;json!(s)}else{
+                if raw.is_empty()||raw.starts_with(['\'','|','>','[','{','&','*','!','#']){return Err("use a plain single-line or JSON-quoted string".into());}json!(raw)
+            };
+    }
+    if !closed{return Err("unterminated front matter".into());}
+    for key in ["kind","created","updated","origin","description","core"]{if metadata.get(key).is_none(){return Err(format!("missing metadata field {key}").into());}}
+    if !["memory","skill","python"].contains(&metadata["kind"].as_str().unwrap_or("")){return Err("kind must be memory, skill or python".into());}
+    if !["agent","user"].contains(&metadata["origin"].as_str().unwrap_or("")){return Err("origin must be agent or user".into());}
+    for key in ["created","updated"]{if !valid_skill_date(metadata[key].as_str().unwrap_or("")){return Err(format!("{key} must be a valid YYYY-MM-DDTHH:MM:SSZ timestamp").into());}}
+    if metadata["updated"].as_str()<metadata["created"].as_str(){return Err("updated precedes created".into());}
+    let description=metadata["description"].as_str().unwrap();
+    if description.trim().is_empty()||description.chars().any(|c|c.is_control()||c=='\u{2028}'||c=='\u{2029}'){
+        return Err("description must be nonempty, single-line and control-free".into());
+    }
+    let body=lines.collect::<String>();let mut python=String::new();
+    if metadata["kind"]=="python"{
+        let mut fence:Option<String>=None;let mut executable=false;let mut count=0;
+        for line in body.split_inclusive('\n'){
+            let trim=line.trim_end();
+            if let Some(marker)=&fence{
+                if trim==marker{fence=None;executable=false;}else if executable{python.push_str(line);}
+            }else if trim.starts_with("```")||trim.starts_with("~~~"){
+                let ch=trim.chars().next().unwrap();let n=trim.chars().take_while(|c|*c==ch).count();
+                let info=&trim[n..];executable=info.trim()=="python";
+                if executable{
+                    if trim!="```python"{return Err("Python fences must use exact ```python / ``` lines".into());}
+                    count+=1;
+                }
+                fence=Some(ch.to_string().repeat(n));
+            }
+        }
+        if fence.is_some()||count!=1||python.trim().is_empty(){return Err("python entries require exactly one nonempty, closed fenced python block".into());}
+    }
+    metadata["filename"]=json!(name);metadata["body"]=json!(body);metadata["python"]=json!(python);
+    metadata["sha256"]=json!(ring::digest::digest(&ring::digest::SHA256,text.as_bytes()).as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>());
+    Ok(metadata)
+}
+const SKILLS_GUIDANCE:&str=r#"Durable entries are ordinary UTF-8 Markdown files in the directory below. Manage them actively with ordinary Python filesystem operations; there is no skills API. Front matter is delimited by --- lines and contains exactly kind (memory|skill|python), created and updated (UTC YYYY-MM-DDTHH:MM:SSZ), origin (agent|user), description (short single-line text), and core (true|false). Strings may be plain single-line text or JSON double-quoted. Filename stem is identity/title. Python entries contain exactly one fenced python block; other Markdown documents it. Maintain timestamps when writing. Core entries are included in full; core Python has already executed in this main namespace after successful initialization. Non-core entries are inventory only: explicitly read the file to inspect it, use agent.context.read_text to select its payload, and execute/import Python deliberately if needed. Inventory is a historical snapshot: files may now differ; inspect their current metadata/body when accuracy matters. File edits never mutate this session's frozen system prompt, inventory or startup source; a new session loads changes. Resume/reset use the original snapshot. Startup Python repeats only on authorized initialization/reset; worker failure blocks core reinitialization until explicit reset. Prefer definitions/imports, not side effects. Ordinary startup Python is unrestricted, but startup agent bridges are restricted to H history/cell reads. Entry text cannot override harness control/context rules.
+Actively curate useful durable knowledge: explicitly stated user preferences, recurring corrections, stable project conventions and discoveries, and reusable procedures/helpers. Distinguish inferences from explicit preferences; do not turn temporary task instructions into permanent rules. Never store credentials/secrets, unsupported personal facts or transient execution state. Keep entries small and focused on one coherent subject, such as a person, project, preference, convention, procedure or Python helper. Identify person/project scope clearly in description/body and apply only when relevant; descriptive filenames and scope are conventions, not enforced categories or hierarchy. Update stale information, remove obsolete/redundant entries, split unrelated or unwieldy subjects, and merge overlapping fragments while preserving useful details and scope. Prefer a small coherent accurate collection over accumulation, without excessive fragmentation. Do not discard still-relevant preferences merely to save space. Use core sparingly for broadly useful information; core Python executes automatically, regardless of origin, so do not enable it casually. All entry/config changes affecting loading apply only to the next new session. Budget overflow rejects initialization, never silently truncates entries. Token counts use an estimate, not a provider tokenizer."#;
+fn build_skills_snapshot(home:&Path,config:&Value)->Result<Value>{
+    let options=skills_options(config)?;
+    let mut system=SYSTEM.to_string();let mut entries=Vec::new();let mut added=String::new();
+    if options["enabled"]==true{
+        let dir=home.join("skills");fs::create_dir_all(&dir)?;
+        if !fs::symlink_metadata(&dir)?.file_type().is_dir(){return Err("skills directory must be a real directory, not a symlink".into());}
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir,fs::Permissions::from_mode(0o700))?;
+        let location=serde_json::to_string(&dir.to_string_lossy())?;
+        added=format!("\n\n[Durable entry instructions]\n{SKILLS_GUIDANCE}\nDirectory: {location}\nInitialization limits (estimated tokens): {options}\n[Entry snapshot]\n");
+        let mut paths=Vec::new();for path in fs::read_dir(&dir)?{let path=path?.path();if path.extension().is_some_and(|e|e=="md")||path.file_name().is_some_and(|n|n==".md"){paths.push(path);}}
+        paths.sort();if paths.len()>options["max_entries"].as_u64().unwrap() as usize{return Err(format!("{}: {} entries exceed skills.max_entries={}; remove/merge entries or increase the limit",dir.display(),paths.len(),options["max_entries"]).into());}
+        for path in paths{
+            let name=path.file_name().and_then(|s|s.to_str()).ok_or("entry filename must be UTF-8")?;
+            if name==".md"||name.chars().any(char::is_control){return Err("entry filename must have a nonempty, printable stem".into());}
+            let meta=fs::symlink_metadata(&path)?;if !meta.file_type().is_file(){return Err(format!("{} must be a regular file, not a symlink/directory",path.display()).into());}
+            let max=options["max_file_bytes"].as_u64().unwrap() as usize;
+            if meta.len()>max as u64{return Err(format!("{}: {} bytes exceed skills.max_file_bytes={max}; shorten/split the entry or increase the limit",path.display(),meta.len()).into());}
+            // Bound reads even if another writer grows a discovered file.
+            let file=OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&path)?;
+            if !file.metadata()?.file_type().is_file(){return Err(format!("{name} must be a regular file").into());}
+            let mut bytes=Vec::new();std::io::Read::read_to_end(&mut std::io::Read::take(file,max as u64+1),&mut bytes)?;
+            if bytes.len()>max{return Err(format!("{} exceeds skills.max_file_bytes={max}; shorten/split the entry or increase the limit",path.display()).into());}
+            let text=std::str::from_utf8(&bytes)?;
+            let mut entry=parse_skill(name,text).map_err(|e|format!("{}: {e}",path.display()))?;
+            entry["path"]=json!(path);let core=entry["core"]==true;
+            let inventory=json!({"filename":name,"kind":entry["kind"],"description":entry["description"],"core":core,"path":path});
+            let rendered=if core{format!("\n[Core entry {}]\n{}\n{}\n[End core entry]\n",serde_json::to_string(name)?,inventory,entry["body"].as_str().unwrap())}
+                else{format!("\n[Available entry] {inventory}\n")};
+            let key=if core{"max_core_entry_tokens"}else{"max_inventory_entry_tokens"};
+            if skills_tokens(&rendered)>options[key].as_u64().unwrap() as usize{return Err(format!("{}: {} estimated tokens exceed skills.{key}={}; shorten/split the entry or increase the limit",path.display(),skills_tokens(&rendered),options[key]).into());}
+            added.push_str(&rendered);
+            if !core{entry.as_object_mut().unwrap().remove("body");entry.as_object_mut().unwrap().remove("python");}
+            entries.push(entry);
+        }
+        if skills_tokens(&added)>options["max_system_tokens"].as_u64().unwrap() as usize{return Err(format!("{}: {} estimated tokens including guidance exceed skills.max_system_tokens={}; shorten/remove entries or increase the limit",dir.display(),skills_tokens(&added),options["max_system_tokens"]).into());}
+        system.push_str(&added);
+    }
+    Ok(json!({"version":1,"system":system,"entries":entries,"options":options,
+        "estimated_added_tokens":skills_tokens(&added),"estimator":"unicode-chars/3-v1 (estimate, not a guarantee)"}))
+}
+impl Host{
+    fn system_prompt(&self)->&str{self.skills["system"].as_str().unwrap_or(SYSTEM)}
+    fn check_system_budget(&self,limit:usize)->Result<()>{self.check_model_system_budget(&self.model,limit)}
+    fn check_model_system_budget(&self,model:&str,limit:usize)->Result<()>{
+        let protected=(self.system_prompt().chars().count()+512).div_ceil(3);
+        let available=model_input_budget(limit,&self.reasoning_metadata(model),4096);
+        if protected+1024>=available{return Err(format!("Unsatisfiable protected system-prefix budget: {protected} estimated input tokens plus 1024 continuation reserve do not fit input budget {available} (context limit {limit}, 4096 output reserve); choose a larger-context model or start a new session with fewer core entries").into());}
+        Ok(())
+    }
+    fn initialize_skills(&mut self)->Result<()>{
+        self.startup_ready=false;
+        self.check_system_budget(self.context_limit)?;
+        let entries=self.skills["entries"].as_array().ok_or("invalid skills snapshot entries")?.iter()
+            .filter(|e|e["core"]==true&&e["kind"]=="python").cloned().collect::<Vec<_>>();
+        if entries.is_empty(){self.startup_ready=true;return Ok(());}
+        self.journal.append("startup_begin",json!({"generation":self.generation,"entries":entries.iter().map(|e|&e["filename"]).collect::<Vec<_>>()}))?;
+        self.initializing=true;
+        let outcome=(||->Result<()>{
+            let mut validation=String::new();
+            for entry in &entries{validation.push_str(&format!("compile({}, {}, 'exec')\n",serde_json::to_string(&entry["python"])?,serde_json::to_string(&entry["path"])?));}
+            let id=format!("startup-validate-{}",self.journal.seq);
+            let result=self.execute(&id,&validation,false)?;
+            if result["status"]!="ok"{return Err(format!("startup precompilation failed; diagnostics in {}",result["stderr"]["ref"]).into());}
+            for entry in entries{
+                let id=format!("startup-{}",self.journal.seq);
+                self.journal.append("startup_entry",json!({"operation":id,"generation":self.generation,"filename":entry["filename"],"sha256":entry["sha256"],"source":entry["python"]}))?;
+                let result=self.execute(&id,entry["python"].as_str().ok_or("missing startup source")?,false)?;
+                if result["status"]!="ok"{return Err(format!("startup {} failed; diagnostics in {}; earlier side effects are not rolled back",entry["filename"],result["stderr"]["ref"]).into());}
+            }
+            Ok(())
+        })();
+        self.initializing=false;
+        self.journal.append("startup_end",json!({"generation":self.generation,"status":if outcome.is_ok(){"ok"}else{"error"}}))?;
+        self.startup_ready=outcome.is_ok();outcome
+    }
+    fn config_command(&mut self,args:&str)->Result<()>{
+        let (verb,rest)=args.split_once(char::is_whitespace).map(|(a,b)|(a,b.trim())).unwrap_or((args,""));
+        if verb.is_empty(){self.ui_json("Configuration (loading changes apply on /new)",&json!({"path":self.home.join("config.json"),"effective":effective_config(&self.config_defaults)?,"session_skills_options":self.skills["options"],"skills_changes_pending":skills_options(&self.config_defaults)?!=self.skills["options"],"config_changes_pending":self.config_defaults!=self.config}));return Ok(());}
+        if verb=="reload"{
+            if !rest.is_empty(){return Err("usage: /config reload".into());}
+            let next=load_json(&self.home.join("config.json"))?;validate_config(&next)?;self.config_defaults=next;
+            self.ui_text("Configuration reloaded. Session prompt/startup snapshot unchanged; catalog refresh preferences apply immediately, other loading defaults apply on /new.");return Ok(());
+        }
+        let (key,value)=rest.split_once(char::is_whitespace).map(|(a,b)|(a,b.trim())).unwrap_or((rest,""));
+        let parts=key.split('.').collect::<Vec<_>>();
+        if key.is_empty()||parts.iter().any(|p|p.is_empty()||!p.chars().all(|c|c.is_ascii_alphanumeric()||c=='_'||c=='-')){return Err("use a dotted configuration key".into());}
+        if parts.iter().any(|p|config_secret_key(p)){return Err("credentials belong in auth.json and /login, not /config".into());}
+        if verb=="get"{
+            if !value.is_empty(){return Err("usage: /config get <key>".into());}
+            let effective=effective_config(&self.config_defaults)?;let mut found=&effective;
+            for part in &parts{found=found.get(*part).ok_or("unknown configuration key")?;}
+            self.ui_json(key,found);return Ok(());
+        }
+        if verb!="set"&&verb!="unset"{return Err("usage: /config [get <key> | set <key> <JSON-value> | unset <key> | reload]".into());}
+        if verb=="unset"&&!value.is_empty(){return Err("usage: /config unset <key>".into());}
+        let mut next=self.config_defaults.clone();let mut target=&mut next;
+        for part in &parts[..parts.len()-1]{
+            let object=target.as_object_mut().ok_or("configuration key crosses a non-object")?;
+            target=object.entry((*part).to_string()).or_insert_with(||json!({}));
+        }
+        let object=target.as_object_mut().ok_or("configuration parent must be an object")?;
+        if verb=="set"{object.insert(parts.last().unwrap().to_string(),serde_json::from_str(value)?);}else{object.remove(*parts.last().unwrap());}
+        validate_config(&next)?;
+        let lock=OpenOptions::new().create(true).read(true).write(true).truncate(false).mode(0o600).open(self.home.join("config.lock"))?;
+        if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX)}!=0{return Err(io::Error::last_os_error().into());}
+        let path=self.home.join("config.json");
+        if load_json(&path)?!=self.config_defaults{return Err("config.json changed externally; /config reload before editing".into());}
+        write_private_json(&path,&next)?;self.config_defaults=next;
+        self.ui_text("Configuration saved. Current session snapshot unchanged; catalog refresh preferences apply immediately, other loading defaults apply on /new.");Ok(())
+    }
+}
+
+// =============================================================================
+// Embedded assets
+// =============================================================================
+
 pub const SPEC: &str = r####"
 # Rust Python harness — draft specification
 Status: incremental implementation with real CLI/PTY E2E tests. Coverage is
@@ -124,7 +5858,10 @@ One writer per session (exclusive lock). Schema upgrades must be explicit.
 ## 5. Python API and context (proposed signatures)
 agent.say(text)
   User-facing Markdown event; stored under H.say; no context inclusion.
-  No final flag. Does not stop the loop.
+  Does not stop the loop, so the agent may communicate and continue.
+agent.final(text)
+  Stages the strong final Markdown answer and an implicit successful turn stop.
+  Queued steering still wins at that cell boundary.
 agent.loop.stop(*, wakeup=None)
   Stages return to user after current cell successfully finishes.
   Does not terminate Python or the program. Subsequent code in the cell runs.
@@ -395,7 +6132,9 @@ Images are not attached merely because a direct command wrote an image file.
 Queued shell/Python operations never race active Python execution.
 
 Pi-like queues: Enter while busy -> steering FIFO; Alt+Enter -> follow-up FIFO.
-Steering is delivered at next safe request/cell boundary; it does not interrupt
+Human mode echoes the exact sanitized text when it is queued and again when it
+is delivered, so steering state is never implicit. Steering is delivered at
+next safe request/cell boundary; it does not interrupt
 the cell. Follow-ups wait for agent.loop.stop() or normal turn completion.
 Support one-at-a-time/all drain modes with explicit defaults (propose Pi defaults).
 Alt+Up restores queued input to editor; preserve kind, order and multiline text.
@@ -1010,8 +6749,13 @@ read_text(text_or_ref, ..., max_chars=8000)
 Human preview:
   Show at most 12 lines EACH of source, stdout and stderr per interaction.
   Omit empty output sections. Complete previews show only their content; a
-  truncated preview reports shown/total lines and the correct H.code/H.user/
-  H.stdout/H.stderr reference.
+  truncated cell preview reports shown/total lines and its canonical
+  H.cells[number].source/stdout/stderr reference.
+  Render source before execution (including before nested helper output), then
+  stdout/stderr and completion metadata, all as secondary/dim material.
+  agent.say may communicate and continue; buffer agent.final presentation until
+  after completion status, making the strong final answer the turn's last
+  semantic output.
   Never make preview truncation alter history or select payload for the model.
   A noninteractive JSON client receives typed preview fields/events rather
   than terminal-rendered prose. Full payloads remain available through H.
@@ -1156,7 +6900,7 @@ cache hits are not a deterministic pass/fail substitute for request inspection.
       Tests: e2e_eviction_then_forced_collapse; evidence: not run; review: pending.
 
 ## 21. say is UI-only (confirmed)
-agent.say(text) returns None and emits a dedicated user-interface event.
+agent.say(text) returns None, emits a user-interface message and continues. agent.final(text) stages the strong final answer and implicitly requests turn stop after the successful current cell; queued steering still wins at that boundary.
 It never writes to the execution's stdout/stderr, and never inserts a second
 copy of its text into model context. The model already sees the source call.
 Terminal UI renders the event as Markdown; JSON UI emits a typed say event.
@@ -1430,11 +7174,14 @@ context compaction added.
       or changing the original input. All command/argument/Python/file candidates
       remain safe and bounded. No-match queries may be edited to recover. Single
       candidate insertion remains quick. JSON/non-TTY output has no UI escapes.
-[x] R10.28 Interactive presentation has semantic idle/thinking/running/input/login
-      states, one stable minimal prompt (empty Enter does not accumulate prompts),
-      and a compact width-safe status line, with the model shown during thinking.
-      Color/styles enhance
-      headings, boundaries/status and Markdown without leaking payload controls.
+[x] R10.28 Interactive presentation has one working status footer above an editable
+      prompt: state, context estimate/input budget, reported cumulative cache hits,
+      model/effort and live phase elapsed time. Missing cache measurements remain
+      visibly unknown, not zero. Agent output is inserted above this footer; draft,
+      cursor and undo survive thinking/cell/idle transitions. Python input() owns
+      stdin exclusively while its prompt is active. Empty Enter stays on one prompt.
+      Width-safe compact layout leaves room for completion even on small terminals.
+      Color/styles enhance headings/status and Markdown without leaking controls.
       NO_COLOR and non-TTY output disable generated styling; JSON remains exact.
       State transitions cover success, exceptions, cancellation, worker reset and
       provider failure; terminal state/cursor always restore on close/error.
@@ -2151,6 +7898,291 @@ Keep the old Python harness unchanged: this is still a transition, not full
 R01–R13 acceptance.
 "####;
 
+const PYTHON: &str = r####"
+import os,sys,json,socket,traceback,types,ast,subprocess,codeop,keyword
+# Editor requests run only between cells, never in the user's namespace. Preserve
+# the builtin operations used for safe dictionary inspection before user code.
+_ide_type=type
+_ide_dict=dict
+_ide_module=types.ModuleType
+_ide_getset=types.GetSetDescriptorType
+_ide_builtin=__import__('builtins')
+_ide_compile=codeop.compile_command
+_ide_getcwd=os.getcwd
+_ide_keywords=tuple(keyword.kwlist)
+_ide_str=str
+_sock=socket.socket(fileno=int(sys.argv[1]))
+_wire=_sock.makefile('rwb',buffering=0)
+def _send(v):
+    _wire.write((json.dumps(v,ensure_ascii=True)+'\n').encode())
+def _recv():
+    line=_wire.readline()
+    if not line: raise EOFError('host disconnected')
+    return json.loads(line)
+_rpc_signal=__import__('signal')
+_rpc_sequence=0
+def _rpc(op,**kw):
+    global _rpc_sequence
+    _rpc_sequence+=1
+    request_id=_rpc_sequence
+    # Defer SIGINT across the whole wire transaction: an interrupted readline
+    # can lose a partial frame, and an unread reply must never become the next
+    # helper's return value. The host closes input/cancels network/shell waits;
+    # escalation still uses SIGKILL if a worker refuses to cooperate.
+    previous=_rpc_signal.pthread_sigmask(_rpc_signal.SIG_BLOCK,{_rpc_signal.SIGINT})
+    try:
+        _send(dict(kind='rpc',rpc_id=request_id,op=op,**kw))
+        while True:
+            v=_recv()
+            if v.get('kind')!='rpc_reply':raise RuntimeError('invalid host RPC response')
+            if v.get('rpc_id')==request_id:break
+            # An old reply is obsolete, not a value or an execution command.
+    finally:
+        _rpc_signal.pthread_sigmask(_rpc_signal.SIG_SETMASK,previous)
+    if not v.get('ok'):
+        if v.get('exception')=='EOFError': raise EOFError()
+        if v.get('exception')=='KeyboardInterrupt': raise KeyboardInterrupt()
+        raise RuntimeError(v.get('error','host operation failed'))
+    return v.get('value')
+class _History:
+    __slots__=('_name',)
+    def __init__(self,name): object.__setattr__(self,'_name',name)
+    def __setattr__(self,name,value): raise AttributeError('H views are read-only')
+    def __delattr__(self,name): raise AttributeError('H views are read-only')
+    def __getitem__(self,key):
+        import operator
+        if isinstance(key,slice):
+            indices=range(*key.indices(len(self)))
+            return [_rpc('history',collection=self._name,index=i) for i in indices]
+        return _rpc('history',collection=self._name,index=operator.index(key))
+    def __len__(self): return _rpc('history_len',collection=self._name)
+class _Cell(dict):
+    __slots__=()
+    def __getattr__(self,name):
+        try:return self[name]
+        except KeyError:raise AttributeError(name) from None
+    def __setattr__(self,name,value):raise AttributeError('H cell views are read-only')
+class _Cells:
+    __slots__=()
+    def __setattr__(self,name,value): raise AttributeError('H.cells is read-only')
+    def __delattr__(self,name): raise AttributeError('H.cells is read-only')
+    def __getitem__(self,number):
+        import operator
+        return _Cell(_rpc('cell',cell=operator.index(number)))
+    def __len__(self): return _rpc('cell_len')
+class _H:
+    __slots__=()
+    def __setattr__(self,name,value): raise AttributeError('H is read-only')
+    def __delattr__(self,name): raise AttributeError('H is read-only')
+    def __getattr__(self,name):
+        if name=='cells': return _Cells()
+        if name not in ('code','user','stdout','stderr','stdin','events','raw','say','requests','responses','usage'):
+            raise AttributeError(name)
+        return _History(name)
+class _Context:
+    def read_text(self,text,*,max_chars=8000,start=0,stop=None):
+        if not isinstance(text,str): raise TypeError('read_text expects text')
+        if not isinstance(max_chars,int) or isinstance(max_chars,bool) or max_chars<=0:
+            raise ValueError('max_chars must be a positive integer')
+        return _rpc('read_text',text=text[start:stop],max_chars=max_chars)
+    def read_raw(self,data):
+        import base64
+        if isinstance(data,dict) and 'base64' in data:
+            return _rpc('read_raw',base64=data['base64'])
+        if isinstance(data,str):
+            with open(data,'rb') as f: data=f.read()
+        return _rpc('read_raw',base64=base64.b64encode(data).decode())
+    def usage(self): return _rpc('context_usage')
+    def items(self): return _rpc('context_items')
+    def collapse(self,*args): raise RuntimeError('collapse must be a standalone literal call')
+class _Loop:
+    def stop(self, *, wakeup=None):
+        if wakeup is not None:
+            if not isinstance(wakeup,(tuple,list)) or len(wakeup)!=2:
+                raise ValueError('wakeup must be (seconds, reason)')
+            if isinstance(wakeup[0],bool) or not isinstance(wakeup[0],(int,float)):
+                raise ValueError('wakeup duration must be a number')
+            import math
+            if not math.isfinite(wakeup[0]) or not 0 < wakeup[0] <= 604800:
+                raise ValueError('wakeup duration must be finite and positive, at most 7 days')
+            if not isinstance(wakeup[1],str): raise ValueError('wakeup reason must be a string')
+        return _rpc('stop',wakeup=wakeup)
+    def reset_python(self): _rpc('reset')
+class _BgTasks:
+    def run(self,source,*,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None):
+        if not isinstance(source,str) or not isinstance(kind,str): raise TypeError('source and kind must be strings')
+        for value in (cwd,name,wakeup_reason):
+            if value is not None and not isinstance(value,str): raise TypeError('cwd, name and wakeup_reason must be strings or None')
+        if env is not None and (not isinstance(env,dict) or not all(isinstance(k,str) and isinstance(v,str) for k,v in env.items())):
+            raise TypeError('env must map strings to strings')
+        if timeout is not None:
+            import math
+            if isinstance(timeout,bool) or not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or not 0 < timeout <= 604800:
+                raise ValueError('timeout must be finite and positive, at most 7 days')
+        return _rpc('bg_run',source=source,task_kind=kind,options=dict(cwd=cwd,env=env,timeout=timeout,name=name,wakeup_reason=wakeup_reason))
+    def list(self,state=None):
+        if state is not None and not isinstance(state,str): raise TypeError('state must be a string or None')
+        return _rpc('task_list',state=state)
+    def get(self,task_id):
+        if not isinstance(task_id,str): raise TypeError('task_id must be a string')
+        return _rpc('task_get',task_id=task_id)
+    def kill(self,task_id,*,force=False):
+        if not isinstance(task_id,str) or not isinstance(force,bool): raise TypeError('task_id must be a string and force must be boolean')
+        return _rpc('task_kill',task_id=task_id,force=force)
+class _LLM:
+    def __call__(self,prompt,**kwargs):
+        import base64,io
+        images=[]
+        for data in kwargs.get('images',()):
+            if isinstance(data,dict) and 'base64' in data:
+                images.append(data); continue
+            if isinstance(data,str):
+                with open(data,'rb') as f: data=f.read()
+            if hasattr(data,'save'):
+                out=io.BytesIO(); data.save(out,format='PNG'); data=out.getvalue()
+            images.append({'base64':base64.b64encode(data).decode()})
+        kwargs['images']=images
+        return _rpc('llm',prompt=prompt,options=kwargs)
+    def list(self,**kwargs): return _rpc('models',options=kwargs)
+    def image(self,prompt,**kwargs): return _rpc('image',prompt=prompt,options=kwargs)
+agent=types.ModuleType('agent')
+agent.context=_Context()
+agent.loop=_Loop()
+agent.bgtasks=_BgTasks()
+agent.llm=_LLM()
+agent.say=lambda text:_rpc('say',text=str(text))
+agent.final=lambda text:_rpc('final',text=str(text))
+agent.sh=lambda command,**kwargs:_rpc('sh',command=command,options=kwargs)
+sys.modules['agent']=agent
+H=_H()
+_ns={'__name__':'__main__','agent':agent,'H':H}
+def _input(prompt=''):
+    return _rpc('input',prompt=str(prompt))
+__import__('builtins').input=_input
+_ns['__builtins__']=__import__('builtins')
+def _path(n):
+    if isinstance(n,ast.Name): return n.id
+    if isinstance(n,ast.Attribute): return _path(n.value)+'.'+n.attr
+    return ''
+def _control(tree,forced):
+    if len(tree.body)==1 and isinstance(tree.body[0],ast.Expr) and isinstance(tree.body[0].value,ast.Call):
+        call=tree.body[0].value
+        name=_path(call.func)
+        if name=='agent.context.collapse':
+            if call.keywords or len(call.args)!=3 or not all(isinstance(a,ast.Constant) and isinstance(a.value,str) for a in call.args):
+                raise ValueError('collapse requires three literal strings')
+            _rpc('collapse',start=call.args[0].value,end=call.args[1].value,summary=call.args[2].value,source=ast.get_source_segment(_source,call))
+            return True
+        if forced and name=='agent.context.read_text':
+            if call.keywords or len(call.args)!=1: raise ValueError('forced read accepts one sliced stderr argument')
+            node=call.args[0]; sl=None
+            if isinstance(node,ast.Subscript) and isinstance(node.slice,ast.Slice):
+                sl=node.slice; node=node.value
+            if not isinstance(node,ast.Subscript) or _path(node.value)!='H.stderr':
+                raise ValueError('only H.stderr reads allowed in forced mode')
+            def integer(n):
+                if n is None:return None
+                if isinstance(n,ast.Constant) and type(n.value) is int and n.value>=0:return n.value
+                raise ValueError('literal nonnegative integer required')
+            index=integer(node.slice)
+            start=integer(sl.lower) if sl else None
+            stop=integer(sl.upper) if sl else None
+            if sl and sl.step is not None: raise ValueError('slice steps forbidden')
+            if start is not None and stop is not None and start>stop: raise ValueError('reversed slice')
+            agent.context.read_text(H.stderr[index][start:stop])
+            return True
+    if forced: raise ValueError('forced mode allows only collapse or literal stderr read')
+    if any(isinstance(n,ast.Call) and _path(n.func)=='agent.context.collapse' for n in ast.walk(tree)):
+        raise ValueError('collapse must be standalone')
+    return False
+def _ide_dictionary(obj):
+    if _ide_type(obj) is _ide_module:
+        return _ide_module.__getattribute__(obj,'__dict__')
+    if _ide_type(obj) is _ide_type:
+        return _ide_type.__getattribute__(obj,'__dict__')
+    cls=_ide_type(obj)
+    if _ide_type(cls) is not _ide_type:return {}
+    # Only a genuine builtin instance-dictionary descriptor may be invoked.
+    # A user property called __dict__, custom metaclass, __dir__ or __getattr__
+    # must never run merely because somebody pressed Tab.
+    for base in _ide_type.__getattribute__(cls,'__mro__'):
+        descriptor=_ide_type.__getattribute__(base,'__dict__').get('__dict__')
+        if descriptor is not None:
+            if _ide_type(descriptor) is _ide_getset:
+                value=descriptor.__get__(obj,cls)
+                if _ide_type(value) is _ide_dict:return value
+            return {}
+    return {}
+def _ide_snapshot():
+    names=set();roots=[]
+    def add_dictionary(prefix,d,limit,collect=False):
+        count=0
+        for name in d:
+            count+=1
+            if count>limit or len(names)>=8192:break
+            if _ide_type(name) is _ide_str and name.isidentifier():
+                path=prefix+name;names.add(path)
+                if collect:roots.append((path,d[name]))
+    add_dictionary('',_ns,2048,True)
+    add_dictionary('',_ide_module.__getattribute__(_ide_builtin,'__dict__'),1024)
+    names.update(_ide_keywords)
+    names.update('H.'+n for n in ('code','user','stdout','stderr','stdin','events','raw','say','requests','responses','usage'))
+    for path,obj in roots:
+        if len(names)>=8192:break
+        if path=='__builtins__':continue  # builtin root names already included
+        d=_ide_dictionary(obj);add_dictionary(path+'.',d,512)
+        cls=_ide_type(obj)
+        if _ide_type(cls) is _ide_type:
+            for base in _ide_type.__getattribute__(cls,'__mro__'):
+                add_dictionary(path+'.',_ide_type.__getattribute__(base,'__dict__'),256)
+        # Two member levels cover os.path.join and agent.context.read_text.
+        # Descend only through actual dictionary values, never descriptors.
+        for count,name in enumerate(d):
+            if count>=512 or len(names)>=8192:break
+            if _ide_type(name) is _ide_str and name.isidentifier():
+                child=d[name];sub=_ide_dictionary(child)
+                add_dictionary(path+'.'+name+'.',sub,256)
+                if path=='agent':
+                    cls=_ide_type(child)
+                    if _ide_type(cls) is _ide_type:
+                        add_dictionary(path+'.'+name+'.',_ide_type.__getattribute__(cls,'__dict__'),256)
+    return {'kind':'ide_names','names':sorted(names),'cwd':_ide_getcwd()}
+_send({'kind':'ready'})
+while True:
+    _cmd=_recv()
+    if _cmd.get('kind')=='rpc_reply':continue
+    if _cmd.get('kind')=='shutdown':break
+    if _cmd.get('kind')=='ide_inspect':
+        try:_send(_ide_snapshot())
+        except BaseException:_send({'kind':'ide_names','names':[]})
+        continue
+    if _cmd.get('kind')=='ide_validate':
+        try:
+            _incomplete=_ide_compile(_cmd['source'],'<editor>','exec') is None
+        except (SyntaxError,ValueError,OverflowError):_incomplete=False
+        _send({'kind':'ide_validation','incomplete':_incomplete})
+        continue
+    _source=_cmd['source']
+    _out=os.open(_cmd['stdout'],os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+    _err=os.open(_cmd['stderr'],os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+    os.dup2(_out,1);os.dup2(_err,2);os.close(_out);os.close(_err)
+    _status='ok'
+    _send({'kind':'started'})
+    try:
+        _tree=ast.parse(_source,filename='<agent-cell>',mode='exec')
+        _compiled=compile(_tree,'<agent-cell>','exec')
+        if not _control(_tree,_cmd.get('forced',False)):exec(_compiled,_ns,_ns)
+    except BaseException:
+        _status='error'
+        traceback.print_exc()
+    finally:
+        sys.stdout.flush();sys.stderr.flush()
+    _send({'kind':'done','status':_status})
+"####;
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 // Fixtures must not inherit developer credentials or endpoint/model overrides.
 // Explicit .env(...) fixture values can still be set by callers after this helper.
@@ -2221,8 +8253,10 @@ mod e2e {
                     format!("agent.context.collapse({:?}, {:?}, 'unique-condensed-summary')",boundary(start),boundary(end))
                 }else{code};
                 requests.push(request);
-                let body=json!({"choices":[{"message":{"content":code}}],
-                    "usage":{"prompt_tokens":20,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":5}}}).to_string();
+                let body=if code=="FIXTURE_TRUNCATED"{
+                    json!({"choices":[{"finish_reason":"length","message":{"content":"print('TRUNCATED-MUST-NOT-RUN')"}}]}).to_string()
+                }else{json!({"choices":[{"message":{"content":code}}],
+                    "usage":{"prompt_tokens":20,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":5}}}).to_string()};
                 write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
             }
             requests
@@ -2259,6 +8293,20 @@ mod e2e {
         let usage=journal(&h).into_iter().rfind(|v|v["kind"]=="usage").unwrap();
         assert_eq!(usage["payload"]["input_tokens"],60);
         assert_eq!(usage["payload"]["cache_hit_tokens"],15);
+        let request=journal(&h).into_iter().find(|v|v["kind"]=="request").unwrap();
+        assert_eq!(request["payload"]["requested_output_tokens"],4096);
+        assert_eq!(request["payload"]["transmitted_output_limit"],4096);
+        assert_eq!(request["payload"]["reserved_output_tokens"],4096);
+    }
+    #[test]
+    fn e2e_incomplete_generation_is_reported_without_executing_source(){
+        let (events,home,requests)=model_run(vec!["FIXTURE_TRUNCATED"],
+            vec![json!({"id":"truncated","kind":"submit","text":"work"})]);
+        assert_eq!(requests.len(),1);
+        assert!(events.iter().any(|v|v["kind"]=="error"&&v["error"].as_str().unwrap_or("").contains("truncated/incomplete")));
+        let history=journal(&home);
+        assert!(!history.iter().any(|v|v["kind"]=="code"||v["kind"]=="cell_start"));
+        assert!(history.iter().any(|v|v["kind"]=="response"));
     }
     #[test]
     fn e2e_direct_prefix_visibility_and_full_user_history(){
@@ -2704,14 +8752,14 @@ try:
  until(b'\x1b[?2004h')
  command('/help');until(b'\x1b[?2004h')
  command("@answer=input('interactive-name? '); print('ANSWER='+answer)")
- wait_prompt('interactive-name? ');os.write(master,'Ada🙂\n'.encode());until(b'\r\nANSWER=Ada');until(b'\x1b[?2004h')
+ wait_prompt('interactive-name? ');os.write(master,'Ada🙂\n'.encode());until(b'ANSWER=Ada');until(b'\x1b[?2004h')
  command("@import builtins; print('IMPORTED='+builtins.input('imported-name? '))")
- wait_prompt('imported-name? ');os.write(master,b'Grace\n');until(b'\r\nIMPORTED=Grace');until(b'\x1b[?2004h')
+ wait_prompt('imported-name? ');os.write(master,b'Grace\n');until(b'IMPORTED=Grace');until(b'\x1b[?2004h')
  command("@print('PARTIAL='+input('partial-then-newline? '))")
  wait_prompt('partial-then-newline? ');os.write(master,b'part\x04')
- time.sleep(.1);os.write(master,b'tail\n');until(b'\r\nPARTIAL=parttail');until(b'\x1b[?2004h')
+ time.sleep(.1);os.write(master,b'tail\n');until(b'PARTIAL=parttail');until(b'\x1b[?2004h')
  command("@print('FD0='+repr(__import__('os').read(0,32)))")
- until(b"\r\nFD0=b''");until(b'\x1b[?2004h')
+ until(b"FD0=b''");until(b'\x1b[?2004h')
  command("@print('BEFORE-INPUT',flush=True); input('partial-input? ')")
  wait_prompt('partial-input? ')
  # Canonical Ctrl-D releases partial text without a newline: poll readability
@@ -2720,9 +8768,9 @@ try:
  time.sleep(.1);os.write(master,b'\x03')
  until(b'\x1b[?2004h')
  command("@print('AFTER-CANCEL'); print(H.stdin[:])")
- until(b'\r\nAFTER-CANCEL\r\n');until(b'\x1b[?2004h')
+ until(b'AFTER-CANCEL');until(b'\x1b[?2004h')
  command("@exec(\"try:\\n input('eof-input? ')\\nexcept EOFError: print('PYTHON-EOF')\")")
- wait_prompt('eof-input? ');os.write(master,b'\x04');until(b'\r\nPYTHON-EOF\r\n');until(b'\x1b[?2004h')
+ wait_prompt('eof-input? ');os.write(master,b'\x04');until(b'PYTHON-EOF');until(b'\x1b[?2004h')
  command("!printf shell-interactive");until(b'shell-interactive');until(b'\x1b[?2004h')
  command('/quit');p.wait(timeout=4)
  assert p.returncode==0
@@ -2748,17 +8796,31 @@ finally:
             .args(["--json","--json-input","--no-model"])
             .env("PY_HOME",&home).env("PY_CONTEXT_LIMIT","10000")
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        use std::io::BufRead;
         let mut stdin=child.stdin.take().unwrap();
+        let mut stdout=std::io::BufReader::new(child.stdout.take().unwrap());
+        writeln!(stdin,"{}",json!({"id":"budget","kind":"status"})).unwrap();
+        let mut ev=Vec::<Value>::new();
+        let usage=loop{
+            let mut line=String::new();assert!(stdout.read_line(&mut line).unwrap()>0);
+            let event:Value=serde_json::from_str(&line).unwrap();
+            let usage=if event["kind"]=="status"{Some(event["context_usage"].clone())}else{None};
+            ev.push(event);if let Some(usage)=usage{break usage;}
+        };
+        // Size this payload using the actual frozen prefix, not a hard-coded
+        // SYSTEM length: enter forcing mode without overflowing the budget.
+        let chars=(usage["input_token_budget"].as_u64().unwrap() as usize*3*95/100)
+            .saturating_sub(usage["rendered_chars"].as_u64().unwrap() as usize+512);
+        let source=format!("agent.context.read_text({:?},max_chars={})","x".repeat(chars),chars);
         for c in [
-            // Leave room for the now-accounted immutable system prefix while
-            // crossing the forcing threshold, then permit a bounded stderr read.
-            py("a","agent.context.read_text('large selected output '*520,max_chars=17000)"),
+            py("a",&source),
             py("b","side_effect=1"),
             py("c","agent.context.read_text(H.stderr[1][:500])"),
             py("d","print('side_effect' in globals())")
         ]{writeln!(stdin,"{}",c).unwrap();}drop(stdin);
-        let out=child.wait_with_output().unwrap();assert!(out.status.success());
-        let ev:Vec<Value>=String::from_utf8(out.stdout).unwrap().lines().map(|s|serde_json::from_str(s).unwrap()).collect();
+        ev.extend(stdout.lines().map(|line|serde_json::from_str::<Value>(&line.unwrap()).unwrap()));
+        assert!(child.wait().unwrap().success());
+        assert_eq!(done(&ev,"a")["status"],"ok");
         assert_eq!(done(&ev,"b")["status"],"error");
         assert_eq!(done(&ev,"c")["status"],"ok");
         assert_eq!(done(&ev,"d")["status"],"error");
@@ -3385,1877 +9447,6 @@ assert p.returncode==0,p.stderr
     }
 }
 
-const PYTHON: &str = r####"
-import os,sys,json,socket,traceback,types,ast,subprocess,codeop,keyword
-# Editor requests run only between cells, never in the user's namespace. Preserve
-# the builtin operations used for safe dictionary inspection before user code.
-_ide_type=type
-_ide_dict=dict
-_ide_module=types.ModuleType
-_ide_getset=types.GetSetDescriptorType
-_ide_builtin=__import__('builtins')
-_ide_compile=codeop.compile_command
-_ide_getcwd=os.getcwd
-_ide_keywords=tuple(keyword.kwlist)
-_ide_str=str
-_sock=socket.socket(fileno=int(sys.argv[1]))
-_wire=_sock.makefile('rwb',buffering=0)
-def _send(v):
-    _wire.write((json.dumps(v,ensure_ascii=True)+'\n').encode())
-def _recv():
-    line=_wire.readline()
-    if not line: raise EOFError('host disconnected')
-    return json.loads(line)
-_rpc_signal=__import__('signal')
-_rpc_sequence=0
-def _rpc(op,**kw):
-    global _rpc_sequence
-    _rpc_sequence+=1
-    request_id=_rpc_sequence
-    # Defer SIGINT across the whole wire transaction: an interrupted readline
-    # can lose a partial frame, and an unread reply must never become the next
-    # helper's return value. The host closes input/cancels network/shell waits;
-    # escalation still uses SIGKILL if a worker refuses to cooperate.
-    previous=_rpc_signal.pthread_sigmask(_rpc_signal.SIG_BLOCK,{_rpc_signal.SIGINT})
-    try:
-        _send(dict(kind='rpc',rpc_id=request_id,op=op,**kw))
-        while True:
-            v=_recv()
-            if v.get('kind')!='rpc_reply':raise RuntimeError('invalid host RPC response')
-            if v.get('rpc_id')==request_id:break
-            # An old reply is obsolete, not a value or an execution command.
-    finally:
-        _rpc_signal.pthread_sigmask(_rpc_signal.SIG_SETMASK,previous)
-    if not v.get('ok'):
-        if v.get('exception')=='EOFError': raise EOFError()
-        if v.get('exception')=='KeyboardInterrupt': raise KeyboardInterrupt()
-        raise RuntimeError(v.get('error','host operation failed'))
-    return v.get('value')
-class _History:
-    __slots__=('_name',)
-    def __init__(self,name): object.__setattr__(self,'_name',name)
-    def __setattr__(self,name,value): raise AttributeError('H views are read-only')
-    def __delattr__(self,name): raise AttributeError('H views are read-only')
-    def __getitem__(self,key):
-        import operator
-        if isinstance(key,slice):
-            indices=range(*key.indices(len(self)))
-            return [_rpc('history',collection=self._name,index=i) for i in indices]
-        return _rpc('history',collection=self._name,index=operator.index(key))
-    def __len__(self): return _rpc('history_len',collection=self._name)
-class _Cell(dict):
-    __slots__=()
-    def __getattr__(self,name):
-        try:return self[name]
-        except KeyError:raise AttributeError(name) from None
-    def __setattr__(self,name,value):raise AttributeError('H cell views are read-only')
-class _Cells:
-    __slots__=()
-    def __setattr__(self,name,value): raise AttributeError('H.cells is read-only')
-    def __delattr__(self,name): raise AttributeError('H.cells is read-only')
-    def __getitem__(self,number):
-        import operator
-        return _Cell(_rpc('cell',cell=operator.index(number)))
-    def __len__(self): return _rpc('cell_len')
-class _H:
-    __slots__=()
-    def __setattr__(self,name,value): raise AttributeError('H is read-only')
-    def __delattr__(self,name): raise AttributeError('H is read-only')
-    def __getattr__(self,name):
-        if name=='cells': return _Cells()
-        if name not in ('code','user','stdout','stderr','stdin','events','raw','say','requests','responses','usage'):
-            raise AttributeError(name)
-        return _History(name)
-class _Context:
-    def read_text(self,text,*,max_chars=8000,start=0,stop=None):
-        if not isinstance(text,str): raise TypeError('read_text expects text')
-        if not isinstance(max_chars,int) or isinstance(max_chars,bool) or max_chars<=0:
-            raise ValueError('max_chars must be a positive integer')
-        return _rpc('read_text',text=text[start:stop],max_chars=max_chars)
-    def read_raw(self,data):
-        import base64
-        if isinstance(data,dict) and 'base64' in data:
-            return _rpc('read_raw',base64=data['base64'])
-        if isinstance(data,str):
-            with open(data,'rb') as f: data=f.read()
-        return _rpc('read_raw',base64=base64.b64encode(data).decode())
-    def usage(self): return _rpc('context_usage')
-    def items(self): return _rpc('context_items')
-    def collapse(self,*args): raise RuntimeError('collapse must be a standalone literal call')
-class _Loop:
-    def stop(self, *, wakeup=None):
-        if wakeup is not None:
-            if not isinstance(wakeup,(tuple,list)) or len(wakeup)!=2:
-                raise ValueError('wakeup must be (seconds, reason)')
-            if isinstance(wakeup[0],bool) or not isinstance(wakeup[0],(int,float)):
-                raise ValueError('wakeup duration must be a number')
-            import math
-            if not math.isfinite(wakeup[0]) or not 0 < wakeup[0] <= 604800:
-                raise ValueError('wakeup duration must be finite and positive, at most 7 days')
-            if not isinstance(wakeup[1],str): raise ValueError('wakeup reason must be a string')
-        return _rpc('stop',wakeup=wakeup)
-    def reset_python(self): _rpc('reset')
-class _BgTasks:
-    def run(self,source,*,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None):
-        if not isinstance(source,str) or not isinstance(kind,str): raise TypeError('source and kind must be strings')
-        for value in (cwd,name,wakeup_reason):
-            if value is not None and not isinstance(value,str): raise TypeError('cwd, name and wakeup_reason must be strings or None')
-        if env is not None and (not isinstance(env,dict) or not all(isinstance(k,str) and isinstance(v,str) for k,v in env.items())):
-            raise TypeError('env must map strings to strings')
-        if timeout is not None:
-            import math
-            if isinstance(timeout,bool) or not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or not 0 < timeout <= 604800:
-                raise ValueError('timeout must be finite and positive, at most 7 days')
-        return _rpc('bg_run',source=source,task_kind=kind,options=dict(cwd=cwd,env=env,timeout=timeout,name=name,wakeup_reason=wakeup_reason))
-    def list(self,state=None):
-        if state is not None and not isinstance(state,str): raise TypeError('state must be a string or None')
-        return _rpc('task_list',state=state)
-    def get(self,task_id):
-        if not isinstance(task_id,str): raise TypeError('task_id must be a string')
-        return _rpc('task_get',task_id=task_id)
-    def kill(self,task_id,*,force=False):
-        if not isinstance(task_id,str) or not isinstance(force,bool): raise TypeError('task_id must be a string and force must be boolean')
-        return _rpc('task_kill',task_id=task_id,force=force)
-class _LLM:
-    def __call__(self,prompt,**kwargs):
-        import base64,io
-        images=[]
-        for data in kwargs.get('images',()):
-            if isinstance(data,dict) and 'base64' in data:
-                images.append(data); continue
-            if isinstance(data,str):
-                with open(data,'rb') as f: data=f.read()
-            if hasattr(data,'save'):
-                out=io.BytesIO(); data.save(out,format='PNG'); data=out.getvalue()
-            images.append({'base64':base64.b64encode(data).decode()})
-        kwargs['images']=images
-        return _rpc('llm',prompt=prompt,options=kwargs)
-    def list(self,**kwargs): return _rpc('models',options=kwargs)
-    def image(self,prompt,**kwargs): return _rpc('image',prompt=prompt,options=kwargs)
-agent=types.ModuleType('agent')
-agent.context=_Context()
-agent.loop=_Loop()
-agent.bgtasks=_BgTasks()
-agent.llm=_LLM()
-agent.say=lambda text:_rpc('say',text=str(text))
-agent.sh=lambda command,**kwargs:_rpc('sh',command=command,options=kwargs)
-sys.modules['agent']=agent
-H=_H()
-_ns={'__name__':'__main__','agent':agent,'H':H}
-def _input(prompt=''):
-    return _rpc('input',prompt=str(prompt))
-__import__('builtins').input=_input
-_ns['__builtins__']=__import__('builtins')
-def _path(n):
-    if isinstance(n,ast.Name): return n.id
-    if isinstance(n,ast.Attribute): return _path(n.value)+'.'+n.attr
-    return ''
-def _control(tree,forced):
-    if len(tree.body)==1 and isinstance(tree.body[0],ast.Expr) and isinstance(tree.body[0].value,ast.Call):
-        call=tree.body[0].value
-        name=_path(call.func)
-        if name=='agent.context.collapse':
-            if call.keywords or len(call.args)!=3 or not all(isinstance(a,ast.Constant) and isinstance(a.value,str) for a in call.args):
-                raise ValueError('collapse requires three literal strings')
-            _rpc('collapse',start=call.args[0].value,end=call.args[1].value,summary=call.args[2].value,source=ast.get_source_segment(_source,call))
-            return True
-        if forced and name=='agent.context.read_text':
-            if call.keywords or len(call.args)!=1: raise ValueError('forced read accepts one sliced stderr argument')
-            node=call.args[0]; sl=None
-            if isinstance(node,ast.Subscript) and isinstance(node.slice,ast.Slice):
-                sl=node.slice; node=node.value
-            if not isinstance(node,ast.Subscript) or _path(node.value)!='H.stderr':
-                raise ValueError('only H.stderr reads allowed in forced mode')
-            def integer(n):
-                if n is None:return None
-                if isinstance(n,ast.Constant) and type(n.value) is int and n.value>=0:return n.value
-                raise ValueError('literal nonnegative integer required')
-            index=integer(node.slice)
-            start=integer(sl.lower) if sl else None
-            stop=integer(sl.upper) if sl else None
-            if sl and sl.step is not None: raise ValueError('slice steps forbidden')
-            if start is not None and stop is not None and start>stop: raise ValueError('reversed slice')
-            agent.context.read_text(H.stderr[index][start:stop])
-            return True
-    if forced: raise ValueError('forced mode allows only collapse or literal stderr read')
-    if any(isinstance(n,ast.Call) and _path(n.func)=='agent.context.collapse' for n in ast.walk(tree)):
-        raise ValueError('collapse must be standalone')
-    return False
-def _ide_dictionary(obj):
-    if _ide_type(obj) is _ide_module:
-        return _ide_module.__getattribute__(obj,'__dict__')
-    if _ide_type(obj) is _ide_type:
-        return _ide_type.__getattribute__(obj,'__dict__')
-    cls=_ide_type(obj)
-    if _ide_type(cls) is not _ide_type:return {}
-    # Only a genuine builtin instance-dictionary descriptor may be invoked.
-    # A user property called __dict__, custom metaclass, __dir__ or __getattr__
-    # must never run merely because somebody pressed Tab.
-    for base in _ide_type.__getattribute__(cls,'__mro__'):
-        descriptor=_ide_type.__getattribute__(base,'__dict__').get('__dict__')
-        if descriptor is not None:
-            if _ide_type(descriptor) is _ide_getset:
-                value=descriptor.__get__(obj,cls)
-                if _ide_type(value) is _ide_dict:return value
-            return {}
-    return {}
-def _ide_snapshot():
-    names=set();roots=[]
-    def add_dictionary(prefix,d,limit,collect=False):
-        count=0
-        for name in d:
-            count+=1
-            if count>limit or len(names)>=8192:break
-            if _ide_type(name) is _ide_str and name.isidentifier():
-                path=prefix+name;names.add(path)
-                if collect:roots.append((path,d[name]))
-    add_dictionary('',_ns,2048,True)
-    add_dictionary('',_ide_module.__getattribute__(_ide_builtin,'__dict__'),1024)
-    names.update(_ide_keywords)
-    names.update('H.'+n for n in ('code','user','stdout','stderr','stdin','events','raw','say','requests','responses','usage'))
-    for path,obj in roots:
-        if len(names)>=8192:break
-        if path=='__builtins__':continue  # builtin root names already included
-        d=_ide_dictionary(obj);add_dictionary(path+'.',d,512)
-        cls=_ide_type(obj)
-        if _ide_type(cls) is _ide_type:
-            for base in _ide_type.__getattribute__(cls,'__mro__'):
-                add_dictionary(path+'.',_ide_type.__getattribute__(base,'__dict__'),256)
-        # Two member levels cover os.path.join and agent.context.read_text.
-        # Descend only through actual dictionary values, never descriptors.
-        for count,name in enumerate(d):
-            if count>=512 or len(names)>=8192:break
-            if _ide_type(name) is _ide_str and name.isidentifier():
-                child=d[name];sub=_ide_dictionary(child)
-                add_dictionary(path+'.'+name+'.',sub,256)
-                if path=='agent':
-                    cls=_ide_type(child)
-                    if _ide_type(cls) is _ide_type:
-                        add_dictionary(path+'.'+name+'.',_ide_type.__getattribute__(cls,'__dict__'),256)
-    return {'kind':'ide_names','names':sorted(names),'cwd':_ide_getcwd()}
-_send({'kind':'ready'})
-while True:
-    _cmd=_recv()
-    if _cmd.get('kind')=='rpc_reply':continue
-    if _cmd.get('kind')=='shutdown':break
-    if _cmd.get('kind')=='ide_inspect':
-        try:_send(_ide_snapshot())
-        except BaseException:_send({'kind':'ide_names','names':[]})
-        continue
-    if _cmd.get('kind')=='ide_validate':
-        try:
-            _incomplete=_ide_compile(_cmd['source'],'<editor>','exec') is None
-        except (SyntaxError,ValueError,OverflowError):_incomplete=False
-        _send({'kind':'ide_validation','incomplete':_incomplete})
-        continue
-    _source=_cmd['source']
-    _out=os.open(_cmd['stdout'],os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
-    _err=os.open(_cmd['stderr'],os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
-    os.dup2(_out,1);os.dup2(_err,2);os.close(_out);os.close(_err)
-    _status='ok'
-    _send({'kind':'started'})
-    try:
-        _tree=ast.parse(_source,filename='<agent-cell>',mode='exec')
-        _compiled=compile(_tree,'<agent-cell>','exec')
-        if not _control(_tree,_cmd.get('forced',False)):exec(_compiled,_ns,_ns)
-    except BaseException:
-        _status='error'
-        traceback.print_exc()
-    finally:
-        sys.stdout.flush();sys.stderr.flush()
-    _send({'kind':'done','status':_status})
-"####;
-
-use serde_json::{Value, json};
-use std::{fs::{self,File,OpenOptions}, io::{self,Write,BufRead,BufReader},
-    path::{Path,PathBuf}, process::{Command,Child}, collections::{HashMap,HashSet},
-    os::unix::{net::UnixStream,io::AsRawFd,fs::OpenOptionsExt,process::CommandExt}};
-use base64::{Engine as _,engine::general_purpose::STANDARD as B64};
-
-type Result<T> = std::result::Result<T,Box<dyn std::error::Error>>;
-#[derive(Clone)]
-struct Item { id:String, role:String, text:String, output:bool, ranges:Vec<(usize,usize)> }
-
-struct Journal { file:File, offsets:Vec<(u64,u64)>, path:PathBuf, seq:usize, failed:bool }
-impl Journal {
-    fn open(path:PathBuf)->Result<Self>{
-        use std::io::Seek;
-        let file=OpenOptions::new().create(true).read(true).append(true).mode(0o600).open(&path)?;
-        if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0 {
-            return Err("session is already open".into());
-        }
-        let mut reader=BufReader::new(File::open(&path)?);
-        let mut offsets=vec![];let mut position=0u64;let mut line=Vec::new();
-        loop{
-            line.clear();let size=reader.read_until(b'\n',&mut line)?;
-            if size==0{break;}
-            if !line.ends_with(b"\n"){
-                let backup=path.with_extension(format!("torn-{}.jsonl",std::process::id()));
-                fs::copy(&path,backup)?;file.set_len(position)?;file.sync_all()?;break;
-            }
-            let value:Value=serde_json::from_slice(&line)?;
-            if value["seq"].as_u64()!=Some(offsets.len() as u64){return Err("invalid journal sequence".into());}
-            offsets.push((position,size as u64));position+=size as u64;
-        }
-        file.sync_all()?;
-        File::open(path.parent().ok_or("journal directory missing")?)?.sync_all()?;
-        let seq=offsets.len();
-        let _=reader.seek(std::io::SeekFrom::Start(0));
-        Ok(Self{file,offsets,path,seq,failed:false})
-    }
-    fn event(&self,index:usize)->Result<Value>{
-        use std::io::{Read,Seek,SeekFrom};
-        let &(offset,size)=self.offsets.get(index).ok_or("history event out of range")?;
-        let mut file=File::open(&self.path)?;file.seek(SeekFrom::Start(offset))?;
-        let mut bytes=vec![0;size as usize];file.read_exact(&mut bytes)?;
-        Ok(serde_json::from_slice(&bytes)?)
-    }
-    fn append(&mut self,kind:&str,payload:Value)->Result<usize>{
-        if self.failed{return Err("session journal write previously failed; restart and recover before continuing".into());}
-        let n=self.seq;
-        let v=json!({"schema_version":1,"seq":n,"kind":kind,"payload":payload,
-            "session_id":self.path.file_stem().unwrap().to_string_lossy(),
-            "timestamp_ms":now_ms()});
-        let bytes=format!("{v}\n").into_bytes();
-        let write=(||->io::Result<u64>{
-            let offset=self.file.metadata()?.len();
-            self.file.write_all(&bytes)?;self.file.flush()?;self.file.sync_all()?;Ok(offset)
-        })();
-        let offset=match write{Ok(offset)=>offset,Err(e)=>{self.failed=true;return Err(e.into());}};
-        self.offsets.push((offset,bytes.len() as u64));self.seq+=1;Ok(n)
-    }
-}
-fn now_ms()->u128 {std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()}
-
-// Captures bounded chunks as execution proceeds; payload lives only in the journal.
-// A lazy index permits nested helper commands without preallocating empty streams.
-struct Capture {
-    file:File, name:String, operation:String, index:Option<usize>,
-    bytes:usize, newlines:usize, chars:Option<usize>, last:Option<u8>,
-    preview:Vec<u8>, preview_lines:usize, carry:Vec<u8>, chunk:usize,
-}
-impl Capture {
-    fn open(path:&Path,name:&str,operation:&str)->Result<Self>{
-        Ok(Self{file:File::open(path)?,name:name.into(),operation:operation.into(),
-            index:None,bytes:0,newlines:0,chars:Some(0),last:None,
-            preview:vec![],preview_lines:0,carry:vec![],chunk:0})
-    }
-    fn commit(&mut self,host:&mut Host,bytes:&[u8])->Result<()>{
-        let index=*self.index.get_or_insert_with(||host.history[&self.name].len());
-        let seq=host.journal.append("stream",json!({"collection":self.name,"index":index,
-            "operation":self.operation,"base64":B64.encode(bytes),
-            "text":String::from_utf8_lossy(bytes),"chunk":self.chunk}))?;
-        let list=host.history.get_mut(&self.name).ok_or("missing stream collection")?;
-        if list.len()==index{list.push(json!({"$chunks":[]}));}
-        list[index]["$chunks"].as_array_mut().ok_or("invalid stream history")?.push(json!(seq));
-        self.chunk+=1;self.bytes+=bytes.len();
-        self.newlines+=bytes.iter().filter(|&&b|b==b'\n').count();
-        if !bytes.is_empty(){self.last=bytes.last().copied();}
-        if let Some(count)=self.chars{
-            self.carry.extend_from_slice(bytes);
-            match std::str::from_utf8(&self.carry){
-                Ok(s)=>{self.chars=Some(count+s.chars().count());self.carry.clear();},
-                Err(e)=>{
-                    let prefix=std::str::from_utf8(&self.carry[..e.valid_up_to()])?;
-                    self.chars=if e.error_len().is_some(){None}else{Some(count+prefix.chars().count())};
-                    self.carry=self.carry[e.valid_up_to()..].to_vec();
-                }
-            }
-        }
-        for &b in bytes{
-            if self.preview_lines>=12||self.preview.len()>=8000{break;}
-            self.preview.push(b);if b==b'\n'{self.preview_lines+=1;}
-        }
-        Ok(())
-    }
-    fn drain(&mut self,host:&mut Host)->Result<bool>{
-        use std::io::Read;
-        let mut buffer=[0u8;65536];
-        // Bound each poll's work, even when a child continuously writes.
-        for _ in 0..4{
-            let size=self.file.read(&mut buffer)?;
-            if size==0{return Ok(false);}
-            self.commit(host,&buffer[..size])?;
-        }
-        Ok(true)
-    }
-    fn finish(mut self,host:&mut Host,complete:bool)->Result<Value>{
-        while self.drain(host)?{}
-        self.finish_metadata(host,complete)
-    }
-    fn finish_metadata(mut self,host:&mut Host,complete:bool)->Result<Value>{
-        if self.index.is_none(){self.commit(host,&[])?;}
-        if !self.carry.is_empty(){self.chars=None;}
-        let index=self.index.ok_or("missing capture index")?;
-        let lines=self.newlines+usize::from(self.last.is_some()&&self.last!=Some(b'\n'));
-        let metadata=json!({"ref":format!("H.{}[{index}]",self.name),"index":index,
-            "bytes":self.bytes,"chars":self.chars,"lines":lines,
-            "preview":String::from_utf8_lossy(&self.preview).lines().take(12).collect::<Vec<_>>().join("\n"),
-            "preview_truncated":self.preview.len()<self.bytes,
-            "omitted_lines":lines.saturating_sub(12),"complete":complete});
-        let mut durable=metadata.clone();durable.as_object_mut().unwrap().remove("preview");
-        host.journal.append(if complete{"stream_complete"}else{"stream_closed"},json!({"collection":self.name,"operation":self.operation,
-            "metadata":durable}))?;
-        Ok(metadata)
-    }
-}
-
-struct Worker { child:Child, reader:BufReader<UnixStream>, writer:UnixStream, dir:PathBuf }
-impl Worker {
-    fn spawn(home:&Path,generation:usize)->Result<Self>{
-        let dir=home.join(format!("worker-{}-{}-{}",std::process::id(),generation,unique_id()));
-        fs::create_dir_all(&dir)?;
-        let script=dir.join("worker.py");fs::write(&script,PYTHON)?;
-        let (host,child_socket)=UnixStream::pair()?;
-        let fd=child_socket.as_raw_fd();
-        let mut command=Command::new(std::env::var("PY_PYTHON").unwrap_or_else(|_|"python3".into()));
-        command.args(["-u",script.to_str().unwrap(),&fd.to_string()])
-            .stdin(std::process::Stdio::null());
-        unsafe {command.pre_exec(move || {
-            if libc::setsid()<0 {return Err(io::Error::last_os_error());}
-            if libc::fcntl(fd,libc::F_SETFD,0)<0 {return Err(io::Error::last_os_error());}
-            Ok(())
-        });}
-        let child=command.spawn()?;drop(child_socket);
-        let writer=host.try_clone()?;
-        let mut worker=Self{child,reader:BufReader::new(host),writer,dir};
-        if worker.recv()?["kind"]!="ready" {return Err("worker did not initialize".into());}
-        Ok(worker)
-    }
-    fn send(&mut self,v:&Value)->Result<()> {writeln!(self.writer,"{}",v)?;Ok(())}
-    fn reply(&mut self,id:&Value,mut response:Value)->Result<()>{
-        response["kind"]=json!("rpc_reply");response["rpc_id"]=id.clone();self.send(&response)
-    }
-    fn recv(&mut self)->Result<Value>{
-        let mut line=String::new();
-        if self.reader.read_line(&mut line)?==0{return Err("Python worker disconnected".into());}
-        Ok(serde_json::from_str(&line)?)
-    }
-}
-impl Drop for Worker {
-    fn drop(&mut self){let _=self.send(&json!({"kind":"shutdown"}));
-        unsafe{libc::kill(-(self.child.id() as i32),libc::SIGKILL);}
-        let _=self.child.kill();
-        let _=self.child.wait();let _=fs::remove_dir_all(&self.dir);}
-}
-#[derive(Clone,Copy,Debug,PartialEq,Eq)]
-enum UiState{Idle,Thinking,Running,Input,Login}
-impl UiState{
-    fn label(self)->&'static str{match self{Self::Idle=>"idle",Self::Thinking=>"thinking",Self::Running=>"running",Self::Input=>"input",Self::Login=>"login"}}
-}
-struct Host {
-    state:UiState,thinking_model:Option<String>,cells:usize,active_cell:Option<usize>,cancel_revision:u64,
-    status_line:std::cell::Cell<bool>,
-    journal:Journal, worker:Worker, home:PathBuf, context:Vec<Item>,
-    history:HashMap<String,Vec<Value>>, ids:HashSet<String>, json:bool,
-    stop:bool, stop_wakeup:Option<(f64,String)>, reset:bool, reset_explicit:bool, generation:usize, revision:usize,
-    bg_tasks:HashMap<String,BgTask>, wakeups:HashMap<String,Wakeup>, servicing:bool,
-    incoming:Option<std::sync::mpsc::Receiver<Value>>, input_closed:bool, pending:std::collections::VecDeque<Value>,
-    attachments:HashMap<String,usize>, queued:HashMap<String,Option<(usize,usize)>>, config:Value, config_defaults:Value, auth:Value,
-    model:String, effort:String, no_model:bool, context_limit:usize,
-    trigger:usize,retain:usize,current_code:Option<String>, usage:Value,
-    skills:Value, catalog:Value, initializing:bool, startup_ready:bool,
-}
-impl Host {
-    fn event(&self,kind:&str,payload:Value) {
-        let mut v=payload;v["kind"]=json!(kind);v["schema_version"]=json!(1);
-        if self.json {println!("{}",v);} else {
-            let transient=terminal_color_for(1);
-            if transient&&kind=="state"{
-                let state=v["state"].as_str().unwrap_or("idle");
-                print!("\r\x1b[K");
-                if state!="idle"{
-                    let text=terminal_state(&v,terminal_width()).join("\n");print!("{text}");self.status_line.set(true);
-                }else{self.status_line.set(false);}
-                let _=io::stdout().flush();return;
-            }
-            if transient&&self.status_line.replace(false){print!("\r\x1b[K");}
-            match kind {
-                "state"=>for line in terminal_state(&v,terminal_width()){println!("{line}");},
-                // A cell gets one durable visual boundary, at completion. While
-                // active, the transient prompt communicates running/thinking.
-                "cell_start"=>{},
-                "cell_end"=>for line in terminal_cell_end(&v,terminal_width()){println!("{line}");},
-                "say"=>for line in terminal_markdown(v["text"].as_str().unwrap_or(""),terminal_width()){println!("{line}");},
-                "input_prompt"=>{print!("{}",terminal_wrap(v["prompt"].as_str().unwrap_or(""),terminal_width()).0.join("\n"));let _=io::stdout().flush();},
-                "preview"=>for line in terminal_preview(&v,terminal_width()){println!("{line}");},
-                "rejected"|"error"=>for line in terminal_wrap(v["error"].as_str().unwrap_or("operation rejected"),terminal_width()).0{eprintln!("{}",terminal_styled_for(&line,"31",2));},
-                "notice"=>for line in terminal_wrap(v["text"].as_str().unwrap_or(""),terminal_width()).0{println!("{line}");},
-                _=>{}
-            }
-        }
-    }
-    fn hist_push(&mut self,name:&str,value:Value)->usize{
-        let value=if ["raw","requests","responses","say","usage","stdin"].contains(&name) && self.journal.seq>0{
-            json!({"$event":self.journal.seq-1})
-        }else{value};
-        let list=self.history.entry(name.into()).or_default();let n=list.len();list.push(value);n
-    }
-    fn add_context(&mut self,role:&str,text:String,output:bool,ranges:Vec<(usize,usize)>)->Result<String>{
-        let id=format!("c{}",self.journal.seq);
-        let ranges=if ranges.is_empty(){vec![(self.journal.seq,self.journal.seq+1)]}else{ranges};
-        let n=self.journal.append("context_add",json!({"id":id,"role":role,"text":text,"output":output,"ranges":ranges}))?;
-        self.context.push(Item{id:id.clone(),role:role.into(),text,output,
-            ranges:if ranges.is_empty(){vec![(n,n+1)]}else{ranges}});
-        self.revision+=1;Ok(id)
-    }
-    fn chars(&self)->usize{self.system_prompt().chars().count()+512+self.context.iter().map(|i|i.text.chars().count()+64).sum::<usize>()}
-    fn input_budget(&self)->usize{model_input_budget(self.context_limit,&self.reasoning_metadata(&self.model),4096)}
-    fn forced(&self)->bool{self.chars().div_ceil(3)>self.input_budget()*9/10}
-    fn context_usage(&self)->Value{
-        json!({"context_revision":self.revision,"item_count":self.context.len(),
-            "rendered_chars":self.chars(),"estimated_input_tokens":self.chars().div_ceil(3),
-            "measured_last_input_tokens":self.usage["last_input_tokens"],
-            "model_context_limit":self.context_limit,"reserved_output_tokens":4096,
-            "input_token_budget":self.input_budget(),
-            "remaining_input_tokens":self.input_budget().saturating_sub(self.chars().div_ceil(3)),
-            "system_chars":self.system_prompt().chars().count(),"skills_estimated_tokens":self.skills["estimated_added_tokens"],
-            "forced":self.forced(),"force_threshold":0.9,"estimator":"unicode-chars/3-v1 estimate; system/control allowance included; image budget separate"})
-    }
-}
-
-impl Host {
-    fn rpc(&mut self,v:&Value)->Result<Value>{
-        let op=v["op"].as_str().unwrap_or("");
-        if self.initializing && !["history","history_len","cell","cell_len"].contains(&op){return Err("startup entries may define/import helpers and read H, but cannot use agent bridge controls, context, input or side-effect helpers during initialization".into());}
-        match op {
-            "cell"=>self.cell_view(v["cell"].as_u64().ok_or("cell number must be a positive integer")? as usize),
-            "cell_len"=>Ok(json!(self.cells)),
-            "history"=>{
-                let name=v["collection"].as_str().ok_or("missing collection")?;
-                let len=if name=="events"{self.journal.seq}else{self.history.get(name).ok_or("unknown H collection")?.len()};
-                if let Some(n)=v["index"].as_i64(){
-                    let index=if n<0{len as i64+n}else{n};
-                    if index<0||index as usize>=len{return Err("H index out of range".into());}
-                    return self.history_value(name,index as usize);
-                }
-                let a=v["start"].as_u64().unwrap_or(0) as usize;
-                let b=v["stop"].as_u64().unwrap_or(len as u64) as usize;
-                if a>b{return Err("invalid H slice".into());}
-                Ok(json!((a.min(len)..b.min(len)).map(|n|self.history_value(name,n)).collect::<Result<Vec<_>>>()?))
-            },
-            "history_len"=>Ok(json!(if v["collection"]=="events"{self.journal.seq}
-                else{self.history.get(v["collection"].as_str().unwrap_or("")).map_or(0,Vec::len)})),
-            "read_text"=>{
-                let text=v["text"].as_str().ok_or("text required")?;
-                let max=v["max_chars"].as_u64().ok_or("positive maximum required")? as usize;
-                if max==0||text.chars().count()>max {return Err("selection exceeds max_chars".into());}
-                if (self.chars()+text.chars().count()+64).div_ceil(3)>=self.input_budget() {
-                    return Err("selection exceeds next-request context budget".into());
-                }
-                let id=self.add_context("user",text.into(),true,vec![])?;Ok(json!(id))
-            },
-            "context_usage"=>Ok(self.context_usage()),
-            "context_items"=>Ok(json!(self.context.iter().map(|i|json!({"id":i.id,"role":i.role,
-                "chars":i.text.chars().count(),"ranges":i.ranges})).collect::<Vec<_>>())),
-            "say"=>{
-                let text=v["text"].as_str().unwrap_or("");
-                self.journal.append("say",json!({"text":text}))?;
-                self.hist_push("say",json!(text));
-                self.event("say",json!({"text":text}));Ok(Value::Null)
-            },
-            "stop"=>{
-                let wakeup=match v.get("wakeup").filter(|w|!w.is_null()){
-                    None=>None,
-                    Some(w)=>{let values=w.as_array().filter(|a|a.len()==2).ok_or("wakeup must be [seconds, reason]")?;
-                        let seconds=bg_seconds(&values[0],604800.0)?.ok_or("wakeup duration required")?;
-                        let reason=bg_text(&json!({"reason":values[1]}),"reason",512)?.ok_or("wakeup reason required")?.to_owned();
-                        Some((seconds,reason))}
-                };
-                self.stop=true;self.stop_wakeup=wakeup;Ok(Value::Null)
-            },
-            "bg_run"=>self.bg_run(v),
-            "task_list"=>self.bg_list(v.get("state").filter(|x|!x.is_null()).map(|x|x.as_str().ok_or("state must be a string")).transpose()?),
-            "task_get"=>self.bg_get(v["task_id"].as_str().ok_or("task_id required")?),
-            "task_kill"=>self.bg_kill(v["task_id"].as_str().ok_or("task_id required")?,v.get("force").map(|x|x.as_bool().ok_or("force must be boolean")).transpose()?.unwrap_or(false)),
-            "reset"=>{self.reset=true;self.reset_explicit=true;Ok(Value::Null)},
-            "collapse"=>self.collapse(v),
-            "sh"=>self.shell(v),
-            "llm"=>self.inner_llm(v),
-            "models"=>{self.reload_auth()?;Ok(self.models())},
-            "image"=>self.image(v),
-            "read_raw"=>self.read_raw(v),
-            // input RPCs are serviced asynchronously in execute, not in this handler.
-            _=>Err(format!("unsupported agent operation: {op}").into())
-        }
-    }
-    fn collapse(&mut self,v:&Value)->Result<Value>{
-        let a=self.context.iter().position(|i|i.id==v["start"]).ok_or("missing start boundary")?;
-        let b=self.context.iter().position(|i|i.id==v["end"]).ok_or("missing end boundary")?;
-        if a>=b{return Err("collapse requires ordered distinct boundaries".into());}
-        let source=v["source"].as_str().ok_or("missing retained call")?;
-        let mut ranges:Vec<(usize,usize)>=self.context[a..b].iter().flat_map(|i|i.ranges.clone()).collect();
-        ranges.sort_unstable();
-        let mut merged:Vec<(usize,usize)>=vec![];
-        for (s,e) in ranges{
-            if let Some(last)=merged.last_mut(){if s<=last.1{last.1=last.1.max(e);continue;}}
-            merged.push((s,e));
-        }
-        let end=self.context[b].clone();
-        let preserve=end.role=="user"||end.role=="summary";
-        let mut text=format!("[Collapsed originals: {:?}]\n{}",merged,source);
-        if preserve{text.push_str("\n[Preserved boundary]\n");text.push_str(&end.text);}
-        let mut all_ranges=merged.clone();if preserve{all_ranges.extend(end.ranges.clone());}
-        let id=self.context[a].id.clone();
-        let own=self.current_code.clone();
-        let mut next=self.context.clone();
-        next.splice(a..=b,[Item{id:id.clone(),role:"summary".into(),text:text.clone(),output:false,ranges:all_ranges.clone()}]);
-        if let Some(own)=own{next.retain(|i|i.id!=own||i.id==id);}
-        let after=self.system_prompt().chars().count()+512+next.iter().map(|i|i.text.chars().count()+64).sum::<usize>();
-        if after>=self.chars(){return Err("collapse must reduce rendered context size".into());}
-        self.journal.append("context_replace",json!({"items":next.iter().map(item_json).collect::<Vec<_>>(),
-            "summary":v["summary"],"ranges":merged}))?;
-        self.context=next;self.revision+=1;Ok(Value::Null)
-    }
-}
-fn item_json(i:&Item)->Value{json!({"id":i.id,"role":i.role,"text":i.text,"output":i.output,"ranges":i.ranges})}
-
-fn stream_info(bytes:&[u8],name:&str,index:usize)->Value{
-    let decoded=std::str::from_utf8(bytes).ok();
-    let lines=bytes.iter().filter(|&&b|b==b'\n').count()+usize::from(!bytes.is_empty()&&!bytes.ends_with(b"\n"));
-    let preview=String::from_utf8_lossy(bytes).lines().take(12).collect::<Vec<_>>().join("\n");
-    json!({"ref":format!("H.{name}[{index}]"),"index":index,"bytes":bytes.len(),
-        "chars":decoded.map(|s|s.chars().count()),"lines":lines,
-        "preview":preview,"preview_truncated":lines>12,
-        "omitted_lines":lines.saturating_sub(12),"complete":true})
-}
-impl Host{
-    fn execute(&mut self,id:&str,source:&str,retain_source:bool)->Result<Value>{
-        let source_ref=format!("H.code[{}]",self.history["code"].len());
-        self.with_cell("python",id,&source_ref,|host|host.execute_inner(id,source,retain_source))
-    }
-    fn execute_inner(&mut self,id:&str,source:&str,retain_source:bool)->Result<Value>{
-        self.stop=false;self.stop_wakeup=None;self.reset=false;self.reset_explicit=false;
-        let code_index=self.hist_push("code",json!(source));
-        let n=self.journal.append("code",json!({"index":code_index,"source":source,
-            "operation":id,"worker_generation":self.generation,"initialization":self.initializing}))?;
-        self.current_code=None;
-        let forced=!self.initializing&&self.forced();
-        if retain_source{
-            self.current_code=Some(self.add_context("assistant",source.into(),false,vec![(n,n+1)])?);
-        }
-        let out=self.worker.dir.join("stdout");let err=self.worker.dir.join("stderr");
-        self.journal.append("intent",json!({"operation":id,"type":"python","code_index":code_index}))?;
-        // Fresh capture paths ensure a pre-start crash cannot recapture a prior
-        // cell's output. A worker that opens/writes them before started still has
-        // its partial bytes committed below even if its handshake is lost.
-        for path in [&out,&err]{OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(path)?;}
-        let sent=self.worker.send(&json!({"kind":"execute","source":source,"stdout":out,"stderr":err,"forced":forced})).is_ok();
-        let mut cancelled=false;
-        let mut started=false;
-        let mut complete=true;
-        let mut worker_exit=None;
-        let mut captures:Option<(Capture,Capture)>=None;
-        let mut cancel_time=None;
-        let mut prompt:Option<InputPrompt>=None;
-        let mut input_rpc=Value::Null;
-        let status=if !sent{complete=false;self.reset=true;"worker_crashed".to_string()}else{'execution:loop{
-            self.service_background()?;
-            if let Some((stdout,stderr))=captures.as_mut(){
-                stdout.drain(self)?;stderr.drain(self)?;
-            }
-            if started && self.poll_target(self.worker.child.id() as i32,
-                if prompt.is_some(){0}else{libc::SIGINT})? {
-                if !cancelled{cancel_time=Some(std::time::Instant::now());}cancelled=true;
-            }
-            if cancelled {
-                if let Some(p)=prompt.take(){
-                    let response=self.close_input(&p,"cancel",None)?;
-                    if self.worker.reply(&input_rpc,response).is_err(){complete=false;self.reset=true;break 'execution "worker_crashed".to_string();}
-                }
-            }
-            while let Some(pos)=self.pending.iter().position(|v|v["kind"]=="stdin_reply"){
-                let command=self.pending.remove(pos).unwrap();
-                if let Some(p)=&prompt{
-                    if let Some((response,cancel))=self.reply_input(p,&command)?{
-                        prompt=None;
-                        if self.worker.reply(&input_rpc,response).is_err(){complete=false;self.reset=true;break 'execution "worker_crashed".to_string();}
-                        if cancel{cancelled=true;cancel_time=Some(std::time::Instant::now());}
-                    }
-                }else{self.event("rejected",json!({"command_id":command["id"],"error":"no matching active input prompt"}));}
-            }
-            if let Some(p)=prompt.as_mut(){
-                let response=if self.input_closed{Some(self.close_input(p,"eof",None)?)}
-                    else if self.incoming.is_none(){self.terminal_input(p)?}else{None};
-                if let Some(response)=response{
-                    prompt=None;
-                    if self.worker.reply(&input_rpc,response).is_err(){complete=false;self.reset=true;break 'execution "worker_crashed".to_string();}
-                }
-            }
-            if cancel_time.is_some_and(|t:std::time::Instant|t.elapsed()>std::time::Duration::from_secs(2)){
-                unsafe{libc::kill(-(self.worker.child.id() as i32),libc::SIGKILL);}
-                complete=false;self.reset=true;break "cancelled".to_string();
-            }
-            let mut pollfd=libc::pollfd{fd:self.worker.reader.get_ref().as_raw_fd(),events:libc::POLLIN,revents:0};
-            if self.worker.reader.buffer().is_empty() && unsafe{libc::poll(&mut pollfd,1,20)}<=0{continue;}
-            let v=match self.worker.recv(){
-                Ok(v)=>v,
-                Err(_)=>{
-                    complete=false;self.reset=true;
-                    // A disconnected worker cannot be reused. Give an exiting process
-                    // time to expose its actual exit status, then terminate its group.
-                    for _ in 0..10{
-                        if let Some(exit)=self.worker.child.try_wait()?{worker_exit=Some(exit);break;}
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    unsafe{libc::kill(-(self.worker.child.id() as i32),libc::SIGKILL);}
-                    if worker_exit.is_none(){worker_exit=Some(self.worker.child.wait()?);}
-                    break if cancelled{"cancelled".to_string()}else{"worker_crashed".to_string()};
-                }
-            };
-
-            if v["kind"]=="started"{
-                if started{complete=false;self.reset=true;break "worker_protocol_error".to_string();}
-                captures=Some((Capture::open(&out,"stdout",id)?,Capture::open(&err,"stderr",id)?));
-                started=true;continue;
-            }
-            if v["kind"]=="done"{
-                if !started{complete=false;self.reset=true;break "worker_protocol_error".to_string();}
-                break if cancelled{"cancelled".to_string()}else{v["status"].as_str().unwrap_or("error").to_string()};
-            }
-            if v["kind"]=="rpc"{
-                if !started||v["rpc_id"].as_u64().is_none(){complete=false;self.reset=true;break "worker_protocol_error".to_string();}
-                let response=if cancelled{input_exception("cancel")}else{
-                    if v["op"]=="input" && !self.initializing{
-                        input_rpc=v["rpc_id"].clone();
-                        prompt=Some(self.begin_input(id,v["prompt"].as_str().unwrap_or(""))?);
-                        continue;
-                    }
-                    let checkpoint=self.cancel_revision;
-                    let response=match self.rpc(&v){
-                        Ok(value)=>json!({"ok":true,"value":value}),
-                        Err(e)=>json!({"ok":false,"error":e.to_string()})
-                    };
-                    if self.cancel_revision!=checkpoint{
-                        // A helper can consume the interrupt while Python waits
-                        // on its RPC. Preserve sticky cancellation/semantic status
-                        // instead of treating that request as an ordinary error.
-                        cancelled=true;cancel_time=Some(std::time::Instant::now());
-                        input_exception("cancel")
-                    }else{response}
-                };
-                if self.worker.reply(&v["rpc_id"],response).is_err(){complete=false;self.reset=true;break "worker_crashed".to_string();}
-                continue;
-            }
-            complete=false;self.reset=true;break "worker_protocol_error".to_string();
-        }};
-        if prompt.is_some(){self.set_state(UiState::Running,None);}
-        if self.reset&&worker_exit.is_none(){
-            worker_exit=self.worker.child.try_wait()?;
-            if worker_exit.is_none(){unsafe{libc::kill(-(self.worker.child.id() as i32),libc::SIGKILL);}
-                worker_exit=Some(self.worker.child.wait()?);}
-        }
-        let (stdout,stderr)=match captures{
-            Some(captures)=>captures,
-            None=>(Capture::open(&out,"stdout",id)?,Capture::open(&err,"stderr",id)?)
-        };
-        let stdout=stdout.finish(self,complete)?;
-        let stderr=stderr.finish(self,complete)?;
-        let code=stream_info(source.as_bytes(),"code",code_index);
-        let metadata=json!({"command_id":id,"status":status,"exit_code":if let Some(exit)=worker_exit{exit.code()}else if status=="ok"{Some(0)}else{Some(1)},
-            "stdout":stdout,"stderr":stderr,"code":code,"context_usage":self.context_usage()});
-        let mut preview=metadata.clone();preview["cell"]=json!(self.active_cell);
-        self.event("preview",preview);
-        let mut metadata=metadata;
-        for stream in ["code","stdout","stderr"] {
-            metadata[stream].as_object_mut().unwrap().remove("preview");
-        }
-        self.journal.append("completion",metadata.clone())?;
-        if retain_source {
-            let mut observation=metadata.clone();
-            for s in ["stdout","stderr","code"]{observation[s].as_object_mut().unwrap().remove("preview");}
-            self.add_context("user",format!("[Execution metadata] {}",observation),false,vec![])?;
-        }
-        self.current_code=None;
-        if status!="ok"{self.stop=false;self.stop_wakeup=None;}
-        if self.reset && !self.initializing {
-            if self.reset_explicit{self.reset_worker()?;}else{
-                self.with_state(UiState::Running,None,|host|host.replace_worker(false))?;
-            }
-        }
-        Ok(metadata)
-    }
-    fn reset_worker(&mut self)->Result<()>{
-        self.with_state(UiState::Running,None,Self::reset_worker_inner)
-    }
-    fn reset_worker_inner(&mut self)->Result<()>{self.replace_worker(true)}
-    fn replace_worker(&mut self,initialize:bool)->Result<()>{
-        self.startup_ready=false;
-        self.generation+=1;
-        self.worker=Worker::spawn(&self.home,self.generation)?;
-        let notice="Session loaded into fresh Python. Previous variables are undefined; H and context are restored.";
-        self.journal.append("worker_reset",json!({"generation":self.generation}))?;
-        self.add_context("user",notice.into(),false,vec![])?;
-        self.event("notice",json!({"text":notice}));
-        if !initialize&&self.skills["entries"].as_array().is_some_and(|entries|entries.iter().any(|e|e["core"]==true&&e["kind"]=="python")){
-            self.journal.append("startup_blocked",json!({"generation":self.generation,"reason":"worker failure; core initialization requires explicit reset"}))?;
-            self.event("notice",json!({"text":"Core Python was not automatically re-executed after worker failure. /reset explicitly authorizes initialization; the outer agent is blocked until then."}));
-            Ok(())
-        }else{self.initialize_skills()}
-    }
-    fn shell(&mut self,v:&Value)->Result<Value>{
-        v["command"].as_str().ok_or("shell command required")?;
-        let id=format!("sh{}",self.journal.seq);
-        // cell_start is the only durable event before shell_inner's intent.
-        let source_ref=format!("H.events[{}]['payload']['source']",self.journal.seq+1);
-        self.with_cell("shell",&id,&source_ref,|host|host.shell_inner(v,&id))
-    }
-    fn shell_inner(&mut self,v:&Value,id:&str)->Result<Value>{
-        let command=v["command"].as_str().ok_or("shell command required")?;
-        let source_event=self.journal.append("intent",json!({"operation":id,"type":"shell","source":command}))?;
-        let mut c=Command::new("/bin/sh");c.args(["-c",command]);
-        if let Some(dir)=v["options"]["cwd"].as_str(){c.current_dir(dir);}
-        if let Some(env)=v["options"]["env"].as_object(){
-            for (k,v) in env {c.env(k,v.as_str().ok_or("environment value must be string")?);}
-        }
-        let timeout=match &v["options"]["timeout"]{
-            Value::Null=>None,
-            value=>{let seconds=value.as_f64().ok_or("timeout must be positive seconds")?;
-                if !seconds.is_finite()||seconds<=0.0{return Err("timeout must be positive seconds".into());}
-                Some(std::time::Duration::try_from_secs_f64(seconds)?)
-            }
-        };
-        let out_path=self.home.join(format!(".{id}-stdout-{}",self.worker.child.id()));
-        let err_path=self.home.join(format!(".{id}-stderr-{}",self.worker.child.id()));
-        let create=|path:&Path|->std::io::Result<File>{
-            use std::os::unix::fs::OpenOptionsExt;
-            OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
-        };
-        c.stdout(create(&out_path)?).stderr(create(&err_path)?).stdin(std::process::Stdio::null());
-        unsafe{c.pre_exec(||{if libc::setsid()<0{return Err(std::io::Error::last_os_error());}Ok(())});}
-        let mut child=c.spawn()?;
-        let pid=child.id() as i32;
-        let mut stdout=Capture::open(&out_path,"stdout",id)?;
-        let mut stderr=Capture::open(&err_path,"stderr",id)?;
-        let began=std::time::Instant::now();
-        let mut stopped=None;
-        let mut state=None;
-        let exit=loop{
-            stdout.drain(self)?;stderr.drain(self)?;
-            if self.poll_target(pid,libc::SIGTERM)?&&stopped.is_none(){
-                stopped=Some(std::time::Instant::now());state=Some("cancelled");
-            }
-            if timeout.is_some_and(|limit|began.elapsed()>=limit)&&stopped.is_none(){
-                self.journal.append("shell_timeout",json!({"operation":id}))?;
-                unsafe{libc::kill(-pid,libc::SIGTERM);}
-                stopped=Some(std::time::Instant::now());state=Some("timeout");
-            }
-            if stopped.is_some_and(|when|when.elapsed()>=std::time::Duration::from_millis(200)){
-                unsafe{libc::kill(-pid,libc::SIGKILL);}
-            }
-            if let Some(status)=child.try_wait()?{break status;}
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
-        // No detached descendants may retain session output descriptors.
-        unsafe{libc::kill(-pid,libc::SIGKILL);}
-        let stdout=stdout.finish(self,true)?;
-        let stderr=stderr.finish(self,true)?;
-        fs::remove_file(&out_path)?;fs::remove_file(&err_path)?;
-        let mut code=stream_info(command.as_bytes(),"events",source_event);
-        code["ref"]=json!(format!("H.events[{source_event}]['payload']['source']"));
-        self.event("preview",json!({"cell":self.active_cell,"command_id":id,"stdout":stdout,"stderr":stderr,
-            "status":state.unwrap_or(if exit.success(){"ok"}else{"error"}),"code":code,
-            "terminal_controls":v["terminal_controls"]==true}));
-        let mut result=json!({"exit_code":exit.code(),"status":state.unwrap_or(if exit.success(){"ok"}else{"error"}),
-            "stdout":stdout,"stderr":stderr});
-        for stream in ["stdout","stderr"]{
-            result[stream].as_object_mut().unwrap().remove("preview");
-        }
-        let mut durable=result.clone();durable["operation"]=json!(id);
-        self.journal.append("shell_completion",durable)?;Ok(result)
-    }
-    fn evict(&mut self)->Result<()>{
-        let eligible:Vec<usize>=self.context.iter().enumerate().filter_map(|(n,i)|i.output.then_some(n)).collect();
-        if eligible.len()<self.trigger{return Ok(());}
-        for &n in eligible.iter().take(eligible.len().saturating_sub(self.retain)){
-            let i=&mut self.context[n];
-            i.text=format!("[Output omitted: originals {:?}; {} chars]",i.ranges,i.text.chars().count());
-            i.output=false;
-        }
-        self.journal.append("context_replace",json!({"items":self.context.iter().map(item_json).collect::<Vec<_>>(),"reason":"output_batch"}))?;
-        self.revision+=1;Ok(())
-    }
-}
-
-impl Host {
-    fn new(home:PathBuf,resume:Option<PathBuf>,json_mode:bool,no_model:bool,model_override:Option<&str>,effort_override:Option<&str>)->Result<Self>{
-        use std::os::unix::fs::PermissionsExt;
-        fs::create_dir_all(home.join("sessions"))?;
-        fs::set_permissions(&home,fs::Permissions::from_mode(0o700))?;
-        fs::set_permissions(home.join("sessions"),fs::Permissions::from_mode(0o700))?;
-        let resumed=resume.is_some();
-        let path=resume.unwrap_or_else(||home.join("sessions").join(format!("{}-{}-{}.jsonl",now_ms(),std::process::id(),unique_id())));
-        let config_path=home.join("config.json");
-        let config={
-            let lock=OpenOptions::new().create(true).read(true).write(true).truncate(false).mode(0o600).open(home.join("config.lock"))?;
-            if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX)}!=0{return Err(io::Error::last_os_error().into());}
-            if config_path.exists(){load_json(&config_path)?}else{
-                let defaults=json!({"skills":skills_defaults(),"model_catalog":model_catalog_defaults()});write_private_json(&config_path,&defaults)?;defaults
-            }
-        };
-        validate_config(&config)?;
-        let mut journal=Journal::open(path)?;
-        let mut snapshot=None;let mut unfinished_startup=false;let mut generation=0;
-        for sequence in 0..journal.seq{
-            let ev=journal.event(sequence)?;
-            match ev["kind"].as_str().unwrap_or(""){
-                "skills_snapshot"=>{if snapshot.is_some(){return Err("duplicate skills snapshot".into());}snapshot=Some(ev["payload"].clone());},
-                "worker_reset"=>generation=ev["payload"]["generation"].as_u64().ok_or("invalid worker generation")? as usize,
-                "startup_begin"|"startup_blocked"=>unfinished_startup=true,
-                "startup_end"=>unfinished_startup=ev["payload"]["status"]!="ok",
-                _=>{}
-            }
-        }
-        let skills=if let Some(snapshot)=snapshot{
-            if snapshot["version"]!=1||!snapshot["system"].is_string()||!snapshot["entries"].is_array(){return Err("invalid skills snapshot".into());}snapshot
-        }else{
-            let snapshot=if resumed{json!({"version":1,"system":SYSTEM,"entries":[],"options":{"enabled":false},"estimated_added_tokens":0,"legacy":true})}
-                else{build_skills_snapshot(&home,&config)?};
-            journal.append("skills_snapshot",snapshot.clone())?;snapshot
-        };
-        let worker=Worker::spawn(&home,if resumed{generation+1}else{0})?;
-        let mut host=Self{state:UiState::Idle,thinking_model:None,cells:0,active_cell:None,cancel_revision:0,
-            status_line:std::cell::Cell::new(false),journal,worker,home,context:vec![],history:HashMap::new(),ids:HashSet::new(),
-            json:json_mode,stop:false,stop_wakeup:None,reset:false,reset_explicit:false,generation:0,revision:0,
-            bg_tasks:HashMap::new(),wakeups:HashMap::new(),servicing:false,
-            incoming:None,input_closed:false,pending:std::collections::VecDeque::new(),attachments:HashMap::new(),queued:HashMap::new(),config:json!({}),config_defaults:json!({}),auth:json!({}),model:std::env::var("PY_MODEL").unwrap_or_else(|_|"openai/gpt-4.1".into()),
-            effort:"medium".into(),no_model,context_limit:std::env::var("PY_CONTEXT_LIMIT").ok().and_then(|s|s.parse().ok()).unwrap_or(128000),trigger:20,retain:10,current_code:None,usage:json!({}),
-            skills,catalog:empty_model_catalog(),initializing:false,startup_ready:false};
-        for name in ["code","user","stdout","stderr","stdin","raw","say","requests","responses","usage"]{
-            host.history.insert(name.into(),vec![]);
-        }
-        let mut settings=None;
-        for sequence in 0..host.journal.seq {
-            let ev=host.journal.event(sequence)?;
-            let p=&ev["payload"];
-            match ev["kind"].as_str().unwrap_or("") {
-                "code"=>{host.hist_push("code",p["source"].clone());},
-                "user"=>{host.hist_push("user",p["text"].clone());},
-                "stdin"=>{host.history.get_mut("stdin").unwrap().push(json!({"$event":sequence}));},
-                "worker_reset"=>{host.generation=p["generation"].as_u64().ok_or("invalid worker generation")? as usize;},
-                "settings_initial"|"settings_change"=>{settings=Some(p.clone());},
-                "task_state"|"task_settled"|"wakeup_state"=>host.bg_restore(ev["kind"].as_str().unwrap(),p)?,
-                "cell_start"=>{host.cells=host.cells.max(p["cell"].as_u64().ok_or("invalid session cell number")? as usize);},
-                "stream"=>{
-                    let list=host.history.get_mut(p["collection"].as_str().unwrap()).ok_or("invalid stream collection")?;
-                    let index=p["index"].as_u64().ok_or("missing stream index")? as usize;
-                    while list.len()<=index{list.push(json!({"$chunks":[]}));}
-                    list[index]["$chunks"].as_array_mut().unwrap().push(json!(sequence));
-                },
-                "say"=>{host.history.get_mut("say").unwrap().push(json!({"$event":sequence}));},
-                "accepted"=>{if let Some(s)=p["command_id"].as_str(){host.ids.insert(s.into());}},
-                "context_add"=>{
-                    host.context.push(parse_item(p));host.revision+=1;
-                },
-                "context_replace"=>{host.context=p["items"].as_array().ok_or("invalid context journal")?
-                    .iter().map(parse_item).collect();host.revision+=1;},
-                "usage"=>{host.usage=p.clone();host.history.get_mut("usage").unwrap().push(json!({"$event":sequence}));},
-                "request"=>{host.history.get_mut("requests").unwrap().push(json!({"$event":sequence}));},
-                "response"=>{host.history.get_mut("responses").unwrap().push(json!({"$event":sequence}));},
-                "raw"=>{host.history.get_mut("raw").unwrap().push(json!({"$event":sequence}));},
-                "attachment"=>{host.attachments.insert(p["context_id"].as_str().unwrap().into(),p["raw_index"].as_u64().unwrap() as usize);},
-                _=>{}
-            }
-        }
-        host.config_defaults=config.clone();host.config=config;
-        host.auth=load_json(&host.home.join("auth.json"))?;
-        match load_model_catalog(&host.home.join("models.json")){
-            Ok(cache)=>host.catalog=cache,Err(_)=>host.event("notice",json!({"text":"Invalid model catalog cache ignored; using offline inventory until refresh."}))
-        }
-        host.configure()?;
-        if let Some(settings)=settings{
-            host.set_model(settings["model"].as_str().ok_or("invalid session model")?.into())?;
-            host.effort=settings["effort"].as_str().ok_or("invalid session effort")?.into();
-            host.validate_effort(&host.effort)?;
-        }
-        if let Some(model)=model_override{host.choose_model(model)?;}
-        if !resumed&&model_override.is_none()&&host.config["model"].is_null()&&std::env::var("PY_MODEL").is_err()
-            &&host.auth["openai-codex"].is_object(){host.select_model_after_login("openai-codex");}
-        if let Some(effort)=effort_override{host.change_effort(effort)?;}
-        host.validate_effort(&host.effort)?;
-        host.check_system_budget(host.context_limit)?;
-        if !resumed{host.journal.append("settings_initial",json!({"model":host.model,"effort":host.effort}))?;}
-        if resumed {
-            host.bg_recover()?;
-            host.generation+=1;
-            let notice="Session loaded into fresh Python. Previous variables are undefined; H and context are restored.";
-            host.journal.append("worker_reset",json!({"generation":host.generation}))?;
-            host.add_context("user",notice.into(),false,vec![])?;
-            host.event("notice",json!({"text":notice}));
-            let recovery=host.recovery_status()?;
-            if recovery["operations"].as_array().is_some_and(|ops|ops.iter().any(|v|v["state"]=="unknown")){
-                host.event("notice",json!({"text":"Interrupted session has unknown operation outcomes. No execution was replayed; /recovery shows captured partial streams."}));
-            }
-        }
-        if resumed&&unfinished_startup{
-            host.event("notice",json!({"text":"Previous startup failed or has unknown side effects. Startup was not replayed. Inspect /recovery; /reset explicitly authorizes a fresh initialization attempt."}));
-        }else{host.initialize_skills()?;}
-        Ok(host)
-    }
-    fn user(&mut self,text:&str,visible:bool)->Result<usize>{
-        let index=self.hist_push("user",json!(text));
-        let n=self.journal.append("user",json!({"index":index,"text":text,"visible":visible}))?;
-        if visible{
-            let selected=text.chars().take(8000).collect::<String>();
-            let rendered=format!("{}\n[{} chars; {} lines; omitted {} chars; H.user[{}]]",
-                selected,text.chars().count(),text.lines().count(),text.chars().count().saturating_sub(8000),index);
-            self.add_context("user",rendered,false,vec![(n,n+1)])?;
-        }
-        Ok(index)
-    }
-    fn dispatch(&mut self,v:Value)->Result<bool>{
-        self.reload_auth()?;
-        let id=v["id"].as_str().unwrap_or("").to_string();
-        if id.is_empty(){self.event("rejected",json!({"command_id":id,"error":"command ID required"}));return Ok(true);}
-        if v["kind"]=="stdin_reply"{
-            self.event("rejected",json!({"command_id":id,"error":"no matching active input prompt"}));return Ok(true);
-        }
-        let queued=self.queued.remove(&id);
-        if queued.is_none()&&self.ids.contains(&id){self.event("rejected",json!({"command_id":id,"error":"duplicate command ID"}));return Ok(true);}
-        let recorded=redacted_command(v.clone())?;
-        if queued.is_some(){
-            self.journal.append("queue_dispatched",json!({"command_id":id,"state":"dispatched"}))?;
-        }else{
-            self.journal.append("accepted",json!({"command_id":id,"command":recorded}))?;
-            self.ids.insert(id.clone());self.event("accepted",json!({"command_id":id}));
-        }
-        match v["kind"].as_str().unwrap_or("") {
-            "python"=>{
-                let source=v["source"].as_str().ok_or("source required")?;
-                let visible=v["visible"].as_bool().unwrap_or(false);
-                if queued.is_none(){self.user(source,false)?;}
-                let result=self.execute(&id,source,false)?;
-                if visible{
-                    let message=format!("@@{}\n[stdout]\n{}\n[stderr]\n{}",source,
-                        self.history_last("stdout")?,
-                        self.history_last("stderr")?);
-                    self.user(&message,true)?;
-                }
-                if self.stop{self.commit_stop()?;}
-                self.event("completed",result);
-            },
-            "bg_run"=>{
-                let result=self.bg_run(&json!({"kind":v.get("task_kind").unwrap_or(&json!("shell")),"source":v["source"],"options":v["options"]}))?;
-                self.event("completed",json!({"command_id":id,"status":"ok","result":result}));
-            },
-            "task_list"|"task_get"|"task_logs"|"task_kill"|"wakeup_list"|"wakeup_cancel"|"wakeup_run"=>{
-                self.finish_background_control(&v)?;
-            },
-            "shell"=>{
-                let command=v["command"].as_str().ok_or("command required")?;
-                if queued.is_none(){self.user(command,false)?;}
-                let r=self.shell(&json!({"command":command,"options":v["options"],
-                    "terminal_controls":v["terminal_controls"]==true}))?;
-                if v["visible"].as_bool().unwrap_or(false){
-                    let message=format!("!!{}\n[stdout]\n{}\n[stderr]\n{}",command,
-                        self.history_last("stdout")?,
-                        self.history_last("stderr")?);
-                    self.user(&message,true)?;
-                }
-                self.event("completed",json!({"command_id":id,"status":r["status"],"stdout":r["stdout"],"stderr":r["stderr"]}));
-            },
-            "submit"=>{
-                let text=v["text"].as_str().ok_or("text required")?;
-                if let Some(Some((index,sequence)))=queued{self.select_user(text,index,sequence)?;}
-                else{self.user(text,true)?;}
-                if !self.no_model{self.run_agent()?;}
-                self.event("completed",json!({"command_id":id,"status":"ok"}));
-            },
-            "interrupt"=>{
-                INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
-                self.event("completed",json!({"command_id":id,"status":"ok","active":false}));
-            },
-            "reset"=>{self.reset_worker()?;self.event("completed",json!({"command_id":id,"status":"ok"}));},
-            "login"=>{
-                let provider=v["provider"].as_str().ok_or("provider required")?;
-                match v["method"].as_str(){
-                    Some("browser")=>self.browser_login(provider,false)?,
-                    Some("manual")=>self.browser_login(provider,true)?,
-                    Some("oauth"|"device")=>self.oauth_login(provider)?,
-                    Some("api-key")|None=>self.key_login(provider,v["key"].as_str().ok_or("key required")?)?,
-                    _=>return Err("Unsupported login method: browser, manual, device, oauth or api-key".into())
-                }
-                let provider=self.resolve_provider(provider)?;
-                self.select_model_after_login(&provider);
-                self.event("completed",json!({"command_id":id,"status":"ok"}));
-            },
-            "logout"=>{
-                self.logout(v["provider"].as_str().ok_or("provider required")?)?;
-                self.event("completed",json!({"command_id":id,"status":"ok"}));
-            },
-            "auth"=>self.event("auth",json!({"command_id":id,"providers":self.auth_status()})),
-            "models"=>{
-                let refresh=v.get("refresh").map(|r|r.as_bool().ok_or("refresh must be boolean")).transpose()?.unwrap_or(false);
-                if refresh{
-                    let provider=v["provider"].as_str().unwrap_or_else(||self.model.split_once('/').map_or("openai",|p|p.0)).to_string();
-                    self.refresh_model_catalog(&provider,true)?;
-                }
-                self.event("models",json!({"command_id":id,"models":self.models()}));
-            },
-            "recovery"=>self.event("recovery",{
-                let mut status=self.recovery_status()?;status["command_id"]=json!(id);status
-            }),
-            "status"=>self.event("status",self.status()),
-            "context"=>self.event("context",json!({"command_id":id,"usage":self.context_usage(),
-                "items":self.context.iter().map(item_json).collect::<Vec<_>>()})),
-            "new"|"resume"=>{
-                let cancel=v.get("cancel_tasks").map(|x|x.as_bool().ok_or("cancel_tasks must be boolean")).transpose()?.unwrap_or(false);
-                let query=if v["kind"]=="resume"{Some(v["session"].as_str().filter(|s|!s.is_empty()).ok_or("session path/query required")?)}else{None};
-                self.switch_session(query,cancel)?;
-                self.journal.append("accepted",json!({"command_id":id,"command":v}))?;self.ids.insert(id.clone());
-                self.event("completed",json!({"command_id":id,"status":"ok","session":self.journal.path}));
-            },
-            "quit"=>{self.bg_guard(v.get("cancel_tasks").map(|x|x.as_bool().ok_or("cancel_tasks must be boolean")).transpose()?.unwrap_or(false))?;return Ok(false);},
-            _=>self.event("rejected",json!({"command_id":id,"error":"unknown command kind"}))
-        }
-        self.evict()?;Ok(true)
-    }
-}
-fn parse_item(p:&Value)->Item{
-    let ranges=p["ranges"].as_array().map(|a|a.iter().filter_map(|v|Some((v[0].as_u64()? as usize,v[1].as_u64()? as usize))).collect()).unwrap_or_default();
-    Item{id:p["id"].as_str().unwrap_or("").into(),role:p["role"].as_str().unwrap_or("user").into(),
-        text:p["text"].as_str().unwrap_or("").into(),output:p["output"].as_bool().unwrap_or(false),ranges}
-}
-
-const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences. Persistent CPython exposes agent and H. H.cells[n] is the canonical record for presented cell n and links its source, output, context and helper histories; H.code/user/stdout/stderr retain full collection histories. Only metadata is automatically observed. Explicitly select payload with agent.context.read_text(H.stderr[i][:4000]) or read_raw. agent.say(text) sends a user-only UI message without stdout/context duplication. agent.sh(command) returns status and H stream refs. agent.llm(prompt,model=...) returns data; agent.llm.list() lists models; agent.llm.image(prompt,model=...) generates image data. agent.context.items()/usage() inspect context metadata. agent.loop.stop(wakeup=None) ends this turn after a successful cell; optional wakeup=(seconds,reason) schedules one continuation. agent.bgtasks.run(source,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None) returns task metadata immediately; kind='python' uses a fresh isolated interpreter without agent or main variables. bgtasks.list(state=None),get(task_id),kill(task_id,force=False) manage jobs. Outputs stay in H; only explicit context reads select them. Completion wakeups are opt-in. Does not kill foreground Python. Collapse must be standalone agent.context.collapse('start','end','summary'); successful output is silent. Retained call contains sole summary plus original ranges. In forced mode only collapse or literal agent.context.read_text(H.stderr[44][:4000]) allowed. No replay after resume. Execution is unrestricted.";
-// Reasoning request fields follow the pinned Pi provider transformations, not
-// generic OpenAI-compatible guesses. This is a pure body-layout helper: it never
-// reads credentials, starts I/O or changes session state. A false/absent reasoning
-// flag means no fields. `off` means unset for APIs/models without verified disable
-// semantics, NOT a promise that the provider's default stops internal reasoning.
-fn model_input_budget(context_limit:usize,meta:&Value,reserved_output:usize)->usize{
-    let combined=context_limit.saturating_sub(reserved_output);
-    meta["max_input_tokens"].as_u64().map_or(combined,|cap|combined.min(cap as usize))
-}
-fn reasoning_fields(api:&str,provider:&str,id:&str,meta:&Value,effort:&str,max:usize)->Result<Value>{
-    if !["off","minimal","low","medium","high","xhigh","max"].contains(&effort){
-        return Err("effort must be off/minimal/low/medium/high/xhigh/max".into());
-    }
-    if max==0{return Err("max_tokens must be positive".into());}
-    let mut fields=json!({});
-    if meta["reasoning"]!=true{return Ok(fields);}
-    let adaptive=id.contains("opus-4-6")||id.contains("opus-4.6");
-    let supported=meta["reasoning_efforts"].as_array();
-    if supported.is_some_and(|levels|!levels.iter().any(|level|level==effort)){
-        return Err(format!("Effort {effort} unsupported by {id}; supported: {}",meta["reasoning_efforts"]).into());
-    }
-    if effort=="max" && !(api=="anthropic-messages"&&adaptive) && !supported.is_some_and(|levels|levels.iter().any(|level|level=="max")){
-        return Err("max effort requires explicit model capability metadata (or Anthropic Messages Opus 4.6); use high or xhigh".into());
-    }
-    let xhigh=id.contains("gpt-5.2")||id.contains("gpt-5.3")||supported.is_some_and(|levels|levels.iter().any(|level|level=="xhigh"));
-    let clamped=if effort=="xhigh"&&!xhigh{"high"}else{effort};
-    match api{
-        "openai-responses" if effort!="off"||supported.is_some()=>{
-            fields["reasoning"]=json!({"effort":if effort=="off"{"none"}else{clamped},"summary":"auto"});
-            fields["include"]=json!(["reasoning.encrypted_content"]);
-        },
-        "openai-completions"=>{
-            let compat=&meta["compat"];
-            let format=compat["thinkingFormat"].as_str().or(compat["thinking_format"].as_str())
-                .unwrap_or(if provider=="zai"{"zai"}else{"openai"});
-            if format=="zai"{fields["thinking"]=json!({"type":if effort=="off"{"disabled"}else{"enabled"}});}
-            else if format=="qwen"{fields["enable_thinking"]=json!(effort!="off");}
-            else{
-                let verified=compat["supportsReasoningEffort"].as_bool()
-                    .or(compat["supports_reasoning_effort"].as_bool())
-                    .unwrap_or(matches!(provider,"openai"|"github-copilot"|"groq"|"cerebras"|"openrouter"));
-                if verified&&effort!="off"{fields["reasoning_effort"]=json!(clamped);}
-            }
-        },
-        "anthropic-messages" if effort!="off"=>{
-            if adaptive{
-                fields["thinking"]=json!({"type":"adaptive"});
-                fields["output_config"]=json!({"effort":match effort{
-                    "minimal"|"low"=>"low","medium"=>"medium","xhigh"|"max"=>"max",_=>"high"}});
-            }else{
-                // Pi's pinned adaptive test is Opus-only; Sonnet 4.6 stays on
-                // its verified budget path. Reserve >=1024 output and >=1024
-                // thinking tokens, refusing caps that cannot satisfy both.
-                let desired=match effort{"minimal"=>1024,"low"=>2048,"medium"=>8192,_=>16384};
-                let cap=meta["max_tokens"].as_u64().unwrap_or(64000).min(usize::MAX as u64) as usize;
-                if cap<2048{return Err("reasoning output cap must allow 1024 thinking and 1024 output tokens".into());}
-                let output=max.max(1024).saturating_add(desired).min(cap);
-                let budget=desired.min(output-1024);
-                fields["max_tokens"]=json!(output);
-                fields["thinking"]=json!({"type":"enabled","budget_tokens":budget});
-            }
-        },
-        "google-generative-ai"=>{
-            if effort=="off"{
-                // 2.5 Flash explicitly permits zero. Pro/3 families cannot
-                // uniformly disable thinking, so leave their default untouched.
-                if id.contains("2.5-flash"){
-                    fields["thinkingConfig"]=json!({"includeThoughts":false,"thinkingBudget":0});
-                }
-            }else if id.contains("3-pro")||id.contains("3-flash"){
-                let level=if id.contains("3-pro"){
-                    if matches!(effort,"minimal"|"low"){"LOW"}else{"HIGH"}
-                }else{match effort{"minimal"=>"MINIMAL","low"=>"LOW","medium"=>"MEDIUM",_=>"HIGH"}};
-                fields["thinkingConfig"]=json!({"includeThoughts":true,"thinkingLevel":level});
-            }else{
-                let budget=if id.contains("2.5-pro")||id.contains("2.5-flash"){
-                    match effort{"minimal"=>128,"low"=>2048,"medium"=>8192,
-                        _=>if id.contains("2.5-pro"){32768}else{24576}}
-                }else{-1};
-                fields["thinkingConfig"]=json!({"includeThoughts":true,"thinkingBudget":budget});
-            }
-        },
-        _=>{}
-    }
-    Ok(fields)
-}
-fn merge_reasoning_fields(body:&mut Value,fields:&Value){
-    for (k,v) in fields.as_object().unwrap(){body[k]=v.clone();}
-}
-impl Host {
-    fn provider_config(&self,model:&str)->Result<(String,String,String)>{
-        let (provider,id)=model.split_once('/').unwrap_or(("openai",model));
-        let provider=provider_alias(provider);
-        let known=PROVIDERS.iter().find(|p|p.0==provider);
-        let cfg=&self.config["providers"][provider];
-        let mut url=cfg["base_url"].as_str()
-            .or(if provider=="github-copilot"{self.auth[provider]["base_url"].as_str().or(Some("https://api.githubcopilot.com"))}else{None})
-            .or(if provider=="openai-codex"{Some("https://chatgpt.com/backend-api")}else{None})
-            .or(known.map(|p|p.1)).ok_or("unknown provider; configure its base_url")?.to_string();
-        if provider=="openai"{if let Ok(custom)=std::env::var("OPENAI_BASE_URL"){url=custom;}}
-        let env=cfg["key_env"].as_str().or(known.map(|p|p.2)).unwrap_or("");
-        let mut key=self.credential(provider,env);
-        if key.is_empty()&&provider=="google"{key=std::env::var("GOOGLE_API_KEY").unwrap_or_default();}
-        if provider=="openai-codex"&&key.is_empty(){return Err("Codex subscription login required: /login codex".into());}
-        if key.is_empty() && !url.starts_with("http://127.0.0.1") {return Err(format!("missing API credential for {provider}").into());}
-        Ok((url.trim_end_matches('/').into(),key,id.into()))
-    }
-    fn models(&self)->Value{
-        let mut models:Vec<Value>=serde_json::from_str(CATALOG).unwrap();
-        // Official Codex/API model docs checked 2026-10-10. Availability remains
-        // account/workspace dependent; this is offline metadata, not an access probe.
-        for (id,name,aliases,off) in [
-            ("gpt-6.1-sol","GPT-6.1 Sol",vec!["sol61","sol6.1"],false),
-            ("gpt-6-astra","GPT-6 Astra",vec!["astra6"],false),
-            ("gpt-6-sol","GPT-6 Sol",vec!["sol6"],true),
-            ("gpt-6-luna","GPT-6 Luna",vec!["luna6"],true),
-            ("gpt-5.6-sol","GPT-5.6 Sol",vec!["sol56","sol5.6"],true),
-            ("gpt-5.6-terra","GPT-5.6 Terra",vec!["terra56","terra5.6"],true),
-            ("gpt-5.6-luna","GPT-5.6 Luna",vec!["luna56","luna5.6"],true),
-        ]{
-            let mut efforts=vec!["low","medium","high","xhigh","max"];
-            if off{efforts.insert(0,"off");}
-            for (provider,api) in [("openai","openai-responses"),("openai-codex","openai-codex-responses")]{
-                models.push(json!({"id":format!("{provider}/{id}"),"name":name,"aliases":aliases,"provider":provider,
-                    "api":api,"context_limit":if provider=="openai-codex"{272000}else{1050000},
-                    "max_input_tokens":if provider=="openai-codex"{258400}else{922000},"max_tokens":128000,
-                    "image_input":true,"reasoning":true,"image_output":false,"reasoning_efforts":efforts}));
-            }
-        }
-        for id in ["gpt-5.2","gpt-5.2-codex","gpt-5.3-codex"]{
-            models.push(json!({"id":format!("openai-codex/{id}"),"name":id,"provider":"openai-codex",
-                "api":"openai-codex-responses","context_limit":400000,"max_tokens":128000,
-                "image_input":true,"reasoning":true,"image_output":false,"deprecated":true}));
-        }
-        for provider in ["openai","openai-codex"]{
-            let record=&self.catalog["providers"][provider];
-            if self.catalog_identity(provider).is_some_and(|identity|record["identity"]==identity){
-                if let Some(discovered)=record["models"].as_array(){
-                    for model in models.iter_mut().filter(|m|m["provider"]==provider){
-                        model["catalog_listed"]=json!(discovered.iter().any(|d|d["id"]==model["id"]));
-                    }
-                    for model in discovered{
-                        models.retain(|m|m["id"]!=model["id"]);models.push(model.clone());
-                    }
-                }
-            }
-        }
-        if let Some(providers)=self.config["providers"].as_object(){
-            for (provider,cfg) in providers{
-                if let Some(list)=cfg["models"].as_array(){
-                    for item in list{
-                        let mut item=item.clone();
-                        item["id"]=json!(format!("{provider}/{}",item["id"].as_str().unwrap_or("")));
-                        item["provider"]=json!(provider);item["configured"]=json!(true);item["user_declared"]=json!(true);
-                        models.retain(|v|v["id"]!=item["id"]);models.push(item);
-                    }
-                }
-            }
-        }
-        for item in &mut models{
-            let provider=item["provider"].as_str().unwrap_or("").to_string();
-            item["known"]=json!(true);
-            item["configured"]=json!(self.config["providers"][&provider].is_object());
-            let provider=provider_alias(&provider);
-            let cfg=&self.config["providers"][provider];
-            let env=cfg["key_env"].as_str().or(PROVIDERS.iter().find(|p|p.0==provider).map(|p|p.2)).unwrap_or("");
-            item["credential_backed"]=json!(!self.credential(provider,env).trim().is_empty());
-            item["ready"]=json!(self.provider_config(item["id"].as_str().unwrap()).is_ok()
-                &&item["metadata_complete"]!=false);
-        }
-        json!(models)
-    }
-    fn model_api(&self,model:&str)->String{
-        let (provider,id)=model.split_once('/').unwrap_or(("openai",model));
-        let provider=provider_alias(provider);
-        if provider=="openai-codex"{return "openai-codex-responses".into();}
-        let cfg=&self.config["providers"][provider];
-        if let Some(models)=cfg["models"].as_array(){
-            if let Some(item)=models.iter().find(|m|m["id"]==id){
-                if let Some(api)=item["api"].as_str(){return api.into();}
-            }
-        }
-        if let Some(api)=cfg["api"].as_str(){return api.into();}
-        let catalog:Vec<Value>=serde_json::from_str(CATALOG).unwrap();
-        if let Some(item)=catalog.iter().find(|m|m["id"]==model){
-            if let Some(api)=item["api"].as_str(){return api.into();}
-        }
-        match provider{"anthropic"=>"anthropic-messages","google"=>"google-generative-ai",_=>"openai-completions"}.into()
-    }
-    fn reasoning_metadata(&self,model:&str)->Value{
-        let (provider,id)=model.split_once('/').unwrap_or(("openai",model));
-        let provider=provider_alias(provider);
-        let canonical=format!("{provider}/{id}");
-        let mut meta=self.models().as_array().unwrap().iter().find(|m|m["id"]==canonical).cloned().unwrap_or(json!({}));
-        if let Some(item)=self.config["providers"][provider]["models"].as_array()
-            .and_then(|list|list.iter().find(|m|m["id"]==id)){
-            if let Some(fields)=item.as_object(){for (k,v) in fields{meta[k]=v.clone();}}
-        }
-        meta
-    }
-    fn invoke(&mut self,model:&str,messages:Vec<Value>,max:usize)->Result<String>{
-        self.with_state(UiState::Thinking,Some(model),|host|host.invoke_inner(model,messages,max))
-    }
-    fn invoke_inner(&mut self,model:&str,messages:Vec<Value>,max:usize)->Result<String>{
-        let (provider,id)=model.split_once('/').unwrap_or(("openai",model));
-        let api=self.model_api(model);
-        let meta=self.reasoning_metadata(model);
-        if meta["metadata_complete"]==false{return Err("model capabilities are incomplete; declare this model's API/context/capabilities in config.json before selecting or invoking it".into());}
-        // Validate before an operation intent or network request. Unsupported
-        // capability metadata is deliberately not inferred from API compatibility.
-        let fields=reasoning_fields(&api,provider_alias(provider),id,&meta,&self.effort,max)?;
-        if meta["max_input_tokens"].is_u64(){
-            let input=serde_json::to_string(&messages)?.chars().count().div_ceil(3);
-            let available=model_input_budget(self.model_limit(model)?,&meta,max);
-            if input>available{return Err(format!("estimated request input {input} exceeds model input budget {available}; reduce the prompt/context before retrying").into());}
-        }
-        self.reload_auth()?;
-        if model.starts_with("github-copilot/"){self.refresh_copilot()?;}
-        let codex=model.starts_with("openai-codex/")||model.starts_with("codex/");
-        if codex{self.refresh_codex()?;}
-        let anthropic_oauth=provider_alias(provider)=="anthropic"&&self.auth["anthropic"]["type"]=="oauth";
-        if anthropic_oauth{self.refresh_anthropic()?;}
-        let (url,key,id)=self.provider_config(model)?;
-        let request=json!({"model":model,"messages":messages,"max_tokens":max,"effort":self.effort});
-        let operation=format!("req{}",self.journal.seq);
-        self.journal.append("intent",json!({"operation":operation,"type":"provider"}))?;
-        self.journal.append("request",request.clone())?;
-        self.hist_push("requests",request);
-        let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(180))
-            .redirect(if codex||anthropic_oauth{reqwest::redirect::Policy::none()}else{reqwest::redirect::Policy::limited(10)}).build()?;
-        let request_builder=if codex{
-            self.codex_request(&client,&url,&key,&id,&messages)?
-        }else if api=="openai-responses"{
-            let mut input=messages.clone();
-            for message in &mut input{
-                if let Some(parts)=message["content"].as_array_mut(){
-                    for part in parts{
-                        match part["type"].as_str(){
-                            Some("text")=>part["type"]=json!("input_text"),
-                            Some("image_url")=>{
-                                let url=part["image_url"]["url"].clone();
-                                *part=json!({"type":"input_image","image_url":url});
-                            },
-                            _=>{}
-                        }
-                    }
-                }
-            }
-            let mut body=json!({"model":id,"input":input,"max_output_tokens":max,"store":false});
-            merge_reasoning_fields(&mut body,&fields);
-            client.post(format!("{url}/responses")).bearer_auth(key).json(&body)
-        }else if api=="anthropic-messages"{
-            let system=messages.iter().filter(|m|m["role"]=="system").filter_map(|m|m["content"].as_str()).collect::<Vec<_>>().join("\n");
-            let mut msgs:Vec<_>=messages.into_iter().filter(|m|m["role"]!="system").collect();
-            for message in &mut msgs{
-                if let Some(parts)=message["content"].as_array_mut(){
-                    for part in parts{
-                        if part["type"]=="image_url"{
-                            let url=part["image_url"]["url"].as_str().ok_or("image URL missing")?;
-                            let(mime,data)=image_data_url(url)?;
-                            *part=json!({"type":"image","source":{"type":"base64","media_type":mime,"data":data}});
-                        }
-                    }
-                }
-            }
-            let mut body=json!({"model":id,"system":system,"messages":msgs,"max_tokens":max});
-            merge_reasoning_fields(&mut body,&fields);
-            let mut request=client.post(format!("{url}/messages")).header("anthropic-version","2023-06-01");
-            if anthropic_oauth{
-                // Explicit subscription-protocol compatibility, not a change to
-                // stored context or harness instructions. Announced during login.
-                body["system"]=json!([
-                    {"type":"text","text":ANTHROPIC_OAUTH_SYSTEM},
-                    {"type":"text","text":system}
-                ]);
-                let mut beta="claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14".to_string();
-                if body.get("thinking").is_some(){beta.push_str(",interleaved-thinking-2025-05-14");}
-                request=request.bearer_auth(key).header("anthropic-beta",beta)
-                    .header("x-app","cli").header("User-Agent","claude-cli/2.1.2 (external, cli) py-rust/0.1.0")
-                    .header("Accept","application/json");
-            }else{
-                request=request.header("x-api-key",key);
-                if body.get("thinking").is_some(){request=request.header("anthropic-beta","interleaved-thinking-2025-05-14");}
-            }
-            request.json(&body)
-        }else if api=="google-generative-ai"{
-            let system=messages.iter().filter(|m|m["role"]=="system").filter_map(|m|m["content"].as_str()).collect::<Vec<_>>().join("\n");
-            let mut contents=Vec::new();
-            for message in messages.iter().filter(|m|m["role"]!="system"){
-                let mut parts=Vec::new();
-                if let Some(text)=message["content"].as_str(){parts.push(json!({"text":text}));}
-                else if let Some(items)=message["content"].as_array(){
-                    for item in items{
-                        if item["type"]=="text"{parts.push(json!({"text":item["text"]}));}
-                        else if item["type"]=="image_url"{
-                            let(mime,data)=image_data_url(item["image_url"]["url"].as_str().ok_or("image URL missing")?)?;
-                            parts.push(json!({"inlineData":{"mimeType":mime,"data":data}}));
-                        }
-                    }
-                }
-                contents.push(json!({"role":if message["role"]=="assistant"{"model"}else{"user"},"parts":parts}));
-            }
-            let mut body=json!({"contents":contents,"systemInstruction":{"parts":[{"text":system}]},
-                "generationConfig":{"maxOutputTokens":max}});
-            if let Some(config)=fields.get("thinkingConfig"){body["generationConfig"]["thinkingConfig"]=config.clone();}
-            client.post(format!("{url}/models/{id}:generateContent")).header("x-goog-api-key",key).json(&body)
-        }else{
-            let mut body=json!({"model":id,"messages":messages,"max_tokens":max});
-            merge_reasoning_fields(&mut body,&fields);
-            client.post(format!("{url}/chat/completions")).bearer_auth(key).json(&body)
-        };
-        let body=if codex{self.codex_sse(request_builder,&operation)?}else{self.http_json(request_builder,&operation)?};
-        self.journal.append("response",json!({"operation":operation,"status":200,"body":body}))?;
-        self.hist_push("responses",body.clone());
-        self.journal.append("operation_complete",json!({"operation":operation,"type":"provider"}))?;
-        let raw=&body["usage"];
-        let input=raw["prompt_tokens"].as_u64().or(raw["input_tokens"].as_u64())
-            .or(body["usageMetadata"]["promptTokenCount"].as_u64());
-        let output=raw["completion_tokens"].as_u64().or(raw["output_tokens"].as_u64())
-            .or(body["usageMetadata"]["candidatesTokenCount"].as_u64());
-        let cache=raw["prompt_tokens_details"]["cached_tokens"].as_u64()
-            .or(raw["input_tokens_details"]["cached_tokens"].as_u64()).or(raw["cache_read_input_tokens"].as_u64())
-            .or(body["usageMetadata"]["cachedContentTokenCount"].as_u64());
-        let cumulative=|name:&str,amount:Option<u64>|->Value{
-            match amount{Some(n)=>json!(self.usage[name].as_u64().unwrap_or(0)+n),None=>Value::Null}
-        };
-        self.usage=json!({"input_tokens":cumulative("input_tokens",input),"output_tokens":cumulative("output_tokens",output),
-            "cache_hit_tokens":cumulative("cache_hit_tokens",cache),"last_input_tokens":input,"operation":operation});
-        self.journal.append("usage",self.usage.clone())?;self.hist_push("usage",self.usage.clone());
-        let text=if let Some(text)=body["choices"][0]["message"]["content"].as_str(){
-            text.to_string()
-        }else if let Some(output)=body["output"].as_array(){
-            output.iter().filter(|m|m["type"]=="message").filter_map(|m|m["content"].as_array())
-                .flatten().filter(|p|p["type"]=="output_text").filter_map(|p|p["text"].as_str()).collect::<String>()
-        }else if let Some(parts)=body["content"].as_array(){
-            parts.iter().filter(|p|p["type"]=="text").filter_map(|p|p["text"].as_str()).collect::<String>()
-        }else if let Some(parts)=body["candidates"][0]["content"]["parts"].as_array(){
-            parts.iter().filter(|p|p["thought"]!=true).filter_map(|p|p["text"].as_str()).collect::<String>()
-        }else{return Err("provider response contains no text".into());};
-        if text.is_empty(){return Err("provider response contains no text".into());}
-        Ok(text)
-    }
-    fn inner_llm(&mut self,v:&Value)->Result<Value>{
-        let model=v["options"]["model"].as_str().unwrap_or(&self.model).to_string();
-        let prompt=v["prompt"].as_str().ok_or("prompt required")?;
-        let max=v["options"]["max_tokens"].as_u64().unwrap_or(2048) as usize;
-        let mut parts=vec![json!({"type":"text","text":prompt})];
-        if let Some(images)=v["options"]["images"].as_array(){
-            if images.len()>4{return Err("at most four images per request".into());}
-            let mut total=0;
-            for image in images{
-                let data=image["base64"].as_str().ok_or("image base64 required")?;
-                let(mime,size)=validate_image(data)?;total+=size;
-                if total>512000{return Err("combined image bytes exceed 512000".into());}
-                parts.push(json!({"type":"image_url","image_url":{"url":format!("data:{mime};base64,{data}")}}));
-            }
-        }
-        let content=if parts.len()==1{json!(prompt)}else{json!(parts)};
-        let system=v["options"]["system"].as_str().unwrap_or("You are a helpful assistant.");
-        // A call-local effort override must not alter the session default, even
-        // when request validation, networking or cancellation returns an error.
-        let override_effort=v["options"].get("effort").filter(|e|!e.is_null())
-            .map(|e|e.as_str().ok_or("effort must be a level string")).transpose()?;
-        let previous=override_effort.map(|e|std::mem::replace(&mut self.effort,e.to_string()));
-        let result=self.invoke(&model,vec![json!({"role":"system","content":system}),
-            json!({"role":"user","content":content})],max);
-        if let Some(previous)=previous{self.effort=previous;}
-        Ok(json!(result?))
-    }
-    fn run_agent(&mut self)->Result<()>{
-        for _ in 0..100{
-            if !self.startup_ready{return Err("Python initialization is incomplete; inspect /recovery and explicitly /reset to retry startup".into());}
-            self.check_system_budget(self.context_limit)?;
-            self.evict()?;
-            let mut messages=vec![json!({"role":"system","content":self.system_prompt()})];
-            messages.extend(self.context.iter().map(|i|{
-                let text=format!("[boundary {}]\n{}",i.id,i.text);
-                let content=if let Some(index)=self.attachments.get(&i.id){
-                    let raw=self.history_value("raw",*index).unwrap_or(Value::Null);
-                    json!([{"type":"text","text":text},{"type":"image_url","image_url":
-                        {"url":format!("data:{};base64,{}",raw["mime"].as_str().unwrap_or("image/png"),raw["base64"].as_str().unwrap_or(""))}}])
-                }else{json!(text)};
-                json!({"role":if i.role=="assistant"{"assistant"}else{"user"},"content":content})
-            }));
-            messages.push(json!({"role":"user","content":format!("Context usage: {}{}",
-                self.context_usage(),if self.forced(){" FORCED COLLAPSE MODE: collapse or literal stderr read only."}else{""})}));
-            let model=self.model.clone();let code=self.invoke(&model,messages,4096)?;
-            let id=format!("agent{}",self.journal.seq);
-            let result=self.execute(&id,&code,true)?;
-            let cancelled=result["status"]=="cancelled";
-            self.event("completed",result);
-            if cancelled{return Ok(());}
-            if self.deliver_steering()?{continue;}
-            if self.stop{self.commit_stop()?;return Ok(());}
-        }
-        Err("outer loop reached safety limit; return to user".into())
-    }
-}
-
-impl Host {
-    fn image(&mut self,v:&Value)->Result<Value>{
-        let model=v["options"]["model"].as_str().unwrap_or("openai/gpt-image-1");
-        self.with_state(UiState::Thinking,Some(model),|host|host.image_inner(v))
-    }
-    fn image_inner(&mut self,v:&Value)->Result<Value>{
-        self.reload_auth()?;
-        let model=v["options"]["model"].as_str().unwrap_or("openai/gpt-image-1");
-        let (url,key,id)=self.provider_config(model)?;
-        if !model.starts_with("openai/"){return Err("image generation currently requires openai-compatible provider".into());}
-        let prompt=v["prompt"].as_str().ok_or("prompt required")?;
-        let operation=format!("img{}",self.journal.seq);
-        self.journal.append("intent",json!({"operation":operation,"type":"image"}))?;
-        self.journal.append("request",json!({"model":model,"prompt":prompt}))?;
-        let request=reqwest::Client::new().post(format!("{url}/images/generations"))
-            .bearer_auth(key).json(&json!({"model":id,"prompt":prompt,"size":"1024x1024","n":1}));
-        let body=self.http_json(request,&operation)?;
-        self.journal.append("response",json!({"operation":operation,"body":body}))?;
-        let data=body["data"][0]["b64_json"].as_str().ok_or("image response missing base64")?;
-        let bytes=B64.decode(data)?;
-        let index=self.history["raw"].len();
-        self.journal.append("raw",json!({"index":index,"base64":data,"mime":"image/png","operation":operation}))?;
-        self.hist_push("raw",json!({"base64":data,"mime":"image/png"}));
-        self.journal.append("operation_complete",json!({"operation":operation,"type":"image"}))?;
-        Ok(json!({"raw_index":index,"ref":format!("H.raw[{index}]"),"bytes":bytes.len()}))
-    }
-    fn read_raw(&mut self,v:&Value)->Result<Value>{
-        let data=v["base64"].as_str().ok_or("image bytes required")?;
-        let bytes=B64.decode(data)?;
-        if bytes.len()>512000{return Err("image exceeds 512000-byte limit".into());}
-        let mime=if bytes.starts_with(b"\x89PNG\r\n\x1a\n"){"image/png"}
-            else if bytes.starts_with(b"\xff\xd8\xff"){"image/jpeg"}
-            else{return Err("only PNG/JPEG images supported".into());};
-        let decoded=image::load_from_memory_with_format(&bytes,
-            if mime=="image/png"{image::ImageFormat::Png}else{image::ImageFormat::Jpeg})?;
-        if decoded.width()>1536||decoded.height()>1536{return Err("image dimensions exceed 1536 pixels".into());}
-        let active=self.context.iter().filter(|i|self.attachments.contains_key(&i.id)).count();
-        if active>=4{return Err("at most four active images per context".into());}
-        let index=self.history["raw"].len();
-        self.journal.append("raw",json!({"index":index,"base64":data,"mime":mime}))?;
-        self.hist_push("raw",json!({"base64":data,"mime":mime}));
-        let id=self.add_context("user",format!("[image H.raw[{index}]]"),true,vec![])?;
-        self.journal.append("attachment",json!({"context_id":id,"raw_index":index}))?;
-        self.attachments.insert(id.clone(),index);
-        Ok(json!(id))
-    }
-}
-fn redacted_command(mut command:Value)->Result<Value>{
-    if let Some(object)=command.as_object_mut(){object.remove("terminal_controls");}
-    if command["kind"]=="login"{
-        command.as_object_mut().ok_or("command must be an object")?.retain(|name,value|match name.as_str(){
-            "id"|"kind"|"provider"=>true,
-            "method"=>value.as_str().is_some_and(|s|["browser","manual","device","oauth","api-key"].contains(&s)),
-            _=>false
-        });
-    }
-    Ok(command)
-}
-fn unique_id()->u64{
-    static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
-    NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)
-}
-// Styling is added only after sanitization and column layout; payload escape
-// bytes never become executable control sequences. NO_COLOR presence wins.
-fn terminal_color_for(fd:i32)->bool{
-    std::env::var_os("NO_COLOR").is_none()&&!std::env::var("TERM").is_ok_and(|t|t=="dumb")&&unsafe{libc::isatty(fd)==1}
-}
-fn terminal_styled_for(text:&str,style:&str,fd:i32)->String{
-    if text.is_empty()||!terminal_color_for(fd){text.into()}else{format!("\x1b[{style}m{text}\x1b[0m")}
-}
-fn terminal_table_styled(lines:Vec<String>)->Vec<String>{
-    if !terminal_color_for(1){return lines;}
-    let mut header=true;
-    lines.into_iter().map(|line|{
-        if line.starts_with('├'){header=false;}
-        if header&&line.starts_with('│'){return terminal_styled(&line,"1");}
-        let mut out=String::new();
-        for c in line.chars(){if "│┌┐└┘├┤┬┴┼─".contains(c){out.push_str(&format!("\x1b[2m{c}\x1b[0m"));}else{out.push(c);}}
-        out
-    }).collect()
-}
-fn terminal_styled(text:&str,style:&str)->String{terminal_styled_for(text,style,1)}
-fn terminal_style_lines(lines:Vec<String>,style:&str)->Vec<String>{lines.into_iter().map(|s|terminal_styled(&s,style)).collect()}
-fn terminal_result_style(status:&str)->&'static str{match status{"ok"=>"32","error"=>"31",_=>"33"}}
-fn ui_text(text:&str){for line in terminal_wrap(text,terminal_width()).0{println!("{line}");}}
-fn terminal_state(v:&Value,width:usize)->Vec<String>{
-    let state=v["state"].as_str().unwrap_or("idle");
-    let text=if state=="thinking"{
-        let mut text=format!("› thinking · {} [{}]",v["model"].as_str().unwrap_or(""),v["effort"].as_str().unwrap_or(""));
-        if let Some(ms)=v["elapsed_ms"].as_u64(){text.push_str(&format!(" · {:.1}s",ms as f64/1000.0));}
-        if let Some(retry)=v["retry"].as_u64().filter(|retry|*retry>0){text.push_str(&format!(" · retry {retry}"));}
-        text
-    }else{format!("› {state}")};
-    terminal_style_lines(terminal_wrap(&text,width).0,match state{"thinking"=>"35","idle"=>"2","input"|"login"=>"33",_=>"36"})
-}
-fn terminal_cell_end(v:&Value,width:usize)->Vec<String>{
-    let status=v["status"].as_str().unwrap_or("error");
-    let identity=if let Some(parent)=v["parent_cell"].as_u64(){format!("cell {parent} › {}",v["cell"])}else{format!("cell {}",v["cell"])};
-    let label=format!("── {identity} · {} {}ms · status: {} ",
-        v["language"].as_str().unwrap_or(""),v["elapsed_ms"],status);
-    let text=format!("{label}{}","─".repeat(width.saturating_sub(terminal_columns(&label))));
-    terminal_style_lines(terminal_wrap(&text,width).0,terminal_result_style(status))
-}
-fn ui_json(title:&str,value:&Value){
-    ui_text(title);ui_text(&serde_json::to_string_pretty(value).unwrap_or_default());
-}
-impl Host{
-    fn ui_text(&self,text:&str){self.event("notice",json!({"text":text}));}
-    fn ui_json(&self,title:&str,value:&Value){
-        if self.json{self.event("info",json!({"title":title,"value":value}));}else{ui_json(title,value);}
-    }
-    fn announce_ready(&self){
-        self.event(if self.startup_ready{"ready"}else{"initialization_blocked"},json!({"session":self.journal.path,"model":self.model,"effort":self.effort,"startup_ready":self.startup_ready,"context_usage":self.context_usage()}));
-        self.event("state",self.state_payload());
-    }
-    fn state_payload(&self)->Value{
-        let mut payload=json!({"state":self.state.label(),"cell":self.active_cell,"cells":self.cells});
-        if self.state==UiState::Thinking{
-            payload["model"]=json!(self.thinking_model.as_deref().unwrap_or(&self.model));
-            payload["effort"]=json!(self.effort);
-        }
-        payload
-    }
-    fn set_state(&mut self,state:UiState,model:Option<&str>){
-        let model=if state==UiState::Thinking{Some(model.unwrap_or(&self.model).to_string())}else{None};
-        if self.state==state&&self.thinking_model==model{return;}
-        self.state=state;self.thinking_model=model;
-        self.event("state",self.state_payload());
-    }
-    fn with_state<T>(&mut self,state:UiState,model:Option<&str>,action:impl FnOnce(&mut Self)->Result<T>)->Result<T>{
-        let previous=self.state;let previous_model=self.thinking_model.clone();
-        self.set_state(state,model);
-        let busy=if state==UiState::Thinking&&terminal_editor_available(self.json){
-            Some(BusyInput::start(self.thinking_model.clone().unwrap_or_else(||self.model.clone()),self.effort.clone()))
-        }else{None};
-        let result=action(self);
-        if let Some(busy)=busy{
-            for (number,(text,mode)) in busy.finish().into_iter().enumerate(){
-                if !text.trim().is_empty(){
-                    self.queue_arrival(json!({"id":format!("steer{}-{number}",now_ms()),"kind":"submit","text":text,"mode":mode}))?;
-                }
-            }
-        }
-        self.set_state(previous,previous_model.as_deref());
-        result
-    }
-    fn with_cell(&mut self,language:&str,operation:&str,source_ref:&str,action:impl FnOnce(&mut Self)->Result<Value>)->Result<Value>{
-        let cell=self.cells.checked_add(1).ok_or("session cell counter exhausted")?;
-        let parent=self.active_cell;
-        let start=json!({"cell":cell,"parent_cell":parent,"language":language,"operation":operation,"source_ref":source_ref});
-        self.journal.append("cell_start",start.clone())?;
-        self.cells=cell;self.active_cell=Some(cell);self.event("cell_start",start);
-        let began=std::time::Instant::now();
-        let result=self.with_state(UiState::Running,None,|host|{
-            let result=action(host);
-            let value=result.as_ref().ok();
-            let status=value.and_then(|v|v["status"].as_str()).unwrap_or("error");
-            let end=json!({"cell":cell,"parent_cell":parent,"language":language,"operation":operation,"source_ref":source_ref,
-                "status":status,"elapsed_ms":began.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                "stdout_ref":value.and_then(|v|v["stdout"]["ref"].as_str()),
-                "stderr_ref":value.and_then(|v|v["stderr"]["ref"].as_str())});
-            let committed=host.journal.append("cell_end",end.clone());
-            if committed.is_ok(){host.event("cell_end",end);}
-            host.active_cell=parent;
-            committed?;result
-        });
-        // Also restore attribution if a durable-end write failed.
-        self.active_cell=parent;result
-    }
-    fn login_providers(&self)->Vec<String>{
-        let mut names:Vec<String>=PROVIDERS.iter().map(|p|p.0.to_string()).collect();
-        names.extend(["openai-codex".into(),"github-copilot".into()]);
-        if let Some(config)=self.config["providers"].as_object(){names.extend(config.keys().cloned());}
-        names.sort();names.dedup();names
-    }
-    fn resolve_provider(&self,query:&str)->Result<String>{
-        let query=provider_alias(query);
-        let names=self.login_providers();
-        if let Some(name)=names.iter().find(|n|n.eq_ignore_ascii_case(query)){return Ok(name.clone());}
-        let found:Vec<_>=names.into_iter().filter(|n|fuzzy_score(query,n).is_some()).collect();
-        if found.len()==1{return Ok(found[0].clone());}
-        if found.is_empty(){return Err(format!("Unknown provider {query}; /login lists supported providers").into());}
-        Err(format!("Provider query is ambiguous: {}",found.join(", ")).into())
-    }
-    fn matching_models(&self,query:&str)->Vec<Value>{
-        let models=self.models();
-        let mut found:Vec<(i64,Value)>=vec![];
-        let (provider,needle)=query.split_once('/').map(|(p,n)|(Some(provider_alias(p)),n)).unwrap_or((None,query));
-        for model in models.as_array().unwrap(){
-            let id=model["id"].as_str().unwrap_or("");
-            if model["image_output"]==true{continue;}
-            if provider.is_some_and(|p|!model["provider"].as_str().unwrap_or("").eq_ignore_ascii_case(p)){continue;}
-            let candidate=if provider.is_some(){id.split_once('/').map_or(id,|(_,id)|id)}else{id};
-            let score=fuzzy_score(needle,candidate).or_else(||fuzzy_score(needle,model["name"].as_str().unwrap_or("")))
-                .or_else(||model["aliases"].as_array().and_then(|aliases|aliases.iter().filter_map(|a|a.as_str().and_then(|a|fuzzy_score(needle,a))).max()));
-            if let Some(score)=score{found.push((score,model.clone()));}
-        }
-        found.sort_by(|a,b|b.0.cmp(&a.0).then_with(||a.1["id"].as_str().cmp(&b.1["id"].as_str())));
-        found.into_iter().map(|p|p.1).collect()
-    }
-    fn choose_model(&mut self,query:&str)->Result<()>{
-        let query=query.trim();
-        let canonical=query.split_once('/').map(|(p,id)|format!("{}/{id}",provider_alias(p))).unwrap_or(query.into());
-        let models=self.models();
-        let exact:Vec<_>=models.as_array().unwrap().iter().filter(|m|m["image_output"]!=true&&
-            (m["id"].as_str().is_some_and(|id|id.eq_ignore_ascii_case(&canonical)||
-                (!query.contains('/')&&id.split_once('/').is_some_and(|(_,id)|id.eq_ignore_ascii_case(query))))
-             ||m["aliases"].as_array().is_some_and(|aliases|aliases.iter().any(|alias|alias.as_str().is_some_and(|alias|
-                if let Some((provider,needle))=canonical.split_once('/'){
-                    m["provider"].as_str().is_some_and(|p|p.eq_ignore_ascii_case(provider))&&alias.eq_ignore_ascii_case(needle)
-                }else{alias.eq_ignore_ascii_case(query)}))))).collect();
-        let found=if exact.is_empty(){self.matching_models(query)}else{exact.into_iter().cloned().collect()};
-        if found.is_empty(){return Err(format!("No model matches {query}; /model list shows known/configured models").into());}
-        if found.len()!=1{
-            return Err(format!("Model query is ambiguous: {}. Use a full provider/model ID.",
-                found.iter().take(16).filter_map(|m|m["id"].as_str()).collect::<Vec<_>>().join(", ")).into());
-        }
-        if found[0]["metadata_complete"]==false{return Err("model discovered without capability metadata; declare its API/context/capabilities in config.json first".into());}
-        let model=found[0]["id"].as_str().unwrap();
-        self.check_model_system_budget(model,self.model_limit(model)?)?;
-        self.set_model(model.into())?;
-        if self.validate_effort(&self.effort).is_err(){
-            self.effort=found[0]["default_effort"].as_str().unwrap_or("medium").into();
-            self.event("notice",json!({"text":format!("Previous effort unsupported by this model; reset to {}.",self.effort)}));
-        }
-        self.save_session_settings()?;
-        self.event("notice",json!({"text":format!("Model: {} [{}]",self.model,self.effort)}));
-        if found[0]["deprecated"]==true{self.event("notice",json!({"text":"This legacy Codex model is deprecated for ChatGPT sign-in. Try /model codex/sol61 or /model codex/luna6; availability depends on your account/workspace."}));}
-        Ok(())
-    }
-    fn validate_effort(&self,effort:&str)->Result<()>{
-        if !["off","minimal","low","medium","high","xhigh","max"].contains(&effort){
-            return Err("Unsupported effort: choose off, minimal, low, medium, high, xhigh or max (model-dependent)".into());
-        }
-        let meta=self.reasoning_metadata(&self.model);
-        if let Some(levels)=meta["reasoning_efforts"].as_array(){
-            if !levels.iter().any(|level|level==effort){return Err(format!("Effort {effort} unsupported by this model; supported: {}",meta["reasoning_efforts"]).into());}
-        }else if effort=="max"&&!(meta["reasoning"]==true&&meta["api"]=="anthropic-messages"&&self.model.contains("claude-opus-4-6")){
-            return Err("Effort max unsupported by this model; requires explicit capability metadata or Opus 4.6".into());
-        }
-        Ok(())
-    }
-    fn change_effort(&mut self,effort:&str)->Result<()>{
-        let effort=effort.to_lowercase();self.validate_effort(&effort)?;
-        self.effort=effort;self.save_session_settings()?;
-        self.event("notice",json!({"text":format!("Effort: {}",self.effort)}));Ok(())
-    }
-    fn save_session_settings(&mut self)->Result<()>{
-        self.journal.append("settings_change",json!({"model":self.model,"effort":self.effort}))?;Ok(())
-    }
-    fn list_models(&self,query:&str){
-        let found=self.matching_models(query);
-        let mut table="## Models (built-in/configured/cached inventory)\n\n| Model | Status | Context |\n| --- | --- | ---: |\n".to_string();
-        let unlisted=found.iter().any(|m|m["catalog_listed"]==false);
-        for model in found{
-            let ready=if model["metadata_complete"]==false{"needs capability metadata"}
-                else if model["credential_backed"]==true&&model["catalog_listed"]==false{"credentials present; not listed"}
-                else if model["credential_backed"]==true{"credentials present"}
-                else if model["ready"]==true{"local/anonymous"}else{"login needed"};
-            table.push_str(&format!("| {}{} | {} | {} |\n",model["id"].as_str().unwrap_or(""),
-                if model["deprecated"]==true{" (deprecated for subscription)"}else{""},ready,model["context_limit"]));
-        }
-        if unlisted{table.push_str("\nNot listed is advisory, not an access denial. Known models remain selectable; the provider confirms access.\n");}
-        self.event("say",json!({"text":table}));
-    }
-    fn session_paths(&self)->Result<Vec<PathBuf>>{
-        let mut paths=fs::read_dir(self.home.join("sessions"))?.filter_map(|p|p.ok().map(|p|p.path()))
-            .filter(|p|p.extension().is_some_and(|e|e=="jsonl")).collect::<Vec<_>>();
-        paths.sort();paths.reverse();Ok(paths)
-    }
-    fn switch_session(&mut self,query:Option<&str>,cancel_tasks:bool)->Result<()>{
-        if !self.pending.is_empty(){return Err("Pending accepted commands must be handled before switching sessions".into());}
-        self.bg_guard(cancel_tasks)?;
-        let path=if let Some(query)=query{
-            let query=query.trim_matches(|c|c=='\''||c=='"');
-            let direct=PathBuf::from(query);
-            let paths=self.session_paths()?;
-            if direct.is_file(){Some(fs::canonicalize(direct)?)}else{
-                let found:Vec<_>=paths.into_iter().filter(|p|fuzzy_score(query,p.file_name().unwrap_or_default().to_string_lossy().as_ref()).is_some()).collect();
-                if found.len()!=1{return Err(format!("Session query matches {} sessions; use /sessions and an exact path",found.len()).into());}
-                Some(found[0].clone())
-            }
-        }else{None};
-        if path.as_ref().is_some_and(|p|fs::canonicalize(&self.journal.path).ok().as_ref()==Some(p)){
-            self.ui_text("Already in this session.");return Ok(());
-        }
-        let defaults=if path.is_none(){load_json(&self.home.join("config.json"))?}else{Value::Null};
-        let model_override=if path.is_none()&&defaults["model"]==self.config["model"]{Some(self.model.as_str())}else{None};
-        let effort_override=if path.is_none()&&defaults["effort"]==self.config["effort"]{Some(self.effort.as_str())}else{None};
-        let mut next=Host::new(self.home.clone(),path.clone(),self.json,self.no_model,model_override,effort_override)?;
-        next.announce_ready();
-        self.ui_text(&format!("Session: {}",next.journal.path.display()));
-        next.incoming=self.incoming.take();next.input_closed=self.input_closed;
-        *self=next;Ok(())
-    }
-    fn ui_command(&mut self,line:&str)->Result<bool>{
-        self.reload_auth()?;
-        let (command,args)=line.split_once(char::is_whitespace).map(|(c,a)|(c,a.trim())).unwrap_or((line,""));
-        match command{
-            "/quit"|"/exit"=>{self.bg_guard(transition_cancel(args)?)?;return Ok(false);},
-            "/tasks"|"/task"|"/bg"|"/wakeups"|"/wakeup"=>self.ui_background_command(command,args)?,
-            "/help"|"/hotkeys"=>self.ui_text("py — ordinary persistent Python, unrestricted execution.\nOrdinary Python. No sandbox.\n! shell / @ Python: hidden from the model; !! / @@: visible.\nTab: fuzzy picker for commands, arguments, Python names, executables and files.\nType to filter; arrows/Tab move, Enter selects (not submits); Esc cancels.\nShift+Enter inserts newline on supported terminals; Ctrl-J is a fallback.\nContinuation lines align after the two-column > prompt.\nPython brackets/suites and bracketed multiline paste form a single cell.\nCtrl-D: exit idle editor. Ctrl-C: clear editor / cancel active operation.\n/model list [query] /models [query]: cached inventory, refreshed when stale\n/model list refresh [provider] /models refresh [provider]: force refresh\n/model <provider/id or fuzzy query>: select, rejecting ambiguity\n/effort <off|minimal|low|medium|high|xhigh> (/think, /thinking)\n/login [provider] [browser|manual|device|api-key] /logout [provider] /auth\n/status /context /config /recovery /session /sessions\n/config get <key> | set <key> <JSON-value> | unset <key> | reload\nDurable entries: ~/.py/skills/*.md (or PY_HOME); ordinary file editing, no skills API.\nCore entries and inventory freeze on /new; reset/resume preserve that snapshot.\nCore Python runs unrestricted in every fresh main worker; prefer definitions/imports.\n/new /resume <path or fuzzy session> /reset /compact [instructions]\n/tasks [state] /task <id> /task logs <id> [stdout|stderr|both]\n/task kill <id> [--force] /bg shell|python <source>\n/wakeups /wakeup cancel|run <id>\n/quit, /new and /resume require --cancel-tasks while jobs run.\nH stores full history; previews show at most 12 original lines.\nSession resume restores H/context/settings, never Python variables or execution.\n/quit: exit. Browser OAuth: Codex callback, Anthropic hidden code paste.\nUnsupported provider protocols and live subscription parity are not claimed."),
-            "/model" if args.is_empty()=>self.ui_text(&self.model),
-            "/model" if args=="list"||args.starts_with("list ")=>self.model_list_command(args.strip_prefix("list").unwrap().trim())?,
-            "/model"=>{
-                let provider=args.split_once('/').map(|p|provider_alias(p.0).to_string()).unwrap_or_else(||self.model.split_once('/').map_or("openai",|p|provider_alias(p.0)).to_string());
-                let cancel_revision=self.cancel_revision;self.maybe_refresh_model_catalog(&provider);
-                if self.cancel_revision!=cancel_revision{return Err("model selection cancelled; previous selection retained".into());}
-                self.choose_model(args)?;
-            },
-            "/models"=>self.model_list_command(args)?,
-            "/effort"|"/think"|"/thinking"=>if args.is_empty(){self.ui_text(&self.effort);}else{self.change_effort(args)?;},
-            "/login"=>self.interactive_login(args)?,
-            "/logout"=>if args.is_empty(){
-                let stored=self.auth.as_object().map(|m|m.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
-                if stored.is_empty(){self.ui_text("No stored credentials. Environment variables are unchanged.");}
-                else{self.ui_text(&format!("Use /logout <provider>: {}. Environment credentials are not removed.",stored.join(", ")));}
-            }else{let provider=self.resolve_provider(args)?;self.logout(&provider)?;self.ui_text(&format!("Removed stored credentials for {provider}; environment credentials unchanged."));},
-            "/auth"=>self.ui_json("Authentication (no secrets)",&self.auth_status()),
-            "/status"=>self.ui_json("Status",&self.status()),
-            "/context"=>self.ui_json("Context metadata",&self.context_usage()),
-            "/config"=>self.config_command(args)?,
-            "/recovery"=>self.ui_json("Recovery: no automatic replay",&self.recovery_status()?),
-            "/session"=>self.ui_text(&format!("Session: {}",self.journal.path.display())),
-            "/sessions"|"/resume" if args.is_empty()=>{self.ui_text("Sessions — /resume <path or fuzzy filename>");for path in self.session_paths()?{self.ui_text(&path.to_string_lossy());}},
-            "/resume"=>{let (query,cancel)=transition_query(args)?;self.switch_session(Some(query),cancel)?;},
-            "/new"=>self.switch_session(None,transition_cancel(args)?)?,
-            "/reset"=>self.reset_worker()?,
-            "/interrupt"=>self.ui_text("No operation is running. Ctrl-C cancels an active operation."),
-            "/compact"=>{
-                if self.no_model{return Err("Compaction requires an authenticated model; local mode never silently discards context".into());}
-                let id=format!("compact{}",self.journal.seq);
-                self.dispatch(json!({"id":id,"kind":"submit","text":format!("Compact the context using a standalone agent.context.collapse call, preserve task constraints, unfinished work and original-range references, then agent.loop.stop(). Additional instructions: {args}")}))?;
-            },
-            _=>return Err(format!("Unknown command {command}; /help lists implemented commands").into())
-        }
-        Ok(true)
-    }
-}
 #[cfg(test)]
 mod background_ui_tests {
     use super::*;
@@ -5363,2189 +9554,6 @@ finally:
  os.close(m)
 "#);}
 }
-fn transition_cancel(args:&str)->Result<bool>{
-    match args.trim(){""=>Ok(false),"--cancel-tasks"=>Ok(true),_=>Err("Only --cancel-tasks is accepted here".into())}
-}
-fn transition_query(args:&str)->Result<(&str,bool)>{
-    let (query,cancel)=if let Some(query)=args.strip_suffix("--cancel-tasks"){
-        if !query.ends_with(char::is_whitespace){return Err("Separate --cancel-tasks from the session path".into());}
-        (query.trim(),true)
-    }else{(args.trim(),false)};
-    if query.is_empty(){return Err("Usage: /resume <path or fuzzy session> [--cancel-tasks]".into());}
-    Ok((query,cancel))
-}
-impl Host{
-    fn ui_background_command(&mut self,command:&str,args:&str)->Result<()>{
-        let id=format!("ui{}",self.journal.seq);let words:Vec<_>=args.split_whitespace().collect();
-        let mut v=match command{
-            "/tasks" if words.len()<=1=>json!({"kind":"task_list","state":words.first()}),
-            "/task"=>match words.as_slice(){
-                [task]=>json!({"kind":"task_get","task_id":task}),
-                ["logs",task]=>json!({"kind":"task_logs","task_id":task,"stream":"both"}),
-                ["logs",task,stream] if ["stdout","stderr","both"].contains(stream)=>json!({"kind":"task_logs","task_id":task,"stream":stream}),
-                ["kill",task]=>json!({"kind":"task_kill","task_id":task,"force":false}),
-                ["kill",task,"--force"]=>json!({"kind":"task_kill","task_id":task,"force":true}),
-                _=>return Err("Usage: /task <id> | /task logs <id> [stdout|stderr|both] | /task kill <id> [--force]".into())
-            },
-            "/bg"=>{
-                let (kind,source)=args.split_once(char::is_whitespace).ok_or("Usage: /bg shell|python <source>")?;
-                if !["shell","python"].contains(&kind)||source.trim().is_empty(){return Err("Usage: /bg shell|python <source>".into());}
-                json!({"kind":"bg_run","task_kind":kind,"source":source.trim_start()})
-            },
-            "/wakeups" if words.is_empty()=>json!({"kind":"wakeup_list"}),
-            "/wakeup"=>match words.as_slice(){
-                ["cancel",wake]=>json!({"kind":"wakeup_cancel","wakeup_id":wake}),
-                ["run",wake]=>json!({"kind":"wakeup_run","wakeup_id":wake}),
-                _=>return Err("Usage: /wakeup cancel|run <id>".into())
-            },
-            _=>return Err("Unexpected arguments; /help lists background commands".into())
-        };
-        let previous:HashSet<_>=self.bg_tasks.keys().cloned().collect();
-        v["id"]=json!(id);self.dispatch(v.clone())?;
-        let result=match v["kind"].as_str().unwrap(){
-            "task_list"=>self.bg_list(v["state"].as_str())?,
-            "bg_run"=>self.bg_tasks.iter().find(|(id,_)|!previous.contains(*id)).map(|(_,task)|task.metadata.clone()).ok_or("background launch did not create a task")?,
-            "task_get"|"task_kill"=>self.bg_get(v["task_id"].as_str().unwrap())?,
-            "task_logs"=>{
-                let metadata=self.bg_get(v["task_id"].as_str().unwrap())?;
-                for stream in ["stdout","stderr"]{
-                    if v["stream"]!="both"&&v["stream"]!=stream{continue;}
-                    let index=metadata[stream]["index"].as_u64().ok_or("task has no output reference")? as usize;
-                    self.ui_text(&format!("{} — {}\n{}\n[{} bytes; preview only; full output in H]",stream,metadata[stream]["ref"].as_str().unwrap_or(""),self.ui_stream_preview(stream,index)?,metadata[stream]["bytes"]));
-                }
-                return Ok(());
-            },
-            _=>self.wakeup_list()?
-        };
-        self.ui_json("Background management",&result);Ok(())
-    }
-    fn ui_stream_preview(&self,stream:&str,index:usize)->Result<String>{
-        let value=self.history.get(stream).and_then(|values|values.get(index)).ok_or("missing task stream")?;
-        let mut bytes=Vec::new();
-        if let Some(chunks)=value["$chunks"].as_array(){
-            for seq in chunks{
-                let event=self.journal.event(seq.as_u64().ok_or("invalid stream chunk")? as usize)?;
-                let chunk=B64.decode(event["payload"]["base64"].as_str().ok_or("missing stream bytes")?)?;
-                bytes.extend_from_slice(&chunk[..chunk.len().min(16384-bytes.len())]);
-                if bytes.len()>=16384||bytes.iter().filter(|b|**b==b'\n').count()>=12{break;}
-            }
-        }else if let Some(text)=value.as_str(){bytes.extend_from_slice(&text.as_bytes()[..text.len().min(16384)]);}
-        else{return Err("invalid task stream".into());}
-        Ok(String::from_utf8_lossy(&bytes).lines().take(12).collect::<Vec<_>>().join("\n").chars().take(4000).collect())
-    }
-}
-fn main(){
-    if let Err(e)=cli(){
-        for line in terminal_wrap(&e.to_string(),terminal_width()).0{eprintln!("{line}");}
-        std::process::exit(1);
-    }
-}
-fn cli()->Result<()>{
-    // Parse every option before touching storage or starting Python. There are
-    // deliberately no positional prompts, key arguments or extension flags.
-    let args:Vec<String>=std::env::args().skip(1).collect();
-    let (mut help,mut version,mut spec,mut json_mode,mut json_input,mut no_model)=(false,false,false,false,false,false);
-    let (mut model,mut effort,mut resume):(Option<String>,Option<String>,Option<PathBuf>)=(None,None,None);
-    let mut i=0;
-    while i<args.len(){
-        let flag=args[i].as_str();
-        match flag{
-            "--help"|"-h"=>help=true,"--version"|"-V"=>version=true,"--spec"=>spec=true,
-            "--json"=>json_mode=true,"--json-input"=>json_input=true,"--no-model"=>no_model=true,
-            "--model"|"--effort"|"--session"|"--resume"=>{
-                let value=args.get(i+1).filter(|v|!v.is_empty()&&!v.starts_with('-'))
-                    .ok_or_else(||format!("{flag} requires a value; run --help for usage"))?;
-                match flag{
-                    "--model"=>{if model.replace(value.clone()).is_some(){return Err("--model specified more than once".into());}},
-                    "--effort"=>{
-                        let value=value.to_lowercase();
-                        if !["off","minimal","low","medium","high","xhigh","max"].contains(&value.as_str()){
-                            return Err("Unsupported effort: off, minimal, low, medium, high, xhigh or max (model-dependent)".into());
-                        }
-                        if effort.replace(value).is_some(){return Err("--effort specified more than once".into());}
-                    },
-                    _=>{if resume.replace(PathBuf::from(value)).is_some(){return Err("Use only one --session or --resume path".into());}}
-                }
-                i+=1;
-            },
-            _=>return Err(format!("Unexpected argument {flag}; run --help for supported options (no positional prompts)").into())
-        }
-        i+=1;
-    }
-    if help{
-        ui_text("Usage: py [options]\nPersistent ordinary Python + a Python-writing model. No sandbox.\n\n--model <provider/id or unique fuzzy query>: choose a known/configured model\n--effort <off|minimal|low|medium|high|xhigh|max>: reasoning preference (supported levels depend on the model)\n--session <path>, --resume <path>: restore an existing journal; fresh Python, no replay\n--no-model: local Python/shell mode, no automatic model turns\n--json: write versioned JSONL events to stdout instead of human previews\n--json-input: read JSONL commands from stdin instead of the editor\n--spec: print the embedded specification and coverage ledger\n--help, -h: show this help without starting Python or creating files\n--version, -V: show the version without creating files\n\nJSON input and output are independent; combine --json --json-input for automation.\nPY_HOME chooses global state storage (default ~/.py); PY_MODEL/config.json choose defaults.\nCLI model/effort override restored session settings and are saved in that session, not global defaults.\nInteractive: /help, /login, /model list, /new, /resume. Tab fuzzily completes.\n! / @: hidden shell / Python; !! / @@: visible. Empty prompts are ignored.\nThere are no positional prompts or CLI API-key flags; use hidden /login entry.");
-        return Ok(());
-    }
-    if version{println!("py {} (transition)",env!("CARGO_PKG_VERSION"));return Ok(());}
-    if spec{print!("{SPEC}");return Ok(());}
-    if let Some(path)=&resume{if !path.is_file(){return Err(format!("Session file does not exist: {}",path.display()).into());}}
-    install_signals();
-    let home=std::env::var_os("PY_HOME").map(PathBuf::from).unwrap_or_else(||
-        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".py"));
-    let mut host=Host::new(home,resume,json_mode,no_model,model.as_deref(),effort.as_deref())?;
-    host.announce_ready();
-    if json_input{
-        let (tx,rx)=std::sync::mpsc::channel();
-        std::thread::spawn(move||{
-            for line in io::stdin().lock().lines(){
-                match line{
-                    Ok(s)=>match serde_json::from_str::<Value>(&s){
-                        Ok(v)=>if tx.send(v).is_err(){break;},
-                        Err(e)=>{let _=tx.send(json!({"id":format!("bad{}",now_ms()),"kind":"invalid","error":e.to_string()}));}
-                    },
-                    Err(_)=>break
-                }
-            }
-        });
-        host.incoming=Some(rx);
-        loop{
-            INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
-            host.service_background()?;
-            let mut command=if let Some(v)=host.pending.pop_front(){v}else{
-                match host.incoming.as_ref().unwrap().recv_timeout(std::time::Duration::from_millis(25)){
-                    Ok(v)=>v,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected)=>break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)=>{
-                        if let Err(e)=host.dispatch_wakeups(){host.event("error",json!({"error":e.to_string()}));}
-                        continue;
-                    }
-                }
-            };
-            INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
-            // Terminal control replay is a capability of explicit editor !/!!
-            // commands, not a client-controlled JSON field.
-            if let Some(object)=command.as_object_mut(){object.remove("terminal_controls");}
-            let command_id=command["id"].as_str().unwrap_or("").to_string();
-            match host.dispatch(command){
-                Ok(false)=>break,Ok(true)=>{},Err(e)=>host.event("error",json!({"command_id":command_id,"error":e.to_string()}))
-            }
-        }
-    }else{
-        let mut editor=rustyline::Editor::<Completion,rustyline::history::DefaultHistory>::new()?;
-        bind_multiline_keys(&mut editor);
-        let history=host.home.join("editor-history");
-        let _=editor.load_history(&history);
-        loop{
-            // Steering captured by the busy prompt is dispatched here if the
-            // active turn ended before consuming it at a cell boundary.
-            if let Some(command)=host.pending.pop_front(){
-                let id=command["id"].as_str().unwrap_or("").to_string();
-                if let Err(error)=host.dispatch(command){host.event("error",json!({"command_id":id,"error":error.to_string()}));}
-                continue;
-            }
-            // Idle interrupts clear the editor, never cancel a future operation.
-            INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
-            host.reload_auth()?;
-            let prompt=if host.json{""}else{"> "};
-            let models=host.models();let providers=host.login_providers();let current_model=host.model.clone();
-            let mut helper=Completion::from_worker(&mut host.worker,models,host.home.clone(),current_model,providers)?;
-            helper.catalog.task_ids=host.bg_tasks.keys().cloned().collect();
-            helper.catalog.wakeup_ids=host.wakeups.keys().cloned().collect();
-            editor.set_helper(Some(helper));
-            editor.bind_sequence(rustyline::KeyEvent::from('\t'),editor.helper().unwrap().picker_handler());
-            let line=match if terminal_editor_available(host.json){
-                terminal_readline(editor.helper().unwrap(),&editor.history().iter().cloned().collect::<Vec<_>>(),if host.json{2}else{1},&mut host)
-            }else{serviceable_readline(editor.helper().unwrap(),prompt,&mut host)}{
-                Ok(s)=>s,Err(rustyline::error::ReadlineError::Interrupted)=>{
-                    INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);continue;
-                },
-                Err(rustyline::error::ReadlineError::Eof)=>break,Err(e)=>return Err(e.into())
-            };
-            INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
-            if line.trim().is_empty(){continue;}
-            // Never persist authentication commands, let alone an accidentally
-            // pasted credential. Keys are accepted only by the hidden tty prompt.
-            if !line.trim_start().starts_with("/login")&&!line.trim_start().starts_with("/config"){
-                editor.add_history_entry(&line)?;
-            }
-            if line.starts_with('/'){
-                match host.ui_command(line.trim()){
-                    Ok(false)=>break,Ok(true)=>{},Err(e)=>host.event("error",json!({"error":e.to_string()}))
-                }
-                continue;
-            }
-            let id=format!("ui{}",host.journal.seq);
-            let v=if let Some(s)=line.strip_prefix("!!"){json!({"id":id,"kind":"shell","command":s,"visible":true,"terminal_controls":true})}
-                else if let Some(s)=line.strip_prefix("!"){json!({"id":id,"kind":"shell","command":s,"terminal_controls":true})}
-                else if let Some(s)=line.strip_prefix("@@"){json!({"id":id,"kind":"python","source":s,"visible":true})}
-                else if let Some(s)=line.strip_prefix("@"){json!({"id":id,"kind":"python","source":s})}
-                else{json!({"id":id,"kind":"submit","text":line})};
-            if let Err(e)=host.dispatch(v){host.event("error",json!({"error":e.to_string()}));}
-        }
-        editor.save_history(&history)?;
-        if history.exists(){fs::set_permissions(&history,std::os::unix::fs::PermissionsExt::from_mode(0o600))?;}
-    }
-    host.bg_shutdown()?;
-    Ok(())
-}
-
-fn bind_multiline_keys(editor:&mut rustyline::Editor<Completion,rustyline::history::DefaultHistory>){
-    // Ctrl-J is a newline, never accept-or-validate. Native backends that report
-    // Shift-Enter can use the same action. Rustyline 15's Unix byte parser does
-    // not decode CSI-u / modifyOtherKeys Enter: do not enable those protocols or
-    // map UnknownEscSeq to newline (it would reinterpret unrelated responses).
-    editor.bind_sequence(rustyline::KeyEvent::ctrl('J'),rustyline::Cmd::Newline);
-    editor.bind_sequence(rustyline::KeyEvent(rustyline::KeyCode::Enter,rustyline::Modifiers::SHIFT),rustyline::Cmd::Newline);
-}
-
-// While a provider owns the main thread, canonical tty input remains available
-// for steering. Complete lines are queued at the next safe cell boundary; a
-// partial line remains in the tty buffer and is picked up by the next prompt.
-struct BusyInput{
-    stop:std::sync::mpsc::Sender<()>,
-    lines:std::sync::mpsc::Receiver<(String,String)>,
-    thread:std::thread::JoinHandle<()>,
-}
-impl BusyInput{
-    fn start(model:String,effort:String)->Self{
-        let (stop_tx,stop_rx)=std::sync::mpsc::channel();
-        let (line_tx,line_rx)=std::sync::mpsc::channel();
-        let thread=std::thread::spawn(move||{
-            use std::os::fd::FromRawFd;
-            let fd=unsafe{libc::dup(0)};if fd<0{return;}
-            let mut input=unsafe{File::from_raw_fd(fd)};
-            let began=std::time::Instant::now();
-            {
-                let value=json!({"state":"thinking","model":model,"effort":effort,"elapsed_ms":0});
-                let text=terminal_state(&value,terminal_width()).join(" ");let mut output=io::stdout().lock();
-                let _=write!(output,"\r\x1b[K{text}\r\n{}",terminal_styled_for("> ","1;36",1));let _=output.flush();
-            }
-            loop{
-                if stop_rx.try_recv().is_ok(){break;}
-                let mut poll=libc::pollfd{fd,events:libc::POLLIN,revents:0};
-                let ready=unsafe{libc::poll(&mut poll,1,100)};
-                if ready>0&&poll.revents&libc::POLLIN!=0{
-                    let mut bytes=[0u8;65536];let size=std::io::Read::read(&mut input,&mut bytes).unwrap_or(0);
-                    if size==0{break;}
-                    let mut text=String::from_utf8_lossy(&bytes[..size]).trim_end_matches(['\r','\n']).to_string();
-                    let mode=if text.ends_with('\u{1b}'){text.pop();"followup"}else{"steering"};
-                    let _=line_tx.send((text,mode.into()));
-                    let mut output=io::stdout().lock();let _=write!(output,"{}",terminal_styled_for("> ","1;36",1));let _=output.flush();
-                }else if ready==0{
-                    let elapsed_ms=began.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                    let value=json!({"state":"thinking","model":model,"effort":effort,"elapsed_ms":elapsed_ms});
-                    let text=terminal_state(&value,terminal_width()).join(" ");let mut output=io::stdout().lock();
-                    let _=write!(output,"\x1b7\r\x1b[1A\x1b[K{text}\x1b8");let _=output.flush();
-                }
-            }
-            let mut output=io::stdout().lock();let _=write!(output,"\r\x1b[K\x1b[1A\r\x1b[K");let _=output.flush();
-        });
-        Self{stop:stop_tx,lines:line_rx,thread}
-    }
-    fn finish(self)->Vec<(String,String)>{
-        let _=self.stop.send(());let _=self.thread.join();self.lines.try_iter().collect()
-    }
-}
-
-// The tty editor is deliberately a direct reader + buffer + renderer. Rustyline
-// still owns non-tty input/history and the shared idle validation/completion API.
-fn terminal_editor_available(json:bool)->bool{
-    (unsafe{libc::isatty(0)==1&&(json||libc::isatty(1)==1)})&&(json||!std::env::var("TERM").is_ok_and(|t|t=="dumb"))
-}
-struct EditTerminal{input:File,output:File,previous:libc::termios,cursor_row:usize,rows:usize,keyboard:bool,display:bool}
-impl EditTerminal{
-    fn open(output_fd:i32)->io::Result<Self>{
-        use std::os::fd::FromRawFd;
-        let mut previous=unsafe{std::mem::zeroed::<libc::termios>()};
-        if unsafe{libc::tcgetattr(0,&mut previous)}<0{return Err(io::Error::last_os_error());}
-        let input=unsafe{libc::dup(0)};if input<0{return Err(io::Error::last_os_error());}
-        let input=unsafe{File::from_raw_fd(input)};
-        let output=unsafe{libc::dup(output_fd)};if output<0{return Err(io::Error::last_os_error());}
-        let output=unsafe{File::from_raw_fd(output)};
-        let mut raw=previous;unsafe{libc::cfmakeraw(&mut raw);}
-        raw.c_cc[libc::VMIN]=1;raw.c_cc[libc::VTIME]=0;
-        if unsafe{libc::tcsetattr(0,libc::TCSANOW,&raw)}<0{return Err(io::Error::last_os_error());}
-        let display=unsafe{libc::isatty(output_fd)==1}&&!std::env::var("TERM").is_ok_and(|t|t=="dumb");
-        Ok(Self{input,output,previous,cursor_row:0,rows:1,keyboard:false,display})
-    }
-    fn keyboard(&mut self,enabled:bool)->io::Result<()>{
-        if self.display&&enabled!=self.keyboard{
-            // Push/pop, not a blind mode reset, preserves the invoking terminal.
-            self.keyboard=enabled;
-            self.output.write_all(if enabled{b"\x1b[>1u"}else{b"\x1b[<u"})?;
-            self.output.flush()?;
-        }Ok(())
-    }
-    fn byte(&mut self,timeout:i32)->io::Result<Option<u8>>{
-        let mut poll=libc::pollfd{fd:self.input.as_raw_fd(),events:libc::POLLIN,revents:0};
-        let ready=unsafe{libc::poll(&mut poll,1,timeout)};
-        if ready<0{let e=io::Error::last_os_error();return if e.kind()==io::ErrorKind::Interrupted{Ok(None)}else{Err(e)};}
-        if ready==0{return Ok(None);}
-        let mut byte=[0];match std::io::Read::read(&mut self.input,&mut byte){
-            Ok(0)=>Err(io::Error::new(io::ErrorKind::UnexpectedEof,"editor input closed")),
-            Ok(_)=>Ok(Some(byte[0])),Err(e) if e.kind()==io::ErrorKind::Interrupted=>Ok(None),Err(e)=>Err(e)
-        }
-    }
-    fn input_ready(&self)->bool{
-        let mut poll=libc::pollfd{fd:self.input.as_raw_fd(),events:libc::POLLIN,revents:0};
-        unsafe{libc::poll(&mut poll,1,0)>0&&poll.revents&libc::POLLIN!=0}
-    }
-    fn width(&self)->usize{terminal_width_for(self.output.as_raw_fd())}
-    fn height(&self)->usize{
-        let mut size=unsafe{std::mem::zeroed::<libc::winsize>()};
-        if unsafe{libc::ioctl(self.output.as_raw_fd(),libc::TIOCGWINSZ,&mut size)}==0&&size.ws_row>0{size.ws_row as usize}else{24}
-    }
-    fn draw(&mut self,line:&str,cursor:usize)->io::Result<()>{
-        if !self.display{return Ok(());}
-        let width=self.width();let pad=if width>=4{2}else{width.saturating_sub(2)};
-        let layout=editor_rows(line,width.saturating_sub(pad+1).max(1));
-        let row=layout.iter().rposition(|r|r.start<=cursor).unwrap_or(0);
-        let visible=self.height().saturating_sub(2).clamp(1,24);
-        let first=row.saturating_sub(visible/2).min(layout.len().saturating_sub(visible));
-        let shown=&layout[first..(first+visible).min(layout.len())];
-        self.output.write_all(b"\r")?;if self.cursor_row>0{write!(self.output,"\x1b[{}A",self.cursor_row)?;}
-        self.output.write_all(b"\x1b[K\x1b[J")?;
-        for (i,item) in shown.iter().enumerate(){
-            if i>0{self.output.write_all(b"\r\n")?;}
-            let prefix=if i==0{if pad==2{"> "}else if pad==1{">"}else{""}}else if pad==2{"  "}else if pad==1{" "}else{""};
-            if i==0{self.output.write_all(terminal_styled_for(prefix,"1;36",self.output.as_raw_fd()).as_bytes())?;}
-            else{self.output.write_all(prefix.as_bytes())?;}
-            self.output.write_all(item.text.as_bytes())?;
-        }
-        let local=row-first;let columns=(pad+terminal_columns(&terminal_safe(&line[layout[row].start..cursor.min(layout[row].end)])))
-            .min(width.saturating_sub(1));
-        self.output.write_all(b"\r")?;
-        let up=shown.len()-1-local;if up>0{write!(self.output,"\x1b[{up}A")?;}
-        if columns>0{write!(self.output,"\x1b[{columns}C")?;}
-        self.output.flush()?;self.cursor_row=local;self.rows=shown.len();Ok(())
-    }
-}
-impl Drop for EditTerminal{
-    fn drop(&mut self){
-        if self.display{
-            let _=self.output.write_all(b"\r");
-            let down=self.rows.saturating_sub(self.cursor_row+1);if down>0{let _=write!(self.output,"\x1b[{down}B");}
-            let _=self.output.write_all(b"\r\n\x1b[?2004l");let _=self.keyboard(false);let _=self.output.flush();
-        }
-        unsafe{libc::tcsetattr(0,libc::TCSANOW,&self.previous);}
-    }
-}
-struct EditRow{start:usize,end:usize,text:String}
-fn editor_rows(line:&str,width:usize)->Vec<EditRow>{
-    let mut rows=vec![];let mut offset=0;
-    for logical in line.split('\n'){
-        let clusters=terminal_clusters(logical);let mut starts=Vec::with_capacity(clusters.len()+1);let mut n=offset;
-        for (text,_) in &clusters{starts.push(n);n+=text.len();}starts.push(n);
-        if clusters.is_empty(){rows.push(EditRow{start:offset,end:offset,text:String::new()});}
-        let mut a=0;
-        while a<clusters.len(){
-            let mut b=a;let mut used=0;let mut space=None;
-            while b<clusters.len(){
-                let safe=terminal_safe(&clusters[b].0);let columns=terminal_columns(&safe).min(width);
-                if used+columns>width&&b>a{break;}
-                used+=columns;b+=1;if clusters[b-1].0.chars().all(char::is_whitespace){space=Some(b);}
-            }
-            if b<clusters.len(){if let Some(split)=space.filter(|s|*s>a){b=split;}}
-            let start=starts[a];let end=starts[b];let safe=terminal_safe(&line[start..end]);
-            let safe=terminal_clusters(&safe).into_iter().map(|(s,w)|if w>width{"?".into()}else{s}).collect::<String>();
-            rows.push(EditRow{start,end,text:picker_clip(&safe,width)});a=b;
-        }
-        offset=n+1;
-    }
-    rows
-}
-fn editor_previous(line:&str,cursor:usize)->usize{
-    let mut offset=0;let mut previous=0;
-    for (cluster,_) in terminal_clusters(line){if offset>=cursor{break;}previous=offset;offset+=cluster.len();}
-    previous
-}
-fn editor_next(line:&str,cursor:usize)->usize{
-    let mut offset=0;for (cluster,_) in terminal_clusters(line){offset+=cluster.len();if offset>cursor{return offset;}}line.len()
-}
-fn editor_line_start(line:&str,cursor:usize)->usize{line[..cursor].rfind('\n').map_or(0,|n|n+1)}
-fn editor_line_end(line:&str,cursor:usize)->usize{line[cursor..].find('\n').map_or(line.len(),|n|cursor+n)}
-fn editor_word_left(line:&str,cursor:usize)->usize{
-    let prefix=line[..cursor].trim_end_matches(char::is_whitespace);
-    prefix.char_indices().rev().find(|(_,c)|c.is_whitespace()).map_or(0,|(n,c)|n+c.len_utf8())
-}
-fn editor_word_right(line:&str,cursor:usize)->usize{
-    let mut word=false;for (offset,c) in line[cursor..].char_indices(){
-        if c.is_whitespace(){if word{return cursor+offset;}}else{word=true;}
-    }line.len()
-}
-struct EditBuffer{line:String,cursor:usize,undo:std::collections::VecDeque<(String,usize)>,killed:String,
-    history:Option<usize>,draft:(String,usize)}
-impl EditBuffer{
-    fn checkpoint(&mut self){
-        if self.line.len()>65536{return;}
-        self.undo.push_back((self.line.clone(),self.cursor));
-        while self.undo.len()>32||self.undo.iter().map(|s|s.0.len()).sum::<usize>()>1_048_576{self.undo.pop_front();}
-    }
-    fn replace(&mut self,start:usize,end:usize,text:&str){
-        if self.line.len().saturating_sub(end-start)+text.len()>1_048_576{return;}
-        self.checkpoint();self.line.replace_range(start..end,text);self.cursor=start+text.len();
-    }
-    fn history(&mut self,old:&[String],up:bool){
-        if old.is_empty(){return;}
-        if self.history.is_none(){if !up{return;}self.draft=(self.line.clone(),self.cursor);self.history=Some(old.len());}
-        let n=self.history.unwrap();let next=if up{n.saturating_sub(1)}else{(n+1).min(old.len())};
-        self.checkpoint();
-        if next==old.len(){self.line=self.draft.0.clone();self.cursor=self.draft.1;self.history=None;}
-        else{self.line=old[next].clone();self.cursor=self.line.len();self.history=Some(next);}
-    }
-    fn vertical(&mut self,old:&[String],up:bool){
-        let rows=editor_rows(&self.line,terminal_width().saturating_sub(3).max(1));
-        let n=rows.iter().rposition(|r|r.start<=self.cursor).unwrap_or(0);
-        if (up&&n==0)||(!up&&n+1==rows.len()){self.history(old,up);return;}
-        let target=&rows[if up{n-1}else{n+1}];let goal=terminal_columns(&terminal_safe(&self.line[rows[n].start..self.cursor.min(rows[n].end)]));
-        let mut used=0;let mut cursor=target.start;
-        for (cluster,_) in terminal_clusters(&self.line[target.start..target.end]){
-            let columns=terminal_columns(&terminal_safe(&cluster));if used+columns>goal{break;}
-            used+=columns;cursor+=cluster.len();
-        }self.cursor=cursor;
-    }
-}
-enum EditKey{Byte(u8),Text(String),Sequence(String),Paste(String),Ignore}
-fn editor_report(code:u32,modifier:u32)->EditKey{
-    if code==13{return match modifier{1=>EditKey::Byte(13),2=>EditKey::Byte(10),_=>EditKey::Ignore};}
-    if matches!(modifier,3|4)&&matches!(code,8|127){return EditKey::Byte(23);}
-    if matches!(modifier,5|6)&&code<128{
-        let c=code as u8;if c.is_ascii_alphabetic(){return EditKey::Byte(c.to_ascii_uppercase()-b'@');}
-        if code==127{return EditKey::Byte(23);}
-    }
-    if modifier<=2{match code{
-        9|27|127=>return EditKey::Byte(code as u8),
-        57350=>return EditKey::Sequence("[D".into()),57351=>return EditKey::Sequence("[C".into()),
-        57352=>return EditKey::Sequence("[A".into()),57353=>return EditKey::Sequence("[B".into()),
-        _=>if let Some(c)=char::from_u32(code).filter(|c|!c.is_control()&&!(57344..=63743).contains(&(*c as u32))){return EditKey::Text(c.to_string());}
-    }}EditKey::Ignore
-}
-fn editor_key(terminal:&mut EditTerminal,host:&mut Host)->rustyline::Result<Option<EditKey>>{
-    let Some(byte)=terminal.byte(50)?else{return Ok(None);};
-    if byte==27{
-        let Some(first)=terminal.byte(35)?else{return Ok(Some(EditKey::Ignore));};
-        if first==b'\r'{return Ok(Some(EditKey::Byte(10)));}
-        if matches!(first,8|127){return Ok(Some(EditKey::Byte(23)));}
-        if first!=b'['&&first!=b'O'{return Ok(Some(EditKey::Sequence(format!("alt:{}",first as char))));}
-        let mut bytes=vec![first];for _ in 0..256{
-            let Some(b)=terminal.byte(35)?else{return Ok(Some(EditKey::Ignore));};bytes.push(b);
-            if (0x40..=0x7e).contains(&b){break;}
-        }
-        if !bytes.last().is_some_and(|b|(0x40..=0x7e).contains(b)){
-            return Err(io::Error::new(io::ErrorKind::InvalidData,"oversized terminal key report").into());
-        }
-        if bytes.len()>64{return Ok(Some(EditKey::Ignore));}
-        let sequence=String::from_utf8_lossy(&bytes).into_owned();
-        if sequence=="[13;2~"{return Ok(Some(EditKey::Byte(10)));}
-        if sequence=="[200~"{
-            let mut paste=vec![];let mut overflow=false;
-            loop{
-                host.service_background().map_err(|e|io::Error::other(e.to_string()))?;
-                if INTERRUPT.load(std::sync::atomic::Ordering::SeqCst){return Err(rustyline::error::ReadlineError::Interrupted);}
-                let Some(b)=terminal.byte(50)?else{continue;};paste.push(b);
-                if paste.ends_with(b"\x1b[201~"){
-                    paste.truncate(paste.len()-6);
-                    return Ok(Some(if overflow{EditKey::Ignore}else{match String::from_utf8(paste){Ok(text)=>EditKey::Paste(text),Err(_)=>EditKey::Ignore}}));
-                }
-                if paste.len()>1_048_576+6{overflow=true;paste.drain(..paste.len()-6);}
-            }
-        }
-        if let Some(parameters)=sequence.strip_prefix('[').and_then(|s|s.strip_suffix('u')){
-            let mut values=parameters.split(';');
-            let mut codes=values.next().unwrap_or("").split(':');let code=codes.next().unwrap_or("").parse::<u32>();
-            let shifted=codes.next().and_then(|c|c.parse::<u32>().ok());
-            let modifier=values.next().unwrap_or("1");
-            if modifier.split(':').nth(1)==Some("3"){return Ok(Some(EditKey::Ignore));}
-            return Ok(Some(match (code,modifier.split(':').next().unwrap_or("").parse::<u32>()){
-                (Ok(code),Ok(modifier))=>editor_report(if modifier==2{shifted.unwrap_or(code)}else{code},modifier),_=>EditKey::Ignore
-            }));
-        }
-        if let Some(parameters)=sequence.strip_prefix("[27;").and_then(|s|s.strip_suffix('~')){
-            let mut values=parameters.split(';');let modifier=values.next().unwrap_or("").parse::<u32>();let code=values.next().unwrap_or("").parse::<u32>();
-            return Ok(Some(match (code,modifier){(Ok(c),Ok(m))=>editor_report(c,m),_=>EditKey::Ignore}));
-        }
-        return Ok(Some(EditKey::Sequence(sequence)));
-    }
-    if byte<32||byte==127{return Ok(Some(EditKey::Byte(byte)));}
-    let length=if byte<128{1}else if byte&0xe0==0xc0{2}else if byte&0xf0==0xe0{3}else if byte&0xf8==0xf0{4}else{0};
-    if length==0{return Ok(Some(EditKey::Ignore));}
-    let mut bytes=vec![byte];for _ in 1..length{if let Some(b)=terminal.byte(100)?{bytes.push(b);}else{return Ok(Some(EditKey::Ignore));}}
-    Ok(Some(match String::from_utf8(bytes){Ok(text)=>EditKey::Text(text),Err(_)=>EditKey::Ignore}))
-}
-fn editor_complete(helper:&Completion,terminal:&mut EditTerminal,buffer:&mut EditBuffer,host:&mut Host)->rustyline::Result<()>{
-    let (start,matching)=helper.catalog.candidates(&buffer.line,buffer.cursor,false)?;
-    let selected=if matching.len()==1{Some(matching[0].replacement.clone())}
-        else if matching.is_empty()||!terminal.display{None}else{
-            let (_,choices)=helper.catalog.candidates(&buffer.line,buffer.cursor,true)?;
-            let prefix=&buffer.line[..buffer.cursor];let python=prefix.starts_with('@');
-            let offset=if prefix.starts_with("@@")||prefix.starts_with("!!"){2}else if python||prefix.starts_with('!'){1}else{0};
-            let (_,quote)=completion_token(prefix,offset);let query=completion_unescape(&prefix[start..],python,quote);
-            // Picker has its own legacy decoder; temporarily restore the prior
-            // keyboard protocol rather than feeding it reports it cannot parse.
-            // A queued typing burst may not have been painted yet. Anchor below
-            // the complete visible input, not below the caret's current line.
-            terminal.draw(&buffer.line,buffer.cursor)?;
-            terminal.keyboard(false)?;
-            let choice=picker_select_service(&choices,&query,terminal.output.as_raw_fd(),terminal.rows,
-                terminal.rows.saturating_sub(terminal.cursor_row),||host.service_background());
-            terminal.keyboard(true)?;
-            choice.map_err(|_|io::Error::other("selection failed"))?
-        };
-    if let Some(value)=selected{buffer.replace(start,buffer.cursor,&value);}
-    terminal.draw(&buffer.line,buffer.cursor)?;
-    if terminal.display{terminal.output.write_all(b"\x1b[?25h")?;terminal.output.flush()?;}
-    Ok(())
-}
-fn serviceable_readline(helper:&Completion,prompt:&str,host:&mut Host)->rustyline::Result<String>{
-    use rustyline::error::ReadlineError;
-    if unsafe{libc::isatty(0)==1}{print!("{prompt}");io::stdout().flush()?;}
-    let mut bytes=Vec::new();
-    let mut refreshed=None;
-    loop{
-        host.service_background().map_err(|e|io::Error::other(e.to_string()))?;
-        if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err(ReadlineError::Interrupted);}
-        let mut poll=libc::pollfd{fd:0,events:libc::POLLIN,revents:0};
-        let ready=unsafe{libc::poll(&mut poll,1,25)};
-        if ready<0{let error=io::Error::last_os_error();if error.kind()==io::ErrorKind::Interrupted{continue;}return Err(error.into());}
-        if ready==0{
-            let pending=host.wakeups.values().any(|w|w.metadata["state"]=="ready");
-            if let Err(e)=host.dispatch_wakeups(){host.event("error",json!({"error":e.to_string()}));}
-            if pending{refreshed=Some(editor_completion(host).map_err(|e|io::Error::other(e.to_string()))?);}
-            continue;
-        }
-        let helper=refreshed.as_ref().unwrap_or(helper);
-        // Never read ahead: foreground Python input() owns subsequent lines.
-        let mut byte=0u8;let size=unsafe{libc::read(0,(&mut byte as *mut u8).cast(),1)};
-        if size<0{let error=io::Error::last_os_error();if error.kind()==io::ErrorKind::Interrupted{continue;}return Err(error.into());}
-        if size==0{return if bytes.is_empty(){Err(ReadlineError::Eof)}else{String::from_utf8(bytes).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e).into())};}
-        if byte==b'\n'{
-            if bytes.last()==Some(&b'\r'){bytes.pop();}
-            let source=std::str::from_utf8(&bytes).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e))?;
-            if helper.incomplete(source)?{bytes.push(b'\n');}else{return Ok(source.into());}
-        }else{bytes.push(byte);}
-        if bytes.len()>1_048_576{return Err(io::Error::new(io::ErrorKind::InvalidData,"editor input exceeds one MiB").into());}
-    }
-}
-fn terminal_readline(helper:&Completion,history:&[String],output_fd:i32,host:&mut Host)->rustyline::Result<String>{
-    use rustyline::error::ReadlineError;
-    let mut terminal=EditTerminal::open(output_fd)?;
-    let mut buffer=EditBuffer{line:String::new(),cursor:0,undo:std::collections::VecDeque::new(),killed:String::new(),history:None,draft:(String::new(),0)};
-    terminal.draw(&buffer.line,buffer.cursor)?;terminal.keyboard(true)?;
-    // This readiness marker is last: callers cannot race a half-configured tty.
-    if terminal.display{terminal.output.write_all(b"\x1b[?2004h")?;terminal.output.flush()?;}
-    let mut width=terminal.width();let mut height=terminal.height();
-    let mut refreshed=None;
-    loop{
-        host.service_background().map_err(|e|io::Error::other(e.to_string()))?;
-        if host.wakeups.values().any(|w|w.metadata["state"]=="ready")&&!terminal.input_ready(){
-            // The entire edit state remains in buffer while the model owns the tty.
-            drop(terminal);
-            if let Err(e)=host.dispatch_wakeups(){host.event("error",json!({"error":e.to_string()}));}
-            refreshed=Some(editor_completion(host).map_err(|e|io::Error::other(e.to_string()))?);
-            terminal=EditTerminal::open(output_fd)?;
-            terminal.draw(&buffer.line,buffer.cursor)?;terminal.keyboard(true)?;
-            if terminal.display{terminal.output.write_all(b"\x1b[?2004h")?;terminal.output.flush()?;}
-            width=terminal.width();height=terminal.height();
-        }
-        let helper=refreshed.as_ref().unwrap_or(helper);
-        if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err(ReadlineError::Interrupted);}
-        if width!=terminal.width()||height!=terminal.height(){width=terminal.width();height=terminal.height();terminal.draw(&buffer.line,buffer.cursor)?;}
-        let key=match editor_key(&mut terminal,host){Err(ReadlineError::Io(e)) if e.kind()==io::ErrorKind::UnexpectedEof=>return Err(ReadlineError::Eof),other=>other?};
-        let Some(key)=key else{continue;};
-        match key{
-            EditKey::Text(text)|EditKey::Paste(text)=>buffer.replace(buffer.cursor,buffer.cursor,&text),
-            EditKey::Byte(13)=>{
-                if buffer.line.trim().is_empty(){continue;}
-                let incomplete=helper.incomplete(&buffer.line)?;
-                if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err(ReadlineError::Interrupted);}
-                if incomplete{buffer.replace(buffer.cursor,buffer.cursor,"\n");}
-                else{terminal.draw(&buffer.line,buffer.cursor)?;return Ok(buffer.line);}
-            },
-            EditKey::Byte(10)=>buffer.replace(buffer.cursor,buffer.cursor,"\n"),
-            EditKey::Byte(3)=>return Err(ReadlineError::Interrupted),
-            EditKey::Byte(4) if buffer.line.is_empty()=>return Err(ReadlineError::Eof),
-            EditKey::Byte(4)=>{let next=editor_next(&buffer.line,buffer.cursor);buffer.replace(buffer.cursor,next,"");},
-            EditKey::Byte(8|127)=>{let previous=editor_previous(&buffer.line,buffer.cursor);buffer.replace(previous,buffer.cursor,"");},
-            EditKey::Byte(1)=>buffer.cursor=editor_line_start(&buffer.line,buffer.cursor),
-            EditKey::Byte(5)=>buffer.cursor=editor_line_end(&buffer.line,buffer.cursor),
-            EditKey::Byte(2)=>buffer.cursor=editor_previous(&buffer.line,buffer.cursor),
-            EditKey::Byte(6)=>buffer.cursor=editor_next(&buffer.line,buffer.cursor),
-            EditKey::Byte(9)=>editor_complete(helper,&mut terminal,&mut buffer,host)?,
-            EditKey::Byte(16)=>buffer.history(history,true),EditKey::Byte(14)=>buffer.history(history,false),
-            EditKey::Byte(21|23|11)=>{
-                let (start,end)=match key{EditKey::Byte(21)=>(editor_line_start(&buffer.line,buffer.cursor),buffer.cursor),
-                    EditKey::Byte(23)=>(editor_word_left(&buffer.line,buffer.cursor),buffer.cursor),
-                    _=>(buffer.cursor,if buffer.cursor==editor_line_end(&buffer.line,buffer.cursor){editor_next(&buffer.line,buffer.cursor)}else{editor_line_end(&buffer.line,buffer.cursor)})};
-                buffer.killed=buffer.line[start..end].into();buffer.replace(start,end,"");
-            },
-            EditKey::Byte(25)=>{let text=buffer.killed.clone();buffer.replace(buffer.cursor,buffer.cursor,&text);},
-            EditKey::Byte(31)=>if let Some((line,cursor))=buffer.undo.pop_back(){buffer.line=line;buffer.cursor=cursor;},
-            EditKey::Sequence(ref sequence)=>match sequence.as_str(){
-                "[A"|"OA"=>buffer.vertical(history,true),"[B"|"OB"=>buffer.vertical(history,false),
-                "[C"|"OC"=>buffer.cursor=editor_next(&buffer.line,buffer.cursor),"[D"|"OD"=>buffer.cursor=editor_previous(&buffer.line,buffer.cursor),
-                "[1;5D"|"alt:b"=>buffer.cursor=editor_word_left(&buffer.line,buffer.cursor),
-                "[1;5C"|"alt:f"=>buffer.cursor=editor_word_right(&buffer.line,buffer.cursor),
-                "[H"|"OH"|"[1~"|"[7~"=>buffer.cursor=editor_line_start(&buffer.line,buffer.cursor),
-                "[F"|"OF"|"[4~"|"[8~"=>buffer.cursor=editor_line_end(&buffer.line,buffer.cursor),
-                "[3~"=>{let next=editor_next(&buffer.line,buffer.cursor);buffer.replace(buffer.cursor,next,"");},_=>{}
-            },_=>{}
-        }
-        // A queued burst is one visual edit, not an O(n²) repaint per byte.
-        // Submit explicitly draws the final buffer before leaving; completion
-        // draws its chosen/restored buffer once selection has finished.
-        if !terminal.input_ready(){terminal.draw(&buffer.line,buffer.cursor)?;}
-    }
-}
-
-impl Host {
-    fn poll_commands(&mut self)->Result<bool>{
-        self.poll_target(self.worker.child.id() as i32,libc::SIGINT)
-    }
-    fn poll_target(&mut self,pid:i32,signal:i32)->Result<bool>{
-        self.service_background()?;
-        let mut cancelled=false;
-        if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){
-            self.journal.append("cancel",json!({"generation":self.generation,"source":"SIGINT"}))?;
-            self.cancel_revision=self.cancel_revision.wrapping_add(1);
-            unsafe{libc::kill(-pid,signal);}
-            cancelled=true;
-        }
-        loop{
-            let command=match self.incoming.as_ref().map(|r|r.try_recv()){
-                Some(Ok(v))=>v,
-                Some(Err(std::sync::mpsc::TryRecvError::Disconnected))=>{self.input_closed=true;break;},
-                _=>break
-            };
-            if command["kind"]=="interrupt"{
-                if !self.accept_input_control(&command)?{continue;}
-                let id=command["id"].as_str().unwrap();
-                self.journal.append("cancel",json!({"command_id":id,"generation":self.generation}))?;
-                self.cancel_revision=self.cancel_revision.wrapping_add(1);
-                unsafe{libc::kill(-pid,signal);}
-                self.event("completed",json!({"command_id":id,"status":"ok"}));
-                cancelled=true;
-            }else if !self.background_control(&command)?{self.queue_arrival(command)?;}
-        }
-        Ok(cancelled)
-    }
-    fn accept_input_control(&mut self,command:&Value)->Result<bool>{
-        let id=command["id"].as_str().unwrap_or("");
-        if id.is_empty()||self.ids.contains(id){
-            self.event("rejected",json!({"command_id":id,"error":"missing or duplicate command ID"}));return Ok(false);
-        }
-        self.journal.append("accepted",json!({"command_id":id,"command":command}))?;
-        self.ids.insert(id.into());self.event("accepted",json!({"command_id":id}));Ok(true)
-    }
-    fn begin_input(&mut self,operation:&str,text:&str)->Result<InputPrompt>{
-        let p=InputPrompt{id:format!("input{}",self.journal.seq),operation:operation.into(),
-            generation:self.generation,text:text.into(),buffer:vec![]};
-        let payload=p.payload();self.journal.append("input_prompt",payload.clone())?;
-        self.set_state(UiState::Input,None);
-        self.event("input_prompt",payload);Ok(p)
-    }
-    fn close_input(&mut self,p:&InputPrompt,action:&str,text:Option<&str>)->Result<Value>{
-        let mut payload=p.payload();payload["action"]=json!(action);
-        let response=if let Some(text)=text{
-            let index=self.history["stdin"].len();
-            payload["index"]=json!(index);payload["text"]=json!(text);
-            self.journal.append("stdin",payload.clone())?;self.hist_push("stdin",json!(text));
-            json!({"ok":true,"value":text})
-        }else{input_exception(action)};
-        payload.as_object_mut().unwrap().remove("text");
-        self.journal.append("input_closed",payload)?;
-        self.set_state(UiState::Running,None);Ok(response)
-    }
-    fn reply_input(&mut self,p:&InputPrompt,command:&Value)->Result<Option<(Value,bool)>>{
-        let action=match command.get("action"){None=>"text",Some(v)=>v.as_str().unwrap_or("")};
-        let text=command["value"].as_str();
-        let id=command["id"].as_str().unwrap_or("");
-        let error=if id.is_empty()||self.ids.contains(id){Some("missing or duplicate command ID")}
-            else if command["prompt_id"]!=p.id||command["operation"]!=p.operation||command["worker_generation"]!=p.generation{
-                Some("reply does not match the active prompt, operation and generation")
-            }else if !["text","eof","cancel"].contains(&action)||(action=="text"&&text.is_none()){
-                Some("stdin_reply requires text value or eof/cancel action")
-            }else{None};
-        if let Some(error)=error{self.event("rejected",json!({"command_id":id,"error":error}));return Ok(None);}
-        if !self.accept_input_control(command)?{return Ok(None);}
-        if action=="cancel"{self.journal.append("cancel",json!({"command_id":id,
-            "operation":p.operation,"prompt_id":p.id,"generation":p.generation}))?;}
-        let response=self.close_input(p,action,if action=="text"{text}else{None})?;
-        self.event("completed",json!({"command_id":id,"status":"ok"}));Ok(Some((response,action=="cancel")))
-    }
-    fn terminal_input(&mut self,p:&mut InputPrompt)->Result<Option<Value>>{
-        let mut fd=libc::pollfd{fd:0,events:libc::POLLIN,revents:0};
-        if unsafe{libc::poll(&mut fd,1,0)}<=0{return Ok(None);}
-        // Canonical terminals can release a partial line on Ctrl-D. Read bounded
-        // nonblocking bytes, retaining the partial line while the event loop runs.
-        let flags=unsafe{libc::fcntl(0,libc::F_GETFL)};
-        if flags<0||unsafe{libc::fcntl(0,libc::F_SETFL,flags|libc::O_NONBLOCK)}<0{
-            return Err(io::Error::last_os_error().into());
-        }
-        let result=(||->Result<Option<Value>>{
-            for _ in 0..512{
-                let mut byte=0u8;let count=unsafe{libc::read(0,(&mut byte as *mut u8).cast(),1)};
-                if count<0{
-                    let error=io::Error::last_os_error();
-                    if [io::ErrorKind::WouldBlock,io::ErrorKind::Interrupted].contains(&error.kind()){return Ok(None);}
-                    return Err(error.into());
-                }
-                if count==0&&p.buffer.is_empty(){return Ok(Some(self.close_input(p,"eof",None)?));}
-                if count==0||byte==b'\n'{
-                    let text=std::str::from_utf8(&p.buffer)?;
-                    return Ok(Some(self.close_input(p,"text",Some(text))?));
-                }
-                p.buffer.push(byte);
-            }
-            Ok(None)
-        })();
-        if unsafe{libc::fcntl(0,libc::F_SETFL,flags)}<0{return Err(io::Error::last_os_error().into());}
-        result
-    }
-}
-
-struct InputPrompt {id:String,operation:String,generation:usize,text:String,buffer:Vec<u8>}
-impl InputPrompt {
-    fn payload(&self)->Value{json!({"prompt_id":self.id,"operation":self.operation,
-        "worker_generation":self.generation,"prompt":self.text})}
-}
-fn input_exception(action:&str)->Value{
-    json!({"ok":false,"exception":if action=="cancel"{"KeyboardInterrupt"}else{"EOFError"}})
-}
-
-// Idle editor IPC is separate from cell execution. The cached names are never
-// queried while a cell is running; only validation uses this cloned socket.
-#[derive(Clone)]
-struct CompletionCatalog{
-    names:Vec<String>,models:Value,home:PathBuf,python_cwd:PathBuf,
-    current_model:String,configured_providers:Vec<String>,task_ids:Vec<String>,wakeup_ids:Vec<String>,
-}
-struct Completion {
-    catalog:CompletionCatalog,
-    selection:std::sync::Arc<std::sync::Mutex<Option<(usize,String)>>>,
-    ipc:std::cell::RefCell<(BufReader<UnixStream>,UnixStream)>,
-}
-impl Completion {
-    fn from_worker(worker:&mut Worker,models:Value,home:PathBuf,current_model:String,configured_providers:Vec<String>)->Result<Self>{
-        worker.send(&json!({"kind":"ide_inspect"}))?;
-        worker.reader.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
-        let response=worker.recv();
-        worker.reader.get_ref().set_read_timeout(None)?;
-        let response=response?;
-        if response["kind"]!="ide_names"{return Err("invalid idle worker inspection response".into());}
-        let names=response["names"].as_array().map(|a|a.iter().filter_map(|v|v.as_str().map(str::to_string)).collect()).unwrap_or_default();
-        let python_cwd=response["cwd"].as_str().map(PathBuf::from).unwrap_or(std::env::current_dir()?);
-        Ok(Self{catalog:CompletionCatalog{names,models,home,python_cwd,current_model,configured_providers,task_ids:vec![],wakeup_ids:vec![]},
-            selection:std::sync::Arc::new(std::sync::Mutex::new(None)),ipc:std::cell::RefCell::new((
-            BufReader::new(worker.reader.get_ref().try_clone()?),worker.writer.try_clone()?))})
-    }
-    fn picker_handler(&self)->rustyline::EventHandler{
-        rustyline::EventHandler::Conditional(Box::new(PickerTab{catalog:self.catalog.clone(),selection:self.selection.clone()}))
-    }
-}
-fn editor_completion(host:&mut Host)->Result<Completion>{
-    let models=host.models();let providers=host.login_providers();
-    let mut helper=Completion::from_worker(&mut host.worker,models,host.home.clone(),host.model.clone(),providers)?;
-    helper.catalog.task_ids=host.bg_tasks.keys().cloned().collect();
-    helper.catalog.wakeup_ids=host.wakeups.keys().cloned().collect();
-    Ok(helper)
-}
-impl CompletionCatalog{
-    fn providers(&self)->Vec<String>{
-        let mut providers:Vec<_>=PROVIDERS.iter().map(|p|p.0.to_string()).collect();
-        providers.extend(["github-copilot".into(),"openai-codex".into(),"codex".into()]);
-        providers.extend(self.configured_providers.iter().cloned());
-        if let Some(models)=self.models.as_array(){for model in models{
-            if let Some(provider)=model["provider"].as_str(){providers.push(provider.into());}
-        }}
-        providers.sort();providers.dedup();providers
-    }
-}
-impl rustyline::Helper for Completion{}
-impl rustyline::hint::Hinter for Completion{type Hint=String;}
-impl rustyline::highlight::Highlighter for Completion{}
-impl rustyline::validate::Validator for Completion{
-    fn validate(&self,ctx:&mut rustyline::validate::ValidationContext<'_>)
-        ->rustyline::Result<rustyline::validate::ValidationResult>{
-        use rustyline::validate::ValidationResult;
-        Ok(if self.incomplete(ctx.input())?{ValidationResult::Incomplete}else{ValidationResult::Valid(None)})
-    }
-}
-impl Completion{
-    fn incomplete(&self,input:&str)->rustyline::Result<bool>{
-        use rustyline::error::ReadlineError;
-        let Some(source)=input.strip_prefix("@@").or_else(||input.strip_prefix('@')) else{
-            return Ok(input.ends_with('\\'));
-        };
-        // A huge paste is accepted as a cell without blocking editor validation.
-        if source.len()>65536{return Ok(false);}
-        let mut ipc=self.ipc.borrow_mut();
-        ipc.0.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
-        let result=(||->rustyline::Result<bool>{
-            writeln!(ipc.1,"{}",json!({"kind":"ide_validate","source":source}))?;
-            let mut line=String::new();
-            if ipc.0.read_line(&mut line)?==0{return Err(ReadlineError::Eof);}
-            let v:Value=serde_json::from_str(&line).map_err(|_|ReadlineError::Io(io::Error::new(io::ErrorKind::InvalidData,"invalid idle validation response")))?;
-            if v["kind"]!="ide_validation"{return Err(ReadlineError::Io(io::Error::new(io::ErrorKind::InvalidData,"unexpected idle validation response")));}
-            Ok(v["incomplete"]==true)
-        })();
-        ipc.0.get_ref().set_read_timeout(None)?;
-        result
-    }
-}
-// Larger scores win. Categories deliberately dominate all within-category
-// bonuses: exact > prefix > contiguous substring > ordered subsequence.
-fn fuzzy_score(query:&str,candidate:&str)->Option<i64>{
-    let query=query.to_lowercase();let candidate=candidate.to_lowercase();
-    if query==candidate{return Some(1_000_000);}
-    if candidate.starts_with(&query){return Some(800_000-candidate.chars().count().min(10_000) as i64);}
-    if let Some(at)=candidate.find(&query){return Some(600_000-at.min(10_000) as i64*2-candidate.chars().count().min(10_000) as i64);}
-    let q:Vec<_>=query.chars().collect();let c:Vec<_>=candidate.chars().collect();
-    if q.len()>c.len(){return None;}
-    let mut next=0;let mut score=400_000;let mut last=None;
-    for (i,ch) in c.iter().enumerate(){
-        if next<q.len()&&*ch==q[next]{
-            if i==0||matches!(c[i-1],'.'|'/'|'_'|'-'|' '){score+=20;}
-            if last==Some(i.saturating_sub(1)){score+=10;}
-            score-=i.min(1000) as i64;last=Some(i);next+=1;
-        }
-    }
-    if next==q.len(){Some(score-c.len().min(10_000) as i64)}else{None}
-}
-fn completion_rank(mut items:Vec<(i64,String,String)>)->Vec<rustyline::completion::Pair>{
-    items.sort_by(|a,b|b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    let mut seen=HashSet::new();items.into_iter().filter(|(_,display,_)|seen.insert(display.clone())).take(4096)
-        .map(|(_,display,replacement)|rustyline::completion::Pair{display:terminal_safe(&display),replacement}).collect()
-}
-// Return the token offset and open quote without splitting a quoted/spaced path.
-fn completion_token(prefix:&str,offset:usize)->(usize,Option<char>){
-    let mut start=offset;let mut quoted_start=offset;let mut quote=None;let mut escaped=false;
-    for (i,ch) in prefix[offset..].char_indices(){let at=offset+i;
-        if escaped{escaped=false;continue;}
-        if ch=='\\'&&quote!=Some('\''){escaped=true;continue;}
-        if let Some(q)=quote{if ch==q{quote=None;}continue;}
-        if ch=='\''||ch=='"'{quote=Some(ch);quoted_start=at+1;}
-        else if ch.is_whitespace()||matches!(ch,';'|'|'|'&'){start=at+ch.len_utf8();}
-    }
-    (if quote.is_some(){quoted_start}else{start},quote)
-}
-fn completion_unescape(s:&str,python:bool,initial_quote:Option<char>)->String{
-    let mut out=String::new();let mut chars=s.chars().peekable();let mut quote=initial_quote;
-    while let Some(c)=chars.next(){
-        if !python&&matches!(c,'\''|'"'){
-            if quote==Some(c){quote=None;continue;}
-            if quote.is_none(){quote=Some(c);continue;}
-        }
-        if c=='\\'{if let Some(&next)=chars.peek(){
-            if (python&&matches!(next,'\\'|'\''|'"'))||(!python&&quote!=Some('\'')&&
-                (quote.is_none()||matches!(next,'\\'|'"'|'$'|'`'))){
-                out.push(chars.next().unwrap());continue;
-            }
-        }}out.push(c);
-    }out
-}
-fn completion_path_word(path:&str,quote:Option<char>,python:bool)->String{
-    if let Some(q)=quote{
-        if !python&&q=='\''{return path.replace('\'',"'\\''");}
-        let mut value=String::new();for c in path.chars(){
-            if c=='\\'||c==q||(!python&&q=='"'&&matches!(c,'$'|'`')){value.push('\\');}
-            value.push(c);
-        }return value;
-    }
-    // Keep the unquoted tilde separate from the quoted filename so the shell
-    // still expands HOME even when the completed basename contains spaces.
-    if !python{if let Some(rest)=path.strip_prefix("~/"){
-        return format!("~/{}",completion_path_word(rest,None,true));
-    }}
-    if path.chars().all(|c|c.is_alphanumeric()||matches!(c,'/'|'.'|'_'|'-'|'~')){return path.into();}
-    format!("'{}'",path.replace('\'',"'\\''"))
-}
-fn completion_files(word:&str,quote:Option<char>,python:bool,cwd:&Path,command:bool)->Vec<(i64,String,String)>{
-    use std::os::unix::fs::PermissionsExt;
-    let word=completion_unescape(word,python,quote);
-    let (directory,query)=word.rsplit_once('/').map_or(("",word.as_str()),|(d,q)|(&word[..d.len()+1],q));
-    let expanded=if directory=="~/"||directory.starts_with("~/"){
-        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(&directory[2..])
-    }else{PathBuf::from(directory)};
-    let search=if expanded.is_absolute(){expanded}else{cwd.join(expanded)};
-    let mut items=Vec::new();
-    if let Ok(entries)=fs::read_dir(search){for entry in entries.take(4096).flatten(){
-        let Some(name)=entry.file_name().to_str().map(str::to_string)else{continue;};
-        if name.starts_with('.')&&!query.starts_with('.'){continue;}
-        if name.chars().any(char::is_control){continue;}
-        let Ok(meta)=entry.metadata()else{continue;};
-        if command&&!meta.is_dir()&&(!meta.is_file()||meta.permissions().mode()&0o111==0){continue;}
-        let Some(score)=fuzzy_score(query,&name)else{continue;};
-        let suffix=if meta.is_dir(){"/"}else{""};
-        let value=if command&&directory.is_empty()&&!meta.is_dir(){format!("./{name}{suffix}")}else{format!("{directory}{name}{suffix}")};
-        items.push((score,format!("{directory}{name}{suffix}"),completion_path_word(&value,quote,python)));
-    }}items
-}
-fn completion_executables(query:&str,quote:Option<char>)->Vec<(i64,String,String)>{
-    use std::os::unix::fs::PermissionsExt;
-    let mut items=Vec::new();let mut visited=HashSet::new();let mut count=0;
-    // POSIX shell builtins are useful even when they have no PATH executable.
-    for name in ["cd","echo","printf","pwd","command","export","unset","alias","unalias","umask",
-        "read","test","true","false","exec","exit","wait","kill","jobs","fg","bg","set","shift","trap"]{
-        if let Some(score)=fuzzy_score(query,name){items.push((score+1,name.into(),completion_path_word(name,quote,false)));}
-    }
-    if let Some(path)=std::env::var_os("PATH"){for dir in std::env::split_paths(&path).take(64){
-        if !visited.insert(dir.clone()){continue;}
-        if let Ok(entries)=fs::read_dir(dir){for entry in entries.take(4096).flatten(){
-            count+=1;if count>16384{return items;}
-            let Some(name)=entry.file_name().to_str().map(str::to_string)else{continue;};
-            if name.chars().any(char::is_control){continue;}
-            let Some(score)=fuzzy_score(query,&name)else{continue;};
-            if entry.metadata().is_ok_and(|m|m.is_file()&&m.permissions().mode()&0o111!=0){
-                items.push((score+1,name.clone(),completion_path_word(&name,quote,false)));
-            }
-        }}
-    }}items
-}
-impl rustyline::completion::Completer for Completion{
-    type Candidate=rustyline::completion::Pair;
-    fn complete(&self,line:&str,pos:usize,_ctx:&rustyline::Context<'_>)
-        ->rustyline::Result<(usize,Vec<Self::Candidate>)>{
-        if let Some((start,value))=self.selection.lock().unwrap().take(){
-            return Ok((start,vec![rustyline::completion::Pair{display:terminal_safe(&value),replacement:value}]));
-        }
-        self.catalog.candidates(line,pos,false)
-    }
-}
-impl CompletionCatalog{
-    fn candidates(&self,line:&str,pos:usize,all:bool)
-        ->rustyline::Result<(usize,Vec<rustyline::completion::Pair>)>{
-        const COMMANDS:&[&str]=&["/help","/hotkeys","/model","/models","/effort","/think","/thinking","/status",
-            "/context","/config","/login","/logout","/auth","/session","/sessions","/resume","/recovery",
-            "/reset","/new","/compact","/interrupt","/quit","/exit","/tasks","/task","/bg","/wakeups","/wakeup"];
-        let Some(prefix)=line.get(..pos)else{return Ok((pos,vec![]));};
-        let mut items=Vec::new();
-        if prefix.starts_with('/'){
-            let Some(space)=prefix.find(char::is_whitespace)else{
-                for command in COMMANDS{if let Some(score)=fuzzy_score(if all{""}else{prefix},command){items.push((score,command.to_string(),command.to_string()));}}
-                return Ok((0,completion_rank(items)));
-            };
-            let command=&prefix[..space];let args=prefix[space..].trim_start();let arg_start=prefix.len()-args.len();
-            let (start,_)=completion_token(prefix,arg_start);let raw_word=&prefix[start..];let word=if all{""}else{raw_word};
-            if command=="/model"||command=="/models"{
-                if command=="/model"&&start==arg_start{if let Some(score)=fuzzy_score(word,"list"){items.push((score,"list".into(),"list".into()));}}
-                if line[..start].trim_end()=="/model list"||line[..start].trim_end()=="/models"{
-                    if let Some(score)=fuzzy_score(word,"refresh"){items.push((score,"refresh".into(),"refresh".into()));}
-                }
-                if let Some(models)=self.models.as_array(){for model in models{
-                    if model["image_output"]==true{continue;}
-                    let Some(id)=model["id"].as_str()else{continue;};
-                    let name=model["name"].as_str().unwrap_or("");
-                    // Provider aliases are alternate spellings, not additional
-                    // picker options. Preserve the user's explicit alias.
-                    let mut value=id.to_string();
-                    if let Some((provider,model_id))=id.split_once('/'){
-                        for (alias,canonical) in [("codex","openai-codex"),("copilot","github-copilot"),("google","google-gemini-cli")]{
-                            if provider==canonical&&raw_word.split_once('/').is_some_and(|(typed,_)|typed.eq_ignore_ascii_case(alias)){
-                                value=format!("{alias}/{model_id}");break;
-                            }
-                        }
-                    }
-                    let score=fuzzy_score(word,&value).or_else(||fuzzy_score(word,name).map(|s|s-100))
-                        .or_else(||model["aliases"].as_array().and_then(|aliases|aliases.iter().filter_map(|a|a.as_str().and_then(|a|{
-                            let alias=if raw_word.contains('/'){format!("{}/{a}",value.split_once('/').unwrap().0)}else{a.into()};fuzzy_score(word,&alias)
-                        })).max()));
-                    if let Some(score)=score{
-                        let aliases=model["aliases"].as_array().map(|a|a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
-                        let display=if aliases.is_empty(){format!("{value}  {name}")}else{format!("{value}  {name}  [{aliases}]")};
-                        items.push((score,display,value));
-                    }
-                }}
-            }else if matches!(command,"/effort"|"/think"|"/thinking"){
-                let model=self.models.as_array().and_then(|models|models.iter().find(|m|m["id"]==self.current_model));
-                let supported=model.and_then(|m|m["reasoning_efforts"].as_array());
-                let max=model.is_some_and(|m|m["reasoning"]==true&&m["api"]=="anthropic-messages"&&self.current_model.contains("claude-opus-4-6"));
-                for effort in ["off","minimal","low","medium","high","xhigh","max"]{
-                    if supported.map_or(effort=="max"&&!max,|levels|!levels.iter().any(|level|level==effort)){continue;}
-                    if let Some(score)=fuzzy_score(word,effort){items.push((score,effort.into(),effort.into()));}
-                }
-            }else if matches!(command,"/login"|"/logout"|"/auth"){
-                let provider=prefix[arg_start..].split_whitespace().next().unwrap_or("");
-                let providers=if start==arg_start{self.providers()}else if command=="/login"{
-                    // Mirror execution's exact/unique-fuzzy provider resolution
-                    // using only the immutable idle snapshot, never host IPC.
-                    let known=self.providers();let query=provider_alias(provider);
-                    let exact=known.iter().find(|p|p.eq_ignore_ascii_case(query)).cloned();
-                    let resolved=exact.or_else(||{
-                        let matches:Vec<_>=known.into_iter().filter(|p|fuzzy_score(query,p).is_some()).collect();
-                        if matches.len()==1{matches.into_iter().next()}else{None}
-                    });
-                    match resolved.as_deref(){
-                        Some("anthropic")=>vec!["browser","manual","api-key","oauth"],
-                        Some("openai-codex")=>vec!["browser","manual","device","oauth"],
-                        Some("github-copilot")=>vec!["device","oauth"],
-                        Some(_)=>vec!["api-key"],
-                        None=>vec![]
-                    }.into_iter().map(str::to_string).collect()
-                }else{vec![]};
-                for provider in providers{if let Some(score)=fuzzy_score(word,&provider){items.push((score,provider.clone(),provider));}}
-            }else if matches!(command,"/tasks"|"/task"|"/bg"|"/wakeup"|"/quit"|"/exit"|"/new"){
-                let tokens:Vec<_>=args.split_whitespace().collect();
-                let at_new=args.ends_with(char::is_whitespace);
-                let slot=tokens.len().saturating_sub(usize::from(!at_new));
-                let task_slot=command=="/task"&&(slot==0||slot==1&&tokens.first().is_some_and(|s|["logs","kill"].contains(s)));
-                let wakeup_slot=command=="/wakeup"&&slot==1;
-                if task_slot||wakeup_slot{
-                    for id in if task_slot{&self.task_ids}else{&self.wakeup_ids}{
-                        if let Some(score)=fuzzy_score(word,id){items.push((score,id.clone(),id.clone()));}
-                    }
-                }
-                let suggestions:&[&str]=match command{
-                    "/tasks"=>&["all","running","finished","succeeded","failed","timed_out","cancelled","killed","outcome_unknown"],
-                    "/task" if args.starts_with("logs ")&&slot>=2=>&["stdout","stderr","both"],
-                    "/task" if args.starts_with("kill ")&&slot>=2=>&["--force"],
-                    "/task" if slot==0=>&["logs","kill"],"/task"=>&[],
-                    "/bg" if slot==0=>&["shell","python"],"/bg"=>&[],
-                    "/wakeup" if slot==0=>&["cancel","run"],"/wakeup"=>&[],
-                    _=>&["--cancel-tasks"]
-                };
-                for suggestion in suggestions{if let Some(score)=fuzzy_score(word,suggestion){items.push((score,suggestion.to_string(),suggestion.to_string()));}}
-            }else if command=="/resume"{
-                let directory=self.home.join("sessions");
-                if let Ok(entries)=fs::read_dir(directory){for entry in entries.take(4096).flatten(){
-                    let name=entry.file_name().to_string_lossy().into_owned();
-                    if let Some(score)=fuzzy_score(word,&name){items.push((score,name,entry.path().to_string_lossy().into_owned()));}
-                }}
-            }else{items=completion_files(completion_file_query(raw_word,all),None,false,&std::env::current_dir()?,false);}
-            return Ok((start,completion_rank(items)));
-        }
-        if prefix.starts_with('@'){
-            let offset=if prefix.starts_with("@@"){2}else{1};
-            let (quoted_start,quote)=completion_token(prefix,offset);
-            if quote.is_some(){return Ok((quoted_start,completion_rank(completion_files(completion_file_query(&prefix[quoted_start..],all),quote,true,&self.python_cwd,false))));}
-            let start=prefix[offset..].char_indices().rev().find(|(_,c)|!c.is_alphanumeric()&&!matches!(c,'_'|'.'))
-                .map_or(offset,|(i,c)|offset+i+c.len_utf8());
-            let word=if all{""}else{&prefix[start..]};let qualifier=word.rsplit_once('.').map(|p|p.0);
-            for name in &self.names{
-                let score=if let Some(qualifier)=qualifier{
-                    name.rsplit_once('.').filter(|(q,_)|*q==qualifier)
-                        .and_then(|(_,n)|fuzzy_score(word.rsplit_once('.').unwrap().1,n))
-                        .or_else(||fuzzy_score(word,name).map(|s|s-50_000))
-                }else{fuzzy_score(word,name).map(|s|if name.contains('.'){s-100_000}else{s})};
-                if let Some(score)=score{items.push((score,name.clone(),name.clone()));}
-            }
-            return Ok((start,completion_rank(items)));
-        }
-        let offset=if prefix.starts_with("!!"){2}else if prefix.starts_with('!'){1}else{0};
-        let (start,quote)=completion_token(prefix,offset);let word=&prefix[start..];
-        let before=prefix[offset..start].trim().trim_end_matches(['\'','"']).trim_end();
-        let command=offset>0&&(before.is_empty()||before.ends_with([';','|','&']));
-        items=completion_files(completion_file_query(word,all),quote,false,&std::env::current_dir()?,command);
-        if command&&!word.contains('/'){
-            let query=if all{String::new()}else{completion_unescape(word,false,quote)};
-            items.extend(completion_executables(&query,quote));
-        }
-        Ok((start,completion_rank(items)))
-    }
-}
-
-fn completion_file_query(word:&str,all:bool)->&str{
-    if all{word.rfind('/').map_or("",|i|&word[..i+1])}else{word}
-}
-// Only this immutable, between-cell snapshot enters the key handler. Python IPC
-// and the worker are deliberately absent from selection and query filtering.
-struct PickerTab{catalog:CompletionCatalog,selection:std::sync::Arc<std::sync::Mutex<Option<(usize,String)>> >}
-impl rustyline::ConditionalEventHandler for PickerTab{
-    fn handle(&self,_event:&rustyline::Event,_count:rustyline::RepeatCount,_positive:bool,ctx:&rustyline::EventContext<'_>)->Option<rustyline::Cmd>{
-        let (start,matching)=self.catalog.candidates(ctx.line(),ctx.pos(),false).ok()?;
-        let selected=if matching.len()==1{Some(matching[0].replacement.clone())}
-        else if matching.is_empty(){None}else{
-            let (_,choices)=self.catalog.candidates(ctx.line(),ctx.pos(),true).ok()?;
-            let prefix=&ctx.line()[..ctx.pos()];
-            let python=prefix.starts_with('@');
-            let offset=if prefix.starts_with("@@")||prefix.starts_with("!!"){2}else if python||prefix.starts_with('!'){1}else{0};
-            let (_,quote)=completion_token(prefix,offset);
-            let query=completion_unescape(&prefix[start..],python,quote);
-            picker_select(&choices,&query,1,1,1).ok().flatten()
-        };
-        Some(if let Some(value)=selected{
-            // Cmd::Replace is unsuitable here: Emacs redo overrides its count,
-            // and insert_str leaves the cursor before inserted text. Complete
-            // delegates atomic range replacement + cursor placement to rustyline.
-            *self.selection.lock().unwrap()=Some((start,value));rustyline::Cmd::Complete
-        }else{rustyline::Cmd::Repaint})
-    }
-}
-struct PickerTerminal{
-    input:File,tty:File,previous:libc::termios,active:bool,
-    slots:usize,cursor_row:usize,origin_up:usize,prompt_rows:usize,
-}
-impl PickerTerminal{
-    fn open(output_fd:i32,prompt_rows:usize,origin_up:usize)->Result<Option<Self>>{
-        use std::os::fd::FromRawFd;
-        let input=unsafe{libc::dup(0)};if input<0{return Err(io::Error::last_os_error().into());}
-        let input=unsafe{File::from_raw_fd(input)};
-        let tty=unsafe{libc::dup(output_fd)};if tty<0{return Err(io::Error::last_os_error().into());}
-        let tty=unsafe{File::from_raw_fd(tty)};
-        let mut size=unsafe{std::mem::zeroed::<libc::winsize>()};
-        let height=if unsafe{libc::ioctl(tty.as_raw_fd(),libc::TIOCGWINSZ,&mut size)}==0&&size.ws_row>0{size.ws_row as usize}else{24};
-        // At most half the screen: reserve room for the source and recent output.
-        // Multiline input can consume that room; a tiny screen declines the menu.
-        let slots=height.saturating_sub(prompt_rows).min((height/2).max(2)).min(8);
-        if slots<2{return Ok(None);}
-        let mut previous=unsafe{std::mem::zeroed::<libc::termios>()};
-        if unsafe{libc::tcgetattr(input.as_raw_fd(),&mut previous)}<0{return Err(io::Error::last_os_error().into());}
-        let mut raw=previous;raw.c_lflag&=!(libc::ICANON|libc::ECHO|libc::ISIG);
-        raw.c_cc[libc::VMIN]=1;raw.c_cc[libc::VTIME]=0;
-        if unsafe{libc::tcsetattr(input.as_raw_fd(),libc::TCSANOW,&raw)}<0{return Err(io::Error::last_os_error().into());}
-        let mut guard=Self{input,tty,previous,active:false,slots:0,cursor_row:0,origin_up:origin_up.max(1),prompt_rows};
-        guard.tty.write_all(b"\r")?;
-        if guard.origin_up>1{write!(guard.tty,"\x1b[{}B",guard.origin_up-1)?;}
-        // Newlines reserve owned rows and naturally scroll at the bottom. The
-        // source scrolls with them; no saved absolute cursor becomes stale.
-        for _ in 0..slots{
-            guard.tty.write_all(b"\r\n")?;
-            if guard.active{guard.cursor_row+=1;}guard.active=true;guard.slots+=1;
-        }
-        guard.top()?;guard.tty.flush()?;Ok(Some(guard))
-    }
-    fn top(&mut self)->io::Result<()>{
-        self.tty.write_all(b"\r")?;
-        if self.cursor_row>0{write!(self.tty,"\x1b[{}A",self.cursor_row)?;}
-        self.cursor_row=0;Ok(())
-    }
-    fn byte(&mut self,timeout:i32)->Result<Option<u8>>{
-        use std::os::fd::AsRawFd;
-        let mut poll=libc::pollfd{fd:self.input.as_raw_fd(),events:libc::POLLIN,revents:0};
-        let ready=unsafe{libc::poll(&mut poll,1,timeout)};
-        if ready<0{
-            let error=io::Error::last_os_error();
-            if error.kind()==io::ErrorKind::Interrupted{return Ok(None);}
-            return Err(error.into());
-        }
-        if ready==0{return Ok(None);}
-        let mut byte=[0];if std::io::Read::read(&mut self.input,&mut byte)?==0{return Err("selection input closed".into());}
-        Ok(Some(byte[0]))
-    }
-    fn size(&self)->(usize,usize){
-        use std::os::fd::AsRawFd;
-        let mut size=unsafe{std::mem::zeroed::<libc::winsize>()};
-        let rows=if unsafe{libc::ioctl(self.tty.as_raw_fd(),libc::TIOCGWINSZ,&mut size)}==0&&size.ws_row>0{size.ws_row as usize}else{24};
-        (terminal_width_for(self.tty.as_raw_fd()).max(1),rows.max(1))
-    }
-}
-impl Drop for PickerTerminal{
-    fn drop(&mut self){
-        use std::os::fd::AsRawFd;
-        if self.active{
-            let _=self.top();
-            // Clear only below the prompt, return to its original caret row.
-            let _=self.tty.write_all(b"\x1b[0J");
-            let _=write!(self.tty,"\x1b[{}A\r\x1b[?25h",self.origin_up);
-            let _=self.tty.flush();
-        }
-        unsafe{libc::tcsetattr(self.input.as_raw_fd(),libc::TCSANOW,&self.previous);}
-    }
-}
-fn picker_clip(text:&str,width:usize)->String{
-    let mut result=String::new();let mut used=0;
-    for (cluster,columns) in terminal_clusters(&terminal_safe(text)){
-        if used+columns>width{break;}result.push_str(&cluster);used+=columns;
-    }result
-}
-fn picker_filter(choices:&[rustyline::completion::Pair],query:&str)->Vec<usize>{
-    let mut ranked:Vec<_>=choices.iter().enumerate().filter_map(|(index,pair)|{
-        if pair.replacement.chars().any(char::is_control){return None;}
-        fuzzy_score(query,&pair.replacement).or_else(||fuzzy_score(query,&pair.display).map(|score|score-100))
-            .map(|score|(score+if pair.replacement.starts_with(query){50}else{0},index))
-    }).collect();
-    ranked.sort_by(|a,b|b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    ranked.into_iter().map(|p|p.1).collect()
-}
-fn picker_draw(terminal:&mut PickerTerminal,choices:&[rustyline::completion::Pair],query:&str,filtered:&[usize],selected:usize)->Result<()>{
-    let (width,_)=terminal.size();let slots=terminal.slots;
-    let mut lines=if slots==2{vec![format!("Fuzzy select · {query}")]}
-        else{vec!["Fuzzy select — Enter picks".into(),format!("Find: {query}")]};
-    if slots>=6{lines.push("↑↓/Tab move · Esc cancels".into());}
-    let footer=usize::from(slots>=5);let available=slots.saturating_sub(lines.len()+footer).max(1);
-    let start=selected.saturating_sub(available/2).min(filtered.len().saturating_sub(available));
-    if filtered.is_empty(){lines.push("No matches — edit query".into());}
-    else{for (position,index) in filtered.iter().enumerate().skip(start).take(available){
-        lines.push(format!("{}{}",if position==selected{"→ "}else{"  "},choices[*index].display));
-    }}
-    if footer>0{lines.push(format!("{}/{}",if filtered.is_empty(){0}else{selected+1},filtered.len()));}
-    terminal.top()?;terminal.tty.write_all(b"\x1b[?25l")?;
-    for index in 0..slots{
-        if index>0{terminal.tty.write_all(b"\r\n")?;terminal.cursor_row+=1;}
-        terminal.tty.write_all(b"\x1b[2K")?;
-        if let Some(line)=lines.get(index){
-            let clipped=picker_clip(line,width.saturating_sub(1).max(1));
-            let style=if index==0{"1;36"}else if index==1&&slots>2{"36"}else if line.starts_with("→ "){"1;7"}else if line.starts_with("  "){"0"}else{"2"};
-            terminal.tty.write_all(terminal_styled_for(&clipped,style,terminal.tty.as_raw_fd()).as_bytes())?;
-        }
-    }
-    let query_row=usize::from(slots>2);
-    let query_line=if slots==2{format!("Fuzzy select · {}",terminal_safe(query))}else{format!("Find: {}",terminal_safe(query))};
-    let cursor=terminal_columns(&query_line).min(width.saturating_sub(1));
-    terminal.tty.write_all(b"\r")?;
-    let up=terminal.cursor_row-query_row;if up>0{write!(terminal.tty,"\x1b[{up}A")?;}
-    terminal.cursor_row=query_row;
-    if cursor>0{write!(terminal.tty,"\x1b[{cursor}C")?;}
-    terminal.tty.write_all(b"\x1b[?25h")?;terminal.tty.flush()?;Ok(())
-}
-// Nested selection keeps bracketed paste enabled. Consume it atomically so
-// pasted Enter/Escape/control bytes can never select, navigate or submit cells.
-fn picker_paste_service(terminal:&mut PickerTerminal,service:&mut impl FnMut()->Result<()>)->Result<Option<String>>{
-    let mut paste=Vec::new();let mut overflow=false;
-    loop{
-        service()?;
-        if INTERRUPT.load(std::sync::atomic::Ordering::SeqCst){
-            unsafe{libc::tcflush(terminal.input.as_raw_fd(),libc::TCIFLUSH);}
-            return Ok(None);
-        }
-        let Some(byte)=terminal.byte(50)?else{continue;};paste.push(byte);
-        if paste.ends_with(b"\x1b[201~"){
-            paste.truncate(paste.len()-6);
-            if overflow{return Ok(None);}
-            let Ok(text)=String::from_utf8(paste)else{return Ok(None);};
-            // Pasted multiline text is one query edit. Collapse whitespace and
-            // drop other controls; they are data, never picker key commands.
-            let text:String=text.chars().map(|c|if c.is_whitespace(){' '}else{c})
-                .filter(|c|!c.is_control()).collect();
-            return Ok(Some(text.split_whitespace().collect::<Vec<_>>().join(" ")));
-        }
-        if paste.len()>1_048_576+6{overflow=true;paste.drain(..paste.len()-6);}
-    }
-}
-fn picker_select(choices:&[rustyline::completion::Pair],initial_query:&str,output_fd:i32,prompt_rows:usize,origin_up:usize)->Result<Option<String>>{
-    picker_select_service(choices,initial_query,output_fd,prompt_rows,origin_up,||Ok(()))
-}
-fn picker_select_service(choices:&[rustyline::completion::Pair],initial_query:&str,output_fd:i32,prompt_rows:usize,origin_up:usize,mut service:impl FnMut()->Result<()>)->Result<Option<String>>{
-    if unsafe{libc::isatty(0)}!=1||unsafe{libc::isatty(output_fd)}!=1||std::env::var("TERM").is_ok_and(|t|t=="dumb"){return Ok(None);}
-    let Some(mut terminal)=PickerTerminal::open(output_fd,prompt_rows,origin_up)?else{return Ok(None);};
-    let mut query:String=initial_query.chars().take(512).collect();let mut filtered=picker_filter(choices,&query);
-    let mut selected=0usize;let mut dirty=true;let mut size=terminal.size();
-    loop{
-        service()?;
-        if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Ok(None);}
-        if size!=terminal.size(){
-            size=terminal.size();
-            if size.1.saturating_sub(terminal.prompt_rows)<terminal.slots{return Ok(None);}
-            dirty=true;
-        }
-        if dirty{picker_draw(&mut terminal,choices,&query,&filtered,selected)?;dirty=false;}
-        let Some(byte)=terminal.byte(50)?else{continue;};
-        let mut edit=false;
-        match byte{
-            3|4=>{INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);return Ok(None);},
-            b'\r'|b'\n'=>if let Some(index)=filtered.get(selected){return Ok(Some(choices[*index].replacement.clone()));},
-            b'\t'|14=>{if !filtered.is_empty(){selected=(selected+1)%filtered.len();dirty=true;}},
-            16=>{if !filtered.is_empty(){selected=if selected==0{filtered.len()-1}else{selected-1};dirty=true;}},
-            8|127=>{query.pop();edit=true;},
-            21=>{query.clear();edit=true;},
-            23=>{while query.ends_with(char::is_whitespace){query.pop();}while !query.is_empty()&&!query.ends_with(char::is_whitespace){query.pop();}edit=true;},
-            27=>{
-                let Some(next)=terminal.byte(35)?else{return Ok(None);};
-                if next!=b'['&&next!=b'O'{return Ok(None);}
-                let mut sequence=vec![next];
-                for _ in 0..256{
-                    let Some(key)=terminal.byte(35)?else{return Ok(None);};sequence.push(key);
-                    if (0x40..=0x7e).contains(&key){break;}
-                }
-                if !sequence.last().is_some_and(|b|(0x40..=0x7e).contains(b)){
-                    return Err("oversized picker terminal key report".into());
-                }
-                match sequence.as_slice(){
-                    b"[A"|b"[Z"|b"OA" if !filtered.is_empty()=>{
-                        selected=if selected==0{filtered.len()-1}else{selected-1};dirty=true;
-                    },
-                    b"[B"|b"OB" if !filtered.is_empty()=>{selected=(selected+1)%filtered.len();dirty=true;},
-                    b"[200~"=>if let Some(text)=picker_paste_service(&mut terminal,&mut service)?{
-                        if query.len()+text.len()<=2048{query.push_str(&text);edit=true;}
-                    },
-                    _=>{}
-                }
-            },
-            c if c>=32=>{
-                let length=if c<128{1}else if c&0xe0==0xc0{2}else if c&0xf0==0xe0{3}else if c&0xf8==0xf0{4}else{0};
-                if length>0{
-                    let mut bytes=vec![c];for _ in 1..length{if let Some(c)=terminal.byte(100)?{bytes.push(c);}else{break;}}
-                    if let Ok(text)=std::str::from_utf8(&bytes){
-                        if query.len()+text.len()<=2048&&!text.chars().any(char::is_control){query.push_str(text);edit=true;}
-                    }
-                }
-            },
-            _=>{}
-        }
-        if edit{filtered=picker_filter(choices,&query);selected=0;dirty=true;}
-    }
-}
-
-impl Host {
-    fn deliver_steering(&mut self)->Result<bool>{
-        self.poll_commands()?;
-        let Some(pos)=self.pending.iter().position(|v|
-            v["kind"]=="submit" && v["mode"].as_str().unwrap_or("steering")=="steering")
-            else{return Ok(false)};
-        let command=self.pending.remove(pos).unwrap();
-        let id=command["id"].as_str().ok_or("queued command ID required")?;
-        let record=self.queued.remove(id).ok_or("missing accepted queue arrival")?;
-        let (index,sequence)=record.ok_or("queued steering has no user record")?;
-        self.select_user(command["text"].as_str().ok_or("queued text required")?,index,sequence)?;
-        self.journal.append("queue_delivered",json!({"command_id":id,"mode":"steering"}))?;
-        self.event("completed",json!({"command_id":id,"status":"delivered"}));
-        self.stop=false;self.stop_wakeup=None;
-        Ok(true)
-    }
-}
-
-static INTERRUPT:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
-extern "C" fn handle_sigint(_:libc::c_int){
-    INTERRUPT.store(true,std::sync::atomic::Ordering::SeqCst);
-}
-fn install_signals(){
-    unsafe{libc::signal(libc::SIGINT,handle_sigint as *const () as libc::sighandler_t);}
-}
-
-impl Host {
-    fn http_json(&mut self,request:reqwest::RequestBuilder,operation:&str)->Result<Value>{
-        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        rt.block_on(async{
-            let future=async{
-                let response=request.send().await?;
-                let status=response.status();
-                let body:Value=response.json().await?;
-                if !status.is_success(){
-                    let detail=if operation=="auth"{String::new()}else{format!(": {body}")};
-                    return Err::<Value,Box<dyn std::error::Error>>(format!("provider HTTP {status}{detail}").into());
-                }
-                Ok(body)
-            };
-            tokio::pin!(future);
-            loop{
-                tokio::select!{
-                    response=&mut future=>return response,
-                    _=tokio::time::sleep(std::time::Duration::from_millis(15))=>{
-                        self.service_background()?;
-                        let mut cancel=INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst);
-                        while let Some(command)=self.incoming.as_ref().and_then(|r|r.try_recv().ok()){
-                            if command["kind"]=="interrupt"{
-                                if !self.accept_input_control(&command)?{continue;}
-                                self.event("completed",json!({"command_id":command["id"],"status":"ok"}));cancel=true;
-                            }else if !self.background_control(&command)?{self.queue_arrival(command)?;}
-                        }
-                        if cancel{
-                            self.journal.append("provider_cancelled",json!({"operation":operation,"billing":"unknown"}))?;
-                            self.cancel_revision=self.cancel_revision.wrapping_add(1);
-                            return Err("provider request cancelled; outcome/billing may be unknown".into());
-                        }
-                    }
-                }
-            }
-        })
-    }
-}
-
-impl Host {
-    fn cell_view(&self,cell:usize)->Result<Value>{
-        if cell==0{return Err("cell numbers start at 1".into());}
-        let mut view:Option<Value>=None;let mut active=Vec::<usize>::new();
-        let mut indices=HashMap::<&str,usize>::new();
-        for sequence in 0..self.journal.seq{
-            let event=self.journal.event(sequence)?;let kind=event["kind"].as_str().unwrap_or("");let payload=&event["payload"];
-            match kind{
-                "cell_start"=>{
-                    let number=payload["cell"].as_u64().unwrap_or(0) as usize;active.push(number);
-                    if number==cell{view=Some(json!({"cell":cell,"parent_cell":payload["parent_cell"],
-                        "language":payload["language"],"operation":payload["operation"],"source_ref":payload["source_ref"],
-                        "status":"running","complete":false,"say_refs":[],"request_refs":[],"response_refs":[],"usage_refs":[],"context_ids":[]}));}
-                },
-                "cell_end"=>{
-                    if payload["cell"].as_u64()==Some(cell as u64){if let Some(value)=view.as_mut(){
-                        for key in ["status","elapsed_ms","stdout_ref","stderr_ref"]{value[key]=payload[key].clone();}value["complete"]=json!(true);
-                    }}
-                    if let Some(number)=payload["cell"].as_u64().map(|n|n as usize){
-                        if let Some(position)=active.iter().rposition(|n|*n==number){active.remove(position);}
-                    }
-                },
-                "code"=>if let Some(value)=view.as_mut().filter(|value|value["operation"]==payload["operation"]){
-                    value["source_ref"]=json!(format!("H.code[{}]",payload["index"]));value["source"]=payload["source"].clone();
-                },
-                "stream_complete"|"stream_closed"=>if let Some(value)=view.as_mut().filter(|value|value["operation"]==payload["operation"]){
-                    if let (Some(collection),Some(index))=(payload["collection"].as_str(),payload["metadata"]["index"].as_u64()){
-                        value[format!("{collection}_ref")]=json!(format!("H.{collection}[{index}]"));
-                        value[collection]=self.history_value(collection,index as usize)?;
-                    }
-                },
-                "context_add" if active.last()==Some(&cell)=>if let Some(value)=view.as_mut(){value["context_ids"].as_array_mut().unwrap().push(payload["id"].clone());},
-                "say"|"request"|"response"|"usage"=>{
-                    let collection=match kind{"say"=>"say","request"=>"requests","response"=>"responses",_=>"usage"};
-                    let index=*indices.entry(collection).or_insert(0);*indices.get_mut(collection).unwrap()+=1;
-                    if active.last()==Some(&cell){if let Some(value)=view.as_mut(){
-                        let key=match kind{"say"=>"say_refs","request"=>"request_refs","response"=>"response_refs",_=>"usage_refs"};
-                        value[key].as_array_mut().unwrap().push(json!(format!("H.{collection}[{index}]")));
-                    }}
-                },
-                _=>{}
-            }
-        }
-        view.ok_or_else(||"cell does not exist".into())
-    }
-    fn history_value(&self,name:&str,index:usize)->Result<Value>{
-        if name=="events"{return self.journal.event(index);}
-        let value=self.history.get(name).and_then(|v|v.get(index)).ok_or("history index missing")?;
-        if let Some(seq)=value["$event"].as_u64(){
-            let ev=self.journal.event(seq as usize)?;
-            let p=&ev["payload"];
-            return Ok(match name{
-                "code"=>p["source"].clone(),
-                "user"|"stdin"|"say"=>p["text"].clone(),
-                _=>p.clone()
-            });
-        }
-        if let Some(chunks)=value["$chunks"].as_array(){
-            let mut bytes=Vec::new();
-            for chunk in chunks{
-                let ev=self.journal.event(chunk.as_u64().ok_or("invalid chunk")? as usize)?;
-                bytes.extend(B64.decode(ev["payload"]["base64"].as_str().ok_or("missing stream bytes")?)?);
-            }
-            return Ok(json!(String::from_utf8_lossy(&bytes)));
-        }
-        Ok(value.clone())
-    }
-    fn history_last(&self,name:&str)->Result<String>{
-        let n=self.history.get(name).ok_or("unknown stream")?.len().checked_sub(1).ok_or("empty stream")?;
-        Ok(self.history_value(name,n)?.as_str().unwrap_or("").into())
-    }
-
-}
-
-const PROVIDERS:&[(&str,&str,&str)]=&[
- ("openai","https://api.openai.com/v1","OPENAI_API_KEY"),
- ("anthropic","https://api.anthropic.com/v1","ANTHROPIC_API_KEY"),
- ("google","https://generativelanguage.googleapis.com/v1beta","GEMINI_API_KEY"),
- ("groq","https://api.groq.com/openai/v1","GROQ_API_KEY"),
- ("cerebras","https://api.cerebras.ai/v1","CEREBRAS_API_KEY"),
- ("mistral","https://api.mistral.ai/v1","MISTRAL_API_KEY"),
- ("xai","https://api.x.ai/v1","XAI_API_KEY"),
- ("openrouter","https://openrouter.ai/api/v1","OPENROUTER_API_KEY"),
- ("zai","https://api.z.ai/api/paas/v4","ZAI_API_KEY"),
- ("opencode","https://opencode.ai/zen/v1","OPENCODE_API_KEY"),
- ("huggingface","https://router.huggingface.co/v1","HF_TOKEN"),
- ("minimax","https://api.minimax.io/v1","MINIMAX_API_KEY"),
- ("minimax-cn","https://api.minimaxi.com/v1","MINIMAX_API_KEY")
-];
-fn load_json(path:&Path)->Result<Value>{
-    if !path.exists(){return Ok(json!({}));}
-    Ok(serde_json::from_reader(File::open(path)?)?)
-}
-fn write_private_json(path:&Path,value:&Value)->Result<()>{
-    let tmp=path.with_extension(format!("tmp-{}",std::process::id()));
-    let mut file=OpenOptions::new().create_new(true).write(true).mode(0o600).open(&tmp)?;
-    file.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;file.sync_all()?;
-    fs::rename(&tmp,path)?;
-    File::open(path.parent().ok_or("missing directory")?)?.sync_all()?;Ok(())
-}
-impl Host{
-    fn credential(&self,provider:&str,env:&str)->String{
-        let stored=&self.auth[provider];
-        stored["key"].as_str().filter(|s|!s.trim().is_empty())
-            .or(stored["access"].as_str().filter(|s|!s.trim().is_empty())).map(str::to_string)
-            .unwrap_or_else(||std::env::var(env).unwrap_or_default())
-    }
-    fn configure(&mut self)->Result<()>{
-        if let Some(model)=self.config["model"].as_str(){self.model=model.into();}
-        if let Ok(model)=std::env::var("PY_MODEL"){self.model=model;}
-        if let Some(effort)=self.config["effort"].as_str(){self.effort=effort.into();}
-        self.set_model(self.model.clone())?;
-        Ok(())
-    }
-    fn model_limit(&self,model:&str)->Result<usize>{
-        let canonical=model.split_once('/').map(|(p,id)|format!("{}/{id}",provider_alias(p))).unwrap_or(model.into());
-        let models=self.models();
-        let mut limit=models.as_array().unwrap().iter().find(|v|v["id"]==canonical)
-            .and_then(|descriptor|descriptor["context_limit"].as_u64()).map_or(self.context_limit,|n|n as usize);
-        if let Ok(value)=std::env::var("PY_CONTEXT_LIMIT"){limit=value.parse()?;}
-        Ok(limit)
-    }
-    fn set_model(&mut self,model:String)->Result<()>{
-        let limit=self.model_limit(&model)?;
-        if self.startup_ready{self.check_model_system_budget(&model,limit)?;}
-        self.context_limit=limit;self.model=model;Ok(())
-    }
-    fn status(&self)->Value{json!({"state":self.state.label(),"cells":self.cells,"active_cell":self.active_cell,
-        "model":self.model,"effort":self.effort,
-        "context_usage":self.context_usage(),"usage":self.usage,"queue_depth":self.pending.len(),
-        "worker_generation":self.generation,"startup_ready":self.startup_ready,"session":self.journal.path,
-        "background_tasks":self.bg_tasks.len(),"active_background_tasks":self.bg_tasks.values().filter(|t|t.child.is_some()).count(),
-        "pending_wakeups":self.wakeups.values().filter(|w|matches!(w.metadata["state"].as_str(),Some("scheduled"|"ready"|"pending_confirmation"))).count()})}
-}
-const CATALOG:&str=r####"[{"id":"anthropic/claude-haiku-4-5","name":"Claude Haiku 4.5 (latest)","provider":"anthropic","base_url":"https://api.anthropic.com","api":"anthropic-messages","context_limit":200000,"max_tokens":64000,"image_input":true,"reasoning":true,"image_output":false},{"id":"anthropic/claude-opus-4-6","name":"Claude Opus 4.6","provider":"anthropic","base_url":"https://api.anthropic.com","api":"anthropic-messages","context_limit":200000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"anthropic/claude-sonnet-4-6","name":"Claude Sonnet 4.6","provider":"anthropic","base_url":"https://api.anthropic.com","api":"anthropic-messages","context_limit":200000,"max_tokens":64000,"image_input":true,"reasoning":true,"image_output":false},{"id":"cerebras/gpt-oss-120b","name":"GPT OSS 120B","provider":"cerebras","base_url":"https://api.cerebras.ai/v1","api":"openai-completions","context_limit":131072,"max_tokens":32768,"image_input":false,"reasoning":true,"image_output":false},{"id":"google/gemini-2.5-flash","name":"Gemini 2.5 Flash","provider":"google","base_url":"https://generativelanguage.googleapis.com/v1beta","api":"google-generative-ai","context_limit":1048576,"max_tokens":65536,"image_input":true,"reasoning":true,"image_output":false},{"id":"google/gemini-2.5-pro","name":"Gemini 2.5 Pro","provider":"google","base_url":"https://generativelanguage.googleapis.com/v1beta","api":"google-generative-ai","context_limit":1048576,"max_tokens":65536,"image_input":true,"reasoning":true,"image_output":false},{"id":"google/gemini-3-pro-preview","name":"Gemini 3 Pro Preview","provider":"google","base_url":"https://generativelanguage.googleapis.com/v1beta","api":"google-generative-ai","context_limit":1000000,"max_tokens":64000,"image_input":true,"reasoning":true,"image_output":false},{"id":"groq/llama-3.3-70b-versatile","name":"Llama 3.3 70B Versatile","provider":"groq","base_url":"https://api.groq.com/openai/v1","api":"openai-completions","context_limit":131072,"max_tokens":32768,"image_input":false,"reasoning":false,"image_output":false},{"id":"mistral/mistral-large-latest","name":"Mistral Large","provider":"mistral","base_url":"https://api.mistral.ai/v1","api":"openai-completions","context_limit":262144,"max_tokens":262144,"image_input":true,"reasoning":false,"image_output":false},{"id":"openai/gpt-4.1","name":"GPT-4.1","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":1047576,"max_tokens":32768,"image_input":true,"reasoning":false,"image_output":false},{"id":"openai/gpt-4o","name":"GPT-4o","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":128000,"max_tokens":16384,"image_input":true,"reasoning":false,"image_output":false},{"id":"openai/gpt-5","name":"GPT-5","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":400000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"openai/gpt-5.2","name":"GPT-5.2","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":400000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"openai/o3","name":"o3","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":200000,"max_tokens":100000,"image_input":true,"reasoning":true,"image_output":false},{"id":"openrouter/anthropic/claude-sonnet-4.6","name":"Anthropic: Claude Sonnet 4.6","provider":"openrouter","base_url":"https://openrouter.ai/api/v1","api":"openai-completions","context_limit":1000000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"xai/grok-4","name":"Grok 4","provider":"xai","base_url":"https://api.x.ai/v1","api":"openai-completions","context_limit":256000,"max_tokens":64000,"image_input":false,"reasoning":true,"image_output":false},{"id":"zai/glm-4.7","name":"GLM-4.7","provider":"zai","base_url":"https://api.z.ai/api/coding/paas/v4","api":"openai-completions","context_limit":204800,"max_tokens":131072,"image_input":false,"reasoning":true,"image_output":false},{"id":"openai/gpt-image-1","provider":"openai","name":"GPT Image 1","api":"image-generation","image_input":true,"image_output":true,"context_limit":128000}]"####;
-
-/* Curated model metadata, provider effort mappings and browser OAuth compatibility
-adapted from Pi (pinned in SPEC).
-MIT License
-
-Copyright (c) 2025 Mario Zechner
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-*/
-
-impl Host {
-    fn auth_status(&self)->Value{
-        json!(self.login_providers().into_iter().map(|name|{
-            let env=self.config["providers"][&name]["key_env"].as_str()
-                .or(PROVIDERS.iter().find(|p|p.0==name).map(|p|p.2)).unwrap_or("");
-            json!({"provider":name,"stored":self.auth[&name].is_object(),
-                "environment":std::env::var(env).is_ok_and(|s|!s.trim().is_empty()),
-                "method":self.auth[&name]["type"],"secret":Value::Null})
-        }).collect::<Vec<_>>())
-    }
-    fn key_login(&mut self,provider:&str,key:&str)->Result<()>{
-        self.with_state(UiState::Login,None,|host|host.key_login_inner(provider,key))
-    }
-    fn key_login_inner(&mut self,provider:&str,key:&str)->Result<()>{
-        if key.trim().is_empty(){return Err("empty API key".into());}
-        let provider=self.resolve_provider(provider)?;
-        if provider=="openai-codex"{return Err("Codex requires subscription browser/device login, not an API key".into());}
-        self.store_credential(&provider,Some(json!({"type":"api_key","key":key})))
-    }
-    fn logout(&mut self,provider:&str)->Result<()>{self.store_credential(provider,None)}
-    fn select_model_after_login(&mut self,provider:&str){
-        // Login must never disguise selection failures as authentication failures,
-        // override a usable model, or write a global model default.
-        let cancel_revision=self.cancel_revision;self.maybe_refresh_model_catalog(provider);
-        if self.cancel_revision!=cancel_revision{return;}
-        if self.provider_config(&self.model).is_ok(){return;}
-        let models=self.models();
-        let candidates:Vec<_>=models.as_array().unwrap().iter().filter(|m|m["provider"]==provider
-            &&m["ready"]==true&&m["image_output"]!=true&&m["deprecated"]!=true
-            &&(m["catalog_listed"]!=false||m["user_declared"]==true)).collect();
-        let selected=candidates.iter().find(|m|m["id"]=="openai-codex/gpt-6.1-sol").or_else(||candidates.first());
-        if let Some(model)=selected.and_then(|m|m["id"].as_str()){
-            if let Err(error)=self.choose_model(model){self.event("notice",json!({"text":format!("Credentials stored, but model selection failed: {error}. Use /model to select a usable model.")}));}
-        }else{self.event("notice",json!({"text":"Credentials stored; no usable known/configured model for this provider. Use /model to select a model."}));}
-    }
-    fn interactive_login(&mut self,arguments:&str)->Result<()>{
-        if arguments.is_empty(){return self.interactive_login_inner(arguments);}
-        self.with_state(UiState::Login,None,|host|host.interactive_login_inner(arguments))
-    }
-    fn interactive_login_inner(&mut self,arguments:&str)->Result<()>{
-        if arguments.is_empty(){
-            self.ui_text("Login: /login <provider> [browser|manual|device|api-key]\nNo Pi/Pig credentials are imported. Browser login opens the provider's sign-in page; manual uses hidden callback/code paste. Live subscription compatibility is not verified by login alone.");
-            for provider in self.login_providers(){
-                let methods=match provider.as_str(){
-                    "openai-codex"=>"OAuth browser (default), manual redirect paste, device login",
-                    "anthropic"=>"OAuth browser (default, hidden authorization-code paste), API key",
-                    "github-copilot"=>"OAuth device login (headless/browser verification)",
-                    _=>"API key (hidden terminal entry)"
-                };
-                self.ui_text(&format!("{provider}: {methods}"));
-            }
-            return Ok(());
-        }
-        let words:Vec<_>=arguments.split_whitespace().collect();
-        if words.len()>2{return Err("Usage: /login <provider> [browser|manual|device|api-key]; never paste credentials into the command".into());}
-        let provider=self.resolve_provider(words[0])?;
-        let browser=matches!(provider.as_str(),"openai-codex"|"anthropic");
-        let device=matches!(provider.as_str(),"openai-codex"|"github-copilot");
-        let method=words.get(1).copied().unwrap_or(if browser{"browser"}else if device{"device"}else{"api-key"});
-        match method{
-            "browser"|"oauth" if browser=>self.browser_login(&provider,false)?,
-            "manual"|"--manual" if browser=>self.browser_login(&provider,true)?,
-            "device"|"oauth" if device=>self.oauth_login(&provider)?,
-            "api-key"|"--api-key" if provider!="openai-codex"&&provider!="github-copilot"=>{
-                let key=terminal_secret_service("API key (hidden): ",None,||{if self.codex_cancel("auth")?{Err("login cancelled".into())}else{Ok(())}})?;self.key_login(&provider,&key)?;
-            },
-            _=>return Err(format!("Unsupported login method for {provider}; /login lists available methods (never put a credential in the command)").into())
-        }
-        self.ui_text(&format!("Stored credentials for {provider}. Live provider compatibility is not verified by login alone."));
-        self.select_model_after_login(&provider);Ok(())
-    }
-}
-
-impl Host{
-    fn auth_http(&mut self,request:reqwest::RequestBuilder)->Result<Value>{
-        // Auth bodies/tokens are deliberately never journaled.
-        self.http_json(request,"auth")
-    }
-    fn oauth_login(&mut self,provider:&str)->Result<()>{
-        self.with_state(UiState::Login,None,|host|host.oauth_login_inner(provider))
-    }
-    fn oauth_login_inner(&mut self,provider:&str)->Result<()>{
-        let provider=provider_alias(provider);
-        if provider=="openai-codex"{return self.codex_login();}
-        if provider=="anthropic"{return self.browser_login(provider,false);}
-        if provider!="github-copilot"{return Err(format!("OAuth flow for {provider} not yet implemented; API-key login is available").into());}
-        let base=std::env::var("PY_GITHUB_AUTH_URL").unwrap_or_else(|_|"https://github.com".into());
-        let client=reqwest::Client::new();
-        let device=self.auth_http(client.post(format!("{base}/login/device/code")).header("Accept","application/json")
-            .json(&json!({"client_id":"Iv1.b507a08c87ecfe98","scope":"read:user"})))?;
-        let code=device["device_code"].as_str().ok_or("device flow missing device code")?;
-        self.event("login_prompt",json!({"provider":provider,
-            "url":device["verification_uri"],"user_code":device["user_code"]}));
-        if !self.json{ui_text(&format!("Open {} and enter {}",device["verification_uri"].as_str().unwrap_or(""),device["user_code"].as_str().unwrap_or("")));}
-        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(device["expires_in"].as_u64().unwrap_or(600));
-        let mut interval=device["interval"].as_u64().unwrap_or(5);
-        loop{
-            if std::time::Instant::now()>=deadline{return Err("device login expired".into());}
-            for _ in 0..interval*10{
-                if self.codex_cancel("auth")?{return Err("login cancelled".into());}
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            let token=self.auth_http(client.post(format!("{base}/login/oauth/access_token")).header("Accept","application/json")
-                .json(&json!({"client_id":"Iv1.b507a08c87ecfe98","device_code":code,
-                    "grant_type":"urn:ietf:params:oauth:grant-type:device_code"})))?;
-            if let Some(access)=token["access_token"].as_str(){
-                self.store_credential(provider,Some(json!({"type":"oauth","refresh":access,"access":access,"expires":0})))?;
-                return Ok(());
-            }
-            match token["error"].as_str(){
-                Some("authorization_pending")=>{},
-                Some("slow_down")=>interval+=5,
-                _=>return Err("device login failed or authorization was denied".into())
-            }
-        }
-    }
-    fn refresh_copilot(&mut self)->Result<()>{
-        let _lock=self.auth_lock()?;
-        self.auth=load_json(&self.home.join("auth.json"))?;
-        let refresh=self.auth["github-copilot"]["refresh"].as_str().ok_or("Copilot login required")?.to_string();
-        if self.auth["github-copilot"]["expires"].as_u64().unwrap_or(0)>now_ms() as u64+60000{return Ok(());}
-        let url=std::env::var("PY_COPILOT_TOKEN_URL").unwrap_or_else(|_|"https://api.github.com/copilot_internal/v2/token".into());
-        let body=self.auth_http(reqwest::Client::new().get(url).header("Authorization",format!("token {refresh}"))
-            .header("User-Agent","GitHubCopilotChat/0.35.0").header("Editor-Version","vscode/1.104.3"))?;
-        let access=body["token"].as_str().ok_or("Copilot token exchange missing token")?;
-        let expires=body["expires_at"].as_u64().ok_or("Copilot exchange missing expiry")?*1000;
-        self.auth["github-copilot"]=json!({"type":"oauth","refresh":refresh,"access":access,
-            "expires":expires,"base_url":body["endpoints"]["api"]});
-        write_private_json(&self.home.join("auth.json"),&self.auth)
-    }
-}
-
-fn image_data_url(url:&str)->Result<(&str,&str)>{
-    let(mime,data)=url.strip_prefix("data:").ok_or("only inline image URLs allowed")?
-        .split_once(";base64,").ok_or("invalid image data URL")?;
-    if mime!="image/png"&&mime!="image/jpeg"{return Err("unsupported image MIME".into());}
-    Ok((mime,data))
-}
-fn validate_image(data:&str)->Result<(&'static str,usize)>{
-    let bytes=B64.decode(data)?;
-    if bytes.len()>512000{return Err("image exceeds 512000-byte limit".into());}
-    let mime=if bytes.starts_with(b"\x89PNG\r\n\x1a\n"){"image/png"}
-        else if bytes.starts_with(b"\xff\xd8\xff"){"image/jpeg"}
-        else{return Err("only PNG/JPEG images supported".into());};
-    let format=if mime=="image/png"{image::ImageFormat::Png}else{image::ImageFormat::Jpeg};
-    let reader=image::ImageReader::with_format(std::io::Cursor::new(&bytes),format);
-    let(width,height)=reader.into_dimensions()?;
-    if width>1536||height>1536{return Err("image dimensions exceed 1536 pixels".into());}
-    image::load_from_memory_with_format(&bytes,format)?;
-    Ok((mime,bytes.len()))
-}
-
-impl Host{
-    fn recovery_status(&self)->Result<Value>{
-        let mut operations=std::collections::BTreeMap::<String,Value>::new();
-        let mut queues=std::collections::BTreeMap::<String,Value>::new();
-        let mut streams=std::collections::BTreeMap::<(String,String,usize),Value>::new();
-        for sequence in 0..self.journal.seq{
-            let event=self.journal.event(sequence)?;
-            let p=&event["payload"];
-            match event["kind"].as_str().unwrap_or(""){
-                "intent"=>{
-                    if let Some(id)=p["operation"].as_str(){
-                        operations.insert(id.into(),json!({"operation":id,"type":p["type"],
-                            "state":"unknown","replay_allowed":false,"intent_event":sequence}));
-                    }
-                },
-                "completion"|"shell_completion"|"operation_complete"|"task_settled"|"provider_cancelled"=>{
-                    if let Some(id)=p["operation"].as_str().or(p["command_id"].as_str()){
-                        if let Some(op)=operations.get_mut(id){
-                            op["state"]=json!(if p["stdout"]["complete"]==false||p["status"]=="worker_crashed"{
-                                "unknown"
-                            }else if event["kind"]=="provider_cancelled"{"cancelled"}else{"completed"});
-                            op["completion_event"]=json!(sequence);
-                        }
-                    }
-                },
-                "stream"=>{
-                    let id=p["operation"].as_str().ok_or("stream operation missing")?;
-                    let name=p["collection"].as_str().ok_or("stream collection missing")?;
-                    let index=p["index"].as_u64().ok_or("stream index missing")? as usize;
-                    let stream=streams.entry((id.into(),name.into(),index)).or_insert_with(||
-                        json!({"operation":id,"collection":name,"index":index,"complete":false,"chunks":0}));
-                    stream["chunks"]=json!(stream["chunks"].as_u64().unwrap_or(0)+1);
-                },
-                "queue_arrival"=>{
-                    if let Some(id)=p["command_id"].as_str(){
-                        queues.insert(id.into(),json!({"command_id":id,"command":p["command"],
-                            "user_index":p["user_index"],"state":"pending","auto_dispatch":false}));
-                    }
-                },
-                "queue_delivered"|"queue_dispatched"|"queue_restored"|"queue_cancelled"=>{
-                    if let Some(queue)=p["command_id"].as_str().and_then(|id|queues.get_mut(id)){
-                        queue["state"]=json!(event["kind"].as_str().unwrap().strip_prefix("queue_").unwrap());
-                    }
-                },
-                "stream_complete"|"stream_closed"=>{
-                    let key=(p["operation"].as_str().ok_or("stream operation missing")?.into(),
-                        p["collection"].as_str().ok_or("stream collection missing")?.into(),
-                        p["metadata"]["index"].as_u64().ok_or("stream index missing")? as usize);
-                    if let Some(stream)=streams.get_mut(&key){
-                        stream["complete"]=p["metadata"]["complete"].clone();stream["counts"]=p["metadata"].clone();
-                    }
-                },
-                _=>{}
-            }
-        }
-        Ok(json!({"operations":operations.into_values().collect::<Vec<_>>(),
-            "streams":streams.into_values().collect::<Vec<_>>(),
-            "queues":queues.into_values().collect::<Vec<_>>(),
-            "policy":"Unknown outcome is never permission to replay. Fresh Python; captured chunks only."}))
-    }
-}
-
-impl Host{
-    fn queue_arrival(&mut self,command:Value)->Result<()>{
-        if command["kind"]=="stdin_reply"{self.pending.push_back(command);return Ok(());}
-        let id=command["id"].as_str().unwrap_or("").to_string();
-        if id.is_empty()||self.ids.contains(&id){
-            self.event("rejected",json!({"command_id":id,"error":"missing or duplicate command ID"}));
-            return Ok(());
-        }
-        let recorded=redacted_command(command.clone())?;
-        self.journal.append("accepted",json!({"command_id":id,"command":recorded}))?;
-        self.ids.insert(id.clone());
-        let text=match command["kind"].as_str(){
-            Some("submit")=>command["text"].as_str(),
-            Some("python")=>command["source"].as_str(),
-            Some("shell")=>command["command"].as_str(),
-            _=>None
-        };
-        let record=if let Some(text)=text{
-            let sequence=self.journal.seq;
-            Some((self.user(text,false)?,sequence))
-        }else{None};
-        self.journal.append("queue_arrival",json!({"command_id":id,"command":recorded,
-            "user_index":record.map(|p|p.0),"state":"pending"}))?;
-        self.queued.insert(id.clone(),record);
-        self.pending.push_back(command);
-        self.event("queued",json!({"command_id":id,"queue_depth":self.pending.len()}));
-        Ok(())
-    }
-    fn select_user(&mut self,text:&str,index:usize,sequence:usize)->Result<()>{
-        let selected=text.chars().take(8000).collect::<String>();
-        let rendered=format!("{}\n[{} chars; {} lines; omitted {} chars; H.user[{}]]",
-            selected,text.chars().count(),text.lines().count(),text.chars().count().saturating_sub(8000),index);
-        self.add_context("user",rendered,false,vec![(sequence,sequence+1)])?;
-        Ok(())
-    }
-}
-
-
-// Terminal rendering is deliberately independent of history and JSON events.
-// POSIX wcwidth gives locale-aware columns without a second UI dependency.
-fn terminal_char_width(c:char)->usize{
-    static LOCALE:std::sync::Once=std::sync::Once::new();
-    LOCALE.call_once(||unsafe{
-        libc::setlocale(libc::LC_CTYPE,c"".as_ptr());
-        // Rust starts in the C locale; prefer a UTF-8 locale if the environment
-        // selected C. This changes only character classification, not numbers.
-        let name=libc::setlocale(libc::LC_CTYPE,std::ptr::null());
-        if !name.is_null()&&[b"C".as_slice(),b"POSIX".as_slice()].contains(&std::ffi::CStr::from_ptr(name).to_bytes()){
-            libc::setlocale(libc::LC_CTYPE,c"C.UTF-8".as_ptr());
-        }
-    });
-    unsafe extern "C"{fn wcwidth(c:libc::wchar_t)->libc::c_int;}
-    let width=unsafe{wcwidth(c as libc::wchar_t)};
-    if width>=0{width as usize}else{1}
-}
-fn terminal_clusters(text:&str)->Vec<(String,usize)>{
-    let mut clusters:Vec<(String,usize)>=vec![];
-    let mut joined=false;let mut regional=false;let mut emoji=false;
-    for c in text.chars(){
-        let width=terminal_char_width(c);
-        let is_regional=('\u{1f1e6}'..='\u{1f1ff}').contains(&c);
-        let modifier=('\u{1f3fb}'..='\u{1f3ff}').contains(&c);
-        // This is a conservative emoji-style join, not arbitrary grapheme
-        // shaping: ASCII/CJK around a ZWJ still consume their own columns.
-        let is_emoji=!modifier&&(('\u{1f300}'..='\u{1faff}').contains(&c)||
-            ('\u{2600}'..='\u{27bf}').contains(&c));
-        if let Some((text,total))=clusters.last_mut(){
-            let emoji_join=joined&&emoji&&is_emoji;
-            if width==0||emoji_join||(is_regional&&regional)||(modifier&&emoji){
-                text.push(c);
-                if emoji_join||is_regional||(modifier&&emoji){*total=(*total).max(width).max(2);}
-                if (c=='\u{fe0f}'&&emoji)||(c=='\u{20e3}'&&text.starts_with(|c:char|c.is_ascii_digit()||c=='#'||c=='*')){
-                    *total=(*total).max(2);emoji=true;
-                }
-                joined=c=='\u{200d}'&&emoji;regional=false;continue;
-            }
-        }
-        clusters.push((c.to_string(),width));joined=false;regional=is_regional;emoji=is_emoji;
-    }
-    clusters
-}
-fn terminal_columns(text:&str)->usize{terminal_clusters(text).iter().map(|(_,w)|w).sum()}
-fn terminal_width()->usize{terminal_width_for(1)}
-fn terminal_width_for(fd:i32)->usize{
-    let mut size:libc::winsize=unsafe{std::mem::zeroed()};
-    if unsafe{libc::ioctl(fd,libc::TIOCGWINSZ,&mut size)}==0&&size.ws_col>0{return (size.ws_col as usize).min(512);}
-    std::env::var("COLUMNS").ok().and_then(|v|v.parse::<usize>().ok()).filter(|v|*v>0).unwrap_or(80).min(512)
-}
-fn terminal_safe(text:&str)->String{
-    let mut safe=String::new();
-    for c in text.chars(){match c{
-        '\n'=>safe.push(c),'\t'=>safe.push_str("    "),
-        c if c.is_control()||('\u{202a}'..='\u{202e}').contains(&c)||('\u{2066}'..='\u{2069}').contains(&c)=>{
-            if (c as u32)<256{safe.push_str(&format!("\\x{:02x}",c as u32));}
-            else{safe.push_str(&format!("\\u{{{:x}}}",c as u32));}
-        },
-        _=>safe.push(c)
-    }}safe
-}
-// Return physical lines and the number of forced long-word breaks. The latter
-// is also a cost in table layout: a broken word is not a free height reduction.
-fn terminal_wrap(text:&str,width:usize)->(Vec<String>,usize){
-    let width=width.max(1);let safe=terminal_safe(text);let mut lines=vec![];let mut breaks=0;
-    for logical in safe.split('\n'){
-        let mut line=String::new();let mut columns=0;let mut whitespace=String::new();
-        for piece in logical.split_inclusive(char::is_whitespace){
-            let word=piece.trim_end_matches(char::is_whitespace);
-            let spaces=&piece[word.len()..];
-            if word.is_empty(){whitespace.push_str(spaces);continue;}
-            let word_width=terminal_columns(word);let ws=terminal_columns(&whitespace);
-            if columns>0&&columns+ws+word_width>width{
-                lines.push(line.trim_end().to_string());line.clear();columns=0;whitespace.clear();
-            }
-            // Preserve indentation and intra-word spaces where they fit. Excess
-            // indentation cannot consume the entire visible content width.
-            if !whitespace.is_empty(){
-                let available=width.saturating_sub(columns+word_width.min(width));
-                let count=ws.min(available);line.push_str(&" ".repeat(count));columns+=count;whitespace.clear();
-            }
-            let clusters=terminal_clusters(word);
-            for (i,(cluster,size)) in clusters.iter().enumerate(){
-                if columns+size>width&&!line.is_empty(){
-                    lines.push(std::mem::take(&mut line));columns=0;if i>0{breaks+=1;}
-                }
-                if *size>width{line.push('?');columns+=1;}else{line.push_str(cluster);columns+=size;}
-            }
-            whitespace.push_str(spaces);
-        }
-        lines.push(line.trim_end().to_string());
-    }
-    (lines,breaks)
-}
-fn terminal_prefixed(text:&str,prefix:&str,width:usize)->Vec<String>{
-    let prefix=terminal_safe(prefix);let indent=terminal_columns(&prefix);
-    if indent>=width{return terminal_wrap(&format!("{prefix}{text}"),width).0;}
-    terminal_wrap(text,width-indent).0.into_iter().enumerate().map(|(i,line)|
-        format!("{}{line}",if i==0{prefix.clone()}else{" ".repeat(indent)})).collect()
-}
-fn terminal_inline(text:&str)->String{
-    let mut result=String::new();let mut rest=text;
-    while !rest.is_empty(){
-        if let Some(after)=rest.strip_prefix('\\'){
-            if let Some(c)=after.chars().next(){if "\\`*_{}[]()#+-.!|>~".contains(c){result.push(c);rest=&after[c.len_utf8()..];continue;}}
-        }
-        let mut consumed=false;
-        for marker in ["**","__","~~","`","*","_"]{
-            if let Some(after)=rest.strip_prefix(marker){
-                if let Some(end)=after.find(marker){result.push_str(&after[..end]);rest=&after[end+marker.len()..];consumed=true;break;}
-            }
-        }
-        if consumed{continue;}
-        if let Some(after)=rest.strip_prefix('['){
-            if let Some(close)=after.find("]("){
-                if let Some(end)=after[close+2..].find(')'){
-                    result.push_str(&after[..close]);result.push_str(" (");
-                    result.push_str(&after[close+2..close+2+end]);result.push(')');
-                    rest=&after[close+3+end..];continue;
-                }
-            }
-        }
-        let c=rest.chars().next().unwrap();result.push(c);rest=&rest[c.len_utf8()..];
-    }result
-}
-fn terminal_table_cells(line:&str)->Vec<String>{
-    let mut cells=vec![];let mut cell=String::new();let mut escaped=false;let mut code=false;
-    for c in line.trim().chars(){
-        if escaped{if c!='|'&&c!='\\'{cell.push('\\');}cell.push(c);escaped=false;continue;}
-        match c{'\\'=>escaped=true,'`'=>{code= !code;cell.push(c);},'|' if !code=>{cells.push(std::mem::take(&mut cell));},_=>cell.push(c)}
-    }
-    if escaped{cell.push('\\');}cells.push(cell);
-    if line.trim_start().starts_with('|'){cells.remove(0);}
-    if line.trim_end().ends_with('|')&&cells.last().is_some_and(String::is_empty){cells.pop();}
-    cells.into_iter().map(|c|terminal_inline(c.trim())).collect()
-}
-fn terminal_table_separator(line:&str,columns:usize)->Option<Vec<i8>>{
-    let cells=terminal_table_cells(line);if cells.len()!=columns{return None;}
-    cells.iter().map(|cell|{
-        let trimmed=cell.trim_matches(':');
-        if trimmed.len()<3||!trimmed.chars().all(|c|c=='-'){return None;}
-        Some(if cell.starts_with(':')&&cell.ends_with(':'){0}else if cell.ends_with(':'){1}else{-1})
-    }).collect()
-}
-// Word costs use prefix sums, not rendered strings for every possible width.
-// A uniform-width word (the common ASCII/CJK case) is constant-time; mixed
-// widths find each physical line by binary search. Zero-width marks are kept.
-struct TerminalWordCost{spaces:usize,prefix:Vec<usize>,uniform:Option<usize>}
-fn terminal_cell_costs(cell:&str,available:usize)->Vec<(usize,usize)>{
-    let safe=terminal_safe(cell);
-    let logical:Vec<Vec<TerminalWordCost>>=safe.split('\n').map(|line|{
-        let mut words=vec![];let mut spaces=0;
-        for piece in line.split_inclusive(char::is_whitespace){
-            let word=piece.trim_end_matches(char::is_whitespace);
-            if word.is_empty(){spaces+=terminal_columns(piece);continue;}
-            let widths:Vec<_>=terminal_clusters(word).into_iter().map(|(_,w)|w).collect();
-            let mut prefix=vec![0];for width in &widths{prefix.push(prefix.last().unwrap()+width);}
-            let uniform=widths.first().copied().filter(|w|*w>0&&widths.iter().all(|x|x==w));
-            words.push(TerminalWordCost{spaces,prefix,uniform});
-            spaces=terminal_columns(&piece[word.len()..]);
-        }
-        words
-    }).collect();
-    let mut costs=vec![(usize::MAX,0)];
-    for width in 1..=available{
-        let mut height=logical.len();let mut breaks=0;
-        for words in &logical{
-            let mut columns=0;let mut nonempty=false;
-            for word in words{
-                let total=*word.prefix.last().unwrap();let count=word.prefix.len()-1;
-                let mut spaces=word.spaces;
-                if columns>0&&columns+spaces+total>width{height+=1;columns=0;nonempty=false;spaces=0;}
-                columns+=spaces.min(width.saturating_sub(columns+total.min(width)));
-                nonempty|=columns>0;
-                if columns+total<=width{columns+=total;nonempty|=count>0;continue;}
-                if let Some(unit)=word.uniform.filter(|unit|*unit<=width){
-                    let fit=((width-columns)/unit).min(count);columns+=fit*unit;
-                    let remaining=count-fit;
-                    if remaining>0{
-                        if nonempty||fit>0{height+=1;if fit>0{breaks+=1;}}
-                        let per_line=width/unit;let extra=(remaining-1)/per_line;
-                        height+=extra;breaks+=extra;columns=((remaining-1)%per_line+1)*unit;
-                    }
-                }else{
-                    let mut at=0;
-                    while at<count{
-                        let end=word.prefix.partition_point(|sum|*sum<=word.prefix[at]+width-columns)
-                            .saturating_sub(1).min(count);
-                        if end>at{columns+=word.prefix[end]-word.prefix[at];at=end;nonempty=true;}
-                        else if !nonempty{
-                            // Matches the wrapper's unavoidable replacement at
-                            // width one; normal table minima prevent this path.
-                            columns+=1;at+=1;nonempty=true;
-                        }
-                        if at<count{height+=1;if at>0{breaks+=1;}columns=0;nonempty=false;}
-                    }
-                }
-                nonempty=true;
-            }
-        }
-        costs.push((height,breaks));
-    }
-    costs
-}
-fn terminal_table_widths(rows:&[Vec<String>],available:usize)->Vec<usize>{
-    let columns=rows[0].len();
-    let natural:Vec<_>=(0..columns).map(|c|rows.iter().map(|r|terminal_columns(&r[c])).max().unwrap_or(1).max(1)).collect();
-    // A CJK/emoji cluster cannot occupy a one-column cell. Do not let a cheap
-    // replacement glyph distort the optimizer when the real glyph can fit.
-    let minimum:Vec<_>=(0..columns).map(|c|rows.iter().flat_map(|r|terminal_clusters(&r[c]))
-        .map(|(_,w)|w).max().unwrap_or(1).max(1)).collect();
-    if natural.iter().sum::<usize>()<=available{return natural;}
-    // Sample at most 128 rows/512 cells, 512 chars/cell and 16,384 total
-    // characters, evenly across the table. Cache equal cells and pre-tokenize
-    // widths once, so preprocessing is not repeated wrapping
-    // and allocation of 131 million characters at a wide terminal. Rendering
-    // below still uses every character of every row, not the optimization sample.
-    let mut unique=HashMap::new();let mut costs=vec![];let mut sample=vec![];
-    let chars_per_cell=512.min((16_384/columns).max(1));
-    let row_limit=rows.len().min(128).min((512/columns).max(1))
-        .min((16_384/(columns*chars_per_cell)).max(1));
-    for at in 0..row_limit{
-        let index=if row_limit==1{0}else{at*(rows.len()-1)/(row_limit-1)};
-        let mut indices=vec![];
-        for cell in &rows[index]{
-            let cell:String=cell.chars().take(chars_per_cell).collect();
-            let index=*unique.entry(cell.clone()).or_insert_with(||{
-                let index=costs.len();costs.push(terminal_cell_costs(&cell,available));index
-            });
-            indices.push(index);
-        }
-        sample.push(indices);
-    }
-    // Bound objective search separately: no more than two million sampled-cell
-    // probes, in addition to the character-bounded prefix-sum cost construction.
-    let evaluations=std::cell::Cell::new(0usize);
-    let max_evaluations=(2_000_000/(sample.len()*columns).max(1)).max(1);
-    let score=|widths:&[usize]|->usize{
-        if evaluations.get()>=max_evaluations{return usize::MAX;}
-        evaluations.set(evaluations.get()+1);
-        sample.iter().map(|row|{
-            let mut height=0;let mut breaks=0;
-            for (&cell,&width) in row.iter().zip(widths){let cost=costs[cell][width];height=height.max(cost.0);breaks+=cost.1;}
-            height+breaks
-        }).sum()
-    };
-    let mut best=minimum.clone();
-    for _ in minimum.iter().sum::<usize>()..available{
-        let candidate=if evaluations.get()+columns<max_evaluations{
-            (0..columns).filter(|&c|best[c]<natural[c]).min_by_key(|&c|{
-                let mut widths=best.clone();widths[c]+=1;(score(&widths),std::cmp::Reverse(natural[c]-best[c]),c)
-            })
-        }else{
-            // Even with an exhausted objective budget, fill available space
-            // deterministically rather than rendering an unnecessarily tall table.
-            (0..columns).filter(|&c|best[c]<natural[c]).max_by_key(|&c|(natural[c]-best[c],std::cmp::Reverse(c)))
-        };
-        if let Some(c)=candidate{best[c]+=1;}else{break;}
-    }
-    let mut best_score=score(&best);
-    // Pair moves can cross one-column plateaus which ordinary width greed cannot.
-    for _ in 0..available.min(128){
-        let mut improvement=None;
-        for from in 0..columns{for to in 0..columns{
-            if evaluations.get()>=max_evaluations||from==to||best[from]<=minimum[from]||best[to]>=natural[to]{continue;}
-            let mut widths=best.clone();widths[from]-=1;widths[to]+=1;let value=score(&widths);
-            if value<best_score&&improvement.as_ref().is_none_or(|(v,_)|value<*v){improvement=Some((value,widths));}
-        }}
-        if let Some((value,widths))=improvement{best_score=value;best=widths;}else{break;}
-    }
-    // Enumerate bounded compositions for <=4 columns. Ties prefer less skewed
-    // widths, then lexical order, making every redraw deterministic.
-    if columns<=4{
-        // Keep bounded recursion state explicit and local, not a layout framework.
-        #[allow(clippy::too_many_arguments)]
-        fn search<F:Fn(&[usize])->usize>(at:usize,budget:usize,natural:&[usize],minimum:&[usize],current:&mut Vec<usize>,
-            best:&mut Vec<usize>,best_score:&mut usize,states:&mut usize,score:&F,
-            evaluations:&std::cell::Cell<usize>,max_evaluations:usize){
-            if *states>=50_000||evaluations.get()>=max_evaluations{return;}
-            if at+1==natural.len(){
-                current.push(budget.min(natural[at]).max(minimum[at]));*states+=1;let value=score(current);
-                let spread=|w:&[usize]|w.iter().max().unwrap()-w.iter().min().unwrap();
-                if value<*best_score||(value==*best_score&&(spread(current),&*current)<(spread(best),&*best)){
-                    *best_score=value;*best=current.clone();
-                }current.pop();return;
-            }
-            let remaining:usize=minimum[at+1..].iter().sum();
-            for width in minimum[at]..=natural[at].min(budget.saturating_sub(remaining)){
-                current.push(width);search(at+1,budget-width,natural,minimum,current,best,best_score,states,score,evaluations,max_evaluations);current.pop();
-                if *states>=50_000||evaluations.get()>=max_evaluations{break;}
-            }
-        }
-        search(0,available,&natural,&minimum,&mut vec![],&mut best,&mut best_score,&mut 0,&score,&evaluations,max_evaluations);
-    }best
-}
-fn terminal_table(rows:&[Vec<String>],align:&[i8],width:usize)->Vec<String>{
-    let columns=rows[0].len();let overhead=3*columns+1;
-    if width<overhead+4*columns{
-        let mut lines=vec![];
-        for row in rows.iter().skip(1){
-            if !lines.is_empty(){lines.push(String::new());}
-            for (header,cell) in rows[0].iter().zip(row){lines.extend(terminal_prefixed(cell,&format!("{header}: "),width));}
-        }
-        if rows.len()==1{for cell in &rows[0]{lines.extend(terminal_wrap(cell,width).0);}}return lines;
-    }
-    let widths=terminal_table_widths(rows,width-overhead);
-    let border=|left:&str,middle:&str,right:&str|format!("{left}{}{right}",
-        widths.iter().map(|w|"─".repeat(w+2)).collect::<Vec<_>>().join(middle));
-    let mut lines=vec![border("┌","┬","┐")];
-    for (index,row) in rows.iter().enumerate(){
-        let wrapped:Vec<_>=row.iter().zip(&widths).map(|(c,&w)|terminal_wrap(c,w).0).collect();
-        for physical in 0..wrapped.iter().map(Vec::len).max().unwrap_or(0){
-            let mut cells=vec![];
-            for (c,&w) in widths.iter().enumerate(){
-                let text=wrapped[c].get(physical).map(String::as_str).unwrap_or("");let padding=w.saturating_sub(terminal_columns(text));
-                let left=if align[c]>0{padding}else if align[c]==0{padding/2}else{0};
-                cells.push(format!(" {}{text}{} "," ".repeat(left)," ".repeat(padding-left)));
-            }
-            lines.push(format!("│{}│",cells.join("│")));
-        }
-        if index+1<rows.len(){lines.push(border("├","┼","┤"));}
-    }
-    lines.push(border("└","┴","┘"));lines
-}
-fn terminal_markdown(text:&str,width:usize)->Vec<String>{
-    let safe=terminal_safe(text);let logical:Vec<_>=safe.lines().collect();let mut lines=vec![];let mut at=0;let mut fence=false;
-    while at<logical.len(){
-        let line=logical[at];let trim=line.trim();
-        if trim.starts_with("```")||trim.starts_with("~~~"){fence= !fence;at+=1;continue;}
-        if fence{
-            lines.extend(terminal_style_lines(terminal_prefixed(line,"  ",width),"36"));at+=1;continue;
-        }
-        if trim.is_empty(){lines.push(String::new());at+=1;continue;}
-        if at+1<logical.len()&&line.contains('|'){
-            let header=terminal_table_cells(line);
-            if !header.is_empty(){if let Some(align)=terminal_table_separator(logical[at+1],header.len()){
-                let columns=header.len();let mut rows=vec![header];at+=2;
-                while at<logical.len()&&logical[at].contains('|')&&!logical[at].trim().is_empty(){
-                    let mut row=terminal_table_cells(logical[at]);row.resize(columns,String::new());row.truncate(columns);rows.push(row);at+=1;
-                }
-                lines.extend(terminal_table_styled(terminal_table(&rows,&align,width)));continue;
-            }}
-        }
-        let heading=trim.chars().take_while(|c|*c=='#').count();
-        if (1..=6).contains(&heading)&&trim[heading..].starts_with(' '){
-            let title=terminal_inline(trim[heading..].trim().trim_end_matches('#').trim());
-            lines.extend(terminal_style_lines(terminal_wrap(&title,width).0,"1;36"));
-            lines.push(terminal_styled(&if heading==1{"═"}else{"─"}.repeat(terminal_columns(&title).min(width)),"2"));at+=1;continue;
-        }
-        if trim.len()>=3&&(trim.chars().all(|c|c=='-')||trim.chars().all(|c|c=='*')||trim.chars().all(|c|c=='_')){
-            lines.push(terminal_styled(&"─".repeat(width),"2"));at+=1;continue;
-        }
-        if let Some(quote)=trim.strip_prefix("> "){
-            let quote=terminal_inline(quote);let available=width.saturating_sub(2).max(1);
-            if width<=2{lines.extend(terminal_wrap(&quote,width).0);}else{
-                lines.extend(terminal_wrap(&quote,available).0.into_iter().map(|l|terminal_styled(&format!("│ {l}"),"2;3")));
-            }at+=1;continue;
-        }
-        let bullet=trim.strip_prefix("- ").or_else(||trim.strip_prefix("* ")).or_else(||trim.strip_prefix("+ "));
-        if let Some(item)=bullet{lines.extend(terminal_prefixed(&terminal_inline(item),"• ",width));at+=1;continue;}
-        let digits=trim.chars().take_while(char::is_ascii_digit).count();
-        if digits>0&&trim[digits..].starts_with(". "){
-            lines.extend(terminal_prefixed(&terminal_inline(&trim[digits+2..]),&trim[..digits+2],width));at+=1;continue;
-        }
-        // Soft paragraph newlines are Markdown spaces; explicit blank lines are
-        // retained. Block starts are kept separate instead of swallowed.
-        let mut paragraph=trim.to_string();at+=1;
-        while at<logical.len(){let next=logical[at].trim();
-            if next.is_empty()||next.starts_with(['#','>','-','*','+','`','~'])||next.contains('|'){break;}
-            paragraph.push(' ');paragraph.push_str(next);at+=1;
-        }
-        lines.extend(terminal_wrap(&terminal_inline(&paragraph),width).0);
-    }lines
-}
-fn terminal_preview(v:&Value,width:usize)->Vec<String>{
-    let mut lines=vec![String::new()];
-    let id=v["command_id"].as_str().unwrap_or("?");
-    if v["cell"].as_u64().is_none(){
-        lines.extend(terminal_style_lines(terminal_wrap(&format!("── cell {id} {}",if v["code"]["ref"].as_str().unwrap_or("").starts_with("H.code"){"python"}else{"shell"}),width).0,"1;36"));
-    }
-    for stream in ["code","stdout","stderr"]{
-        if !v[stream].is_object()||stream!="code"&&v[stream]["bytes"].as_u64()==Some(0){continue;}
-        lines.extend(terminal_style_lines(terminal_wrap(&format!("── {stream}"),width).0,"36"));
-        if let Some(preview)=v[stream]["preview"].as_str(){if !preview.is_empty(){
-            let raw=stream!="code"&&v["terminal_controls"]==true&&unsafe{libc::isatty(1)==1}
-                &&!std::env::var("TERM").is_ok_and(|term|term=="dumb");
-            if raw{lines.extend(preview.split('\n').map(str::to_owned));}
-            else{lines.extend(terminal_wrap(preview,width).0);}
-        }}
-        if v[stream]["preview_truncated"]==true{
-            let total=v[stream]["lines"].as_u64().unwrap_or(0);
-            let shown=v[stream]["preview"].as_str().map(|text|text.lines().count()).unwrap_or(0);
-            let reference=if let Some(cell)=v["cell"].as_u64(){
-                format!("H.cells[{cell}].{}",if stream=="code"{"source"}else{stream})
-            }else{v[stream]["ref"].as_str().unwrap_or("?").to_string()};
-            let info=if v[stream]["omitted_lines"].as_u64().unwrap_or(0)>0{
-                format!("{shown} lines shown out of {total} · {reference}")
-            }else{format!("preview truncated · {reference}")};
-            lines.extend(terminal_style_lines(terminal_wrap(&info,width).0,"2"));
-        }
-    }
-    lines.push(String::new());lines
-}
 
 #[cfg(test)]
 mod rendering_e2e {
@@ -7569,32 +9577,32 @@ mod rendering_e2e {
     #[test]
     fn e2e_say_markdown_wraps_by_word_and_keeps_original(){
         let text="# Heading\n\nalpha beta gamma delta epsilon zeta eta theta\n\n- **bold** text with `code`\n\n> quoted words inside a block quote\n\n```python\nprint('literal')\n```";
-        let (output,journal)=run(&format!("agent.say({})",serde_json::to_string(text).unwrap()),24,false);
-        let rendered=output.split("\n── code\n").next().unwrap();
+        let (output,journal)=run(&format!("agent.final({})",serde_json::to_string(text).unwrap()),24,false);
+        let rendered=output.split("── cell").nth(1).unwrap();
         assert!(!rendered.contains("**bold**"),"Markdown markers must be rendered in say (not rewritten source): {output}");
         assert!(output.contains("• bold text with code"));assert!(output.contains("│ quoted words inside"));
         assert!(output.lines().any(|l|l=="alpha beta gamma delta"),"word wrapping: {output}");
         let say=journal.iter().find(|v|v["kind"]=="say").unwrap();assert_eq!(say["payload"]["text"],text);
         // JSON events are a separate machine surface, never terminal-rendered text.
-        let (json_output,_)=run(&format!("agent.say({})",serde_json::to_string(text).unwrap()),24,true);
+        let (json_output,_)=run(&format!("agent.final({})",serde_json::to_string(text).unwrap()),24,true);
         assert_eq!(json_output.lines().map(|l|serde_json::from_str::<Value>(l).unwrap())
-            .find(|v|v["kind"]=="say").unwrap()["text"],text);
+            .find(|v|v["kind"]=="final").unwrap()["text"],text);
     }
     #[test]
     fn e2e_say_table_optimizes_height_and_wraps_columns(){
         let text="| A | B |\n| --- | --- |\n| a | alpha beta gamma delta epsilon zeta |";
-        let (output,_)=run(&format!("agent.say({})",serde_json::to_string(text).unwrap()),32,false);
+        let (output,_)=run(&format!("agent.final({})",serde_json::to_string(text).unwrap()),32,false);
         let rows:Vec<_>=output.lines().filter(|l|l.starts_with('│')).collect();
         assert!(!rows.is_empty(),"must render a bordered table: {output}");
         assert_eq!(rows.len(),3,"header plus minimal two body lines, not equal-width tall table: {output}");
         assert!(rows.iter().any(|l|l.contains("alpha beta gamma delta")),"wide content column: {output}");
-        assert!(!output.split("\n── code\n").next().unwrap().contains("| --- |"));
+        assert!(!output.split("── cell").nth(1).unwrap().contains("| --- |"));
         for l in rows{assert!(l.chars().count()<=32,"too wide: {l}");}
     }
     #[test]
     fn e2e_say_table_long_word_breaks_are_not_free(){
         let text="| A | B |\n| --- | --- |\n| aaabbbcccddd | alpha beta gamma |\n| alpha beta | x |";
-        let (output,_)=run(&format!("agent.say({})",serde_json::to_string(text).unwrap()),25,false);
+        let (output,_)=run(&format!("agent.final({})",serde_json::to_string(text).unwrap()),25,false);
         let top=output.lines().find(|l|l.starts_with('┌')).unwrap();
         let widths:Vec<_>=top.trim_start_matches('┌').trim_end_matches('┐').split('┬').map(|s|s.chars().count()-2).collect();
         // Exact small-table optimum is [12,6]: five content lines, no broken
@@ -7605,7 +9613,7 @@ mod rendering_e2e {
     #[test]
     fn e2e_say_narrow_table_unicode_and_controls(){
         let text="| Name | Words |\n| --- | --- |\n| 界 é | alpha beta gamma |\n\n\u{1b}]52;c;DANGER\u{7}\nlongunbrokenwordabcdefghijk";
-        let (output,journal)=run(&format!("agent.say({})",serde_json::to_string(text).unwrap()),12,false);
+        let (output,journal)=run(&format!("agent.final({})",serde_json::to_string(text).unwrap()),12,false);
         assert!(!output.contains('\u{1b}')&&!output.contains('\u{7}'),"terminal control injection: {output:?}");
         assert!(output.contains("界"));assert!(output.contains("é"));
         assert!(output.lines().any(|l|l.contains("Name:")),"stack cells when borders cannot fit: {output}");
@@ -7625,7 +9633,7 @@ p=subprocess.Popen([sys.argv[1],'--json-input','--no-model'],stdin=subprocess.PI
  env=dict(os.environ,PY_HOME=sys.argv[2],COLUMNS='99',NO_COLOR='1'))
 os.close(slave);transcript=bytearray()
 try:
- p.stdin.write((json.dumps(dict(id='pty-render',kind='python',source='agent.say('+repr(text)+')'))+'\n').encode());p.stdin.close()
+ p.stdin.write((json.dumps(dict(id='pty-render',kind='python',source='agent.final('+repr(text)+')'))+'\n').encode());p.stdin.close()
  deadline=time.monotonic()+6
  while True:
   assert time.monotonic()<deadline,bytes(transcript)
@@ -7703,6 +9711,26 @@ os.write(m,b'/quit\r');p.wait(timeout=4);os.close(m)
             .map(|v|v["payload"]["text"].as_str().unwrap()).collect::<String>(),"alpha beta gamma delta epsilon zeta\n");
     }
     #[test]
+    fn e2e_source_precedes_nested_shell_output_without_duplicate_preview(){
+        let source="agent.sh('printf CHILD-OUTPUT'); print('PARENT-OUTPUT')";
+        let (output,_)=run(source,160,false);
+        assert!(!output.contains("── code"),"{output}");
+        assert_eq!(output.lines().filter(|line|*line==source).count(),1,"{output}");
+        let parent_source=output.find(source).unwrap();
+        let child_source=output.find("\nprintf CHILD-OUTPUT\n").unwrap();
+        let child_output=output.find("\nCHILD-OUTPUT\n").unwrap();
+        let child_end=output.find("── cell 1 › 2 · shell").unwrap();
+        let parent_output=output.find("\nPARENT-OUTPUT\n").unwrap();
+        let parent_end=output.find("── cell 1 · python").unwrap();
+        assert!(parent_source<child_source&&child_source<child_output&&child_output<child_end
+            &&child_end<parent_output&&parent_output<parent_end,"{output}");
+        let (json,_)=run(source,160,true);
+        let previews:Vec<Value>=json.lines().map(|line|serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event|event["kind"]=="preview").collect();
+        assert_eq!(previews.len(),2);
+        assert_eq!(previews[1]["code"]["preview"],source);
+    }
+    #[test]
     fn e2e_preview_omits_empty_streams_and_summarizes_only_truncation(){
         let (empty,_)=run("pass",80,false);
         assert!(!empty.contains("── stdout")&&!empty.contains("── stderr"),"{empty}");
@@ -7715,312 +9743,20 @@ os.write(m,b'/quit\r');p.wait(timeout=4);os.close(m)
     }
 }
 
-/* Codex device/protocol reference: Pig, revision pinned in SPEC.
-MIT License
-
-Copyright Hewlett Packard Enterprise Development LP
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-*/
-// Codex device/protocol constants follow the Pig pin in SPEC; own client identity.
-// Browser OAuth uses the Pi pin; WebSocket transport and implicit retries are not provided.
-const CODEX_CLIENT_ID:&str="app_EMoamEEZ73f0CkXaXp7hrann";
-fn provider_alias(provider:&str)->&str{if provider=="codex"{"openai-codex"}else{provider}}
-fn codex_token_value(body:&Value)->Result<Value>{
-    let access=oauth_token(body,"access_token")?;
-    let refresh=oauth_token(body,"refresh_token")?;
-    let seconds=body["expires_in"].as_f64().filter(|s|s.is_finite()&&*s>0.0&&*s<=31536000.0).ok_or("Codex token response has invalid expiry")?;
-    let pieces:Vec<_>=access.split('.').collect();
-    if pieces.len()!=3{return Err("Codex access token has invalid account metadata".into());}
-    let bytes=base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(pieces[1].trim_end_matches('='))
-        .map_err(|_|"Codex access token has invalid account metadata")?;
-    let claims:Value=serde_json::from_slice(&bytes).map_err(|_|"Codex access token has invalid account metadata")?;
-    // Decode for account routing only, not JWT signature verification.
-    let account=claims["https://api.openai.com/auth"]["chatgpt_account_id"].as_str()
-        .filter(|s|!s.is_empty()&&s.len()<=512&&s.bytes().all(|c|(33..=126).contains(&c)))
-        .ok_or("Codex access token lacks valid account ID")?;
-    Ok(json!({"type":"oauth","access":access,"refresh":refresh,
-        "expires":now_ms() as u64+(seconds*1000.0) as u64,"accountId":account}))
-}
-impl Host{
-    fn auth_lock(&mut self)->Result<File>{self.auth_lock_until(None)}
-    fn auth_checkpoint(&mut self,deadline:Option<std::time::Instant>)->Result<()>{
-        if self.codex_cancel("auth")?{return Err("authentication cancelled; credentials unchanged".into());}
-        if deadline.is_some_and(|until|std::time::Instant::now()>=until){
-            return Err("browser login timed out; credentials unchanged".into());
+#[cfg(test)]
+mod provider_completion_tests{
+    use super::*;
+    #[test]
+    fn explicit_output_truncation_is_rejected_for_all_protocols(){
+        for body in [json!({"choices":[{"finish_reason":"length"}]}),json!({"stop_reason":"max_tokens"}),
+            json!({"candidates":[{"finishReason":"MAX_TOKENS"}]}),json!({"status":"incomplete"})]{
+            assert!(validate_provider_completion(&body).unwrap_err().to_string().contains("truncated/incomplete"));
         }
-        Ok(())
-    }
-    fn auth_lock_until(&mut self,deadline:Option<std::time::Instant>)->Result<File>{
-        let file=OpenOptions::new().create(true).read(true).write(true).mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC).open(self.home.join("auth.lock"))?;
-        loop{
-            if deadline.is_some(){self.auth_checkpoint(deadline)?;}
-            if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0{
-                if deadline.is_some(){self.auth_checkpoint(deadline)?;}
-                return Ok(file);
-            }
-            let error=io::Error::last_os_error();
-            if error.kind()!=io::ErrorKind::WouldBlock&&error.kind()!=io::ErrorKind::Interrupted{return Err(error.into());}
-            self.auth_checkpoint(deadline)?;
-            std::thread::sleep(std::time::Duration::from_millis(15));
+        for body in [json!({}),json!({"choices":[{"finish_reason":"stop"}]}),
+            json!({"stop_reason":"end_turn"}),json!({"candidates":[{"finishReason":"STOP"}]}),json!({"status":"completed"})]{
+            assert!(validate_provider_completion(&body).is_ok());
         }
     }
-    fn reload_auth(&mut self)->Result<()>{
-        let _lock=self.auth_lock()?;
-        self.auth=load_json(&self.home.join("auth.json"))?;Ok(())
-    }
-    fn store_credential(&mut self,provider:&str,credential:Option<Value>)->Result<()>{
-        self.store_credential_until(provider,credential,None)
-    }
-    fn store_credential_until(&mut self,provider:&str,credential:Option<Value>,deadline:Option<std::time::Instant>)->Result<()>{
-        let _lock=self.auth_lock_until(deadline)?;
-        let path=self.home.join("auth.json");let mut auth=load_json(&path)?;
-        let map=auth.as_object_mut().ok_or("invalid auth config")?;
-        let provider=provider_alias(provider);
-        if let Some(value)=credential{map.insert(provider.into(),value);}else{map.remove(provider);}
-        if deadline.is_some(){self.auth_checkpoint(deadline)?;}
-        // Successful atomic write is the commit boundary. Cancellation arriving
-        // after this checkpoint cannot promise rollback of an already-saved login.
-        write_private_json(&path,&auth)?;self.auth=auth;Ok(())
-    }
-    fn codex_cancel(&mut self,operation:&str)->Result<bool>{
-        self.service_background()?;
-        let mut cancel=INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst);
-        loop{
-            let command=match self.incoming.as_ref().map(|r|r.try_recv()){
-                Some(Ok(v))=>v,
-                Some(Err(std::sync::mpsc::TryRecvError::Disconnected))=>{self.input_closed=true;break;},
-                _=>break
-            };
-            if command["kind"]=="interrupt"{
-                if self.accept_input_control(&command)?{
-                    self.event("completed",json!({"command_id":command["id"],"status":"ok"}));cancel=true;
-                }
-            }else if !self.background_control(&command)?{self.queue_arrival(command)?;}
-        }
-        if cancel{
-            self.journal.append("provider_cancelled",json!({"operation":operation,"billing":"unknown"}))?;
-            self.cancel_revision=self.cancel_revision.wrapping_add(1);
-        }
-        Ok(cancel)
-    }
-    fn codex_wait<T>(&mut self,future:impl std::future::Future<Output=Result<T>>,operation:&str)->Result<T>{
-        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        rt.block_on(async{
-            tokio::pin!(future);
-            loop{
-                if self.codex_cancel(operation)?{return Err("Codex operation cancelled; request outcome may be unknown".into());}
-                tokio::select!{
-                    response=&mut future=>return response,
-                    _=tokio::time::sleep(std::time::Duration::from_millis(15))=>{}
-                }
-            }
-        })
-    }
-    fn codex_http(&mut self,request:reqwest::RequestBuilder)->Result<(u16,Value)>{
-        self.codex_wait(async{
-            let mut response=request.send().await.map_err(|_|"Codex authentication network error")?;
-            let status=response.status().as_u16();let mut bytes=Vec::new();
-            while let Some(chunk)=response.chunk().await.map_err(|_|"Codex authentication network error")?{
-                if bytes.len()+chunk.len()>1048576{return Err("Codex authentication response exceeds limit".into());}
-                bytes.extend_from_slice(&chunk);
-            }
-            let body=match serde_json::from_slice(&bytes){
-                Ok(body)=>body,
-                // Pig treats device polling 403/404 as pending even with an
-                // empty/non-JSON body. Other callers still reject these statuses.
-                Err(_)if status==403||status==404=>Value::Null,
-                Err(_)=>return Err("Codex authentication returned invalid JSON".into())
-            };
-            Ok((status,body))
-        },"auth")
-    }
-    fn codex_auth_base()->String{std::env::var("PY_CODEX_AUTH_BASE_URL").unwrap_or_else(|_|"https://auth.openai.com".into()).trim_end_matches('/').into()}
-    fn codex_login(&mut self)->Result<()>{
-        let base=Self::codex_auth_base();
-        let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build()?;
-        let (status,device)=self.codex_http(client.post(format!("{base}/api/accounts/deviceauth/usercode")).json(&json!({"client_id":CODEX_CLIENT_ID})))?;
-        if status!=200{return Err(format!("Codex device login unavailable (HTTP {status}); enable device-code login in ChatGPT settings if required").into());}
-        let device_id=device["device_auth_id"].as_str().filter(|s|!s.is_empty()).ok_or("Codex device response missing device ID")?;
-        let code=device["user_code"].as_str().filter(|s|!s.is_empty()&&s.len()<=128&&!s.chars().any(char::is_control)).ok_or("Codex device response missing user code")?;
-        let mut interval=device["interval"].as_f64().or_else(||device["interval"].as_str()?.trim().parse().ok())
-            .filter(|n|n.is_finite()&&*n>=0.0&&*n<=60.0).ok_or("Codex device response has invalid interval")?.max(0.01);
-        self.event("login_prompt",json!({"provider":"openai-codex","method":"device_code","url":"https://auth.openai.com/codex/device","user_code":code}));
-        if !self.json{ui_text(&format!("Open https://auth.openai.com/codex/device and enter {code}. Ctrl-C cancels."));}
-        let seconds=std::env::var("PY_CODEX_DEVICE_TIMEOUT_SECONDS").ok().map(|s|s.parse::<f64>()).transpose()?
-            .unwrap_or(900.0);
-        if !seconds.is_finite()||seconds<=0.0||seconds>900.0{return Err("invalid Codex device timeout (0–900 seconds)".into());}
-        let deadline=std::time::Instant::now()+std::time::Duration::from_secs_f64(seconds);
-        loop{
-            let left=deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero(){return Err("Codex device login expired; try /login codex again".into());}
-            let pause=std::time::Duration::from_secs_f64(interval).min(left);
-            self.codex_wait(async{tokio::time::sleep(pause).await;Ok(())},"auth")?;
-            if std::time::Instant::now()>=deadline{return Err("Codex device login expired; try /login codex again".into());}
-            let (status,token)=self.codex_http(client.post(format!("{base}/api/accounts/deviceauth/token"))
-                .timeout(deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_secs(30)))
-                .json(&json!({"device_auth_id":device_id,"user_code":code})))?;
-            if status==200{
-                let authorization=token["authorization_code"].as_str().filter(|s|!s.is_empty()).ok_or("Codex device token response missing authorization code")?;
-                let verifier=token["code_verifier"].as_str().filter(|s|!s.is_empty()).ok_or("Codex device token response missing verifier")?;
-                let (status,body)=self.codex_http(client.post(format!("{base}/oauth/token")).header("Accept","application/json")
-                    .form(&[("grant_type","authorization_code"),("client_id",CODEX_CLIENT_ID),("code",authorization),
-                        ("code_verifier",verifier),("redirect_uri","https://auth.openai.com/deviceauth/callback")]))?;
-                if status!=200{return Err(format!("Codex token exchange failed (HTTP {status}); try /login codex again").into());}
-                return self.store_credential("openai-codex",Some(codex_token_value(&body)?));
-            }
-            let error=token["error"].as_str().or(token["error"]["code"].as_str()).unwrap_or("");
-            if status==403||status==404||error=="deviceauth_authorization_pending"{continue;}
-            if error=="slow_down"{interval=(interval+5.0).min(60.0);continue;}
-            return Err(format!("Codex device authorization denied or failed (HTTP {status})").into());
-        }
-    }
-    fn refresh_codex(&mut self)->Result<()>{
-        // Lock spans reload/check/exchange/write: rotating refresh tokens are used once.
-        let _lock=self.auth_lock()?;
-        self.auth=load_json(&self.home.join("auth.json"))?;
-        let credential=&self.auth["openai-codex"];
-        let refresh=oauth_token(credential,"refresh").map_err(|_|"Codex stored credential invalid; /login codex again")?.to_string();
-        if credential["expires"].as_u64().unwrap_or(0)>now_ms() as u64{
-            oauth_token(credential,"access").map_err(|_|"Codex stored credential invalid; /login codex again")?;
-            credential["accountId"].as_str().filter(|s|!s.is_empty()&&s.len()<=512&&s.bytes().all(|c|(33..=126).contains(&c)))
-                .ok_or("Codex stored credential has invalid account ID; /login codex again")?;
-            return Ok(());
-        }
-        let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build()?;
-        let (status,body)=self.codex_http(client.post(format!("{}/oauth/token",Self::codex_auth_base())).header("Accept","application/json")
-            .form(&[("grant_type","refresh_token"),("client_id",CODEX_CLIENT_ID),("refresh_token",refresh.as_str())]))?;
-        if status!=200{return Err(format!("Codex token refresh failed (HTTP {status}); /login codex again").into());}
-        let next=codex_token_value(&body)?;
-        let mut auth=self.auth.clone();auth["openai-codex"]=next;
-        write_private_json(&self.home.join("auth.json"),&auth)?;self.auth=auth;Ok(())
-    }
-    fn codex_request(&self,client:&reqwest::Client,url:&str,key:&str,id:&str,messages:&[Value])->Result<reqwest::RequestBuilder>{
-        let mut instructions=Vec::new();let mut input=Vec::new();
-        for message in messages{
-            let role=message["role"].as_str().unwrap_or("user");
-            if role=="system"||role=="developer"{
-                if let Some(text)=message["content"].as_str(){instructions.push(text.to_string());}
-                else if let Some(parts)=message["content"].as_array(){for p in parts{if let Some(text)=p["text"].as_str(){instructions.push(text.to_string());}}}
-                continue;
-            }
-            let mut item=message.clone();
-            if let Some(text)=item["content"].as_str(){item["content"]=json!([{"type":if role=="assistant"{"output_text"}else{"input_text"},"text":text}]);}
-            else if let Some(parts)=item["content"].as_array_mut(){for part in parts{
-                if part["type"]=="text"{part["type"]=json!(if role=="assistant"{"output_text"}else{"input_text"});}
-                else if part["type"]=="image_url"{*part=json!({"type":"input_image","image_url":part["image_url"]["url"]});}
-            }}
-            input.push(item);
-        }
-        let session=self.journal.path.file_stem().and_then(|s|s.to_str()).unwrap_or("py-session");
-        let mut body=json!({"model":id,"store":false,"stream":true,"instructions":instructions.join("\n"),"input":input,
-            "text":{"verbosity":"medium"},"include":["reasoning.encrypted_content"],"prompt_cache_key":session});
-        let effort=self.effort.as_str();
-        let meta=self.reasoning_metadata(&format!("openai-codex/{id}"));
-        reasoning_fields("openai-codex-responses","openai-codex",id,&meta,effort,4096)?;
-        if effort!="off"||meta["reasoning_efforts"].is_array(){body["reasoning"]=json!({"effort":if effort=="off"{"none"}else if effort=="minimal"&&(id.starts_with("gpt-5.2")||id.starts_with("gpt-5.3")){"low"}else{effort},"summary":"auto"});}
-        let endpoint=if url.ends_with("/codex/responses"){url.to_string()}else if url.ends_with("/codex"){format!("{url}/responses")}else{format!("{url}/codex/responses")};
-        Ok(client.post(endpoint).bearer_auth(key).header("chatgpt-account-id",self.auth["openai-codex"]["accountId"].as_str().ok_or("Codex account ID missing")?)
-            .header("OpenAI-Beta","responses=experimental").header("Accept","text/event-stream").header("originator","py")
-            .header("User-Agent","py-rust/0.1.0").header("session-id",session).header("x-client-request-id",session).json(&body))
-    }
-    fn codex_sse(&mut self,request:reqwest::RequestBuilder,operation:&str)->Result<Value>{
-        let mut secrets=Vec::new();credential_secret_values(&self.auth,&mut secrets);
-        if let Ok((_,key,_))=self.provider_config("openai-codex/gpt-6.1-sol"){if !key.is_empty(){secrets.push(key);}}
-        self.codex_wait(async{
-            let mut response=request.send().await.map_err(|_|"Codex provider network error; outcome unknown")?;
-            let status=response.status();
-            if !status.is_success(){
-                let mut bytes=Vec::new();
-                while let Some(chunk)=response.chunk().await.map_err(|_|"Codex error response disconnected")?{
-                    if bytes.len()+chunk.len()>65536{return Err(format!("Codex provider HTTP {status}; error body exceeds 64 KiB; no automatic retry").into());}
-                    bytes.extend_from_slice(&chunk);
-                }
-                let detail=codex_error_detail(&bytes,&secrets);
-                return Err(format!("Codex provider HTTP {status}{detail}; no automatic retry").into());
-            }
-            codex_read_sse(response).await
-        },operation)
-    }
-}
-fn credential_secret_values(value:&Value,out:&mut Vec<String>){
-    if let Some(object)=value.as_object(){for (key,value) in object{
-        if matches!(key.as_str(),"key"|"access"|"refresh"|"access_token"|"refresh_token"|"id_token"|"accountId"){
-            if let Some(value)=value.as_str().filter(|v|!v.is_empty()){out.push(value.into());}
-        }else{credential_secret_values(value,out);}
-    }}else if let Some(values)=value.as_array(){for value in values{credential_secret_values(value,out);}}
-}
-fn codex_error_detail(bytes:&[u8],secrets:&[String])->String{
-    let Ok(text)=std::str::from_utf8(bytes)else{return ": unreadable error response".into();};
-    let mut detail=if let Ok(body)=serde_json::from_str::<Value>(text){
-        let error=&body["error"];
-        [error["message"].as_str().or(error.as_str()).or(body["message"].as_str()).or(body["detail"].as_str()),
-            error["code"].as_str(),error["param"].as_str()].into_iter().flatten().collect::<Vec<_>>().join("; ")
-    }else{text.to_string()};
-    // Redact before truncation so a token crossing the preview boundary cannot
-    // leak a partial prefix. Never store the raw rejection body in the journal.
-    let mut secrets:Vec<_>=secrets.iter().filter(|s|!s.is_empty()).collect();secrets.sort_by_key(|s|std::cmp::Reverse(s.len()));
-    for secret in secrets{detail=detail.replace(secret,"[redacted]");}
-    let truncated=detail.chars().count()>1024;
-    let mut safe:String=detail.chars().take(1024).map(|c|if c.is_control()||matches!(c,'\u{2028}'|'\u{2029}'){ ' ' }else{c}).collect();
-    if truncated{safe.push_str(" [truncated]");}
-    if safe.trim().is_empty(){String::new()}else{format!(": {}",safe.trim())}
-}
-async fn codex_read_sse(mut response:reqwest::Response)->Result<Value>{
-    let mut bytes=Vec::new();let mut data=Vec::new();let mut delta=String::new();let mut total=0usize;
-    while let Some(chunk)=response.chunk().await.map_err(|_|"Codex stream disconnected; outcome unknown")?{
-        total+=chunk.len();if total>16*1024*1024{return Err("Codex stream exceeds 16 MiB; outcome unknown".into());}
-        bytes.extend_from_slice(&chunk);
-        let mut consumed=0usize;
-        while let Some(offset)=bytes[consumed..].iter().position(|b|*b==b'\n'){
-            let end=consumed+offset;let line=&bytes[consumed..end];consumed=end+1;
-            let line=line.strip_suffix(b"\r").unwrap_or(line);
-            if line.is_empty(){
-                if data.is_empty(){continue;}
-                let text=std::str::from_utf8(&data).map_err(|_|"Codex SSE has invalid UTF-8")?;
-                if text.trim()=="[DONE]"{data.clear();continue;}
-                let event:Value=serde_json::from_str(text).map_err(|_|"Codex SSE has invalid JSON")?;data.clear();
-                match event["type"].as_str().unwrap_or(""){
-                    "response.output_text.delta"=>{if let Some(text)=event["delta"].as_str(){delta.push_str(text);}},
-                    "error"|"response.failed"|"response.incomplete"=>return Err("Codex response failed or incomplete; no automatic retry".into()),
-                    "response.done"|"response.completed"=>{
-                        let mut body=event["response"].clone();
-                        if body["status"]!="completed"{return Err("Codex response did not complete successfully; no automatic retry".into());}
-                        if (body["output"].is_null()||body["output"].as_array().is_some_and(Vec::is_empty))&&!delta.is_empty(){
-                            body["output"]=json!([{"type":"message","content":[{"type":"output_text","text":delta}]}]);
-                        }
-                        return Ok(body);
-                    },
-                    _=>{}
-                }
-            }else if let Some(part)=line.strip_prefix(b"data:"){
-                if !data.is_empty(){data.push(b'\n');}
-                data.extend_from_slice(part.strip_prefix(b" ").unwrap_or(part));
-                if data.len()>2*1024*1024{return Err("Codex SSE frame exceeds 2 MiB; outcome unknown".into());}
-            }
-        }
-        bytes.drain(..consumed);
-        if bytes.len()>2*1024*1024{return Err("Codex SSE line exceeds 2 MiB; outcome unknown".into());}
-        tokio::task::yield_now().await;
-    }
-    Err("Codex stream ended without successful terminal event; outcome unknown".into())
 }
 
 #[cfg(test)]
@@ -8222,6 +9958,97 @@ responses.extend([jsonreply({'device_auth_id':'d','user_code':'ABCD','interval':
 e=run([login()],{'PY_CODEX_DEVICE_TIMEOUT_SECONDS':'0.02'});assert any('expired' in v.get('error','') for v in e),e
 responses.extend([jsonreply({'device_auth_id':'d','user_code':'ABCD','interval':0}),jsonreply({'error':{'code':'slow_down'}},429),jsonreply({'authorization_code':'c','code_verifier':'v'}),jsonreply(tokens())])
 t=time.monotonic();e=run([login()]);assert completed(e,'login')['status']=='ok' and time.monotonic()-t>=5
+"#);}
+    #[test]
+    fn e2e_codex_executes_final_phase_only_not_commentary_drafts(){fixture(r#"
+auth(time.time()*1000+3600000)
+code='agent.say("ONCE")'
+items=[{'type':'message','phase':'commentary','content':[{'type':'output_text','text':code+'\n'}]},
+       {'type':'message','phase':'commentary','content':[{'type':'output_text','text':'raise RuntimeError("DRAFT-MUST-NOT-RUN")\n'}]},
+       {'type':'message','phase':'final_answer','content':[{'type':'output_text','text':code}]}]
+stream='data: '+json.dumps({'type':'response.completed','response':{'status':'completed','output':items}})+'\n\n'
+responses.append((200,stream,'text/event-stream'))
+e=run([py('code=agent.llm("test",model="codex/gpt-5.3-codex"); exec(code)')])
+assert completed(e,'python')['status']=='ok',e
+assert [v['text'] for v in e if v['kind']=='say']==['ONCE'],e
+assert len(requests)==1 and 'DRAFT-MUST-NOT-RUN' in journals(),requests
+# Text equality is not a deduplication rule: legitimate repeated statements in
+# the final program must still execute twice.
+items[-1]['content'][0]['text']=code+'\n'+code
+responses.append((200,'data: '+json.dumps({'type':'response.completed','response':{'status':'completed','output':items}})+'\n\n','text/event-stream'))
+e=run([py('exec(agent.llm("test",model="codex/gpt-5.3-codex"))')])
+assert [v['text'] for v in e if v['kind']=='say']==['ONCE','ONCE'],e
+"#);}
+    #[test]
+    fn e2e_codex_delta_fallback_preserves_message_phases(){fixture(r#"
+auth(time.time()*1000+3600000)
+def frame(e):return 'data: '+json.dumps(e)+'\n\n'
+stream=''
+for index,phase,code in [(0,'commentary','agent.say("DRAFT")'),(1,'final_answer','agent.say("FINAL")')]:
+ item={'id':'msg'+str(index),'type':'message','phase':phase,'content':[]}
+ stream+=frame({'type':'response.output_item.added','output_index':index,'item':item})
+ stream+=frame({'type':'response.output_text.delta','output_index':index,'item_id':item['id'],'delta':code[:8]})
+ stream+=frame({'type':'response.output_text.delta','item_id':item['id'],'delta':code[8:]})
+ stream+=frame({'type':'response.output_item.done','output_index':index,'item':item})
+stream+=frame({'type':'response.completed','response':{'status':'completed','output':[]}})
+responses.append((200,stream,'text/event-stream'))
+e=run([py('exec(agent.llm("test",model="codex/gpt-5.3-codex"))')])
+assert completed(e,'python')['status']=='ok' and [v['text'] for v in e if v['kind']=='say']==['FINAL'],e
+stream=frame({'type':'response.completed','response':{'status':'completed','output':[{'type':'message','phase':'commentary','content':[{'type':'output_text','text':'agent.say("DO-NOT-RUN")'}]}]}})
+responses.append((200,stream,'text/event-stream'))
+e=run([py('exec(agent.llm("test",model="codex/gpt-5.3-codex"))')])
+assert completed(e,'python')['status']=='error' and not any(v['kind']=='say' for v in e),e
+assert 'no final answer text' in journals(),journals()
+"#);}
+    #[test]
+    fn e2e_codex_completed_text_wins_over_shorter_delta_prefix(){fixture(r#"
+auth(time.time()*1000+3600000)
+def frame(e):return 'data: '+json.dumps(e)+'\n\n'
+full='agent.say("ONE")\nagent.say("TWO")'
+for completion in ('item','text'):
+ item={'id':'msg0','type':'message','phase':'final_answer','content':[]}
+ stream=frame({'type':'response.output_item.added','output_index':0,'item':item})
+ stream+=frame({'type':'response.output_text.delta','output_index':0,'delta':'agent.say("ONE")'})
+ if completion=='item':
+  item['content']=[{'type':'output_text','text':full}]
+  stream+=frame({'type':'response.output_item.done','output_index':0,'item':item})
+ else:stream+=frame({'type':'response.output_text.done','output_index':0,'content_index':0,'text':full})
+ stream+=frame({'type':'response.completed','response':{'status':'completed','output':[]}})
+ responses.append((200,stream,'text/event-stream'))
+ e=run([py('exec(agent.llm("test",model="codex/gpt-5.3-codex"))')])
+ assert completed(e,'python')['status']=='ok' and [v['text'] for v in e if v['kind']=='say']==['ONE','TWO'],e
+"#);}
+    #[test]
+    fn e2e_codex_output_limit_and_missing_cache_measurements_are_explicit(){fixture(r#"
+auth(time.time()*1000+3600000)
+for cache in (30,None,40):
+ body={'status':'completed','output':[{'type':'message','phase':'final_answer','content':[{'type':'output_text','text':'hello'}]}]}
+ if cache is not None:body['usage']={'input_tokens':100,'output_tokens':20,'input_tokens_details':{'cached_tokens':cache}}
+ responses.append((200,'data: '+json.dumps({'type':'response.completed','response':body})+'\n\n','text/event-stream'))
+e=run([py('for _ in range(3): agent.llm("test",model="codex/gpt-5.3-codex")')])
+assert completed(e,'python')['status']=='ok',e
+history=[json.loads(line) for line in journals().splitlines()]
+usage=[v['payload'] for v in history if v['kind']=='usage'][-1]
+assert usage['cache_hit_tokens'] is None and usage['reported_cache_hit_tokens']==70 and usage['cache_usage_complete'] is False,usage
+record=[v['payload'] for v in history if v['kind']=='request'][0]
+assert record['requested_output_tokens']==2048 and record['transmitted_output_limit'] is None and record['reserved_output_tokens']==4096,record
+assert len(requests)==3 and all('max_output_tokens' not in json.loads(r[2]) for r in requests),requests
+# Produce a legacy-format fixture with a lost prefix after a missing sample.
+# This edits test data only; production histories are never rewritten.
+path=next(home+'/sessions/'+n for n in os.listdir(home+'/sessions') if n.endswith('.jsonl'))
+legacy=[json.loads(line) for line in open(path)];number=0
+for event in legacy:
+ if event['kind']=='usage':
+  value=event['payload'];value.pop('cache_usage_complete',None);value.pop('reported_cache_hit_tokens',None)
+  value['cache_hit_tokens']=(30,None,40)[number];number+=1
+with open(path,'w') as f:
+ for event in legacy:f.write(json.dumps(event)+'\n')
+responses.append((200,sse('ok'),'text/event-stream'))
+p=subprocess.Popen([sys.argv[1],'--json','--json-input','--no-model','--session',path],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+out,err=p.communicate((json.dumps({'id':'resumed','kind':'python','source':'agent.llm("test",model="codex/gpt-5.3-codex")'})+'\n').encode(),timeout=12)
+assert p.returncode==0,(out,err)
+usage=[json.loads(line)['payload'] for line in open(path) if json.loads(line)['kind']=='usage'][-1]
+assert usage['cache_hit_tokens'] is None and usage['reported_cache_hit_tokens']==43 and usage['cache_usage_complete'] is False,usage
 "#);}
     #[test]
     fn e2e_codex_sse_deltas_crlf_split_and_image_input(){fixture(r#"
@@ -8763,97 +10590,6 @@ assert 'status: ok' in out and '── stdout' in out and 'shell-ok' in out,out
 assert 'Tab' in out and '/login' in out and '/new' in out,out
 assert all(len(l)<=35 for l in out.splitlines()),out
 "#);}
-}
-
-// No getpass subprocess or echoed stdin fallback: secrets belong only to the
-// foreground controlling terminal. The guard restores terminal state on errors
-// and unwinding; cancellation also discards any unfinished canonical line.
-struct SecretTerminal {
-    tty:File,
-    original:libc::termios,
-    active:bool,
-}
-impl SecretTerminal {
-    fn restore(&mut self,discard:bool)->io::Result<()> {
-        if !self.active{return Ok(());}
-        if discard{unsafe{libc::tcflush(self.tty.as_raw_fd(),libc::TCIFLUSH);}}
-        if unsafe{libc::tcsetattr(self.tty.as_raw_fd(),libc::TCSANOW,&self.original)}!=0 {
-            return Err(io::Error::last_os_error());
-        }
-        self.active=false;Ok(())
-    }
-}
-impl Drop for SecretTerminal {
-    fn drop(&mut self){let _=self.restore(true);}
-}
-struct SecretBytes(Vec<u8>);
-impl Drop for SecretBytes {
-    fn drop(&mut self){
-        for byte in &mut self.0{unsafe{std::ptr::write_volatile(byte,0);}}
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-    }
-}
-fn terminal_secret_service(prompt:&str,deadline:Option<std::time::Instant>,mut service:impl FnMut()->Result<()>)->Result<String> {
-    let tty=OpenOptions::new().read(true).write(true)
-        .custom_flags(libc::O_NOCTTY|libc::O_CLOEXEC|libc::O_NONBLOCK).open("/dev/tty")
-        .map_err(|_|"API-key entry requires a controlling terminal; use an environment variable or JSON login for automation")?;
-    let fd=tty.as_raw_fd();
-    if unsafe{libc::tcgetpgrp(fd)}!=unsafe{libc::getpgrp()} {
-        return Err("API-key entry requires the foreground terminal".into());
-    }
-    let mut original=unsafe{std::mem::zeroed::<libc::termios>()};
-    if unsafe{libc::tcgetattr(fd,&mut original)}!=0 {
-        return Err("API-key entry requires a terminal with controllable echo".into());
-    }
-    let mut secret_mode=original;
-    secret_mode.c_lflag|=libc::ICANON|libc::ISIG;
-    secret_mode.c_lflag&=!(libc::ECHO|libc::ECHONL|libc::ECHOCTL);
-    if unsafe{libc::tcsetattr(fd,libc::TCSAFLUSH,&secret_mode)}!=0 {
-        return Err("could not disable terminal echo; API key was not read".into());
-    }
-    let mut guard=SecretTerminal{tty,original,active:true};
-    let result=(||->Result<String>{
-        guard.tty.write_all(terminal_safe(prompt).as_bytes())?;
-        guard.tty.flush()?;
-        // Canonical read preserves the terminal's native erase/kill bindings.
-        // A partial line returned by Ctrl-D is cancellation, never a stored key.
-        let mut bytes=SecretBytes(vec![0;65536]);
-        loop {
-            service()?;
-            if deadline.is_some_and(|d|std::time::Instant::now()>=d){return Err("browser login timed out; retry /login <provider> manual".into());}
-            if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err("login cancelled".into());}
-            let mut poll=libc::pollfd{fd,events:libc::POLLIN,revents:0};
-            let ready=unsafe{libc::poll(&mut poll,1,100)};
-            if ready<0 {
-                let error=io::Error::last_os_error();
-                if error.kind()==io::ErrorKind::Interrupted{continue;}
-                return Err("could not poll terminal for API key".into());
-            }
-            if ready==0{continue;}
-            if poll.revents&(libc::POLLERR|libc::POLLNVAL)!=0 {
-                return Err("terminal disconnected during API-key entry".into());
-            }
-            let count=unsafe{libc::read(fd,bytes.0.as_mut_ptr().cast(),bytes.0.len())};
-            if count<0 {
-                let error=io::Error::last_os_error();
-                if matches!(error.kind(),io::ErrorKind::Interrupted|io::ErrorKind::WouldBlock){continue;}
-                return Err("could not read API key from terminal".into());
-            }
-            if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err("login cancelled".into());}
-            if count==0{return Err("login cancelled".into());}
-            let length=count as usize;
-            if length==bytes.0.len(){return Err("API key exceeds the input limit".into());}
-            if bytes.0[length-1]!=b'\n'{return Err("login cancelled".into());}
-            let mut length=length-1;
-            if length>0&&bytes.0[length-1]==b'\r'{length-=1;}
-            let text=std::str::from_utf8(&bytes.0[..length]).map_err(|_|"API key must be valid UTF-8")?;
-            if text.trim().is_empty(){return Err("empty API key; login cancelled".into());}
-            return Ok(text.to_owned());
-        }
-    })();
-    guard.restore(result.is_err()).map_err(|_|"could not restore terminal after API-key entry")?;
-    guard.tty.write_all(b"\n")?;guard.tty.flush()?;
-    result
 }
 
 #[cfg(test)]
@@ -9468,213 +11204,6 @@ probe('openai/gpt-4.1',False);probe('anthropic/claude-opus-4-6',True);probe('cod
 "#);}
 }
 
-// Browser authorization constants and subscription compatibility follow the Pi
-// revision pinned in SPEC (not installed newer docs, and not Pig's newer endpoints).
-const ANTHROPIC_CLIENT_ID:&str="9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const ANTHROPIC_REDIRECT:&str="https://console.anthropic.com/oauth/code/callback";
-const ANTHROPIC_OAUTH_SYSTEM:&str="You are Claude Code, Anthropic's official CLI for Claude.";
-fn oauth_random(length:usize)->Result<Vec<u8>>{
-    use std::io::Read as _;
-    let mut bytes=vec![0;length];File::open("/dev/urandom")?.read_exact(&mut bytes)?;Ok(bytes)
-}
-fn oauth_pkce()->Result<(String,String)>{
-    let verifier=base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(oauth_random(32)?);
-    let digest=ring::digest::digest(&ring::digest::SHA256,verifier.as_bytes());
-    let challenge=base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref());
-    Ok((verifier,challenge))
-}
-fn oauth_token<'a>(body:&'a Value,name:&str)->Result<&'a str>{
-    body[name].as_str().filter(|s|!s.is_empty()&&s.len()<=32768&&s.bytes().all(|c|(33..=126).contains(&c)))
-        .ok_or_else(||"OAuth response contains an invalid or missing token".into())
-}
-fn anthropic_token_value(body:&Value)->Result<Value>{
-    let access=oauth_token(body,"access_token")?;let refresh=oauth_token(body,"refresh_token")?;
-    let seconds=body["expires_in"].as_f64().filter(|s|s.is_finite()&&*s>300.0&&*s<=31536000.0)
-        .ok_or("Anthropic OAuth response has invalid token expiry")?;
-    Ok(json!({"type":"oauth","access":access,"refresh":refresh,
-        "expires":now_ms() as u64+(seconds*1000.0) as u64-300000}))
-}
-fn oauth_query(url:&reqwest::Url,name:&str)->Result<Option<String>>{
-    let values:Vec<_>=url.query_pairs().filter(|(key,_)|key==name).map(|(_,v)|v.into_owned()).collect();
-    if values.len()>1{return Err("OAuth callback contains duplicate parameters".into());}
-    Ok(values.into_iter().next())
-}
-fn oauth_code(url:&reqwest::Url,state:&str)->Result<String>{
-    if oauth_query(url,"state")?.as_deref()!=Some(state){return Err("OAuth callback state mismatch; login not saved".into());}
-    if oauth_query(url,"error")?.is_some(){return Err("OAuth authorization denied; login not saved".into());}
-    let code=oauth_query(url,"code")?.filter(|s|!s.is_empty()&&s.len()<=32768&&s.bytes().all(|c|(33..=126).contains(&c)))
-        .ok_or("OAuth callback has no valid authorization code")?;
-    Ok(code)
-}
-fn oauth_pasted_code(input:&str,redirect:&str,state:&str)->Result<String>{
-    let input=input.trim();
-    if input.contains("://"){
-        let url=reqwest::Url::parse(input).map_err(|_|"Invalid OAuth redirect URL")?;
-        let expected=reqwest::Url::parse(redirect).map_err(|_|"Invalid OAuth callback configuration")?;
-        if url.origin()!=expected.origin()||url.path()!=expected.path()||!url.username().is_empty()||url.password().is_some(){
-            return Err("OAuth redirect URL does not match this login's callback".into());
-        }
-        return oauth_code(&url,state);
-    }
-    let (code,received)=input.split_once('#').ok_or("Paste the full redirect URL or code#state from this login")?;
-    if received!=state{return Err("OAuth callback state mismatch; login not saved".into());}
-    if code.is_empty()||code.len()>32768||!code.bytes().all(|c|(33..=126).contains(&c)){
-        return Err("OAuth callback has no valid authorization code".into());
-    }
-    Ok(code.into())
-}
-fn oauth_browser_open(url:&str){
-    // Browser processes may outlive login; launch without waiting, reap in a
-    // detached thread, and never route their output/arguments through H.
-    let program=std::env::var("PY_OAUTH_BROWSER").unwrap_or_else(|_|if cfg!(target_os="macos"){"open"}else{"xdg-open"}.into());
-    if program.is_empty(){return;}
-    if let Ok(mut child)=Command::new(program).arg(url).stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn(){
-        std::thread::spawn(move||{let _=child.wait();});
-    }
-}
-impl Host{
-    fn anthropic_auth_base()->String{
-        std::env::var("PY_ANTHROPIC_AUTH_BASE_URL").unwrap_or_else(|_|"https://console.anthropic.com".into()).trim_end_matches('/').into()
-    }
-    fn browser_deadline()->Result<std::time::Instant>{
-        let seconds=std::env::var("PY_OAUTH_TIMEOUT_SECONDS").ok().map(|s|s.parse::<f64>()).transpose()?
-            .unwrap_or(300.0);
-        if !seconds.is_finite()||seconds<=0.0||seconds>900.0{return Err("Invalid browser OAuth timeout (0–900 seconds)".into());}
-        Ok(std::time::Instant::now()+std::time::Duration::from_secs_f64(seconds))
-    }
-    fn browser_callback(&mut self,listener:&std::net::TcpListener,state:&str,deadline:std::time::Instant)->Result<String>{
-        use std::io::Read as _;
-        listener.set_nonblocking(true)?;
-        loop{
-            if self.codex_cancel("auth")?{return Err("browser login cancelled".into());}
-            if std::time::Instant::now()>=deadline{return Err("browser login timed out; use /login codex manual for remote callback paste".into());}
-            let (mut stream,peer)=match listener.accept(){
-                Ok(v)=>v,
-                Err(e)if matches!(e.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::Interrupted)=>{std::thread::sleep(std::time::Duration::from_millis(15));continue;},
-                Err(_)=>return Err("Could not receive browser OAuth callback".into())
-            };
-            if !peer.ip().is_loopback(){continue;}
-            stream.set_nonblocking(true)?;
-            let until=(std::time::Instant::now()+std::time::Duration::from_secs(1)).min(deadline);
-            let mut bytes=SecretBytes(Vec::new());let mut complete=false;
-            loop{
-                if self.codex_cancel("auth")?{return Err("browser login cancelled".into());}
-                if std::time::Instant::now()>=until{break;}
-                let mut buffer=[0;1024];
-                match stream.read(&mut buffer){
-                    Ok(0)=>break,
-                    Ok(n)=>{bytes.0.extend_from_slice(&buffer[..n]);if bytes.0.len()>8192{break;}
-                        if bytes.0.windows(4).any(|w|w==b"\r\n\r\n"){complete=true;break;}},
-                    Err(e)if matches!(e.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::Interrupted)=>std::thread::sleep(std::time::Duration::from_millis(15)),
-                    Err(_)=>break
-                }
-            }
-            let parsed=if complete&&bytes.0.len()<=8192{
-                std::str::from_utf8(&bytes.0).ok().and_then(|text|text.lines().next()).and_then(|line|{
-                    let parts:Vec<_>=line.split(' ').collect();
-                    if parts.len()!=3||parts[0]!="GET"||!parts[1].starts_with('/')||!matches!(parts[2],"HTTP/1.0"|"HTTP/1.1"){return None;}
-                    reqwest::Url::parse(&format!("http://localhost{}",parts[1])).ok()
-                })
-            }else{None};
-            let outcome=parsed.as_ref().filter(|url|url.path()=="/auth/callback").map(|url|oauth_code(url,state));
-            let status=if parsed.as_ref().is_some_and(|url|url.path()!="/auth/callback"){"404 Not Found"}
-                else if outcome.as_ref().is_some_and(|result|result.is_ok()){ "200 OK" }else{"400 Bad Request"};
-            let body=if status=="200 OK"{"Authorization received. Return to py."}else{"Invalid authorization callback."};
-            let response=format!("HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
-            let _=stream.write_all(response.as_bytes());let _=stream.shutdown(std::net::Shutdown::Both);
-            if let Some(Ok(code))=outcome{return Ok(code);}
-            // A provider denial with the valid state ends the flow. Invalid
-            // requests never consume the valid callback or reveal credentials.
-            if parsed.as_ref().is_some_and(|url|url.path()=="/auth/callback"
-                &&oauth_query(url,"state").ok().flatten().as_deref()==Some(state)
-                &&oauth_query(url,"error").ok().flatten().is_some()){
-                return Err("OAuth authorization denied; login not saved".into());
-            }
-        }
-    }
-    fn browser_login(&mut self,provider:&str,manual:bool)->Result<()>{
-        self.with_state(UiState::Login,None,|host|host.browser_login_inner(provider,manual))
-    }
-    fn browser_login_inner(&mut self,provider:&str,manual:bool)->Result<()>{
-        let provider=provider_alias(provider);
-        if !matches!(provider,"anthropic"|"openai-codex"){return Err("Browser OAuth unsupported for this provider; /login lists methods".into());}
-        let deadline=Self::browser_deadline()?;
-        let (verifier,challenge)=oauth_pkce()?;
-        let state=if provider=="anthropic"{verifier.clone()}else{base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(oauth_random(24)?)};
-        let port=std::env::var("PY_OAUTH_CALLBACK_PORT").ok().map(|s|s.parse::<u16>()).transpose()?.unwrap_or(1455);
-        let listener=if provider=="openai-codex"&&!manual{
-            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,port)).ok()
-        }else{None};
-        if listener.is_none()&&provider=="openai-codex"&&!manual&&self.json{
-            return Err("Could not bind Codex callback; use a free callback port, device method, or interactive manual paste".into());
-        }
-        let callback_port=listener.as_ref().map(|l|l.local_addr().map(|addr|addr.port())).transpose()?.unwrap_or(port);
-        let redirect=if provider=="anthropic"{ANTHROPIC_REDIRECT.to_string()}
-            else{format!("http://localhost:{callback_port}/auth/callback")};
-        let authorize=if provider=="anthropic"{
-            std::env::var("PY_ANTHROPIC_AUTHORIZE_URL").unwrap_or_else(|_|"https://claude.ai/oauth/authorize".into())
-        }else{format!("{}/oauth/authorize",Self::codex_auth_base())};
-        let mut url=reqwest::Url::parse(&authorize).map_err(|_|"Invalid OAuth authorize endpoint")?;
-        {
-            let mut query=url.query_pairs_mut();
-            query.append_pair("client_id",if provider=="anthropic"{ANTHROPIC_CLIENT_ID}else{CODEX_CLIENT_ID})
-                .append_pair("response_type","code").append_pair("redirect_uri",&redirect)
-                .append_pair("scope",if provider=="anthropic"{"org:create_api_key user:profile user:inference"}else{"openid profile email offline_access"})
-                .append_pair("code_challenge",&challenge).append_pair("code_challenge_method","S256").append_pair("state",&state);
-            if provider=="anthropic"{query.append_pair("code","true");}
-            else{query.append_pair("id_token_add_organizations","true").append_pair("codex_cli_simplified_flow","true").append_pair("originator","py");}
-        }
-        self.event("login_prompt",json!({"provider":provider,"method":if manual{"manual"}else{"browser"},"url":url.as_str()}));
-        if !self.json{
-            ui_text(&format!("Open this URL in your browser (automatic opener is best-effort):\n{url}\nCtrl-C cancels; authorization codes are entered only in the hidden prompt."));
-            if provider=="anthropic"{ui_text("Anthropic subscription compatibility uses the provider's Claude Code protocol marker/headers; py identity is also sent. Your original system instructions follow unchanged. Live compatibility is unverified; API-key login is available.");}
-            if provider=="openai-codex"&&listener.is_none()&&!manual{ui_text("Callback port unavailable; paste this login's full redirect URL in the hidden prompt instead.");}
-        }
-        oauth_browser_open(url.as_str());
-        let code=if let Some(listener)=listener.as_ref(){self.browser_callback(listener,&state,deadline)?}
-            else{let pasted=terminal_secret_service("Authorization code (hidden): ",Some(deadline),||{if self.codex_cancel("auth")?{Err("login cancelled".into())}else{Ok(())}})?;
-                oauth_pasted_code(&pasted,&redirect,&state)?};
-        // Drop the loopback listener before any exchange: no second callback can
-        // influence an exchange or be falsely acknowledged as another login.
-        drop(listener);
-        if std::time::Instant::now()>=deadline{return Err("browser login timed out; credentials unchanged".into());}
-        let client=reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
-            .timeout(deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_secs(30))).build()?;
-        let request=if provider=="anthropic"{
-            client.post(format!("{}/v1/oauth/token",Self::anthropic_auth_base())).json(&json!({
-                "grant_type":"authorization_code","client_id":ANTHROPIC_CLIENT_ID,"code":code,"state":state,
-                "redirect_uri":redirect,"code_verifier":verifier}))
-        }else{
-            client.post(format!("{}/oauth/token",Self::codex_auth_base())).form(&[
-                ("grant_type","authorization_code"),("client_id",CODEX_CLIENT_ID),("code",code.as_str()),
-                ("code_verifier",verifier.as_str()),("redirect_uri",redirect.as_str())])
-        };
-        let (status,body)=self.codex_http(request).map_err(|e|e.to_string().replace("Codex","OAuth"))?;
-        if status!=200{return Err(format!("OAuth token exchange rejected (HTTP {status}); login not saved").into());}
-        let credential=if provider=="anthropic"{anthropic_token_value(&body)?}else{codex_token_value(&body)?};
-        if self.codex_cancel("auth")?{return Err("browser login cancelled; credentials unchanged".into());}
-        self.store_credential_until(provider,Some(credential),Some(deadline))
-    }
-    fn refresh_anthropic(&mut self)->Result<()>{
-        let _lock=self.auth_lock()?;self.auth=load_json(&self.home.join("auth.json"))?;
-        let credential=&self.auth["anthropic"];
-        if credential["type"]!="oauth"{return Err("Anthropic subscription credential changed; retry operation without replaying code".into());}
-        if credential["expires"].as_u64().unwrap_or(0)>now_ms() as u64{
-            oauth_token(credential,"access")?;oauth_token(credential,"refresh")?;return Ok(());
-        }
-        let refresh=oauth_token(credential,"refresh")?.to_string();
-        let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build()?;
-        let (status,body)=self.codex_http(client.post(format!("{}/v1/oauth/token",Self::anthropic_auth_base()))
-            .json(&json!({"grant_type":"refresh_token","client_id":ANTHROPIC_CLIENT_ID,"refresh_token":refresh})))
-            .map_err(|e|e.to_string().replace("Codex","Anthropic OAuth"))?;
-        if status!=200{return Err(format!("Anthropic OAuth refresh rejected (HTTP {status}); stored credential unchanged").into());}
-        let next=anthropic_token_value(&body)?;let mut auth=self.auth.clone();auth["anthropic"]=next;
-        if self.codex_cancel("auth")?{return Err("Anthropic OAuth refresh cancelled; stored credential unchanged".into());}
-        write_private_json(&self.home.join("auth.json"),&auth)?;self.auth=auth;Ok(())
-    }
-}
-
 #[cfg(test)]
 mod browser_auth_e2e{
     fn check(body:&str){
@@ -10196,7 +11725,7 @@ for key in ('\x1b[13;2u','\x1b[27;2;13~','\x1b[13;2~','\x1b\r'):
  assert b'\r\n  print(n)' in data,(sources(),bytes(data))
  frame=bytes(data).split(b'\x1b[K\x1b[J')[-1]
  visible=re.sub(rb'\x1b\[[0-9;?<>:]*[a-zA-Z]',b'',frame)
- assert visible.startswith(b'> @n=7\r\n  print(n)'),visible
+ assert b'> @n=7\r\n  print(n)' in visible,visible
  command('');assert sources()[-1]=='n=7\nprint(n)',(sources(),bytes(data))
  assert output().endswith('7\n'),output()
 "#);}
@@ -10251,7 +11780,7 @@ send('@print("alpha beta gamma delta epsilon")');pump(.12)
 assert b'\r\n  ' in data,bytes(data)
 frame=bytes(data).split(b'\x1b[K\x1b[J')[-1]
 visible=re.sub(rb'\x1b\[[0-9;?<>:]*[a-zA-Z]',b'',frame)
-assert visible.startswith(b'> @print("alpha beta \r\n  gamma delta epsilon")'),visible
+assert b'> @print("alpha beta \r\n  gamma delta epsilon")' in visible,visible
 send('\x1b[D\x1b[D!');command('')
 assert sources()==['print("alpha beta gamma delta epsilon!")'],(sources(),bytes(data))
 assert output()=='alpha beta gamma delta epsilon!\n',output()
@@ -10308,8 +11837,8 @@ import os,sys,tempfile,subprocess,json,glob,threading,queue,time,signal
 home=tempfile.mkdtemp(prefix='py-state-');env=dict(os.environ,PY_HOME=home)
 for k in ('PY_MODEL','PY_CONTEXT_LIMIT'):env.pop(k,None)
 class Client:
- def __init__(self,extra=()):
-  self.p=subprocess.Popen([sys.argv[1],'--json','--json-input','--no-model',*extra],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env);self.q=queue.Queue();self.all=[]
+ def __init__(self,extra=(),model=False):
+  self.p=subprocess.Popen([sys.argv[1],'--json','--json-input',*([] if model else ['--no-model']),*extra],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env);self.q=queue.Queue();self.all=[]
   def read():
    for line in self.p.stdout:self.q.put(json.loads(line))
   threading.Thread(target=read,daemon=True).start();self.until('ready')
@@ -10348,6 +11877,42 @@ states=[v for v in c.all if v['kind']=='state'];assert states[0]['state']=='idle
 assert all('model' not in v for v in states if v['state']!='thinking'),states
 "#);}
     #[test]
+    fn e2e_state_final_implicitly_stops_after_one_presented_cell(){fixture(r#"
+import http.server
+requests=[]
+class Handler(http.server.BaseHTTPRequestHandler):
+ def log_message(self,*a):pass
+ def do_POST(self):
+  requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+  data=json.dumps({'choices':[{'message':{'content':'agent.final("Hi! How can I help?")'}}]}).encode()
+  self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(data)
+srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=srv.serve_forever,daemon=True).start()
+open(home+'/config.json','w').write(json.dumps({'providers':{'openai':{'base_url':'http://127.0.0.1:'+str(srv.server_port)+'/v1','models':[{'id':'fixture','api':'openai-completions'}]}}}))
+env.update(OPENAI_API_KEY='fixture',PY_MODEL='openai/fixture')
+c=Client(model=True);c.send(id='hi',kind='submit',text='hi');c.until('completed');c.close();srv.shutdown()
+ev=events();assert len(requests)==1,requests
+assert len([v for v in ev if v['kind']=='cell_start'])==1,ev
+assert [v['payload']['source'] for v in ev if v['kind']=='code']==['agent.final("Hi! How can I help?")'],ev
+"#);}
+    #[test]
+    fn e2e_state_say_can_continue_before_final(){fixture(r#"
+import http.server
+requests=[]
+class Handler(http.server.BaseHTTPRequestHandler):
+ def log_message(self,*a):pass
+ def do_POST(self):
+  requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+  code='agent.say("still working")' if len(requests)==1 else 'agent.final("done")'
+  data=json.dumps({'choices':[{'message':{'content':code}}]}).encode()
+  self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(data)
+srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=srv.serve_forever,daemon=True).start()
+open(home+'/config.json','w').write(json.dumps({'providers':{'openai':{'base_url':'http://127.0.0.1:'+str(srv.server_port)+'/v1','models':[{'id':'fixture','api':'openai-completions'}]}}}))
+env.update(OPENAI_API_KEY='fixture',PY_MODEL='openai/fixture')
+c=Client(model=True);c.send(id='work',kind='submit',text='work');c.until('completed');c.close();srv.shutdown()
+ev=events();assert len(requests)==2 and len([v for v in ev if v['kind']=='cell_start'])==2,(requests,ev)
+assert [v['payload']['source'] for v in ev if v['kind']=='code']==['agent.say("still working")','agent.final("done")'],ev
+"#);}
+    #[test]
     fn e2e_state_h_cells_use_presented_number_as_canonical_provenance(){fixture(r#"
 c=Client();c.send(id='first',kind='python',source='print("alpha")');c.until('completed')
 c.send(id='inspect',kind='python',source='import json; print(json.dumps(H.cells[1],sort_keys=True))');c.until('completed');c.close()
@@ -10355,6 +11920,11 @@ text=''.join(v['payload']['text'] for v in events() if v['kind']=='stream' and v
 cell=json.loads(text)
 assert cell['cell']==1 and cell['language']=='python' and cell['status']=='ok' and cell['complete'] is True,cell
 assert cell['source_ref']=='H.code[0]' and cell['stdout_ref']=='H.stdout[0]' and cell['stderr_ref']=='H.stderr[0]',cell
+"#);}
+    #[test]
+    fn e2e_state_nested_shell_cell_source_and_outputs_are_readable(){fixture(r#"
+c=Client();c.send(id='parent',kind='python',source='agent.sh("printf child")\nassert H.cells[2].source=="printf child"\nassert H.cells[2].stdout=="child"\nassert H.cells[2].parent_cell==1');c.until('completed');c.close()
+ends=[v['payload'] for v in events() if v['kind']=='cell_end'];assert len(ends)==2 and all(v['status']=='ok' for v in ends),ends
 "#);}
     #[test]
     fn e2e_state_input_cancel_and_reset_restore_idle(){fixture(r#"
@@ -10412,20 +11982,20 @@ def wait(text,start=0):
  while text not in data[start:]:
   assert time.monotonic()<end,(text,data[-3000:])
   if select.select([m],[],[],.04)[0]:data.extend(os.read(m,65536))
-def ready(start):wait(b'\x1b[?2004h',start)
+def ready(start):wait(b'\x1b[>1u\x1b[?2004h',start)
 try:
- ready(0);assert b'openai/gpt-4.1' not in data,data
- start=len(data);os.write(m,b'@agent.llm("hello",model="openai/fixture")\r');wait(b'\xe2\x80\xba thinking \xc2\xb7 openai/fixture',start)
+ ready(0);assert b'openai/gpt-4.1' in data,data
+ start=len(data);os.write(m,b'@agent.llm("hello",model="openai/fixture")\r');wait(b'thinking ',start);wait(b'openai/fixture [medium]',start)
  assert not any(v['kind']=='cell_end' for v in events()),events()
  wait(b'\r\n> ',start)
- release.set();ready(start);assert b'cell 1' in data[start:] and b'ms' in data[start:] and b'\xe2\x80\xba idle' in data[start:],data
+ release.set();ready(start);assert b'cell 1' in data[start:] and b'ms' in data[start:] and b'idle' in data[start:],data
  start=len(data);os.write(m,b'@input("state-input? ")\r');wait(b'state-input? ',start);wait(b'\xe2\x80\xba input',start)
- os.write(m,b'\x03');ready(start);assert b'cell 2' in data[start:] and b'\xe2\x80\xba idle' in data[start:],data
+ os.write(m,b'\x03');ready(start);assert b'cell 2' in data[start:] and b'idle' in data[start:],data
  start=len(data);os.write(m,b'/login openai api-key\r');wait(b'API key (hidden): ',start);assert b'\xe2\x80\xba login' in data[start:],data
- os.write(m,b'\x03');ready(start);assert b'\xe2\x80\xba idle' in data[start:],data
+ os.write(m,b'\x03');ready(start);assert b'idle' in data[start:],data
  assert not os.path.exists(home+'/auth.json')
- release.clear();start=len(data);os.write(m,b'@agent.llm("cancel",model="openai/fixture")\r');wait(b'\xe2\x80\xba thinking \xc2\xb7 openai/fixture',start)
- os.kill(p.pid,signal.SIGINT);ready(start);release.set();assert b'\xe2\x80\xba idle' in data[start:],data
+ release.clear();start=len(data);os.write(m,b'@agent.llm("cancel",model="openai/fixture")\r');wait(b'thinking ',start);wait(b'openai/fixture [medium]',start)
+ os.kill(p.pid,signal.SIGINT);ready(start);release.set();assert b'idle' in data[start:],data
  start=len(data);os.write(m,b'@pass\r');ready(start);os.write(m,b'/quit\r');assert p.wait(timeout=5)==0
  ends=[v['payload'] for v in events() if v['kind']=='cell_end'];assert [v['cell'] for v in ends]==[1,2,3,4],ends
  assert ends[0]['status']=='ok' and ends[1]['status']=='cancelled' and ends[2]['status']=='cancelled' and ends[3]['status']=='ok',ends
@@ -10475,28 +12045,82 @@ class Handler(http.server.BaseHTTPRequestHandler):
  def do_POST(self):
   body=json.loads(self.rfile.read(int(self.headers['Content-Length'])));requests.append(body)
   if len(requests)==1:time.sleep(.4)
-  code='agent.say("first")\nagent.loop.stop()' if len(requests)==1 else 'agent.say("steered")\nagent.loop.stop()'
+  code='agent.final("first")' if len(requests)==1 else 'agent.final("steered")'
   data=json.dumps({'output':[{'type':'message','content':[{'type':'output_text','text':code}]}]}).encode()
   self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(data)
 srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=srv.serve_forever,daemon=True).start()
 open(home+'/config.json','w').write(json.dumps({'providers':{'openai':{'base_url':'http://127.0.0.1:'+str(srv.server_port)+'/v1','models':[{'id':'fixture','api':'openai-responses'}]}}}))
 env.update(OPENAI_API_KEY='fixture',PY_MODEL='openai/fixture',TERM='xterm');env.pop('NO_COLOR',None)
+# Accepted IDs survive process restart: old process-local steering counters
+# must not reject a newly submitted message in this resumed session.
+c=Client()
+for number in range(100):c.send(id='steer'+str(number),kind='status');c.until('status')
+c.close();session=glob.glob(home+'/sessions/*.jsonl')[0]
 m,s=pty.openpty();fcntl.ioctl(s,termios.TIOCSWINSZ,__import__('struct').pack('HHHH',24,100,0,0))
 def tty():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
-p=subprocess.Popen([sys.argv[1]],stdin=s,stdout=s,stderr=s,preexec_fn=tty,env=env);os.close(s);data=bytearray()
+p=subprocess.Popen([sys.argv[1],'--session',session],stdin=s,stdout=s,stderr=s,preexec_fn=tty,env=env);os.close(s);data=bytearray()
 def pump(timeout=.05):
  if select.select([m],[],[],timeout)[0]:data.extend(os.read(m,65536))
 def wait(test,label):
  end=time.monotonic()+8
  while not test():assert time.monotonic()<end,(label,bytes(data[-5000:]));pump()
-wait(lambda:b'\x1b[?2004h' in data,'initial prompt');prompts=data.count(b'\x1b[?2004h');os.write(m,b'hello\r')
-wait(lambda:b'\xe2\x80\xba thinking' in data and b'\r\n\x1b[1;36m> \x1b[0m' in data,'busy steering prompt')
+idle_ready=b'\x1b[>1u\x1b[?2004h'
+wait(lambda:idle_ready in data,'initial prompt');prompts=data.count(idle_ready);os.write(m,b'hello\r')
+wait(lambda:b'thinking ' in data and b'\r\n\x1b[1;36m> \x1b[0m' in data,'busy steering prompt')
 os.write(m,b'steer now\r');wait(lambda:len(requests)>=2,'steered request')
-wait(lambda:data.count(b'\x1b[?2004h')>prompts,'final prompt')
+wait(lambda:data.count(idle_ready)>prompts,'final prompt')
 assert 'steer now' in json.dumps(requests[1]),requests
+visible=data.decode(errors='replace');assert 'queued steering › steer now' in visible and 'sent steering › steer now' in visible,visible
+assert visible.rfind('steered')>visible.rfind('status: ok'),visible
 os.write(m,b'/quit\r');assert p.wait(timeout=5)==0;os.close(m);srv.shutdown()
 ev=events();assert any(v['kind']=='queue_arrival' and v['payload']['command']['text']=='steer now' for v in ev),ev
 assert any(v['kind']=='queue_delivered' for v in ev),ev
+"#);}
+    #[test]
+    fn e2e_state_busy_draft_cursor_survive_cells_and_return_to_idle_prompt(){fixture(r#"
+import pty,fcntl,termios,select,http.server
+requests=[]
+class Handler(http.server.BaseHTTPRequestHandler):
+ def log_message(self,*a):pass
+ def do_POST(self):
+  body=json.loads(self.rfile.read(int(self.headers['Content-Length'])));requests.append(body)
+  time.sleep(.3)
+  code='reply=input("resume-input? "); print("cell-one:"+reply)' if len(requests)==1 else 'agent.final("done")'
+  data=json.dumps({'output':[{'type':'message','phase':'final_answer','content':[{'type':'output_text','text':code}]}],
+      'usage':{'input_tokens':100,'output_tokens':20,'input_tokens_details':{'cached_tokens':30}}}).encode()
+  self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(data)
+srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=srv.serve_forever,daemon=True).start()
+open(home+'/config.json','w').write(json.dumps({'providers':{'openai':{'base_url':'http://127.0.0.1:'+str(srv.server_port)+'/v1','models':[{'id':'fixture','api':'openai-responses'}]}}}))
+env.update(OPENAI_API_KEY='fixture',PY_MODEL='openai/fixture',TERM='xterm',NO_COLOR='1')
+m,s=pty.openpty();fcntl.ioctl(s,termios.TIOCSWINSZ,__import__('struct').pack('HHHH',24,120,0,0))
+def tty():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
+p=subprocess.Popen([sys.argv[1]],stdin=s,stdout=s,stderr=s,preexec_fn=tty,env=env);os.close(s);data=bytearray()
+def pump():
+ if select.select([m],[],[],.03)[0]:data.extend(os.read(m,65536))
+def wait(test,label):
+ end=time.monotonic()+8
+ while not test():assert time.monotonic()<end,(label,bytes(data[-5000:]));pump()
+idle_ready=b'\x1b[>1u\x1b[?2004h'
+wait(lambda:idle_ready in data,'initial prompt');count=data.count(idle_ready);os.write(m,b'hello\r')
+wait(lambda:b'thinking ' in data,'thinking')
+# Keep the paste open across provider completion / Python input ownership.
+os.write(m,b'\x1b[200~!printf draft_');time.sleep(.5);pump()
+assert any(v['kind']=='cell_start' for v in events()) and not any(v['kind']=='input_prompt' for v in events()),events()
+os.write(m,b'tail\x1b[201~')
+wait(lambda:b'\r\nresume-input?' in data,'exclusive Python input prompt')
+os.write(m,b'user-value\r')
+wait(lambda:len(requests)==2,'second thinking phase')
+os.write(m,b'\x1b[D\x1b[D\x1b[D\x1b[D')
+wait(lambda:data.count(idle_ready)>count,'final idle prompt')
+assert len(requests)==2 and not any(v['kind']=='queue_arrival' for v in events()),events()
+assert [v['payload']['text'] for v in events() if v['kind']=='stdin']==['user-value'],events()
+last=bytes(data).split(b'\x1b[K\x1b[J')[-1]
+assert b'> !printf draft_tail' in last and b'ctx ~' in last and 'cache hit ∑60' in last.decode(),last
+assert b'openai/fixture [medium]' in last and b'idle' in last,last
+count=data.count(idle_ready);os.write(m,b'keep-\r');wait(lambda:data.count(idle_ready)>count,'draft submitted')
+commands=[v['payload']['source'] for v in events() if v['kind']=='intent' and v['payload']['type']=='shell']
+assert commands==['printf draft_keep-tail'],commands
+os.write(m,b'/quit\r');assert p.wait(timeout=5)==0;os.close(m);srv.shutdown()
 "#);}
     #[test]
     fn e2e_state_human_cell_end_status_refs_and_wrap(){fixture(r#"
@@ -10559,7 +12183,7 @@ start=menu('/mo')
 paste('del\r\r@print("paste-must-not-run")\r\x1b[A\x03\x04')
 time.sleep(.15);pump()
 assert b'\x1b[0J' not in data[start:],('paste selected/cancelled picker',bytes(data[start:]))
-assert b'openai/gpt-5' not in data[start:],('paste dispatched /model',bytes(data[start:]))
+assert b'\r\nopenai/gpt-5\r\n' not in data[start:],('paste dispatched /model',bytes(data[start:]))
 assert not any(v['kind'] in ('cell_start','code','user','settings_change') for v in records()),records()
 send('\x1b');wait(lambda:b'\x1b[0J' in data[start:],'Escape restores original')
 command('del')
@@ -10572,7 +12196,7 @@ start=menu('/mo');send('\x15');paste('model\r\n\t')
 time.sleep(.12);pump()
 assert b'\x1b[0J' not in data[start:],('pasted newline selected',bytes(data[start:]))
 send('\r');wait(lambda:b'\x1b[0J' in data[start:],'physical Enter selects')
-assert b'openai/gpt-5' not in data[start:],('selection submitted',bytes(data[start:]))
+assert b'\r\nopenai/gpt-5\r\n' not in data[start:],('selection submitted',bytes(data[start:]))
 command('');assert b'openai/gpt-5' in data[start:],bytes(data[start:])
 start=menu('/mo');send('\x15');paste(b'model\xff\r')
 time.sleep(.1);pump();assert b'\x1b[0J' not in data[start:],bytes(data[start:])
@@ -10584,7 +12208,7 @@ command('')
 start=menu('/mo');paste(b'model '+b'x'*1_048_577+b'\r\r')
 time.sleep(.1);pump()
 assert b'\x1b[0J' not in data[start:],('oversized paste selected',bytes(data[start:]))
-assert b'openai/gpt-5' not in data[start:],bytes(data[start:])
+assert b'\r\nopenai/gpt-5\r\n' not in data[start:],bytes(data[start:])
 send('del\r');wait(lambda:b'\x1b[0J' in data[start:],'oversized paste left original query unchanged')
 command('');assert b'openai/gpt-5' in data[start:],bytes(data[start:])
 "#);}
@@ -10737,13 +12361,15 @@ def human(source,extraenv=None):
     #[test]
     fn e2e_styled_markdown_cells_status_and_plain_fallback(){check(r#"
 text='# Styled heading\n\n```python\nprint(42)\n```\n\n| A | B |\n| --- | --- |\n| 界 é | alpha beta gamma delta epsilon |\n\ncontrol \x1b]52;c;DANGER\x07'
-source='agent.say('+repr(text)+')'
+source='agent.final('+repr(text)+')'
 colored=human(source);unstyled=human(source,{'NO_COLOR':''});dumb=human(source,{'TERM':'dumb'})
 assert '\x1b[1;36m' in colored and '\x1b[32m' in colored,colored
+assert '\x1b[2m' in colored and '\x1b[1;97m' in colored,colored
 assert '\x1b' not in unstyled and '\x1b' not in dumb,(unstyled,dumb)
 visible=plain(colored)
 assert visible.count('── cell 1 · python')==1 and '── cell style' not in visible,visible
 assert re.search(r'cell 1 · python \d+ms · status: ok',visible),visible
+assert visible.index('agent.final(')<visible.index('── cell 1')<visible.rfind('Styled heading'),visible
 assert 'H.stdout[0]' not in visible and 'H.stderr[0]' not in visible,visible
 assert '\x1b]52;' not in colored and '\x07' not in colored,colored
 assert all(len(re.sub('[界]','xx',line))<=48 for line in visible.splitlines()),visible
@@ -10756,7 +12382,7 @@ assert p.returncode==0 and '\x1b' not in p.stdout,p
     fn e2e_styled_minimal_prompt_and_aligned_continuation(){check(r#"
 master,slave=setup();p=subprocess.Popen([sys.argv[1],'--no-model'],stdin=slave,stdout=slave,stderr=slave,env=env,preexec_fn=controlling);os.close(slave)
 try:
- first=drain(p,master,b'\x1b[?2004h');assert '\x1b[1;36m> \x1b[0m' in first and 'gpt-4.1' not in first and 'ctx=' not in first,first
+ first=drain(p,master,b'\x1b[?2004h');assert '\x1b[1;36m> \x1b[0m' in first and 'gpt-4.1' in first and 'ctx ~' in first,first
  os.write(master,b'@x=1\x1b[13;2ux+=1');edited=drain(p,master,b'x+=1');assert '\r\n  x+=1' in edited,edited
  os.write(master,b'\r');done=drain(p,master,b'\x1b[?2004h');assert 'cell 1' in plain(done) and '\x1b[32m' in done,done
  os.write(master,b'/mo\t');menu=drain(p,master,b'\x1b[1;7m');assert '\x1b[1;36mFuzzy select' in menu and '\x1b[1;7m' in menu,menu
@@ -10938,7 +12564,7 @@ finally:
     #[test]
     fn e2e_inline_prompt_output_and_selection_cancel_coexist(){fixture(r#"
 command('@print("inline_keep")')
-menu('/mod');visible=screen.text();assert 'inline_keep' in visible,visible
+menu('/mod');wait(lambda:'Find:' in screen.text(),'picker query visible');visible=screen.text();assert 'inline_keep' in visible,visible
 assert visible.index('> /mod')<visible.index('Fuzzy select')<visible.index('Find:'),visible
 count=len(sources());close_picker('el\r');assert len(sources())==count and '> /model' in screen.text(),(sources(),screen.text())
 assert '/models' not in screen.text(),screen.text()
@@ -10962,9 +12588,9 @@ stdout=''.join(v['payload']['text'] for v in records() if v['kind']=='stream' an
     fn e2e_inline_bottom_narrow_resize_and_repeated_close(){fixture(r#"
 fcntl.ioctl(m,termios.TIOCSWINSZ,struct.pack('HHHH',6,32,0,0));screen.resize(6,32)
 command('@print("bottom-edge")')
-menu('/');assert '> /' in screen.text() and '› idle' in screen.text(),screen.text()
+menu('/');assert '> /' in screen.text() and 'idle' in screen.text() and 'ctx ~' in screen.text(),screen.text()
 fcntl.ioctl(m,termios.TIOCSWINSZ,struct.pack('HHHH',8,22,0,0));screen.resize(8,22)
-send('model');wait(lambda:'Find: /model' in screen.text(),'resize/filter');assert '> /' in screen.text(),screen.text()
+send('model');wait(lambda:'Find: /model' in screen.text() or 'Fuzzy select · /model' in screen.text(),'resize/filter');assert '> /' in screen.text(),screen.text()
 close_picker('\r');assert '> /model' in screen.text(),screen.text();send('\x15')
 for _ in range(4):
  menu('/');close_picker('\x03');assert '> /' in screen.text(),screen.text();send('\x15')
@@ -10984,407 +12610,6 @@ command('els')
 menu('/mo');assert '> /mo' in screen.text(),screen.text();close_picker('dels\r');assert '> /models' in screen.text(),screen.text()
 command('');assert not any(v['kind']=='code' for v in records()),records()
 "#);}
-}
-
-
-// Session-owned isolated processes. All capture/journal mutation remains on Host's thread.
-struct BgTask {
-    child:Option<Child>, stdout:Option<Capture>, stderr:Option<Capture>, dir:PathBuf,
-    metadata:Value, deadline:Option<std::time::Instant>,
-    cancel_at:Option<std::time::Instant>, terminal_status:Option<String>,
-    reaped:Option<std::process::ExitStatus>,
-}
-impl Drop for BgTask {
-    fn drop(&mut self){
-        if let Some(mut child)=self.child.take(){
-            if self.reaped.is_none(){
-                unsafe{libc::kill(-(child.id() as i32),libc::SIGKILL);}
-                let _=child.kill();let _=child.wait();
-            }
-        }
-        if !self.dir.as_os_str().is_empty(){let _=fs::remove_dir_all(&self.dir);}
-    }
-}
-struct Wakeup { metadata:Value, deadline:Option<std::time::Instant> }
-impl Host {
-    fn commit_stop(&mut self)->Result<()> {
-        if let Some((seconds,reason))=self.stop_wakeup.take(){
-            // One durable event commits both settled stop and its timer.
-            self.schedule_wakeup(seconds,&reason,None)?;
-        }
-        Ok(())
-    }
-    fn background_control(&mut self,v:&Value)->Result<bool>{
-        if !matches!(v["kind"].as_str(),Some("task_list"|"task_get"|"task_logs"|"task_kill"|"wakeup_list"|"wakeup_cancel"|"wakeup_run")){return Ok(false);}
-        if !self.accept_input_control(v)?{return Ok(true);}
-        if let Err(e)=self.finish_background_control(v){self.event("error",json!({"command_id":v["id"],"error":e.to_string()}));}
-        Ok(true)
-    }
-    fn finish_background_control(&mut self,v:&Value)->Result<()> {
-        let result=match v["kind"].as_str().unwrap_or(""){
-            "task_list"=>self.bg_list(v.get("state").filter(|x|!x.is_null()).map(|x|x.as_str().ok_or("state must be a string")).transpose()?)?,
-            "task_get"|"task_logs"=>{
-                let metadata=self.bg_get(v["task_id"].as_str().ok_or("task_id required")?)?;
-                if v["kind"]=="task_logs"{
-                    let stream=v.get("stream").map(|x|x.as_str().ok_or("stream must be a string")).transpose()?.unwrap_or("both");
-                    if !["both","stdout","stderr"].contains(&stream){return Err("stream must be stdout, stderr or both".into());}
-                    let mut logs=json!({"task":metadata});
-                    for name in ["stdout","stderr"]{if stream=="both"||stream==name{
-                        logs[name]=json!({"ref":logs["task"][name]["ref"],"preview":self.ui_stream_preview(name,logs["task"][name]["index"].as_u64().ok_or("missing stream index")? as usize)?});
-                    }}
-                    logs
-                }else{metadata}
-            },
-            "task_kill"=>self.bg_kill(v["task_id"].as_str().ok_or("task_id required")?,v.get("force").map(|x|x.as_bool().ok_or("force must be boolean")).transpose()?.unwrap_or(false))?,
-            "wakeup_list"=>self.wakeup_list()?,
-            "wakeup_cancel"=>self.wakeup_cancel(v["wakeup_id"].as_str().ok_or("wakeup_id required")?)?,
-            "wakeup_run"=>self.wakeup_run(v["wakeup_id"].as_str().ok_or("wakeup_id required")?)?,
-            _=>return Err("unknown background control".into())
-        };
-        self.event("completed",json!({"command_id":v["id"],"status":"ok","result":result}));Ok(())
-    }
-}
-fn bg_text<'a>(v:&'a Value,key:&str,max:usize)->Result<Option<&'a str>>{
-    match v.get(key){
-        None|Some(Value::Null)=>Ok(None),
-        Some(Value::String(s)) if !s.trim().is_empty()&&s.chars().count()<=max=>Ok(Some(s)),
-        _=>Err(format!("{key} must be a nonempty string of at most {max} characters").into())
-    }
-}
-fn bg_seconds(v:&Value,max:f64)->Result<Option<f64>>{
-    if v.is_null(){return Ok(None);}
-    let seconds=v.as_f64().ok_or("duration must be a number")?;
-    if !seconds.is_finite()||seconds<=0.0||seconds>max{return Err(format!("duration must be finite, positive and at most {max} seconds").into());}
-    Ok(Some(seconds))
-}
-impl Host {
-    fn bg_save_task(&mut self,metadata:&Value)->Result<()>{
-        self.journal.append("task_state",metadata.clone())?;
-        self.event("task_state",metadata.clone());Ok(())
-    }
-    fn bg_save_wakeup(&mut self,metadata:&Value)->Result<()>{
-        self.journal.append("wakeup_state",metadata.clone())?;
-        self.event("wakeup_state",metadata.clone());Ok(())
-    }
-    fn bg_run(&mut self,v:&Value)->Result<Value>{
-        self.service_background()?;
-        if self.bg_tasks.values().filter(|t|t.child.is_some()).count()>=4{return Err("at most four active background jobs".into());}
-        let source=v["source"].as_str().ok_or("background source required")?;
-        if source.trim().is_empty(){return Err("background source must not be empty".into());}
-        let kind=match v.get("task_kind").or_else(||v.get("kind")){None=>"shell",Some(value)=>value.as_str().ok_or("background kind must be a string")?};
-        if !["shell","python"].contains(&kind){return Err("background kind must be shell or python".into());}
-        let options=v.get("options").filter(|p|!p.is_null()).unwrap_or(v);
-        if !options.is_object(){return Err("background options must be an object".into());}
-        let name=bg_text(options,"name",128)?.map(str::to_owned);
-        let wakeup_reason=bg_text(options,"wakeup_reason",512)?.map(str::to_owned);
-        let timeout=bg_seconds(&options["timeout"],604800.0)?;
-        let cwd=match options.get("cwd"){
-            None|Some(Value::Null)=>None,
-            Some(Value::String(s))=>Some(s.clone()),
-            _=>return Err("cwd must be a string".into())
-        };
-        let mut env=Vec::new();
-        if let Some(value)=options.get("env").filter(|p|!p.is_null()){
-            for (key,value) in value.as_object().ok_or("env must be an object")?{
-                if key.is_empty()||key.contains(['=','\0']){return Err("invalid environment key".into());}
-                let value=value.as_str().ok_or("environment values must be strings")?;
-                if value.contains('\0'){return Err("invalid environment value".into());}
-                env.push((key.clone(),value.to_owned()));
-            }
-        }
-        let id=format!("task{}",self.journal.seq);
-        let dir=self.home.join(format!("background-{}-{}",std::process::id(),unique_id()));
-        fs::create_dir(&dir)?;
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&dir,fs::Permissions::from_mode(0o700))?;
-        let out=dir.join("stdout");let err=dir.join("stderr");
-        let outfile=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&out)?;
-        let errfile=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&err)?;
-        let mut stdout=Capture::open(&out,"stdout",&id)?;
-        let mut stderr=Capture::open(&err,"stderr",&id)?;
-        // Commit empty chunks now so all running jobs have stable, distinct refs.
-        stdout.commit(self,&[])?;stderr.commit(self,&[])?;
-        let mut metadata=json!({"id":id,"kind":kind,"name":name,"status":"starting",
-            "created_ms":now_ms(),"wakeup_reason":wakeup_reason,
-            "stdout":{"ref":format!("H.stdout[{}]",stdout.index.unwrap()),"index":stdout.index,"bytes":0,"complete":false},
-            "stderr":{"ref":format!("H.stderr[{}]",stderr.index.unwrap()),"index":stderr.index,"bytes":0,"complete":false}});
-        self.bg_save_task(&metadata)?;
-        self.journal.append("intent",json!({"operation":id,"type":"background","kind":kind,"source":source,"cwd":cwd}))?;
-        let mut task=BgTask{child:None,stdout:Some(stdout),stderr:Some(stderr),dir,
-            metadata:metadata.clone(),deadline:timeout.map(|s|std::time::Instant::now()+std::time::Duration::from_secs_f64(s)),
-            cancel_at:None,terminal_status:None,reaped:None};
-        let mut command=if kind=="shell"{let mut c=Command::new("/bin/sh");c.args(["-c",source]);c}
-            else{let mut c=Command::new(std::env::var("PY_PYTHON").unwrap_or_else(|_|"python3".into()));c.args(["-u","-c",source]);c};
-        if let Some(cwd)=cwd{command.current_dir(cwd);}
-        command.envs(env).stdin(std::process::Stdio::null()).stdout(outfile).stderr(errfile);
-        unsafe{command.pre_exec(||{if libc::setsid()<0{return Err(io::Error::last_os_error());}Ok(())});}
-        match command.spawn(){
-            Ok(child)=>{metadata["status"]=json!("running");metadata["pid"]=json!(child.id());task.child=Some(child);},
-            Err(error)=>{
-                metadata["status"]=json!("failed");
-                task.stderr.as_mut().unwrap().commit(self,format!("Background launch failed: {error}\n").as_bytes())?;
-                metadata["stdout"]=task.stdout.take().unwrap().finish(self,true)?;
-                metadata["stderr"]=task.stderr.take().unwrap().finish(self,true)?;
-                for key in ["stdout","stderr"]{metadata[key].as_object_mut().unwrap().remove("preview");}
-                metadata["finished_ms"]=json!(now_ms());
-            }
-        }
-        task.metadata=metadata.clone();self.bg_tasks.insert(id.clone(),task);
-        if metadata["status"]=="failed"{self.bg_settle(&metadata)?;}else{self.bg_save_task(&metadata)?;}
-        Ok(metadata)
-    }
-    fn bg_list(&mut self,state:Option<&str>)->Result<Value>{
-        self.service_background()?;
-        if state.is_some_and(|s|!["all","starting","running","cancelling","finished","succeeded","failed","cancelled","killed","timed_out","outcome_unknown"].contains(&s)){return Err("unknown task state filter".into());}
-        let mut tasks:Vec<_>=self.bg_tasks.values().map(|t|t.metadata.clone())
-            .filter(|m|state.is_none_or(|s|s=="all"||m["status"]==s||s=="finished"&&!matches!(m["status"].as_str(),Some("starting"|"running"|"cancelling")))) .collect();
-        tasks.sort_by_key(|m|m["created_ms"].as_u64().unwrap_or(0));Ok(json!(tasks))
-    }
-    fn bg_get(&mut self,id:&str)->Result<Value>{
-        self.service_background()?;Ok(self.bg_tasks.get(id).ok_or("unknown task ID")?.metadata.clone())
-    }
-    fn bg_kill(&mut self,id:&str,force:bool)->Result<Value>{
-        self.service_background()?;
-        let task=self.bg_tasks.get_mut(id).ok_or("unknown task ID")?;
-        if let Some(child)=task.child.as_ref().filter(|_|task.reaped.is_none()){
-            let signal=if force{libc::SIGKILL}else{libc::SIGTERM};
-            if unsafe{libc::kill(-(child.id() as i32),signal)}<0&&io::Error::last_os_error().raw_os_error()!=Some(libc::ESRCH){return Err(io::Error::last_os_error().into());}
-            if task.cancel_at.is_none(){task.cancel_at=Some(std::time::Instant::now());task.terminal_status=Some(if force{"killed"}else{"cancelled"}.into());}
-            else if force&&task.terminal_status.as_deref()!=Some("timed_out"){task.terminal_status=Some("killed".into());}
-            task.metadata["status"]=json!("cancelling");
-            let metadata=task.metadata.clone();self.bg_save_task(&metadata)?;
-        }
-        Ok(self.bg_tasks.get(id).unwrap().metadata.clone())
-    }
-    fn bg_settle(&mut self,metadata:&Value)->Result<()>{
-        let wakeup=metadata["wakeup_reason"].as_str().map(|reason|json!({
-            "id":format!("wake{}",self.journal.seq),"reason":reason,"due_ms":now_ms(),
-            "state":"ready","task":metadata}));
-        // Terminal status and opt-in wakeup creation are one durable transition.
-        self.journal.append("task_settled",json!({"operation":metadata["id"],"status":metadata["status"],"task":metadata,"wakeup":wakeup}))?;
-        self.event("task_state",metadata.clone());
-        if let Some(w)=wakeup{
-            self.event("wakeup_state",w.clone());
-            self.wakeups.insert(w["id"].as_str().unwrap().into(),Wakeup{metadata:w,deadline:None});
-        }
-        Ok(())
-    }
-    fn service_background(&mut self)->Result<()>{
-        if self.journal.failed{
-            self.bg_abort();return Err("session journal failed; owned background jobs terminated, capture may be partial".into());
-        }
-        if self.servicing{return Ok(());}
-        self.servicing=true;
-        let result=self.service_background_inner();self.servicing=false;
-        if result.is_err(){self.bg_abort();}
-        result
-    }
-    fn bg_abort(&mut self){
-        // No more journal writes after a persistence failure, not even cleanup.
-        for task in self.bg_tasks.values_mut(){
-            if let Some(mut child)=task.child.take(){
-                if task.reaped.is_none(){
-                    unsafe{libc::kill(-(child.id() as i32),libc::SIGKILL);}
-                    let _=child.kill();let _=child.wait();
-                }
-                task.metadata["status"]=json!("outcome_unknown");
-                task.metadata.as_object_mut().unwrap().remove("pid");
-                for name in ["stdout","stderr"]{task.metadata[name]["complete"]=json!(false);}
-            }
-        }
-    }
-    fn service_background_inner(&mut self)->Result<()>{
-        let ids:Vec<_>=self.bg_tasks.iter().filter_map(|(id,t)|t.child.as_ref().map(|_|id.clone())).collect();
-        for id in ids{
-            let mut task=self.bg_tasks.remove(&id).unwrap();
-            let result=(||->Result<bool>{
-                let more_out=if let Some(out)=task.stdout.as_mut(){let more=out.drain(self)?;task.metadata["stdout"]["bytes"]=json!(out.bytes);more}else{false};
-                let more_err=if let Some(err)=task.stderr.as_mut(){let more=err.drain(self)?;task.metadata["stderr"]["bytes"]=json!(err.bytes);more}else{false};
-                let now=std::time::Instant::now();
-                let child=task.child.as_mut().unwrap();
-                let mut exit=if let Some(exit)=task.reaped{Some(exit)}else{child.try_wait()?};
-                if exit.is_none(){
-                    if task.cancel_at.is_none()&&task.deadline.is_some_and(|d|now>=d){
-                        unsafe{libc::kill(-(child.id() as i32),libc::SIGTERM);}
-                        task.cancel_at=Some(now);task.terminal_status=Some("timed_out".into());task.metadata["status"]=json!("cancelling");
-                        self.bg_save_task(&task.metadata)?;
-                    }
-                    if task.cancel_at.is_some_and(|t|now.duration_since(t)>=std::time::Duration::from_millis(500)){
-                        unsafe{libc::kill(-(child.id() as i32),libc::SIGKILL);}
-                        exit=child.try_wait()?;
-                    }
-                }
-                if let Some(exit)=exit{
-                    // Reap once, then finish the backlog across bounded pump ticks.
-                    if task.reaped.is_none(){
-                        unsafe{libc::kill(-(child.id() as i32),libc::SIGKILL);}
-                        task.reaped=Some(exit);
-                        return Ok(false);
-                    }
-                    if more_out||more_err{return Ok(false);}
-                    task.child.take();
-                    task.metadata["stdout"]=task.stdout.take().unwrap().finish_metadata(self,true)?;
-                    task.metadata["stderr"]=task.stderr.take().unwrap().finish_metadata(self,true)?;
-                    for key in ["stdout","stderr"]{task.metadata[key].as_object_mut().unwrap().remove("preview");}
-                    task.metadata["status"]=json!(task.terminal_status.clone().unwrap_or_else(||if exit.success(){"succeeded"}else{"failed"}.into()));
-                    task.metadata["exit_code"]=json!(exit.code());task.metadata["finished_ms"]=json!(now_ms());
-                    self.bg_settle(&task.metadata)?;
-                    return Ok(true);
-                }
-                Ok(false)
-            })();
-            self.bg_tasks.insert(id,task);
-            result?;
-        }
-        let mut ready=Vec::new();
-        for wakeup in self.wakeups.values_mut(){
-            if wakeup.metadata["state"]=="scheduled"&&wakeup.deadline.is_some_and(|due|due<=std::time::Instant::now()){
-                wakeup.metadata["state"]=json!("ready");ready.push(wakeup.metadata.clone());
-            }
-        }
-        for metadata in ready{self.bg_save_wakeup(&metadata)?;}
-        Ok(())
-    }
-    fn schedule_wakeup(&mut self,seconds:f64,reason:&str,task:Option<Value>)->Result<Value>{
-        bg_seconds(&json!(seconds),604800.0)?;
-        bg_text(&json!({"reason":reason}),"reason",512)?;
-        let metadata=json!({"id":format!("wake{}",self.journal.seq),"reason":reason,
-            "due_ms":now_ms()+(seconds*1000.0).ceil() as u128,"state":"scheduled","task":task,"stop_settled":task.is_none()});
-        self.bg_save_wakeup(&metadata)?;
-        self.wakeups.insert(metadata["id"].as_str().unwrap().into(),Wakeup{metadata:metadata.clone(),
-            deadline:Some(std::time::Instant::now()+std::time::Duration::from_secs_f64(seconds))});Ok(metadata)
-    }
-    fn wakeup_list(&mut self)->Result<Value>{
-        self.service_background()?;let mut entries:Vec<_>=self.wakeups.values().map(|w|w.metadata.clone()).collect();
-        entries.sort_by_key(|m|m["due_ms"].as_u64().unwrap_or(0));Ok(json!(entries))
-    }
-    fn wakeup_cancel(&mut self,id:&str)->Result<Value>{
-        let w=self.wakeups.get_mut(id).ok_or("unknown wakeup ID")?;
-        if w.metadata["state"]=="cancelled"{return Ok(w.metadata.clone());}
-        if !matches!(w.metadata["state"].as_str(),Some("scheduled"|"ready"|"pending_confirmation")){return Err("wakeup is already settled".into());}
-        w.metadata["state"]=json!("cancelled");let metadata=w.metadata.clone();self.bg_save_wakeup(&metadata)?;Ok(metadata)
-    }
-    fn wakeup_run(&mut self,id:&str)->Result<Value>{
-        let w=self.wakeups.get_mut(id).ok_or("unknown wakeup ID")?;
-        if !matches!(w.metadata["state"].as_str(),Some("scheduled"|"ready"|"pending_confirmation")){return Err("wakeup is already settled".into());}
-        w.metadata["state"]=json!("ready");let metadata=w.metadata.clone();self.bg_save_wakeup(&metadata)?;Ok(metadata)
-    }
-    // Called only at an idle/safe boundary, never from servicing a busy operation.
-    fn dispatch_wakeups(&mut self)->Result<bool>{
-        self.service_background()?;
-        if !self.pending.is_empty(){return Ok(false);}
-        if let Some(command)=self.incoming.as_ref().and_then(|r|r.try_recv().ok()){
-            if !self.background_control(&command)?{self.queue_arrival(command)?;}
-            return Ok(false);
-        }
-        let mut ids:Vec<_>=self.wakeups.iter().filter_map(|(id,w)|(w.metadata["state"]=="ready").then_some(id.clone())).collect();
-        ids.sort();if ids.is_empty(){return Ok(false);}
-        let mut batch=Vec::new();
-        for id in &ids{
-            let w=self.wakeups.get_mut(id).unwrap();w.metadata["state"]=json!("dispatching");
-            let metadata=w.metadata.clone();self.bg_save_wakeup(&metadata)?;batch.push(metadata);
-        }
-        let notice=json!({"wakeups":batch});
-        if self.no_model{self.event("notice",json!({"text":format!("Wakeup: {notice}")}));}
-        else{
-            self.add_context("user",format!("Scheduled continuation (metadata only): {notice}"),false,vec![])?;
-        }
-        // A crash while dispatched remains outcome_unknown on resume, never replayed.
-        let result=if self.no_model{Ok(())}else{self.run_agent()};
-        for id in ids{
-            let w=self.wakeups.get_mut(&id).unwrap();w.metadata["state"]=json!("consumed");
-            let metadata=w.metadata.clone();self.bg_save_wakeup(&metadata)?;
-        }
-        result?;Ok(true)
-    }
-    fn bg_restore(&mut self,kind:&str,p:&Value)->Result<()>{
-        if kind=="task_settled"{
-            self.bg_restore("task_state",&p["task"])?;
-            if !p["wakeup"].is_null(){self.bg_restore("wakeup_state",&p["wakeup"])?;}
-            return Ok(());
-        }
-        let id=p["id"].as_str().ok_or("invalid background journal ID")?.to_owned();
-        match kind{
-            "task_state"=>{self.bg_tasks.insert(id,BgTask{child:None,stdout:None,stderr:None,dir:PathBuf::new(),
-                metadata:p.clone(),deadline:None,cancel_at:None,terminal_status:None,reaped:None});},
-            "wakeup_state"=>{self.wakeups.insert(id,Wakeup{metadata:p.clone(),deadline:None});},_=>{}
-        }
-        Ok(())
-    }
-    fn bg_recover(&mut self)->Result<()>{
-        let mut tasks=Vec::new();let mut wakeups=Vec::new();
-        for task in self.bg_tasks.values_mut(){
-            if matches!(task.metadata["status"].as_str(),Some("starting"|"running"|"cancelling")){
-                task.metadata["status"]=json!("outcome_unknown");task.metadata["replay_allowed"]=json!(false);
-                task.metadata.as_object_mut().unwrap().remove("pid");
-                for name in ["stdout","stderr"]{
-                    let mut bytes=0usize;
-                    if let Some(index)=task.metadata[name]["index"].as_u64(){
-                        if let Some(chunks)=self.history[name].get(index as usize).and_then(|v|v["$chunks"].as_array()){
-                            for seq in chunks{
-                                let event=self.journal.event(seq.as_u64().ok_or("invalid stream chunk")? as usize)?;
-                                let data=event["payload"]["base64"].as_str().ok_or("invalid stream bytes")?;
-                                bytes+=data.len()/4*3-data.bytes().rev().take_while(|b|*b==b'=').count();
-                            }
-                        }
-                    }
-                    task.metadata[name]["bytes"]=json!(bytes);task.metadata[name]["complete"]=json!(false);
-                }
-                tasks.push(task.metadata.clone());
-            }
-        }
-        for w in self.wakeups.values_mut(){
-            if matches!(w.metadata["state"].as_str(),Some("scheduled"|"ready"|"dispatching")){
-                w.metadata["state"]=json!(if w.metadata["state"]=="dispatching"{"outcome_unknown"}else{"pending_confirmation"});wakeups.push(w.metadata.clone());
-            }
-        }
-        for metadata in tasks{self.bg_save_task(&metadata)?;}
-        for metadata in wakeups{self.bg_save_wakeup(&metadata)?;}
-        Ok(())
-    }
-    fn bg_guard(&mut self,cancel:bool)->Result<()>{
-        self.service_background()?;
-        if self.bg_tasks.values().any(|t|t.child.is_some()){
-            if !cancel{return Err("background jobs are running; kill them first or request --cancel-tasks".into());}
-            self.bg_shutdown()?;
-        }
-        Ok(())
-    }
-    fn bg_shutdown(&mut self)->Result<()>{
-        let ids:Vec<_>=self.bg_tasks.iter().filter_map(|(id,t)|t.child.as_ref().map(|_|id.clone())).collect();
-        for id in &ids{self.bg_kill(id,false)?;}
-        let deadline=std::time::Instant::now()+std::time::Duration::from_millis(750);
-        while self.bg_tasks.values().any(|t|t.child.is_some())&&std::time::Instant::now()<deadline{
-            self.service_background()?;std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        for id in &ids{
-            if self.bg_tasks.get(id).is_some_and(|t|t.child.is_some()){
-                self.bg_kill(id,true)?;
-            }
-        }
-        let deadline=std::time::Instant::now()+std::time::Duration::from_millis(250);
-        while self.bg_tasks.values().any(|t|t.child.is_some())&&std::time::Instant::now()<deadline{
-            self.service_background()?;std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        // A large backlog or escaped writer must not make shutdown unbounded.
-        // Preserve captured bytes explicitly as partial rather than claiming EOF.
-        for id in ids{
-            let mut task=self.bg_tasks.remove(&id).unwrap();
-            let result=(||->Result<()>{
-                if let Some(mut child)=task.child.take(){
-                    if task.reaped.is_none(){child.wait()?;}
-                    task.metadata["stdout"]=task.stdout.take().unwrap().finish_metadata(self,false)?;
-                    task.metadata["stderr"]=task.stderr.take().unwrap().finish_metadata(self,false)?;
-                    for name in ["stdout","stderr"]{task.metadata[name].as_object_mut().unwrap().remove("preview");}
-                    task.metadata["status"]=json!(task.terminal_status.clone().unwrap_or_else(||"cancelled".into()));
-                    task.metadata["finished_ms"]=json!(now_ms());self.bg_settle(&task.metadata)?;
-                }
-                Ok(())
-            })();
-            self.bg_tasks.insert(id,task);result?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -11697,346 +12922,6 @@ path=max(glob.glob(home+'/sessions/*.jsonl'),key=os.path.getmtime)
 r=[json.loads(l) for l in open(path) if l.endswith('\n')]
 assert not any(v['kind']=='task_settled' for v in r),r[-3:]
 "#);}
-}
-
-// Durable entries remain ordinary files; only initialization interprets them.
-// Pure, bounded catalog normalization. Remote instructions and tool metadata
-// are intentionally never copied into normalized descriptors.
-fn catalog_safe_id(id:&str)->bool{
-    !id.is_empty()&&id.len()<=128&&id.bytes().all(|c|c.is_ascii_alphanumeric()||matches!(c,b'.'|b'_'|b'-'))
-}
-// OpenAI fine-tuned model IDs contain colons; Codex native slugs do not.
-fn catalog_api_id(id:&str)->bool{
-    !id.is_empty()&&id.len()<=128&&id.bytes().all(|c|c.is_ascii_alphanumeric()||matches!(c,b'.'|b'_'|b'-'|b':'))
-}
-fn catalog_safe_label(text:&str,max:usize)->bool{
-    !text.trim().is_empty()&&text.chars().count()<=max
-        &&!text.chars().any(|c|c.is_control()||matches!(c,'\u{2028}'|'\u{2029}'))
-}
-fn catalog_optional_limit(item:&Value,key:&str)->Result<Option<u64>>{
-    match item.get(key){
-        None|Some(Value::Null)=>Ok(None),
-        Some(value)=>{
-            let n=value.as_u64().filter(|n|(1..=16777216).contains(n))
-                .ok_or_else(||format!("Invalid model catalog {key}: expected an integer in 1..=16777216"))?;
-            Ok(Some(n))
-        }
-    }
-}
-fn catalog_effort(effort:&str)->Option<&str>{
-    match effort{
-        "none"=>Some("off"),
-        "off"|"minimal"|"low"|"medium"|"high"|"xhigh"|"max"=>Some(effort),
-        _=>None,
-    }
-}
-fn catalog_aliases(slug:&str,base:Option<&Value>)->Vec<String>{
-    let mut aliases=base.and_then(|m|m["aliases"].as_array()).map(|values|values.iter()
-        .filter_map(Value::as_str).filter(|s|catalog_safe_id(s)).map(str::to_string).collect::<Vec<_>>())
-        .unwrap_or_default();
-    if let Some((version,kind))=slug.strip_prefix("gpt-").and_then(|s|s.rsplit_once('-')){
-        if ["sol","astra","luna","terra"].contains(&kind)&&!version.is_empty()
-            &&!version.starts_with('.')&&!version.ends_with('.')
-            &&version.bytes().all(|c|c.is_ascii_digit()||c==b'.'){
-            let alias=format!("{kind}{}",version.replace('.',""));
-            if catalog_safe_id(&alias)&&!aliases.contains(&alias){aliases.push(alias);}
-        }
-    }
-    aliases
-}
-fn normalize_codex_catalog(body:&Value,base:&[Value])->Result<Vec<Value>>{
-    let entries=body["models"].as_array().ok_or("Codex model catalog requires a models array")?;
-    if entries.len()>2048{return Err("Codex model catalog exceeds 2048 entries".into());}
-    let mut seen=std::collections::HashSet::new();
-    let mut normalized=Vec::new();
-    for item in entries{
-        let slug=item["slug"].as_str().filter(|id|catalog_safe_id(id)).ok_or("Invalid Codex catalog model slug")?;
-        if !seen.insert(slug){return Err(format!("Duplicate Codex catalog model slug: {slug}").into());}
-        let name=item["display_name"].as_str().filter(|s|catalog_safe_label(s,256))
-            .ok_or("Invalid Codex catalog model display_name")?;
-        let visibility=item["visibility"].as_str().filter(|s|matches!(*s,"list"|"hide"|"none"))
-            .ok_or("Invalid Codex catalog model visibility")?;
-        let context=catalog_optional_limit(item,"context_window")?;
-        let maximum=catalog_optional_limit(item,"max_context_window")?;
-        let context=context.or(maximum);
-        let percent=match item.get("effective_context_window_percent"){
-            None=>95,
-            Some(value)=>value.as_u64().filter(|n|(1..=100).contains(n))
-                .ok_or("Invalid Codex effective_context_window_percent")?,
-        };
-        let input=context.map(|n|n*percent/100);
-        if input==Some(0){return Err("Codex effective input limit must be positive".into());}
-        let priority=match item.get("priority"){
-            None=>i32::MAX as i64,
-            Some(value)=>value.as_i64().filter(|n|(i32::MIN as i64..=i32::MAX as i64).contains(n))
-                .ok_or("Invalid Codex catalog priority")?,
-        };
-        let mut levels=Vec::new();
-        match item.get("supported_reasoning_levels"){
-            None=>{},
-            Some(value)=>{
-                for level in value.as_array().filter(|a|a.len()<=32).ok_or("Invalid Codex supported_reasoning_levels")?{
-                    let effort=level["effort"].as_str().filter(|s|catalog_safe_id(s)&&s.len()<=32)
-                        .ok_or("Invalid Codex reasoning effort preset")?;
-                    if let Some(effort)=catalog_effort(effort){
-                        if !levels.contains(&effort){levels.push(effort);}
-                    }
-                }
-            }
-        }
-        let preferred=match item.get("default_reasoning_level"){
-            None|Some(Value::Null)=>None,
-            Some(value)=>Some(value.as_str().filter(|s|catalog_safe_id(s)&&s.len()<=32)
-                .ok_or("Invalid Codex default_reasoning_level")?),
-        };
-        let default=preferred.and_then(catalog_effort).filter(|s|levels.contains(s))
-            .or_else(||if levels.contains(&"medium"){Some("medium")}else{levels.first().copied()});
-        let image_input=match item.get("input_modalities"){
-            None=>true, // The native schema's documented default.
-            Some(value)=>{
-                let modalities=value.as_array().filter(|a|a.len()<=32).ok_or("Invalid Codex input_modalities")?;
-                for modality in modalities{
-                    if !modality.as_str().is_some_and(|s|catalog_safe_id(s)&&s.len()<=32){
-                        return Err("Invalid Codex input modality".into());
-                    }
-                }
-                modalities.iter().any(|v|v=="image")
-            }
-        };
-        // Validate hidden descriptors too: never accept a partial malformed catalog.
-        if visibility!="list"{continue;}
-        let id=format!("openai-codex/{slug}");
-        let known=base.iter().find(|m|m["id"]==id);
-        normalized.push(json!({"id":id,"name":name,"provider":"openai-codex",
-            "api":"openai-codex-responses","aliases":catalog_aliases(slug,known),
-            "context_limit":context,"max_input_tokens":input,"reasoning":!levels.is_empty(),
-            "reasoning_efforts":levels,"default_effort":default,"image_input":image_input,
-            "image_output":false,"deprecated":false,"priority":priority,
-            "metadata_complete":context.is_some()&&!levels.is_empty(),
-            "catalog_listed":true,"source":"provider-discovery"}));
-    }
-    normalized.sort_by(|a,b|a["priority"].as_i64().cmp(&b["priority"].as_i64())
-        .then_with(||a["id"].as_str().cmp(&b["id"].as_str())));
-    Ok(normalized)
-}
-fn normalize_openai_catalog(body:&Value,base:&[Value],provider:&str)->Result<Vec<Value>>{
-    if !catalog_safe_id(provider){return Err("Invalid model catalog provider ID".into());}
-    let entries=body["data"].as_array().ok_or("API model catalog requires a data array")?;
-    if entries.len()>2048{return Err("API model catalog exceeds 2048 entries".into());}
-    let mut seen=std::collections::HashSet::new();
-    let mut normalized=Vec::new();
-    for entry in entries{
-        let slug=entry["id"].as_str().filter(|id|catalog_api_id(id)).ok_or("Invalid API catalog model ID")?;
-        if !seen.insert(slug){return Err(format!("Duplicate API catalog model ID: {slug}").into());}
-        let id=format!("{provider}/{slug}");
-        let known=base.iter().find(|m|m["id"]==id);
-        let mut model=json!({"id":id,"name":slug,"provider":provider,"context_limit":null,
-            "metadata_complete":false,"catalog_listed":true,"source":"provider-discovery"});
-        if let Some(known)=known{
-            // /models proves availability only, not protocol or capabilities.
-            for key in ["name","api","context_limit","max_input_tokens","max_tokens","image_input",
-                "image_output","reasoning","reasoning_efforts","default_effort","aliases","deprecated"]{
-                if let Some(value)=known.get(key){model[key]=value.clone();}
-            }
-            model["metadata_complete"]=json!(known["metadata_complete"]!=false
-                &&known["context_limit"].as_u64().is_some_and(|n|(1..=16777216).contains(&n))
-                &&known["api"].as_str().is_some_and(|s|!s.is_empty()));
-        }
-        normalized.push(model);
-    }
-    normalized.sort_by(|a,b|a["id"].as_str().cmp(&b["id"].as_str()));
-    Ok(normalized)
-}
-
-const MODEL_CATALOG_MAX_BYTES:u64=8*1024*1024;
-// Native catalog compatibility revision, not this harness's package version.
-// Current upstream metadata requires 0.153/0.155 for the GPT-6 family.
-fn model_catalog_defaults()->Value{json!({"auto_refresh":true,"refresh_interval_seconds":3600,"retry_interval_seconds":300,"codex_client_version":"0.155.0"})}
-fn model_catalog_options(config:&Value)->Result<Value>{
-    let mut options=model_catalog_defaults();
-    if let Some(value)=config.get("model_catalog"){
-        for (key,value) in value.as_object().ok_or("model_catalog must be an object")?{
-            if options.get(key).is_none(){return Err(format!("unknown model_catalog option {key}").into());}
-            if key=="auto_refresh"{if !value.is_boolean(){return Err("model_catalog.auto_refresh must be boolean".into());}}
-            else if key=="codex_client_version"{
-                if !value.as_str().is_some_and(|s|s.len()<=32&&s.split('.').count()==3&&s.split('.').all(|p|!p.is_empty()&&p.bytes().all(|b|b.is_ascii_digit())&&p.parse::<u32>().is_ok())){return Err("model_catalog.codex_client_version must be a numeric major.minor.patch string".into());}
-            }
-            else if !value.as_u64().is_some_and(|n|(1..=604800).contains(&n)){return Err(format!("model_catalog.{key} must be an integer in 1..=604800").into());}
-            options[key]=value.clone();
-        }
-    }
-    Ok(options)
-}
-fn catalog_contains_secret(value:&Value,secrets:&[String])->bool{
-    match value{
-        Value::String(text)=>secrets.iter().any(|s|!s.is_empty()&&text.contains(s)),
-        Value::Array(values)=>values.iter().any(|v|catalog_contains_secret(v,secrets)),
-        Value::Object(values)=>values.values().any(|v|catalog_contains_secret(v,secrets)),_=>false
-    }
-}
-fn empty_model_catalog()->Value{json!({"version":1,"providers":{}})}
-fn load_model_catalog(path:&Path)->Result<Value>{
-    let file=match OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path){
-        Ok(file)=>file,Err(error)if error.kind()==io::ErrorKind::NotFound=>return Ok(empty_model_catalog()),Err(error)=>return Err(error.into())
-    };
-    if !file.metadata()?.is_file()||file.metadata()?.len()>MODEL_CATALOG_MAX_BYTES{return Err("model catalog cache must be a regular file of at most 8 MiB".into());}
-    let mut cache:Value=serde_json::from_reader(file)?;
-    if cache["version"]!=1||!cache["providers"].is_object(){return Err("invalid model catalog cache".into());}
-    for (provider,record) in cache["providers"].as_object_mut().unwrap(){
-        if !["openai","openai-codex"].contains(&provider.as_str())||!record["identity"].as_str().is_some_and(|s|s.len()==64&&s.bytes().all(|c|c.is_ascii_hexdigit())){
-            return Err("invalid model catalog cache identity".into());
-        }
-        for key in ["fetched_at_ms","attempted_at_ms"]{if record.get(key).is_some_and(|v|!v.is_u64()){return Err("invalid model catalog timestamp".into());}}
-        if let Some(models)=record.get_mut("models"){
-            let models=models.as_array_mut().filter(|m|m.len()<=2048).ok_or("invalid model catalog cache entries")?;
-            let mut seen=HashSet::new();
-            for model in models{
-                let id=model["id"].as_str().ok_or("invalid cached model ID")?;
-                let (p,slug)=id.split_once('/').ok_or("invalid cached model ID")?;
-                let valid_slug=if provider=="openai-codex"{catalog_safe_id(slug)}else{catalog_api_id(slug)};
-                if p!=provider.as_str()||!valid_slug||!seen.insert(id.to_string()){return Err("invalid cached model identity".into());}
-                if !model["name"].as_str().is_some_and(|s|catalog_safe_label(s,256))||!model["metadata_complete"].is_boolean(){return Err("invalid cached model metadata".into());}
-                for key in ["context_limit","max_input_tokens","max_tokens"]{catalog_optional_limit(model,key)?;}
-                if let Some(levels)=model.get("reasoning_efforts"){
-                    if !levels.as_array().is_some_and(|a|a.len()<=7&&a.iter().all(|v|v.as_str().is_some_and(|s|catalog_effort(s)==Some(s)))){return Err("invalid cached model effort metadata".into());}
-                }
-                for key in ["reasoning","image_input","image_output","deprecated"]{if model.get(key).is_some_and(|v|!v.is_boolean()){return Err("invalid cached model capability".into());}}
-                if model["metadata_complete"]==true&&(!model["context_limit"].is_u64()
-                    ||!model["api"].as_str().is_some_and(|s|["openai-codex-responses","openai-responses","openai-completions","image-generation"].contains(&s))
-                    ||(provider=="openai-codex"&&(!model["reasoning_efforts"].as_array().is_some_and(|a|!a.is_empty())||model["api"]!="openai-codex-responses"))){return Err("inconsistent cached model capabilities".into());}
-                if let Some(aliases)=model.get("aliases"){
-                    if !aliases.as_array().is_some_and(|a|a.len()<=32&&a.iter().all(|v|v.as_str().is_some_and(catalog_safe_id))){return Err("invalid cached model aliases".into());}
-                }
-                let mut safe=json!({});
-                for key in ["id","name","api","context_limit","max_input_tokens","max_tokens","reasoning","reasoning_efforts","default_effort","image_input","image_output","deprecated","priority","aliases","metadata_complete"]{
-                    if let Some(value)=model.get(key){safe[key]=value.clone();}
-                }
-                safe["provider"]=json!(provider);safe["source"]=json!("provider-discovery");safe["catalog_listed"]=json!(true);*model=safe;
-            }
-        }
-    }
-    Ok(cache)
-}
-impl Host{
-    fn catalog_endpoint(&self,provider:&str)->Result<(String,String)>{
-        let provider=provider_alias(provider);
-        if !["openai","openai-codex"].contains(&provider){return Err("catalog refresh currently supports codex and openai; other providers retain offline/configured inventory".into());}
-        let (base,key,_)=self.provider_config(&format!("{provider}/catalog-discovery"))?;
-        let endpoint=if provider=="openai-codex"{
-            let base=base.strip_suffix("/codex/responses").map(|s|format!("{s}/codex")).unwrap_or(base);
-            if base.ends_with("/codex"){format!("{base}/models")}else{format!("{base}/codex/models")}
-        }else{format!("{}/models",base.trim_end_matches('/'))};
-        Ok((endpoint,key))
-    }
-    fn catalog_identity(&self,provider:&str)->Option<String>{
-        let provider=provider_alias(provider);
-        let (endpoint,key)=self.catalog_endpoint(provider).ok()?;
-        // Credential/account/endpoint-bound; no plaintext identity or token is cached.
-        let principal=if provider=="openai-codex"{
-            key.split('.').nth(1).and_then(|part|base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(part.trim_end_matches('=')).ok())
-                .and_then(|bytes|serde_json::from_slice::<Value>(&bytes).ok())
-                .filter(|claims|claims["https://api.openai.com/auth"]["chatgpt_account_id"]==self.auth[provider]["accountId"])
-                .map(|claims|json!({"auth":claims["https://api.openai.com/auth"],"profile":claims["https://api.openai.com/profile"],"subject":claims["sub"],"email":claims["email"]}).to_string()).unwrap_or(key)
-        }else{key};
-        let revision=if provider=="openai-codex"{model_catalog_options(&self.config_defaults).ok()?["codex_client_version"].as_str()?.to_string()}else{String::new()};
-        let scope=format!("{provider}\0{endpoint}\0{principal}\0{revision}\0{}",self.auth[provider]["accountId"].as_str().unwrap_or(""));
-        Some(ring::digest::digest(&ring::digest::SHA256,scope.as_bytes()).as_ref().iter().map(|b|format!("{b:02x}")).collect())
-    }
-    fn catalog_auto_enabled(&self)->bool{
-        match std::env::var("PY_MODEL_CATALOG_AUTO_REFRESH").ok().as_deref(){Some("0"|"false")=>false,Some("1"|"true")=>true,_=>model_catalog_options(&self.config_defaults).map_or(false,|v|v["auto_refresh"]==true)}
-    }
-    fn maybe_refresh_model_catalog(&mut self,provider:&str){
-        if !self.catalog_auto_enabled()||self.catalog_identity(provider).is_none(){return;}
-        if let Err(error)=self.refresh_model_catalog(provider,false){
-            self.event("notice",json!({"text":format!("Model catalog refresh failed: {error}. Keeping cached/offline inventory; /model list refresh retries explicitly.")}));
-        }
-    }
-    fn refresh_model_catalog(&mut self,provider:&str,force:bool)->Result<bool>{
-        let provider=provider_alias(provider).to_string();
-        self.reload_auth()?;
-        self.catalog_endpoint(&provider)?;
-        let before=self.catalog_identity(&provider).ok_or("catalog refresh requires credentials; /login the provider first")?;
-        let record=&self.catalog["providers"][&provider];let now=now_ms() as u64;
-        let options=model_catalog_options(&self.config_defaults)?;
-        if !force&&record["identity"]==before{
-            let recent=|key:&str,seconds:u64|record[key].as_u64().is_some_and(|t|t<=now&&now-t<seconds*1000);
-            if recent("fetched_at_ms",options["refresh_interval_seconds"].as_u64().unwrap())||recent("attempted_at_ms",options["retry_interval_seconds"].as_u64().unwrap()){return Ok(false);}
-        }
-        self.event("notice",json!({"text":format!("Refreshing {provider} model catalog…")}));
-        let cancel_revision=self.cancel_revision;
-        let result=self.with_state(UiState::Running,None,|host|{
-            if provider=="openai-codex"{host.refresh_codex()?;}
-            let (endpoint,key)=host.catalog_endpoint(&provider)?;
-            let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).build()?;
-            let mut request=client.get(endpoint).bearer_auth(&key).header("Accept","application/json").header("originator","py").header("User-Agent","py-rust/0.1.0");
-            if provider=="openai-codex"{
-                request=request.query(&[("client_version",options["codex_client_version"].as_str().unwrap())]).header("chatgpt-account-id",host.auth["openai-codex"]["accountId"].as_str().ok_or("Codex account ID missing")?);
-            }
-            let mut secrets=Vec::new();credential_secret_values(&host.auth,&mut secrets);secrets.push(key);
-            let body=host.codex_wait(async{
-                let mut response=request.send().await.map_err(|_|"model catalog network error")?;let status=response.status();let mut bytes=Vec::new();
-                while let Some(chunk)=response.chunk().await.map_err(|_|"model catalog response disconnected")?{
-                    if bytes.len() as u64+chunk.len() as u64>MODEL_CATALOG_MAX_BYTES{return Err("model catalog response exceeds 8 MiB".into());}bytes.extend_from_slice(&chunk);
-                }
-                if !status.is_success(){return Err(format!("model catalog HTTP {status}{}",codex_error_detail(&bytes,&secrets)).into());}
-                Ok(serde_json::from_slice::<Value>(&bytes).map_err(|_|"model catalog returned invalid JSON")?)
-            },"model_catalog")?;
-            let base=host.models();
-            if provider=="openai-codex"{normalize_codex_catalog(&body,base.as_array().unwrap())}else{normalize_openai_catalog(&body,base.as_array().unwrap(),&provider)}
-        });
-        // Metadata/validation failures may echo a credential in an ID or label too.
-        let mut secrets=Vec::new();credential_secret_values(&self.auth,&mut secrets);
-        if let Ok((_,key))=self.catalog_endpoint(&provider){secrets.push(key);}
-        let mut result:Result<Vec<Value>>=result.map_err(|error|format!("model catalog refresh{}",codex_error_detail(error.to_string().as_bytes(),&secrets)).into());
-        if result.as_ref().is_ok_and(|models|catalog_contains_secret(&json!(models),&secrets)){
-            result=Err("model catalog contained reflected credential data; update rejected".into());
-        }
-        // Tokens can rotate during refresh; bind the response to the actual principal.
-        let identity=self.catalog_identity(&provider).unwrap_or(before);
-        let mut record=if self.catalog["providers"][&provider]["identity"]==identity{self.catalog["providers"][&provider].clone()}else{json!({"identity":identity})};
-        record["attempted_at_ms"]=json!(now_ms() as u64);
-        if self.cancel_revision!=cancel_revision{return Err("model catalog refresh cancelled; previous cache retained".into());}
-        if let Ok(models)=&result{record["models"]=json!(models);record["fetched_at_ms"]=json!(now_ms() as u64);}
-        self.commit_model_catalog(&provider,record)?;
-        self.context_limit=self.model_limit(&self.model)?;
-        match result{
-            Ok(models)=>{
-                self.journal.append("model_catalog_refresh",json!({"provider":provider,"count":models.len(),"fetched_at_ms":now_ms() as u64}))?;
-                self.event("notice",json!({"text":format!("Updated {provider} model catalog: {} entries. Active model and session prompt unchanged.",models.len())}));Ok(true)
-            },Err(error)=>Err(error)
-        }
-    }
-    fn commit_model_catalog(&mut self,provider:&str,mut record:Value)->Result<()>{
-        let lock=OpenOptions::new().create(true).read(true).write(true).truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(self.home.join("models.lock"))?;
-        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
-        loop{
-            if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0{break;}
-            let error=io::Error::last_os_error();if error.raw_os_error()!=Some(libc::EWOULDBLOCK){return Err(error.into());}
-            if std::time::Instant::now()>=deadline||self.codex_cancel("model_catalog")?{return Err("model catalog cache busy/cancelled; previous cache retained".into());}
-            std::thread::sleep(std::time::Duration::from_millis(15));
-        }
-        let path=self.home.join("models.json");
-        let mut cache=load_model_catalog(&path).unwrap_or_else(|_|empty_model_catalog());
-        let latest=&cache["providers"][provider];
-        // A failed/older concurrent request must not replace a newer good snapshot.
-        if latest["identity"]==record["identity"]&&latest["models"].is_array()
-            &&latest["fetched_at_ms"].as_u64().unwrap_or(0)>record["fetched_at_ms"].as_u64().unwrap_or(0){
-            record["models"]=latest["models"].clone();record["fetched_at_ms"]=latest["fetched_at_ms"].clone();
-        }
-        record["attempted_at_ms"]=json!(record["attempted_at_ms"].as_u64().unwrap_or(0).max(latest["attempted_at_ms"].as_u64().unwrap_or(0)));
-        cache["providers"][provider]=record;
-        if serde_json::to_vec(&cache)?.len() as u64>MODEL_CATALOG_MAX_BYTES{return Err("normalized model cache exceeds 8 MiB".into());}
-        write_private_json(&path,&cache)?;self.catalog=cache;Ok(())
-    }
-    fn model_list_command(&mut self,args:&str)->Result<()>{
-        let (verb,rest)=args.split_once(char::is_whitespace).map(|(a,b)|(a,b.trim())).unwrap_or((args,""));
-        let provider=self.model.split_once('/').map(|p|provider_alias(p.0)).unwrap_or("openai").to_string();
-        if verb=="refresh"{
-            let target=if rest.is_empty(){provider}else{self.resolve_provider(rest)?};
-            let result=self.refresh_model_catalog(&target,true);
-            self.list_models(&format!("{target}/"));result.map(|_|())
-        }else{self.maybe_refresh_model_catalog(&provider);self.list_models(args);Ok(())}
-    }
 }
 
 #[cfg(test)]
@@ -12461,216 +13346,6 @@ assert any(v['kind']=='error' and 'currently supports codex and openai' in v.get
 assert any(v['kind']=='error' and 'Unknown provider' in v.get('error','') for v in ev),ev
 assert not requests,requests
 "#);
-    }
-}
-
-
-fn skills_defaults()->Value{json!({"enabled":true,"max_system_tokens":8000,"max_core_entry_tokens":2000,
-    "max_inventory_entry_tokens":128,"max_entries":128,"max_file_bytes":65536})}
-fn skills_options(config:&Value)->Result<Value>{
-    if !config.is_object(){return Err("config.json must contain an object".into());}
-    let mut result=skills_defaults();
-    if let Some(options)=config.get("skills"){
-        for (key,value) in options.as_object().ok_or("skills config must be an object")?{
-            if result.get(key).is_none(){return Err(format!("unknown skills setting: {key}").into());}
-            if key=="enabled"{if !value.is_boolean(){return Err("skills.enabled must be boolean".into());}}
-            else if !value.as_u64().is_some_and(|n|n>0&&n<=16_777_216){return Err(format!("skills.{key} must be an integer in 1..=16777216").into());}
-            result[key]=value.clone();
-        }
-    }
-    Ok(result)
-}
-fn config_secret_key(key:&str)->bool{
-    matches!(key.to_ascii_lowercase().replace('-',"_").as_str(),"auth"|"credentials"|"key"|"api_key"|"apikey"|"access"|"refresh"|"token"|"password"|"access_token"|"refresh_token"|"secret"|"client_secret"|"authorization")
-}
-fn config_has_secrets(value:&Value)->bool{
-    match value{
-        Value::Object(object)=>object.iter().any(|(key,value)|config_secret_key(key)||config_has_secrets(value)),
-        Value::Array(values)=>values.iter().any(config_has_secrets),_=>false
-    }
-}
-fn validate_config(config:&Value)->Result<()>{
-    if config_has_secrets(config){return Err("credentials belong in auth.json and /login, not config.json".into());}
-    skills_options(config)?;model_catalog_options(config)?;
-    for key in ["model","effort"]{if let Some(value)=config.get(key){
-        if !value.as_str().is_some_and(|s|!s.trim().is_empty()){return Err(format!("{key} must be a nonempty string").into());}
-    }}
-    if let Some(effort)=config["effort"].as_str(){if !["off","minimal","low","medium","high","xhigh","max"].contains(&effort){return Err("invalid configured effort".into());}}
-    if let Some(providers)=config.get("providers"){if !providers.is_object(){return Err("providers must be an object".into());}}
-    Ok(())
-}
-fn effective_config(config:&Value)->Result<Value>{let mut value=config.clone();value["skills"]=skills_options(config)?;value["model_catalog"]=model_catalog_options(config)?;Ok(value)}
-fn skills_tokens(text:&str)->usize{text.chars().count().div_ceil(3)}
-fn valid_skill_date(date:&str)->bool{
-    if date.len()!=20||!date.is_ascii(){return false;}
-    let b=date.as_bytes();if b[4]!=b'-'||b[7]!=b'-'||b[10]!=b'T'||b[13]!=b':'||b[16]!=b':'||b[19]!=b'Z'{return false;}
-    if b.iter().enumerate().any(|(i,c)|![4,7,10,13,16,19].contains(&i)&&!c.is_ascii_digit()){return false;}
-    let number=|a,b|date[a..b].parse::<u32>().ok();
-    let (Some(y),Some(m),Some(d),Some(h),Some(min),Some(s))=(number(0,4),number(5,7),number(8,10),number(11,13),number(14,16),number(17,19)) else{return false};
-    let days=match m{1|3|5|7|8|10|12=>31,4|6|9|11=>30,2=>if y%4==0&&(y%100!=0||y%400==0){29}else{28},_=>0};
-    y>0&&d>0&&d<=days&&h<24&&min<60&&s<60
-}
-fn parse_skill(name:&str,text:&str)->Result<Value>{
-    let mut lines=text.split_inclusive('\n');
-    if lines.next().map(str::trim_end)!=Some("---"){return Err("missing --- front matter".into());}
-    let mut metadata=json!({});let mut closed=false;
-    for line in lines.by_ref(){
-        let line=line.trim_end();if line=="---"{closed=true;break;}
-        if line.trim().is_empty(){continue;}
-        let (key,raw)=line.split_once(':').ok_or("expected key: value front matter")?;
-        if !["kind","created","updated","origin","description","core"].contains(&key){return Err(format!("unknown metadata field {key}").into());}
-        if metadata.get(key).is_some(){return Err(format!("duplicate metadata field {key}").into());}
-        let raw=raw.trim();
-        metadata[key]=if key=="core"{match raw{"true"=>json!(true),"false"=>json!(false),_=>return Err("core must be true or false".into())}}
-            else if raw.starts_with('"'){let s:String=serde_json::from_str(raw)?;json!(s)}else{
-                if raw.is_empty()||raw.starts_with(['\'','|','>','[','{','&','*','!','#']){return Err("use a plain single-line or JSON-quoted string".into());}json!(raw)
-            };
-    }
-    if !closed{return Err("unterminated front matter".into());}
-    for key in ["kind","created","updated","origin","description","core"]{if metadata.get(key).is_none(){return Err(format!("missing metadata field {key}").into());}}
-    if !["memory","skill","python"].contains(&metadata["kind"].as_str().unwrap_or("")){return Err("kind must be memory, skill or python".into());}
-    if !["agent","user"].contains(&metadata["origin"].as_str().unwrap_or("")){return Err("origin must be agent or user".into());}
-    for key in ["created","updated"]{if !valid_skill_date(metadata[key].as_str().unwrap_or("")){return Err(format!("{key} must be a valid YYYY-MM-DDTHH:MM:SSZ timestamp").into());}}
-    if metadata["updated"].as_str()<metadata["created"].as_str(){return Err("updated precedes created".into());}
-    let description=metadata["description"].as_str().unwrap();
-    if description.trim().is_empty()||description.chars().any(|c|c.is_control()||c=='\u{2028}'||c=='\u{2029}'){
-        return Err("description must be nonempty, single-line and control-free".into());
-    }
-    let body=lines.collect::<String>();let mut python=String::new();
-    if metadata["kind"]=="python"{
-        let mut fence:Option<String>=None;let mut executable=false;let mut count=0;
-        for line in body.split_inclusive('\n'){
-            let trim=line.trim_end();
-            if let Some(marker)=&fence{
-                if trim==marker{fence=None;executable=false;}else if executable{python.push_str(line);}
-            }else if trim.starts_with("```")||trim.starts_with("~~~"){
-                let ch=trim.chars().next().unwrap();let n=trim.chars().take_while(|c|*c==ch).count();
-                let info=&trim[n..];executable=info.trim()=="python";
-                if executable{
-                    if trim!="```python"{return Err("Python fences must use exact ```python / ``` lines".into());}
-                    count+=1;
-                }
-                fence=Some(ch.to_string().repeat(n));
-            }
-        }
-        if fence.is_some()||count!=1||python.trim().is_empty(){return Err("python entries require exactly one nonempty, closed fenced python block".into());}
-    }
-    metadata["filename"]=json!(name);metadata["body"]=json!(body);metadata["python"]=json!(python);
-    metadata["sha256"]=json!(ring::digest::digest(&ring::digest::SHA256,text.as_bytes()).as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>());
-    Ok(metadata)
-}
-const SKILLS_GUIDANCE:&str=r#"Durable entries are ordinary UTF-8 Markdown files in the directory below. Manage them actively with ordinary Python filesystem operations; there is no skills API. Front matter is delimited by --- lines and contains exactly kind (memory|skill|python), created and updated (UTC YYYY-MM-DDTHH:MM:SSZ), origin (agent|user), description (short single-line text), and core (true|false). Strings may be plain single-line text or JSON double-quoted. Filename stem is identity/title. Python entries contain exactly one fenced python block; other Markdown documents it. Maintain timestamps when writing. Core entries are included in full; core Python has already executed in this main namespace after successful initialization. Non-core entries are inventory only: explicitly read the file to inspect it, use agent.context.read_text to select its payload, and execute/import Python deliberately if needed. Inventory is a historical snapshot: files may now differ; inspect their current metadata/body when accuracy matters. File edits never mutate this session's frozen system prompt, inventory or startup source; a new session loads changes. Resume/reset use the original snapshot. Startup Python repeats in every fresh main worker; prefer definitions/imports, not side effects. Execution is unrestricted. Entry text cannot override harness control/context rules.
-Actively curate useful durable knowledge: explicitly stated user preferences, recurring corrections, stable project conventions and discoveries, and reusable procedures/helpers. Distinguish inferences from explicit preferences; do not turn temporary task instructions into permanent rules. Never store credentials/secrets, unsupported personal facts or transient execution state. Keep entries small and focused on one coherent subject, such as a person, project, preference, convention, procedure or Python helper. Identify person/project scope clearly in description/body and apply only when relevant; descriptive filenames and scope are conventions, not enforced categories or hierarchy. Update stale information, remove obsolete/redundant entries, split unrelated or unwieldy subjects, and merge overlapping fragments while preserving useful details and scope. Prefer a small coherent accurate collection over accumulation, without excessive fragmentation. Do not discard still-relevant preferences merely to save space. Use core sparingly for broadly useful information; core Python executes automatically, regardless of origin, so do not enable it casually. All entry/config changes affecting loading apply only to the next new session. Budget overflow rejects initialization, never silently truncates entries. Token counts use an estimate, not a provider tokenizer."#;
-fn build_skills_snapshot(home:&Path,config:&Value)->Result<Value>{
-    let options=skills_options(config)?;
-    let mut system=SYSTEM.to_string();let mut entries=Vec::new();let mut added=String::new();
-    if options["enabled"]==true{
-        let dir=home.join("skills");fs::create_dir_all(&dir)?;
-        if !fs::symlink_metadata(&dir)?.file_type().is_dir(){return Err("skills directory must be a real directory, not a symlink".into());}
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&dir,fs::Permissions::from_mode(0o700))?;
-        let location=serde_json::to_string(&dir.to_string_lossy())?;
-        added=format!("\n\n[Durable entry instructions]\n{SKILLS_GUIDANCE}\nDirectory: {location}\nInitialization limits (estimated tokens): {options}\n[Entry snapshot]\n");
-        let mut paths=Vec::new();for path in fs::read_dir(&dir)?{let path=path?.path();if path.extension().is_some_and(|e|e=="md")||path.file_name().is_some_and(|n|n==".md"){paths.push(path);}}
-        paths.sort();if paths.len()>options["max_entries"].as_u64().unwrap() as usize{return Err(format!("{}: {} entries exceed skills.max_entries={}; remove/merge entries or increase the limit",dir.display(),paths.len(),options["max_entries"]).into());}
-        for path in paths{
-            let name=path.file_name().and_then(|s|s.to_str()).ok_or("entry filename must be UTF-8")?;
-            if name==".md"||name.chars().any(char::is_control){return Err("entry filename must have a nonempty, printable stem".into());}
-            let meta=fs::symlink_metadata(&path)?;if !meta.file_type().is_file(){return Err(format!("{} must be a regular file, not a symlink/directory",path.display()).into());}
-            let max=options["max_file_bytes"].as_u64().unwrap() as usize;
-            if meta.len()>max as u64{return Err(format!("{}: {} bytes exceed skills.max_file_bytes={max}; shorten/split the entry or increase the limit",path.display(),meta.len()).into());}
-            // Bound reads even if another writer grows a discovered file.
-            let file=OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&path)?;
-            if !file.metadata()?.file_type().is_file(){return Err(format!("{name} must be a regular file").into());}
-            let mut bytes=Vec::new();std::io::Read::read_to_end(&mut std::io::Read::take(file,max as u64+1),&mut bytes)?;
-            if bytes.len()>max{return Err(format!("{} exceeds skills.max_file_bytes={max}; shorten/split the entry or increase the limit",path.display()).into());}
-            let text=std::str::from_utf8(&bytes)?;
-            let mut entry=parse_skill(name,text).map_err(|e|format!("{}: {e}",path.display()))?;
-            entry["path"]=json!(path);let core=entry["core"]==true;
-            let inventory=json!({"filename":name,"kind":entry["kind"],"description":entry["description"],"core":core,"path":path});
-            let rendered=if core{format!("\n[Core entry {}]\n{}\n{}\n[End core entry]\n",serde_json::to_string(name)?,inventory,entry["body"].as_str().unwrap())}
-                else{format!("\n[Available entry] {inventory}\n")};
-            let key=if core{"max_core_entry_tokens"}else{"max_inventory_entry_tokens"};
-            if skills_tokens(&rendered)>options[key].as_u64().unwrap() as usize{return Err(format!("{}: {} estimated tokens exceed skills.{key}={}; shorten/split the entry or increase the limit",path.display(),skills_tokens(&rendered),options[key]).into());}
-            added.push_str(&rendered);
-            if !core{entry.as_object_mut().unwrap().remove("body");entry.as_object_mut().unwrap().remove("python");}
-            entries.push(entry);
-        }
-        if skills_tokens(&added)>options["max_system_tokens"].as_u64().unwrap() as usize{return Err(format!("{}: {} estimated tokens including guidance exceed skills.max_system_tokens={}; shorten/remove entries or increase the limit",dir.display(),skills_tokens(&added),options["max_system_tokens"]).into());}
-        system.push_str(&added);
-    }
-    Ok(json!({"version":1,"system":system,"entries":entries,"options":options,
-        "estimated_added_tokens":skills_tokens(&added),"estimator":"unicode-chars/3-v1 (estimate, not a guarantee)"}))
-}
-impl Host{
-    fn system_prompt(&self)->&str{self.skills["system"].as_str().unwrap_or(SYSTEM)}
-    fn check_system_budget(&self,limit:usize)->Result<()>{self.check_model_system_budget(&self.model,limit)}
-    fn check_model_system_budget(&self,model:&str,limit:usize)->Result<()>{
-        let protected=(self.system_prompt().chars().count()+512).div_ceil(3);
-        let available=model_input_budget(limit,&self.reasoning_metadata(model),4096);
-        if protected+1024>=available{return Err(format!("Unsatisfiable protected system-prefix budget: {protected} estimated input tokens plus 1024 continuation reserve do not fit input budget {available} (context limit {limit}, 4096 output reserve); choose a larger-context model or start a new session with fewer core entries").into());}
-        Ok(())
-    }
-    fn initialize_skills(&mut self)->Result<()>{
-        self.startup_ready=false;
-        self.check_system_budget(self.context_limit)?;
-        let entries=self.skills["entries"].as_array().ok_or("invalid skills snapshot entries")?.iter()
-            .filter(|e|e["core"]==true&&e["kind"]=="python").cloned().collect::<Vec<_>>();
-        if entries.is_empty(){self.startup_ready=true;return Ok(());}
-        self.journal.append("startup_begin",json!({"generation":self.generation,"entries":entries.iter().map(|e|&e["filename"]).collect::<Vec<_>>()}))?;
-        self.initializing=true;
-        let outcome=(||->Result<()>{
-            let mut validation=String::new();
-            for entry in &entries{validation.push_str(&format!("compile({}, {}, 'exec')\n",serde_json::to_string(&entry["python"])?,serde_json::to_string(&entry["path"])?));}
-            let id=format!("startup-validate-{}",self.journal.seq);
-            let result=self.execute(&id,&validation,false)?;
-            if result["status"]!="ok"{return Err(format!("startup precompilation failed; diagnostics in {}",result["stderr"]["ref"]).into());}
-            for entry in entries{
-                let id=format!("startup-{}",self.journal.seq);
-                self.journal.append("startup_entry",json!({"operation":id,"generation":self.generation,"filename":entry["filename"],"sha256":entry["sha256"],"source":entry["python"]}))?;
-                let result=self.execute(&id,entry["python"].as_str().ok_or("missing startup source")?,false)?;
-                if result["status"]!="ok"{return Err(format!("startup {} failed; diagnostics in {}; earlier side effects are not rolled back",entry["filename"],result["stderr"]["ref"]).into());}
-            }
-            Ok(())
-        })();
-        self.initializing=false;
-        self.journal.append("startup_end",json!({"generation":self.generation,"status":if outcome.is_ok(){"ok"}else{"error"}}))?;
-        self.startup_ready=outcome.is_ok();outcome
-    }
-    fn config_command(&mut self,args:&str)->Result<()>{
-        let (verb,rest)=args.split_once(char::is_whitespace).map(|(a,b)|(a,b.trim())).unwrap_or((args,""));
-        if verb.is_empty(){self.ui_json("Configuration (loading changes apply on /new)",&json!({"path":self.home.join("config.json"),"effective":effective_config(&self.config_defaults)?,"session_skills_options":self.skills["options"],"skills_changes_pending":skills_options(&self.config_defaults)?!=self.skills["options"],"config_changes_pending":self.config_defaults!=self.config}));return Ok(());}
-        if verb=="reload"{
-            if !rest.is_empty(){return Err("usage: /config reload".into());}
-            let next=load_json(&self.home.join("config.json"))?;validate_config(&next)?;self.config_defaults=next;
-            self.ui_text("Configuration reloaded. Session prompt/startup snapshot unchanged; catalog refresh preferences apply immediately, other loading defaults apply on /new.");return Ok(());
-        }
-        let (key,value)=rest.split_once(char::is_whitespace).map(|(a,b)|(a,b.trim())).unwrap_or((rest,""));
-        let parts=key.split('.').collect::<Vec<_>>();
-        if key.is_empty()||parts.iter().any(|p|p.is_empty()||!p.chars().all(|c|c.is_ascii_alphanumeric()||c=='_'||c=='-')){return Err("use a dotted configuration key".into());}
-        if parts.iter().any(|p|config_secret_key(p)){return Err("credentials belong in auth.json and /login, not /config".into());}
-        if verb=="get"{
-            if !value.is_empty(){return Err("usage: /config get <key>".into());}
-            let effective=effective_config(&self.config_defaults)?;let mut found=&effective;
-            for part in &parts{found=found.get(*part).ok_or("unknown configuration key")?;}
-            self.ui_json(key,found);return Ok(());
-        }
-        if verb!="set"&&verb!="unset"{return Err("usage: /config [get <key> | set <key> <JSON-value> | unset <key> | reload]".into());}
-        if verb=="unset"&&!value.is_empty(){return Err("usage: /config unset <key>".into());}
-        let mut next=self.config_defaults.clone();let mut target=&mut next;
-        for part in &parts[..parts.len()-1]{
-            let object=target.as_object_mut().ok_or("configuration key crosses a non-object")?;
-            target=object.entry((*part).to_string()).or_insert_with(||json!({}));
-        }
-        let object=target.as_object_mut().ok_or("configuration parent must be an object")?;
-        if verb=="set"{object.insert(parts.last().unwrap().to_string(),serde_json::from_str(value)?);}else{object.remove(*parts.last().unwrap());}
-        validate_config(&next)?;
-        let lock=OpenOptions::new().create(true).read(true).write(true).truncate(false).mode(0o600).open(self.home.join("config.lock"))?;
-        if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX)}!=0{return Err(io::Error::last_os_error().into());}
-        let path=self.home.join("config.json");
-        if load_json(&path)?!=self.config_defaults{return Err("config.json changed externally; /config reload before editing".into());}
-        write_private_json(&path,&next)?;self.config_defaults=next;
-        self.ui_text("Configuration saved. Current session snapshot unchanged; catalog refresh preferences apply immediately, other loading defaults apply on /new.");Ok(())
     }
 }
 
@@ -13201,4 +13876,3 @@ mod skills_unit_tests {
         for fragment in ["ordinary Python filesystem operations","user preferences","small and focused","person, project","Update stale information","remove obsolete","split unrelated","merge overlapping","preserving useful details and scope","do not turn temporary task instructions","Never store credentials/secrets"]{assert!(SKILLS_GUIDANCE.contains(fragment),"{fragment}");}
     }
 }
-
