@@ -2014,7 +2014,7 @@ Discovery currently supports Codex subscriptions and the OpenAI API. Other
 providers retain their built-in/configured inventory and report unsupported
 explicit refresh; there is no guessed compatible endpoint.
 Codex GET /codex/models uses authorization, account routing and client_version;
-OpenAI GET /models proves available IDs, not their unknown capabilities.
+OpenAI GET /models provides listed IDs, not a definitive access check or unknown capabilities.
 Source: openai/codex models-manager, codex-api endpoint/models and protocol
 openai_models.rs (reviewed 2026-10-10). Native context_window takes precedence over
 max_context_window; the effective input allowance uses the native percentage.
@@ -2051,8 +2051,10 @@ reasoning presets are limited to implemented levels; ultra is not supported.
 Unknown API IDs, including fine-tunes, are visible but cannot be selected or
 invoked without explicit API/context/capability metadata in config.json. Explicit
 user declarations override discovery; discovery never fabricates capabilities.
-Account catalogs mark absent built-ins unavailable without destroying legacy
-session IDs. HTTP errors are bounded/redacted, never silently retried for inference.
+Catalog omission is advisory, not an access denial: built-in/configured models
+remain selectable and callable with known capabilities even when absent/hidden in
+discovery. The provider decides real access. Track catalog_listed separately from
+credential readiness; automatic default selection prefers listed models. HTTP errors are bounded/redacted, never silently retried for inference.
 
 Refreshing does not select a model, rebuild Python, change globals, modify the
 frozen system prompt or select discovery payloads into model context. It can update
@@ -2060,8 +2062,10 @@ capability/pressure limits. Genuine cancellation retains the prior cache; an old
 agent.loop.stop is not cancellation of a later metadata operation.
 
 Acceptance evidence: cargo build -j 8; PY_HARNESS_BIN=$PWD/target/debug/py cargo
- test -j 8 -- --test-threads=4. 233 tests pass, including 16 catalog tests;
+ test -j 8 -- --test-threads=4. 234 tests pass, including 17 catalog tests;
 local real-binary fixtures verify HTTP wire/caches, not live account compatibility.
+Additional regression: e2e_catalog_unlisted_known_model_can_be_selected_and_called
+verifies hidden/omitted known IDs remain explicitly selectable and callable.
 [x] R16.01 Native/API endpoints, normalization, fresh IDs/aliases and private
     persistent cache work. Tests: e2e_catalog_force_refresh_native_metadata_namespace_prompt_and_private_cache; catalog_native_limits_fields_aliases_and_efforts.
 [x] R16.02 Stale auto refresh, fresh suppression, explicit bypass, failure backoff,
@@ -4614,7 +4618,7 @@ impl Host {
             if self.catalog_identity(provider).is_some_and(|identity|record["identity"]==identity){
                 if let Some(discovered)=record["models"].as_array(){
                     for model in models.iter_mut().filter(|m|m["provider"]==provider){
-                        model["available"]=json!(discovered.iter().any(|d|d["id"]==model["id"]));
+                        model["catalog_listed"]=json!(discovered.iter().any(|d|d["id"]==model["id"]));
                     }
                     for model in discovered{
                         models.retain(|m|m["id"]!=model["id"]);models.push(model.clone());
@@ -4643,7 +4647,7 @@ impl Host {
             let env=cfg["key_env"].as_str().or(PROVIDERS.iter().find(|p|p.0==provider).map(|p|p.2)).unwrap_or("");
             item["credential_backed"]=json!(!self.credential(provider,env).trim().is_empty());
             item["ready"]=json!(self.provider_config(item["id"].as_str().unwrap()).is_ok()
-                &&item["metadata_complete"]!=false&&(item["available"]!=false||item["user_declared"]==true));
+                &&item["metadata_complete"]!=false);
         }
         json!(models)
     }
@@ -4683,7 +4687,6 @@ impl Host {
         let api=self.model_api(model);
         let meta=self.reasoning_metadata(model);
         if meta["metadata_complete"]==false{return Err("model capabilities are incomplete; declare this model's API/context/capabilities in config.json before selecting or invoking it".into());}
-        if meta["available"]==false&&meta["user_declared"]!=true{return Err("model not offered in the last account catalog; /model list refresh or select another model".into());}
         // Validate before an operation intent or network request. Unsupported
         // capability metadata is deliberately not inferred from API compatibility.
         let fields=reasoning_fields(&api,provider_alias(provider),id,&meta,&self.effort,max)?;
@@ -5079,7 +5082,6 @@ impl Host{
                 found.iter().take(16).filter_map(|m|m["id"].as_str()).collect::<Vec<_>>().join(", ")).into());
         }
         if found[0]["metadata_complete"]==false{return Err("model discovered without capability metadata; declare its API/context/capabilities in config.json first".into());}
-        if found[0]["available"]==false&&found[0]["user_declared"]!=true{return Err("model not offered in the last account catalog; /model list refresh to check availability".into());}
         let model=found[0]["id"].as_str().unwrap();
         self.check_model_system_budget(model,self.model_limit(model)?)?;
         self.set_model(model.into())?;
@@ -5114,15 +5116,17 @@ impl Host{
     }
     fn list_models(&self,query:&str){
         let found=self.matching_models(query);
-        let mut table="## Models (built-in/configured/cached inventory)\n\n| Model | Authentication | Context |\n| --- | --- | ---: |\n".to_string();
+        let mut table="## Models (built-in/configured/cached inventory)\n\n| Model | Status | Context |\n| --- | --- | ---: |\n".to_string();
+        let unlisted=found.iter().any(|m|m["catalog_listed"]==false);
         for model in found{
             let ready=if model["metadata_complete"]==false{"needs capability metadata"}
-                else if model["available"]==false&&model["user_declared"]!=true{"not in account catalog"}
+                else if model["credential_backed"]==true&&model["catalog_listed"]==false{"credentials present; not listed"}
                 else if model["credential_backed"]==true{"credentials present"}
                 else if model["ready"]==true{"local/anonymous"}else{"login needed"};
             table.push_str(&format!("| {}{} | {} | {} |\n",model["id"].as_str().unwrap_or(""),
                 if model["deprecated"]==true{" (deprecated for subscription)"}else{""},ready,model["context_limit"]));
         }
+        if unlisted{table.push_str("\nNot listed is advisory, not an access denial. Known models remain selectable; the provider confirms access.\n");}
         self.event("say",json!({"text":table}));
     }
     fn session_paths(&self)->Result<Vec<PathBuf>>{
@@ -6756,7 +6760,8 @@ impl Host {
         if self.provider_config(&self.model).is_ok(){return;}
         let models=self.models();
         let candidates:Vec<_>=models.as_array().unwrap().iter().filter(|m|m["provider"]==provider
-            &&m["ready"]==true&&m["image_output"]!=true&&m["deprecated"]!=true).collect();
+            &&m["ready"]==true&&m["image_output"]!=true&&m["deprecated"]!=true
+            &&(m["catalog_listed"]!=false||m["user_declared"]==true)).collect();
         let selected=candidates.iter().find(|m|m["id"]=="openai-codex/gpt-6.1-sol").or_else(||candidates.first());
         if let Some(model)=selected.and_then(|m|m["id"].as_str()){
             if let Err(error)=self.choose_model(model){self.event("notice",json!({"text":format!("Credentials stored, but model selection failed: {error}. Use /model to select a usable model.")}));}
@@ -11539,7 +11544,7 @@ fn normalize_codex_catalog(body:&Value,base:&[Value])->Result<Vec<Value>>{
             "reasoning_efforts":levels,"default_effort":default,"image_input":image_input,
             "image_output":false,"deprecated":false,"priority":priority,
             "metadata_complete":context.is_some()&&!levels.is_empty(),
-            "available":true,"source":"provider-discovery"}));
+            "catalog_listed":true,"source":"provider-discovery"}));
     }
     normalized.sort_by(|a,b|a["priority"].as_i64().cmp(&b["priority"].as_i64())
         .then_with(||a["id"].as_str().cmp(&b["id"].as_str())));
@@ -11557,7 +11562,7 @@ fn normalize_openai_catalog(body:&Value,base:&[Value],provider:&str)->Result<Vec
         let id=format!("{provider}/{slug}");
         let known=base.iter().find(|m|m["id"]==id);
         let mut model=json!({"id":id,"name":slug,"provider":provider,"context_limit":null,
-            "metadata_complete":false,"available":true,"source":"provider-discovery"});
+            "metadata_complete":false,"catalog_listed":true,"source":"provider-discovery"});
         if let Some(known)=known{
             // /models proves availability only, not protocol or capabilities.
             for key in ["name","api","context_limit","max_input_tokens","max_tokens","image_input",
@@ -11637,7 +11642,7 @@ fn load_model_catalog(path:&Path)->Result<Value>{
                 for key in ["id","name","api","context_limit","max_input_tokens","max_tokens","reasoning","reasoning_efforts","default_effort","image_input","image_output","deprecated","priority","aliases","metadata_complete"]{
                     if let Some(value)=model.get(key){safe[key]=value.clone();}
                 }
-                safe["provider"]=json!(provider);safe["source"]=json!("provider-discovery");safe["available"]=json!(true);*model=safe;
+                safe["provider"]=json!(provider);safe["source"]=json!("provider-discovery");safe["catalog_listed"]=json!(true);*model=safe;
             }
         }
     }
@@ -11951,6 +11956,28 @@ def no_secrets():
             .output()
             .unwrap();
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn e2e_catalog_unlisted_known_model_can_be_selected_and_called() {
+        fixture(r#"
+hidden=native('gpt-6.1-sol');hidden['visibility']='hide'
+reply(catalog(native('gpt-6-sol'),hidden))
+ev=run([refresh(),models('after')]);known=model_map(ev,'after')['openai-codex/gpt-6.1-sol']
+assert known['catalog_listed'] is False and known['ready'] is True,known
+assert 'available' not in known,known
+stop_reply()
+ev=run(lines='/model openai-codex/gpt-6.1-sol\n@print(agent.llm("hello"))\n/model list\n/status\n')
+assert not any(v['kind']=='error' for v in ev),ev
+assert all(v['status']=='ok' for v in ev if v['kind']=='completed'),ev
+assert next(v['value'] for v in ev if v['kind']=='info' and v.get('title')=='Status')['model']=='openai-codex/gpt-6.1-sol',ev
+assert [r['method'] for r in requests]==['GET','POST'],requests
+assert json.loads(requests[-1]['body'])['model']=='gpt-6.1-sol',requests
+text='\n'.join(v.get('text','') for v in ev if v['kind']=='say')
+assert 'credentials present; not listed' in text and 'not an access denial' in text,text
+assert 'not in account catalog' not in text,text
+no_secrets()
+"#);
     }
 
     #[test]
