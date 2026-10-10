@@ -1009,8 +1009,9 @@ read_text(text_or_ref, ..., max_chars=8000)
 
 Human preview:
   Show at most 12 lines EACH of source, stdout and stderr per interaction.
-  Include exact total lines/characters/bytes as applicable, completeness,
-  omitted counts and the correct H.code/H.user/H.stdout/H.stderr reference.
+  Omit empty output sections. Complete previews show only their content; a
+  truncated preview reports shown/total lines and the correct H.code/H.user/
+  H.stdout/H.stderr reference.
   Never make preview truncation alter history or select payload for the model.
   A noninteractive JSON client receives typed preview fields/events rather
   than terminal-rendered prose. Full payloads remain available through H.
@@ -1267,11 +1268,14 @@ Keep orthogonal parts as direct functions/state, not a UI/provider framework.
       table widths using the rendered-height/forced-split objective: bounded
       exact search for small tables, deterministic sampled heuristic for large
       tables, not a global optimality claim. Very narrow tables may stack cells.
-      Unicode widths/combining marks must fit; terminal controls in payloads
-      cannot inject terminal commands. JSON say text remains byte-for-byte text.
+      Unicode widths/combining marks must fit; terminal controls in ordinary
+      payloads cannot inject terminal commands. Output from explicit interactive
+      !/!! commands may control the user's TTY. JSON say text remains byte-for-byte text.
 [x] R10.11 Human cell previews have clear operation/source/stdout/stderr boundaries,
-      status and refs/counts, width-aware word wrapping. Preview/history limits
-      remain independent: rendering never modifies H or model context.
+      omit empty output sections, and show refs/counts only for truncation. Each cell
+      has one colored ending boundary with language and final status; H.cells[number]
+      is its canonical provenance view. Preview/history limits remain
+      independent: rendering never modifies H or model context.
 [x] R10.12 /model list [query] and /models [query] list matching cached,
       built-in/configured models, refreshing stale supported catalogs per R16;
       /model <id-or-query> resolves an exact ID or unique fuzzy match, rejects
@@ -1427,8 +1431,9 @@ context compaction added.
       remain safe and bounded. No-match queries may be edited to recover. Single
       candidate insertion remains quick. JSON/non-TTY output has no UI escapes.
 [x] R10.28 Interactive presentation has semantic idle/thinking/running/input/login
-      states, minimal prompt, and a compact width-safe status line, with the model
-      shown during thinking (not repeated in every prompt). Color/styles enhance
+      states, one stable minimal prompt (empty Enter does not accumulate prompts),
+      and a compact width-safe status line, with the model shown during thinking.
+      Color/styles enhance
       headings, boundaries/status and Markdown without leaking payload controls.
       NO_COLOR and non-TTY output disable generated styling; JSON remains exact.
       State transitions cover success, exceptions, cancellation, worker reset and
@@ -3438,11 +3443,26 @@ class _History:
             return [_rpc('history',collection=self._name,index=i) for i in indices]
         return _rpc('history',collection=self._name,index=operator.index(key))
     def __len__(self): return _rpc('history_len',collection=self._name)
+class _Cell(dict):
+    __slots__=()
+    def __getattr__(self,name):
+        try:return self[name]
+        except KeyError:raise AttributeError(name) from None
+    def __setattr__(self,name,value):raise AttributeError('H cell views are read-only')
+class _Cells:
+    __slots__=()
+    def __setattr__(self,name,value): raise AttributeError('H.cells is read-only')
+    def __delattr__(self,name): raise AttributeError('H.cells is read-only')
+    def __getitem__(self,number):
+        import operator
+        return _Cell(_rpc('cell',cell=operator.index(number)))
+    def __len__(self): return _rpc('cell_len')
 class _H:
     __slots__=()
     def __setattr__(self,name,value): raise AttributeError('H is read-only')
     def __delattr__(self,name): raise AttributeError('H is read-only')
     def __getattr__(self,name):
+        if name=='cells': return _Cells()
         if name not in ('code','user','stdout','stderr','stdin','events','raw','say','requests','responses','usage'):
             raise AttributeError(name)
         return _History(name)
@@ -3771,6 +3791,7 @@ impl Capture {
         let metadata=json!({"ref":format!("H.{}[{index}]",self.name),"index":index,
             "bytes":self.bytes,"chars":self.chars,"lines":lines,
             "preview":String::from_utf8_lossy(&self.preview).lines().take(12).collect::<Vec<_>>().join("\n"),
+            "preview_truncated":self.preview.len()<self.bytes,
             "omitted_lines":lines.saturating_sub(12),"complete":complete});
         let mut durable=metadata.clone();durable.as_object_mut().unwrap().remove("preview");
         host.journal.append(if complete{"stream_complete"}else{"stream_closed"},json!({"collection":self.name,"operation":self.operation,
@@ -3824,6 +3845,7 @@ impl UiState{
 }
 struct Host {
     state:UiState,thinking_model:Option<String>,cells:usize,active_cell:Option<usize>,cancel_revision:u64,
+    status_line:std::cell::Cell<bool>,
     journal:Journal, worker:Worker, home:PathBuf, context:Vec<Item>,
     history:HashMap<String,Vec<Value>>, ids:HashSet<String>, json:bool,
     stop:bool, stop_wakeup:Option<(f64,String)>, reset:bool, reset_explicit:bool, generation:usize, revision:usize,
@@ -3838,9 +3860,21 @@ impl Host {
     fn event(&self,kind:&str,payload:Value) {
         let mut v=payload;v["kind"]=json!(kind);v["schema_version"]=json!(1);
         if self.json {println!("{}",v);} else {
+            let transient=terminal_color_for(1);
+            if transient&&kind=="state"{
+                let state=v["state"].as_str().unwrap_or("idle");
+                print!("\r\x1b[K");
+                if state!="idle"{
+                    let text=terminal_state(&v,terminal_width()).join("\n");print!("{text}");self.status_line.set(true);
+                }else{self.status_line.set(false);}
+                let _=io::stdout().flush();return;
+            }
+            if transient&&self.status_line.replace(false){print!("\r\x1b[K");}
             match kind {
                 "state"=>for line in terminal_state(&v,terminal_width()){println!("{line}");},
-                "cell_start"=>for line in terminal_cell_start(&v,terminal_width()){println!("{line}");},
+                // A cell gets one durable visual boundary, at completion. While
+                // active, the transient prompt communicates running/thinking.
+                "cell_start"=>{},
                 "cell_end"=>for line in terminal_cell_end(&v,terminal_width()){println!("{line}");},
                 "say"=>for line in terminal_markdown(v["text"].as_str().unwrap_or(""),terminal_width()){println!("{line}");},
                 "input_prompt"=>{print!("{}",terminal_wrap(v["prompt"].as_str().unwrap_or(""),terminal_width()).0.join("\n"));let _=io::stdout().flush();},
@@ -3883,8 +3917,10 @@ impl Host {
 impl Host {
     fn rpc(&mut self,v:&Value)->Result<Value>{
         let op=v["op"].as_str().unwrap_or("");
-        if self.initializing && !["history","history_len"].contains(&op){return Err("startup entries may define/import helpers and read H, but cannot use agent bridge controls, context, input or side-effect helpers during initialization".into());}
+        if self.initializing && !["history","history_len","cell","cell_len"].contains(&op){return Err("startup entries may define/import helpers and read H, but cannot use agent bridge controls, context, input or side-effect helpers during initialization".into());}
         match op {
+            "cell"=>self.cell_view(v["cell"].as_u64().ok_or("cell number must be a positive integer")? as usize),
+            "cell_len"=>Ok(json!(self.cells)),
             "history"=>{
                 let name=v["collection"].as_str().ok_or("missing collection")?;
                 let len=if name=="events"{self.journal.seq}else{self.history.get(name).ok_or("unknown H collection")?.len()};
@@ -3980,7 +4016,8 @@ fn stream_info(bytes:&[u8],name:&str,index:usize)->Value{
     let preview=String::from_utf8_lossy(bytes).lines().take(12).collect::<Vec<_>>().join("\n");
     json!({"ref":format!("H.{name}[{index}]"),"index":index,"bytes":bytes.len(),
         "chars":decoded.map(|s|s.chars().count()),"lines":lines,
-        "preview":preview,"omitted_lines":lines.saturating_sub(12),"complete":true})
+        "preview":preview,"preview_truncated":lines>12,
+        "omitted_lines":lines.saturating_sub(12),"complete":true})
 }
 impl Host{
     fn execute(&mut self,id:&str,source:&str,retain_source:bool)->Result<Value>{
@@ -4217,7 +4254,8 @@ impl Host{
         let mut code=stream_info(command.as_bytes(),"events",source_event);
         code["ref"]=json!(format!("H.events[{source_event}]['payload']['source']"));
         self.event("preview",json!({"cell":self.active_cell,"command_id":id,"stdout":stdout,"stderr":stderr,
-            "status":state.unwrap_or(if exit.success(){"ok"}else{"error"}),"code":code}));
+            "status":state.unwrap_or(if exit.success(){"ok"}else{"error"}),"code":code,
+            "terminal_controls":v["terminal_controls"]==true}));
         let mut result=json!({"exit_code":exit.code(),"status":state.unwrap_or(if exit.success(){"ok"}else{"error"}),
             "stdout":stdout,"stderr":stderr});
         for stream in ["stdout","stderr"]{
@@ -4277,7 +4315,7 @@ impl Host {
         };
         let worker=Worker::spawn(&home,if resumed{generation+1}else{0})?;
         let mut host=Self{state:UiState::Idle,thinking_model:None,cells:0,active_cell:None,cancel_revision:0,
-            journal,worker,home,context:vec![],history:HashMap::new(),ids:HashSet::new(),
+            status_line:std::cell::Cell::new(false),journal,worker,home,context:vec![],history:HashMap::new(),ids:HashSet::new(),
             json:json_mode,stop:false,stop_wakeup:None,reset:false,reset_explicit:false,generation:0,revision:0,
             bg_tasks:HashMap::new(),wakeups:HashMap::new(),servicing:false,
             incoming:None,input_closed:false,pending:std::collections::VecDeque::new(),attachments:HashMap::new(),queued:HashMap::new(),config:json!({}),config_defaults:json!({}),auth:json!({}),model:std::env::var("PY_MODEL").unwrap_or_else(|_|"openai/gpt-4.1".into()),
@@ -4406,7 +4444,8 @@ impl Host {
             "shell"=>{
                 let command=v["command"].as_str().ok_or("command required")?;
                 if queued.is_none(){self.user(command,false)?;}
-                let r=self.shell(&json!({"command":command,"options":v["options"]}))?;
+                let r=self.shell(&json!({"command":command,"options":v["options"],
+                    "terminal_controls":v["terminal_controls"]==true}))?;
                 if v["visible"].as_bool().unwrap_or(false){
                     let message=format!("!!{}\n[stdout]\n{}\n[stderr]\n{}",command,
                         self.history_last("stdout")?,
@@ -4478,7 +4517,7 @@ fn parse_item(p:&Value)->Item{
         text:p["text"].as_str().unwrap_or("").into(),output:p["output"].as_bool().unwrap_or(false),ranges}
 }
 
-const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences. Persistent CPython exposes agent and H. H.code/user/stdout/stderr contain full history. Only metadata is automatically observed. Explicitly select payload with agent.context.read_text(H.stderr[i][:4000]) or read_raw. agent.say(text) sends a user-only UI message without stdout/context duplication. agent.sh(command) returns status and H stream refs. agent.llm(prompt,model=...) returns data; agent.llm.list() lists models; agent.llm.image(prompt,model=...) generates image data. agent.context.items()/usage() inspect context metadata. agent.loop.stop(wakeup=None) ends this turn after a successful cell; optional wakeup=(seconds,reason) schedules one continuation. agent.bgtasks.run(source,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None) returns task metadata immediately; kind='python' uses a fresh isolated interpreter without agent or main variables. bgtasks.list(state=None),get(task_id),kill(task_id,force=False) manage jobs. Outputs stay in H; only explicit context reads select them. Completion wakeups are opt-in. Does not kill foreground Python. Collapse must be standalone agent.context.collapse('start','end','summary'); successful output is silent. Retained call contains sole summary plus original ranges. In forced mode only collapse or literal agent.context.read_text(H.stderr[44][:4000]) allowed. No replay after resume. Execution is unrestricted.";
+const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences. Persistent CPython exposes agent and H. H.cells[n] is the canonical record for presented cell n and links its source, output, context and helper histories; H.code/user/stdout/stderr retain full collection histories. Only metadata is automatically observed. Explicitly select payload with agent.context.read_text(H.stderr[i][:4000]) or read_raw. agent.say(text) sends a user-only UI message without stdout/context duplication. agent.sh(command) returns status and H stream refs. agent.llm(prompt,model=...) returns data; agent.llm.list() lists models; agent.llm.image(prompt,model=...) generates image data. agent.context.items()/usage() inspect context metadata. agent.loop.stop(wakeup=None) ends this turn after a successful cell; optional wakeup=(seconds,reason) schedules one continuation. agent.bgtasks.run(source,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None) returns task metadata immediately; kind='python' uses a fresh isolated interpreter without agent or main variables. bgtasks.list(state=None),get(task_id),kill(task_id,force=False) manage jobs. Outputs stay in H; only explicit context reads select them. Completion wakeups are opt-in. Does not kill foreground Python. Collapse must be standalone agent.context.collapse('start','end','summary'); successful output is silent. Retained call contains sole summary plus original ranges. In forced mode only collapse or literal agent.context.read_text(H.stderr[44][:4000]) allowed. No replay after resume. Execution is unrestricted.";
 // Reasoning request fields follow the pinned Pi provider transformations, not
 // generic OpenAI-compatible guesses. This is a pure body-layout helper: it never
 // reads credentials, starts I/O or changes session state. A false/absent reasoning
@@ -4926,6 +4965,7 @@ impl Host {
     }
 }
 fn redacted_command(mut command:Value)->Result<Value>{
+    if let Some(object)=command.as_object_mut(){object.remove("terminal_controls");}
     if command["kind"]=="login"{
         command.as_object_mut().ok_or("command must be an object")?.retain(|name,value|match name.as_str(){
             "id"|"kind"|"provider"=>true,
@@ -4964,18 +5004,21 @@ fn terminal_result_style(status:&str)->&'static str{match status{"ok"=>"32","err
 fn ui_text(text:&str){for line in terminal_wrap(text,terminal_width()).0{println!("{line}");}}
 fn terminal_state(v:&Value,width:usize)->Vec<String>{
     let state=v["state"].as_str().unwrap_or("idle");
-    let text=if state=="thinking"{format!("· thinking · {} [{}]",v["model"].as_str().unwrap_or(""),v["effort"].as_str().unwrap_or(""))}
-        else{format!("· {state}")};
+    let text=if state=="thinking"{
+        let mut text=format!("› thinking · {} [{}]",v["model"].as_str().unwrap_or(""),v["effort"].as_str().unwrap_or(""));
+        if let Some(ms)=v["elapsed_ms"].as_u64(){text.push_str(&format!(" · {:.1}s",ms as f64/1000.0));}
+        if let Some(retry)=v["retry"].as_u64().filter(|retry|*retry>0){text.push_str(&format!(" · retry {retry}"));}
+        text
+    }else{format!("› {state}")};
     terminal_style_lines(terminal_wrap(&text,width).0,match state{"thinking"=>"35","idle"=>"2","input"|"login"=>"33",_=>"36"})
 }
-fn terminal_cell_start(v:&Value,width:usize)->Vec<String>{
-    terminal_style_lines(terminal_wrap(&format!("── cell {} · {} · {} · operation {}",v["cell"],v["language"].as_str().unwrap_or(""),
-        v["source_ref"].as_str().unwrap_or(""),v["operation"].as_str().unwrap_or("")),width).0,"1;36")
-}
 fn terminal_cell_end(v:&Value,width:usize)->Vec<String>{
-    let mut text=format!("cell {} · {} · elapsed {}ms",v["cell"],v["status"].as_str().unwrap_or("error"),v["elapsed_ms"]);
-    for field in ["stdout_ref","stderr_ref"]{if let Some(reference)=v[field].as_str(){text.push_str(" · ");text.push_str(reference);}}
-    terminal_style_lines(terminal_wrap(&text,width).0,terminal_result_style(v["status"].as_str().unwrap_or("error")))
+    let status=v["status"].as_str().unwrap_or("error");
+    let identity=if let Some(parent)=v["parent_cell"].as_u64(){format!("cell {parent} › {}",v["cell"])}else{format!("cell {}",v["cell"])};
+    let label=format!("── {identity} · {} {}ms · status: {} ",
+        v["language"].as_str().unwrap_or(""),v["elapsed_ms"],status);
+    let text=format!("{label}{}","─".repeat(width.saturating_sub(terminal_columns(&label))));
+    terminal_style_lines(terminal_wrap(&text,width).0,terminal_result_style(status))
 }
 fn ui_json(title:&str,value:&Value){
     ui_text(title);ui_text(&serde_json::to_string_pretty(value).unwrap_or_default());
@@ -5006,7 +5049,17 @@ impl Host{
     fn with_state<T>(&mut self,state:UiState,model:Option<&str>,action:impl FnOnce(&mut Self)->Result<T>)->Result<T>{
         let previous=self.state;let previous_model=self.thinking_model.clone();
         self.set_state(state,model);
+        let busy=if state==UiState::Thinking&&terminal_editor_available(self.json){
+            Some(BusyInput::start(self.thinking_model.clone().unwrap_or_else(||self.model.clone()),self.effort.clone()))
+        }else{None};
         let result=action(self);
+        if let Some(busy)=busy{
+            for (number,(text,mode)) in busy.finish().into_iter().enumerate(){
+                if !text.trim().is_empty(){
+                    self.queue_arrival(json!({"id":format!("steer{}-{number}",now_ms()),"kind":"submit","text":text,"mode":mode}))?;
+                }
+            }
+        }
         self.set_state(previous,previous_model.as_deref());
         result
     }
@@ -5448,7 +5501,7 @@ fn cli()->Result<()>{
         loop{
             INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
             host.service_background()?;
-            let command=if let Some(v)=host.pending.pop_front(){v}else{
+            let mut command=if let Some(v)=host.pending.pop_front(){v}else{
                 match host.incoming.as_ref().unwrap().recv_timeout(std::time::Duration::from_millis(25)){
                     Ok(v)=>v,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected)=>break,
@@ -5459,6 +5512,9 @@ fn cli()->Result<()>{
                 }
             };
             INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
+            // Terminal control replay is a capability of explicit editor !/!!
+            // commands, not a client-controlled JSON field.
+            if let Some(object)=command.as_object_mut(){object.remove("terminal_controls");}
             let command_id=command["id"].as_str().unwrap_or("").to_string();
             match host.dispatch(command){
                 Ok(false)=>break,Ok(true)=>{},Err(e)=>host.event("error",json!({"command_id":command_id,"error":e.to_string()}))
@@ -5470,6 +5526,13 @@ fn cli()->Result<()>{
         let history=host.home.join("editor-history");
         let _=editor.load_history(&history);
         loop{
+            // Steering captured by the busy prompt is dispatched here if the
+            // active turn ended before consuming it at a cell boundary.
+            if let Some(command)=host.pending.pop_front(){
+                let id=command["id"].as_str().unwrap_or("").to_string();
+                if let Err(error)=host.dispatch(command){host.event("error",json!({"command_id":id,"error":error.to_string()}));}
+                continue;
+            }
             // Idle interrupts clear the editor, never cancel a future operation.
             INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
             host.reload_auth()?;
@@ -5502,8 +5565,8 @@ fn cli()->Result<()>{
                 continue;
             }
             let id=format!("ui{}",host.journal.seq);
-            let v=if let Some(s)=line.strip_prefix("!!"){json!({"id":id,"kind":"shell","command":s,"visible":true})}
-                else if let Some(s)=line.strip_prefix("!"){json!({"id":id,"kind":"shell","command":s})}
+            let v=if let Some(s)=line.strip_prefix("!!"){json!({"id":id,"kind":"shell","command":s,"visible":true,"terminal_controls":true})}
+                else if let Some(s)=line.strip_prefix("!"){json!({"id":id,"kind":"shell","command":s,"terminal_controls":true})}
                 else if let Some(s)=line.strip_prefix("@@"){json!({"id":id,"kind":"python","source":s,"visible":true})}
                 else if let Some(s)=line.strip_prefix("@"){json!({"id":id,"kind":"python","source":s})}
                 else{json!({"id":id,"kind":"submit","text":line})};
@@ -5523,6 +5586,55 @@ fn bind_multiline_keys(editor:&mut rustyline::Editor<Completion,rustyline::histo
     // map UnknownEscSeq to newline (it would reinterpret unrelated responses).
     editor.bind_sequence(rustyline::KeyEvent::ctrl('J'),rustyline::Cmd::Newline);
     editor.bind_sequence(rustyline::KeyEvent(rustyline::KeyCode::Enter,rustyline::Modifiers::SHIFT),rustyline::Cmd::Newline);
+}
+
+// While a provider owns the main thread, canonical tty input remains available
+// for steering. Complete lines are queued at the next safe cell boundary; a
+// partial line remains in the tty buffer and is picked up by the next prompt.
+struct BusyInput{
+    stop:std::sync::mpsc::Sender<()>,
+    lines:std::sync::mpsc::Receiver<(String,String)>,
+    thread:std::thread::JoinHandle<()>,
+}
+impl BusyInput{
+    fn start(model:String,effort:String)->Self{
+        let (stop_tx,stop_rx)=std::sync::mpsc::channel();
+        let (line_tx,line_rx)=std::sync::mpsc::channel();
+        let thread=std::thread::spawn(move||{
+            use std::os::fd::FromRawFd;
+            let fd=unsafe{libc::dup(0)};if fd<0{return;}
+            let mut input=unsafe{File::from_raw_fd(fd)};
+            let began=std::time::Instant::now();
+            {
+                let value=json!({"state":"thinking","model":model,"effort":effort,"elapsed_ms":0});
+                let text=terminal_state(&value,terminal_width()).join(" ");let mut output=io::stdout().lock();
+                let _=write!(output,"\r\x1b[K{text}\r\n{}",terminal_styled_for("> ","1;36",1));let _=output.flush();
+            }
+            loop{
+                if stop_rx.try_recv().is_ok(){break;}
+                let mut poll=libc::pollfd{fd,events:libc::POLLIN,revents:0};
+                let ready=unsafe{libc::poll(&mut poll,1,100)};
+                if ready>0&&poll.revents&libc::POLLIN!=0{
+                    let mut bytes=[0u8;65536];let size=std::io::Read::read(&mut input,&mut bytes).unwrap_or(0);
+                    if size==0{break;}
+                    let mut text=String::from_utf8_lossy(&bytes[..size]).trim_end_matches(['\r','\n']).to_string();
+                    let mode=if text.ends_with('\u{1b}'){text.pop();"followup"}else{"steering"};
+                    let _=line_tx.send((text,mode.into()));
+                    let mut output=io::stdout().lock();let _=write!(output,"{}",terminal_styled_for("> ","1;36",1));let _=output.flush();
+                }else if ready==0{
+                    let elapsed_ms=began.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    let value=json!({"state":"thinking","model":model,"effort":effort,"elapsed_ms":elapsed_ms});
+                    let text=terminal_state(&value,terminal_width()).join(" ");let mut output=io::stdout().lock();
+                    let _=write!(output,"\x1b7\r\x1b[1A\x1b[K{text}\x1b8");let _=output.flush();
+                }
+            }
+            let mut output=io::stdout().lock();let _=write!(output,"\r\x1b[K\x1b[1A\r\x1b[K");let _=output.flush();
+        });
+        Self{stop:stop_tx,lines:line_rx,thread}
+    }
+    fn finish(self)->Vec<(String,String)>{
+        let _=self.stop.send(());let _=self.thread.join();self.lines.try_iter().collect()
+    }
 }
 
 // The tty editor is deliberately a direct reader + buffer + renderer. Rustyline
@@ -5686,6 +5798,7 @@ impl EditBuffer{
 enum EditKey{Byte(u8),Text(String),Sequence(String),Paste(String),Ignore}
 fn editor_report(code:u32,modifier:u32)->EditKey{
     if code==13{return match modifier{1=>EditKey::Byte(13),2=>EditKey::Byte(10),_=>EditKey::Ignore};}
+    if matches!(modifier,3|4)&&matches!(code,8|127){return EditKey::Byte(23);}
     if matches!(modifier,5|6)&&code<128{
         let c=code as u8;if c.is_ascii_alphabetic(){return EditKey::Byte(c.to_ascii_uppercase()-b'@');}
         if code==127{return EditKey::Byte(23);}
@@ -5702,6 +5815,7 @@ fn editor_key(terminal:&mut EditTerminal,host:&mut Host)->rustyline::Result<Opti
     if byte==27{
         let Some(first)=terminal.byte(35)?else{return Ok(Some(EditKey::Ignore));};
         if first==b'\r'{return Ok(Some(EditKey::Byte(10)));}
+        if matches!(first,8|127){return Ok(Some(EditKey::Byte(23)));}
         if first!=b'['&&first!=b'O'{return Ok(Some(EditKey::Sequence(format!("alt:{}",first as char))));}
         let mut bytes=vec![first];for _ in 0..256{
             let Some(b)=terminal.byte(35)?else{return Ok(Some(EditKey::Ignore));};bytes.push(b);
@@ -5831,6 +5945,7 @@ fn terminal_readline(helper:&Completion,history:&[String],output_fd:i32,host:&mu
         match key{
             EditKey::Text(text)|EditKey::Paste(text)=>buffer.replace(buffer.cursor,buffer.cursor,&text),
             EditKey::Byte(13)=>{
+                if buffer.line.trim().is_empty(){continue;}
                 let incomplete=helper.incomplete(&buffer.line)?;
                 if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err(ReadlineError::Interrupted);}
                 if incomplete{buffer.replace(buffer.cursor,buffer.cursor,"\n");}
@@ -6616,6 +6731,50 @@ impl Host {
 }
 
 impl Host {
+    fn cell_view(&self,cell:usize)->Result<Value>{
+        if cell==0{return Err("cell numbers start at 1".into());}
+        let mut view:Option<Value>=None;let mut active=Vec::<usize>::new();
+        let mut indices=HashMap::<&str,usize>::new();
+        for sequence in 0..self.journal.seq{
+            let event=self.journal.event(sequence)?;let kind=event["kind"].as_str().unwrap_or("");let payload=&event["payload"];
+            match kind{
+                "cell_start"=>{
+                    let number=payload["cell"].as_u64().unwrap_or(0) as usize;active.push(number);
+                    if number==cell{view=Some(json!({"cell":cell,"parent_cell":payload["parent_cell"],
+                        "language":payload["language"],"operation":payload["operation"],"source_ref":payload["source_ref"],
+                        "status":"running","complete":false,"say_refs":[],"request_refs":[],"response_refs":[],"usage_refs":[],"context_ids":[]}));}
+                },
+                "cell_end"=>{
+                    if payload["cell"].as_u64()==Some(cell as u64){if let Some(value)=view.as_mut(){
+                        for key in ["status","elapsed_ms","stdout_ref","stderr_ref"]{value[key]=payload[key].clone();}value["complete"]=json!(true);
+                    }}
+                    if let Some(number)=payload["cell"].as_u64().map(|n|n as usize){
+                        if let Some(position)=active.iter().rposition(|n|*n==number){active.remove(position);}
+                    }
+                },
+                "code"=>if let Some(value)=view.as_mut().filter(|value|value["operation"]==payload["operation"]){
+                    value["source_ref"]=json!(format!("H.code[{}]",payload["index"]));value["source"]=payload["source"].clone();
+                },
+                "stream_complete"|"stream_closed"=>if let Some(value)=view.as_mut().filter(|value|value["operation"]==payload["operation"]){
+                    if let (Some(collection),Some(index))=(payload["collection"].as_str(),payload["metadata"]["index"].as_u64()){
+                        value[format!("{collection}_ref")]=json!(format!("H.{collection}[{index}]"));
+                        value[collection]=self.history_value(collection,index as usize)?;
+                    }
+                },
+                "context_add" if active.last()==Some(&cell)=>if let Some(value)=view.as_mut(){value["context_ids"].as_array_mut().unwrap().push(payload["id"].clone());},
+                "say"|"request"|"response"|"usage"=>{
+                    let collection=match kind{"say"=>"say","request"=>"requests","response"=>"responses",_=>"usage"};
+                    let index=*indices.entry(collection).or_insert(0);*indices.get_mut(collection).unwrap()+=1;
+                    if active.last()==Some(&cell){if let Some(value)=view.as_mut(){
+                        let key=match kind{"say"=>"say_refs","request"=>"request_refs","response"=>"response_refs",_=>"usage_refs"};
+                        value[key].as_array_mut().unwrap().push(json!(format!("H.{collection}[{index}]")));
+                    }}
+                },
+                _=>{}
+            }
+        }
+        view.ok_or_else(||"cell does not exist".into())
+    }
     fn history_value(&self,name:&str,index:usize)->Result<Value>{
         if name=="events"{return self.journal.event(index);}
         let value=self.history.get(name).and_then(|v|v.get(index)).ok_or("history index missing")?;
@@ -7365,14 +7524,27 @@ fn terminal_preview(v:&Value,width:usize)->Vec<String>{
         lines.extend(terminal_style_lines(terminal_wrap(&format!("── cell {id} {}",if v["code"]["ref"].as_str().unwrap_or("").starts_with("H.code"){"python"}else{"shell"}),width).0,"1;36"));
     }
     for stream in ["code","stdout","stderr"]{
-        if !v[stream].is_object(){continue;}
+        if !v[stream].is_object()||stream!="code"&&v[stream]["bytes"].as_u64()==Some(0){continue;}
         lines.extend(terminal_style_lines(terminal_wrap(&format!("── {stream}"),width).0,"36"));
-        if let Some(preview)=v[stream]["preview"].as_str(){if !preview.is_empty(){lines.extend(terminal_wrap(preview.trim_end_matches('\n'),width).0);}}
-        let info=format!("{stream}: {} lines, {} chars; {}",v[stream]["lines"],v[stream]["chars"],v[stream]["ref"].as_str().unwrap_or("?"));
-        lines.extend(terminal_style_lines(terminal_wrap(&info,width).0,"2"));
+        if let Some(preview)=v[stream]["preview"].as_str(){if !preview.is_empty(){
+            let raw=stream!="code"&&v["terminal_controls"]==true&&unsafe{libc::isatty(1)==1}
+                &&!std::env::var("TERM").is_ok_and(|term|term=="dumb");
+            if raw{lines.extend(preview.split('\n').map(str::to_owned));}
+            else{lines.extend(terminal_wrap(preview,width).0);}
+        }}
+        if v[stream]["preview_truncated"]==true{
+            let total=v[stream]["lines"].as_u64().unwrap_or(0);
+            let shown=v[stream]["preview"].as_str().map(|text|text.lines().count()).unwrap_or(0);
+            let reference=if let Some(cell)=v["cell"].as_u64(){
+                format!("H.cells[{cell}].{}",if stream=="code"{"source"}else{stream})
+            }else{v[stream]["ref"].as_str().unwrap_or("?").to_string()};
+            let info=if v[stream]["omitted_lines"].as_u64().unwrap_or(0)>0{
+                format!("{shown} lines shown out of {total} · {reference}")
+            }else{format!("preview truncated · {reference}")};
+            lines.extend(terminal_style_lines(terminal_wrap(&info,width).0,"2"));
+        }
     }
-    if let Some(status)=v["status"].as_str(){lines.extend(terminal_style_lines(terminal_wrap(&format!("status: {status}"),width).0,terminal_result_style(status)));}
-    lines.push(terminal_styled(&"─".repeat(width),"2"));lines.push(String::new());lines
+    lines.push(String::new());lines
 }
 
 #[cfg(test)]
@@ -7398,7 +7570,7 @@ mod rendering_e2e {
     fn e2e_say_markdown_wraps_by_word_and_keeps_original(){
         let text="# Heading\n\nalpha beta gamma delta epsilon zeta eta theta\n\n- **bold** text with `code`\n\n> quoted words inside a block quote\n\n```python\nprint('literal')\n```";
         let (output,journal)=run(&format!("agent.say({})",serde_json::to_string(text).unwrap()),24,false);
-        let rendered=output.split("── cell").next().unwrap();
+        let rendered=output.split("\n── code\n").next().unwrap();
         assert!(!rendered.contains("**bold**"),"Markdown markers must be rendered in say (not rewritten source): {output}");
         assert!(output.contains("• bold text with code"));assert!(output.contains("│ quoted words inside"));
         assert!(output.lines().any(|l|l=="alpha beta gamma delta"),"word wrapping: {output}");
@@ -7416,7 +7588,7 @@ mod rendering_e2e {
         assert!(!rows.is_empty(),"must render a bordered table: {output}");
         assert_eq!(rows.len(),3,"header plus minimal two body lines, not equal-width tall table: {output}");
         assert!(rows.iter().any(|l|l.contains("alpha beta gamma delta")),"wide content column: {output}");
-        assert!(!output.split("── cell").next().unwrap().contains("| --- |"));
+        assert!(!output.split("\n── code\n").next().unwrap().contains("| --- |"));
         for l in rows{assert!(l.chars().count()<=32,"too wide: {l}");}
     }
     #[test]
@@ -7490,17 +7662,56 @@ finally:
             .map(|v|v["payload"]["text"].as_str().unwrap()).collect::<String>(),format!("{text}\n"));
     }
     #[test]
+    fn e2e_direct_shell_controls_reach_tty_but_python_controls_do_not(){
+        let home=std::env::temp_dir().join(format!("py-shell-controls-{}-{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let script=r#"
+import os,pty,fcntl,termios,subprocess,select,time,sys
+m,s=pty.openpty()
+def controlling():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
+env=dict(os.environ,PY_HOME=sys.argv[2],TERM='xterm',NO_COLOR='1')
+p=subprocess.Popen([sys.argv[1],'--no-model'],stdin=s,stdout=s,stderr=s,env=env,preexec_fn=controlling);os.close(s);data=bytearray()
+def wait(needle,start=0):
+ end=time.monotonic()+6
+ while time.monotonic()<end:
+  if select.select([m],[],[],.05)[0]:
+   try:data.extend(os.read(m,65536))
+   except OSError:pass
+  if needle in data[start:]:return
+  if p.poll() is not None:break
+ raise AssertionError((needle,bytes(data[start:])))
+wait(b'> ');time.sleep(.05);start=len(data);os.write(m,b"!printf '\\033[2JRAW-SHELL'\r");wait(b'\x1b[2JRAW-SHELL',start);wait(b'\x1b[?2004h',start);time.sleep(.05)
+start=len(data);os.write(m,b'@print("\\033[2JPYTHON")\r');wait(b'\\x1b[2JPYTHON',start);wait(b'\x1b[?2004h',start);time.sleep(.05)
+assert b'\x1b[2JPYTHON' not in data[start:],bytes(data[start:])
+os.write(m,b'/quit\r');p.wait(timeout=4);os.close(m)
+"#;
+        let out=crate::test_command("python3").args(["-c",script,&std::env::var("PY_HARNESS_BIN").unwrap(),home.to_str().unwrap()]).output().unwrap();
+        assert!(out.status.success(),"direct shell controls failure:\n{}\n{}",String::from_utf8_lossy(&out.stderr),String::from_utf8_lossy(&out.stdout));
+    }
+    #[test]
     fn e2e_cell_preview_boundaries_wrap_without_changing_history(){
         let source="print('alpha beta gamma delta epsilon zeta')\nimport sys\nprint('stderr alpha beta gamma delta',file=sys.stderr)";
         let (output,journal)=run(source,30,false);
-        assert!(output.contains("── cell 1 · python")&&output.contains("operation render-cell"),"numbered operation boundary: {output}");
+        assert_eq!(output.matches("── cell 1 · python").count(),1,"one numbered cell boundary: {output}");
+        assert!(!output.contains("operation render-cell")&&!output.contains("H.code[0]"),"internal metadata leaked into presentation: {output}");
         assert!(!output.contains("── cell render-cell"),"no duplicate legacy operation header: {output}");
         assert!(output.contains("── stdout")&&output.contains("── stderr"));
         assert!(output.contains("alpha beta gamma delta"));
-        assert!(output.contains("status: ok"));
-        assert!(output.contains("H.stdout[0]")&&output.contains("H.stderr[0]"));
+        assert!(output.contains("── cell 1 · python")&&output.contains("status:")&&output.contains("ok"));
+        assert!(!output.contains("stdout:")&&!output.contains("stderr:")&&!output.contains("H.stdout[0]")&&!output.contains("H.stderr[0]"));
         assert_eq!(journal.iter().filter(|v|v["kind"]=="stream"&&v["payload"]["collection"]=="stdout")
             .map(|v|v["payload"]["text"].as_str().unwrap()).collect::<String>(),"alpha beta gamma delta epsilon zeta\n");
+    }
+    #[test]
+    fn e2e_preview_omits_empty_streams_and_summarizes_only_truncation(){
+        let (empty,_)=run("pass",80,false);
+        assert!(!empty.contains("── stdout")&&!empty.contains("── stderr"),"{empty}");
+        let (short,_)=run("print('one')",80,false);
+        assert!(short.contains("── stdout")&&short.contains("one"),"{short}");
+        assert!(!short.contains("lines shown out of")&&!short.contains("H.stdout["),"{short}");
+        let (long,_)=run("print(*range(20),sep='\\n')",80,false);
+        assert!(long.contains("12 lines shown out of 20 · H.cells[1].stdout"),"{long}");
+        assert!(!long.contains("── stderr"),"{long}");
     }
 }
 
@@ -10054,6 +10265,20 @@ assert sources()==['print("large-editor-responsive")'],sources()
 assert output()=='large-editor-responsive\n',output()
 "#);}
     #[test]
+    fn e2e_editor_alt_backspace_erases_words_in_legacy_kitty_and_xterm_reports(){pty(r#"
+for report,replacement in [('\x1b\x7f','three'),('\x1b[127;3u','six'),('\x1b[27;3;127~','nine')]:
+ send('!echo one two');pump();send(report);command(replacement)
+assert output()=='one three\none six\none nine\n',output()
+commands=[e['payload']['source'] for e in records() if e['kind']=='intent' and e['payload']['type']=='shell']
+assert commands==['echo one three','echo one six','echo one nine'],commands
+"#);}
+    #[test]
+    fn e2e_editor_empty_enter_keeps_one_prompt(){pty(r#"
+start=len(data);ready=data.count(b'\x1b[?2004h');send('\r'*8);pump(.1)
+assert data.count(b'\x1b[?2004h')==ready and b'\r\n' not in data[start:],bytes(data[start:])
+command('@print("after-empty")');assert sources()==['print("after-empty")'] and output()=='after-empty\n'
+"#);}
+    #[test]
     fn e2e_editor_extended_printable_keys_ctrl_j_and_release(){pty(r#"
 send('@print("\x1b[97:65;2u\x1b[946u\x1b[128105u")\x1b[13;2:3u');pump()
 assert not sources(),sources()
@@ -10123,6 +10348,15 @@ states=[v for v in c.all if v['kind']=='state'];assert states[0]['state']=='idle
 assert all('model' not in v for v in states if v['state']!='thinking'),states
 "#);}
     #[test]
+    fn e2e_state_h_cells_use_presented_number_as_canonical_provenance(){fixture(r#"
+c=Client();c.send(id='first',kind='python',source='print("alpha")');c.until('completed')
+c.send(id='inspect',kind='python',source='import json; print(json.dumps(H.cells[1],sort_keys=True))');c.until('completed');c.close()
+text=''.join(v['payload']['text'] for v in events() if v['kind']=='stream' and v['payload']['operation']=='inspect' and v['payload']['collection']=='stdout')
+cell=json.loads(text)
+assert cell['cell']==1 and cell['language']=='python' and cell['status']=='ok' and cell['complete'] is True,cell
+assert cell['source_ref']=='H.code[0]' and cell['stdout_ref']=='H.stdout[0]' and cell['stderr_ref']=='H.stderr[0]',cell
+"#);}
+    #[test]
     fn e2e_state_input_cancel_and_reset_restore_idle(){fixture(r#"
 c=Client();c.send(id='input',kind='python',source='input("name? ")');prompt=c.until('input_prompt')
 assert [v['state'] for v in c.all if v['kind']=='state'][-1]=='input',c.all
@@ -10181,16 +10415,17 @@ def wait(text,start=0):
 def ready(start):wait(b'\x1b[?2004h',start)
 try:
  ready(0);assert b'openai/gpt-4.1' not in data,data
- start=len(data);os.write(m,b'@agent.llm("hello",model="openai/fixture")\r');wait(b'\xc2\xb7 thinking \xc2\xb7 openai/fixture',start)
+ start=len(data);os.write(m,b'@agent.llm("hello",model="openai/fixture")\r');wait(b'\xe2\x80\xba thinking \xc2\xb7 openai/fixture',start)
  assert not any(v['kind']=='cell_end' for v in events()),events()
- release.set();ready(start);assert b'cell 1' in data[start:] and b'elapsed' in data[start:] and b'\xc2\xb7 idle' in data[start:],data
- start=len(data);os.write(m,b'@input("state-input? ")\r');wait(b'state-input? ',start);wait(b'\xc2\xb7 input',start)
- os.write(m,b'\x03');ready(start);assert b'cell 2' in data[start:] and b'\xc2\xb7 idle' in data[start:],data
- start=len(data);os.write(m,b'/login openai api-key\r');wait(b'API key (hidden): ',start);assert b'\xc2\xb7 login' in data[start:],data
- os.write(m,b'\x03');ready(start);assert b'\xc2\xb7 idle' in data[start:],data
+ wait(b'\r\n> ',start)
+ release.set();ready(start);assert b'cell 1' in data[start:] and b'ms' in data[start:] and b'\xe2\x80\xba idle' in data[start:],data
+ start=len(data);os.write(m,b'@input("state-input? ")\r');wait(b'state-input? ',start);wait(b'\xe2\x80\xba input',start)
+ os.write(m,b'\x03');ready(start);assert b'cell 2' in data[start:] and b'\xe2\x80\xba idle' in data[start:],data
+ start=len(data);os.write(m,b'/login openai api-key\r');wait(b'API key (hidden): ',start);assert b'\xe2\x80\xba login' in data[start:],data
+ os.write(m,b'\x03');ready(start);assert b'\xe2\x80\xba idle' in data[start:],data
  assert not os.path.exists(home+'/auth.json')
- release.clear();start=len(data);os.write(m,b'@agent.llm("cancel",model="openai/fixture")\r');wait(b'\xc2\xb7 thinking \xc2\xb7 openai/fixture',start)
- os.kill(p.pid,signal.SIGINT);ready(start);release.set();assert b'\xc2\xb7 idle' in data[start:],data
+ release.clear();start=len(data);os.write(m,b'@agent.llm("cancel",model="openai/fixture")\r');wait(b'\xe2\x80\xba thinking \xc2\xb7 openai/fixture',start)
+ os.kill(p.pid,signal.SIGINT);ready(start);release.set();assert b'\xe2\x80\xba idle' in data[start:],data
  start=len(data);os.write(m,b'@pass\r');ready(start);os.write(m,b'/quit\r');assert p.wait(timeout=5)==0
  ends=[v['payload'] for v in events() if v['kind']=='cell_end'];assert [v['cell'] for v in ends]==[1,2,3,4],ends
  assert ends[0]['status']=='ok' and ends[1]['status']=='cancelled' and ends[2]['status']=='cancelled' and ends[3]['status']=='ok',ends
@@ -10232,12 +10467,45 @@ assert [v['status'] for v in ends]==['worker_crashed','error','ok'],ends
 assert status['state']=='idle' and status['cells']==3,status
 "#);}
     #[test]
+    fn e2e_state_busy_prompt_accepts_steering_during_thinking(){fixture(r#"
+import pty,fcntl,termios,select,http.server
+requests=[]
+class Handler(http.server.BaseHTTPRequestHandler):
+ def log_message(self,*a):pass
+ def do_POST(self):
+  body=json.loads(self.rfile.read(int(self.headers['Content-Length'])));requests.append(body)
+  if len(requests)==1:time.sleep(.4)
+  code='agent.say("first")\nagent.loop.stop()' if len(requests)==1 else 'agent.say("steered")\nagent.loop.stop()'
+  data=json.dumps({'output':[{'type':'message','content':[{'type':'output_text','text':code}]}]}).encode()
+  self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(data)
+srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=srv.serve_forever,daemon=True).start()
+open(home+'/config.json','w').write(json.dumps({'providers':{'openai':{'base_url':'http://127.0.0.1:'+str(srv.server_port)+'/v1','models':[{'id':'fixture','api':'openai-responses'}]}}}))
+env.update(OPENAI_API_KEY='fixture',PY_MODEL='openai/fixture',TERM='xterm');env.pop('NO_COLOR',None)
+m,s=pty.openpty();fcntl.ioctl(s,termios.TIOCSWINSZ,__import__('struct').pack('HHHH',24,100,0,0))
+def tty():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
+p=subprocess.Popen([sys.argv[1]],stdin=s,stdout=s,stderr=s,preexec_fn=tty,env=env);os.close(s);data=bytearray()
+def pump(timeout=.05):
+ if select.select([m],[],[],timeout)[0]:data.extend(os.read(m,65536))
+def wait(test,label):
+ end=time.monotonic()+8
+ while not test():assert time.monotonic()<end,(label,bytes(data[-5000:]));pump()
+wait(lambda:b'\x1b[?2004h' in data,'initial prompt');prompts=data.count(b'\x1b[?2004h');os.write(m,b'hello\r')
+wait(lambda:b'\xe2\x80\xba thinking' in data and b'\r\n\x1b[1;36m> \x1b[0m' in data,'busy steering prompt')
+os.write(m,b'steer now\r');wait(lambda:len(requests)>=2,'steered request')
+wait(lambda:data.count(b'\x1b[?2004h')>prompts,'final prompt')
+assert 'steer now' in json.dumps(requests[1]),requests
+os.write(m,b'/quit\r');assert p.wait(timeout=5)==0;os.close(m);srv.shutdown()
+ev=events();assert any(v['kind']=='queue_arrival' and v['payload']['command']['text']=='steer now' for v in ev),ev
+assert any(v['kind']=='queue_delivered' for v in ev),ev
+"#);}
+    #[test]
     fn e2e_state_human_cell_end_status_refs_and_wrap(){fixture(r#"
 env['COLUMNS']='39'
 out=subprocess.run([sys.argv[1],'--no-model'],input='@pass\n@raise ValueError("fixture")\n!printf shell\n/quit\n',text=True,capture_output=True,env=env,timeout=12)
 assert out.returncode==0,(out.stdout,out.stderr)
 assert 'cell 1' in out.stdout and 'cell 2' in out.stdout and 'cell 3' in out.stdout,out.stdout
-assert 'elapsed' in out.stdout and 'H.code[0]' in out.stdout and 'H.stdout[' in out.stdout,out.stdout
+assert 'ms · status: ok' in out.stdout and 'ms · status: error' in out.stdout,out.stdout
+assert 'H.code[' not in out.stdout and 'H.stdout[' not in out.stdout,out.stdout
 assert all(len(l)<=39 for l in (out.stdout+out.stderr).splitlines()),out.stdout
 "#);}
 }
@@ -10444,7 +10712,7 @@ mod styled_e2e{
 import os,sys,subprocess,tempfile,pty,fcntl,termios,struct,select,time,json,re,glob,threading,http.server
 home=tempfile.mkdtemp(prefix='py-style-');env=dict(os.environ,PY_HOME=home,TERM='xterm-256color',COLUMNS='48')
 env.pop('NO_COLOR',None)
-def plain(text):return re.sub(r'\x1b\[[0-9;]*m','',text)
+def plain(text):return re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',text).replace('\r','\n')
 def setup():
  master,slave=pty.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',24,48,0,0));return master,slave
 def controlling():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
@@ -10475,7 +10743,8 @@ assert '\x1b[1;36m' in colored and '\x1b[32m' in colored,colored
 assert '\x1b' not in unstyled and '\x1b' not in dumb,(unstyled,dumb)
 visible=plain(colored)
 assert visible.count('── cell 1 · python')==1 and '── cell style' not in visible,visible
-assert 'cell 1 · ok · elapsed' in visible and 'H.stdout[0]' in visible and 'H.stderr[0]' in visible,visible
+assert re.search(r'cell 1 · python \d+ms · status: ok',visible),visible
+assert 'H.stdout[0]' not in visible and 'H.stderr[0]' not in visible,visible
 assert '\x1b]52;' not in colored and '\x07' not in colored,colored
 assert all(len(re.sub('[界]','xx',line))<=48 for line in visible.splitlines()),visible
 session=glob.glob(home+'/sessions/*.jsonl')[0];events=[json.loads(l) for l in open(session)]
@@ -10553,9 +10822,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=srv.serve_forever,daemon=True).start()
 open(home+'/config.json','w').write(json.dumps({'providers':{'openai':{'base_url':'http://127.0.0.1:'+str(srv.server_port)+'/v1','models':[{'id':'fixture','api':'openai-responses'}]}}}));env['OPENAI_API_KEY']='fixture-only'
 out=human("agent.llm('hello',model='openai/fixture')");visible=plain(out)
-assert '\x1b[35m' in out and '· thinking · openai/fixture [medium]' in visible,visible
-assert all('openai/fixture' not in line for line in visible.splitlines() if line.startswith('·') and 'thinking' not in line),visible
-assert visible.rstrip().endswith('· idle'),visible
+assert '\x1b[35m' in out and '› thinking · openai/fixture [medium]' in visible,visible
+assert all('openai/fixture' not in line for line in visible.splitlines() if line.startswith('›') and 'thinking' not in line),visible
+assert '› idle' not in visible,visible
 srv.shutdown()
 "#);}
 }
@@ -10693,7 +10962,7 @@ stdout=''.join(v['payload']['text'] for v in records() if v['kind']=='stream' an
     fn e2e_inline_bottom_narrow_resize_and_repeated_close(){fixture(r#"
 fcntl.ioctl(m,termios.TIOCSWINSZ,struct.pack('HHHH',6,32,0,0));screen.resize(6,32)
 command('@print("bottom-edge")')
-menu('/');assert '> /' in screen.text() and '· idle' in screen.text(),screen.text()
+menu('/');assert '> /' in screen.text() and '› idle' in screen.text(),screen.text()
 fcntl.ioctl(m,termios.TIOCSWINSZ,struct.pack('HHHH',8,22,0,0));screen.resize(8,22)
 send('model');wait(lambda:'Find: /model' in screen.text(),'resize/filter');assert '> /' in screen.text(),screen.text()
 close_picker('\r');assert '> /model' in screen.text(),screen.text();send('\x15')
