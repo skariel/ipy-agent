@@ -1,0 +1,18 @@
+[package]
+name = "py-rust"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "py"
+path = "main.rs"
+
+[dependencies]
+serde_json = "1"
+base64 = "0.22"
+ring = "0.17"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rustyline = "15"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
