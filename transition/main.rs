@@ -22,6 +22,8 @@ partial; unchecked families are not accepted as complete.
 - All session records live in JSONL under global ~/.py.
 - Resume restores H and context, but starts a fresh Python namespace.
   Never deserialize old variables or execute old cells to reconstruct state.
+  Explicit core Python initialization (section 30) runs frozen startup source,
+  not historical cells; failed/unknown startup requires explicit retry.
 - Resume adds a model-visible notice: "Session loaded into fresh Python.
   Previous variables are undefined; H and context are restored."
   The model decides what to reconstruct.
@@ -44,7 +46,8 @@ Pi references: coding-agent README, core/auth-storage.ts, model-registry.ts,
 agent-session.ts, interactive-mode.ts, docs/keybindings.md, docs/providers.md.
 Pig references: agent/queue.go, cmd/pig, ai/auth and model code.
 Pin behavior to the agreed reference versions, not moving upstream "latest".
-No copying their tools, extensions, skills, agent loop, or automatic compaction.
+No copying their tools, extensions, skills implementation, agent loop, or automatic compaction.
+The harness's ordinary-file durable entries are defined independently in section 30.
 Review licenses/attribution before copying code or catalog data.
 Provider priorities and exact compatibility surface remain decisions.
 
@@ -71,6 +74,8 @@ The agent's only general way to insert new payloads is explicit read_text or
 read_raw; printing, say, H retrieval, or a helper result never does so.
 Exceptions are the agreed source/user-message routing, collapse replacements,
 system control notices and usage metadata, not alternative payload channels.
+An explicitly requested wakeup may select its bounded reason and task status,
+counts and H references as control metadata (section 29), never task output.
 Normal UI rendering is independent of what the model sees.
 
 ## 4. History and storage contract (proposed)
@@ -120,10 +125,16 @@ One writer per session (exclusive lock). Schema upgrades must be explicit.
 agent.say(text)
   User-facing Markdown event; stored under H.say; no context inclusion.
   No final flag. Does not stop the loop.
-agent.loop.stop()
-  Requests return to user after current cell successfully finishes.
+agent.loop.stop(*, wakeup=None)
+  Stages return to user after current cell successfully finishes.
   Does not terminate Python or the program. Subsequent code in the cell runs.
-  On cell failure, failure wins; do not claim successful completion.
+  wakeup=(seconds, reason) optionally requests a one-shot delayed continuation;
+  None schedules no wakeup. Repeated calls replace the staged stop request.
+  Arm the wakeup only when a successful cell actually stops the outer turn.
+  On cell failure/cancellation, failure wins and the staged stop/wakeup is
+  discarded. Steering that overrides stop also discards its staged wakeup.
+  Stop settlement and wakeup creation form one durable transaction; section 29
+  defines scheduling, validation, recovery and management.
 agent.context.read_text(text_or_ref, *, start=0, stop=None, max_chars=8000)
   Accepts selected text directly, or a typed H reference with optional slicing.
   Commits a context item, then returns that item's stable context ID.
@@ -133,11 +144,17 @@ agent.context.read_text(text_or_ref, *, start=0, stop=None, max_chars=8000)
   it is never silently truncated. The caller may explicitly select a smaller slice.
 agent.context.read_raw(ref)
   Explicitly attaches a supported raw image to context after capability,
-  format, size and decoding checks. Original stays in H unchanged.
+  format, size and decoding checks, then returns the new stable context ID.
+  The active attachment binding belongs to that context item; the immutable
+  image payload belongs to H.raw. Removing or textually replacing the item
+  must remove the active binding without removing or rewriting H.raw.
   No automatic image transmission from display(), file creation, or bytes.
   v1 proposal: raster images only, not PDFs/audio/video.
 agent.context.items()
-  Returns IDs, roles, references and counts, not full payloads.
+  Returns IDs, roles, references and counts, not full payloads. For an active
+  raw attachment it also returns non-payload metadata: attachment kind, MIME,
+  H.raw reference, dimensions/byte count when known, and budget estimate.
+  An omitted/detached image must not still be reported as active.
 agent.context.collapse(start_id, end_id, summary)
   Standalone literal-only context control using stable boundary IDs.
   Exact range/end-text preservation and pressure behavior are in section 6.
@@ -147,6 +164,23 @@ agent.sh(command, *, cwd=None, env=None, timeout=None)
   Runs shell, journals source/output/status, returns a structured result
   containing refs and counts. No automatic context payload.
   Shell/cwd defaults must be documented; timeout does not mean rollback.
+agent.bgtasks.run(source, *, kind="shell", cwd=None, env=None, timeout=None,
+                  name=None, wakeup_reason=None)
+  Starts an independent background job and returns task metadata including
+  stable id/status and immediately reserved stdout/stderr H references.
+  kind is shell or python. Python jobs use a fresh isolated interpreter, not
+  the main persistent namespace; they have no agent/H helper bridge in v1.
+  Source/output/status stay in H; output is never automatically selected.
+  wakeup_reason opts into one continuation on terminal task completion.
+agent.bgtasks.list(state=None)
+  Returns task metadata only; optional exact-state filter.
+agent.bgtasks.get(task_id)
+  Returns current metadata/counts/completeness and H references, not payloads.
+agent.bgtasks.kill(task_id, *, force=False)
+  Requests bounded process-group cancellation; force requests immediate KILL.
+  Returns metadata, not a promise of rollback or synchronous termination.
+  Repeated kill of a terminal task is harmless. Missing task IDs reject.
+  Blocking wait/live follow and convenience run aliases are not in initial scope.
 agent.loop.reset_python()
   Proposal: schedules fresh CPython after this cell. No automatic replay;
   records new generation and inserts the same variables-lost lifecycle notice.
@@ -240,8 +274,15 @@ Every accepted code submission is saved in H.code, including rejected collapse
 submissions. Original messages already exist in the session journal; collapse
 records their event references and new summary. No `collapsed` global/collection
 and no duplicate archive of full messages. H/context APIs expose original refs.
-Collapsed images are no longer attached, but remain available through H.raw;
-explicit read_raw reattaches them.
+Collapse detaches every image bound to any consumed context item, including
+an image whose ID is the retained start boundary and an image at a preserved
+end boundary. Retaining an ID or copying the end item's text/provenance must
+not retain its binary attachment as an accidental side effect. The replacement
+may contain an H.raw reference but is text-only. Originals remain immutable in
+H.raw; explicit read_raw creates a fresh context item/attachment to reattach
+one. Commit the replacement items and resulting active-attachment set in the
+same context transaction, and persist enough detach state that resume cannot
+resurrect an attachment from an older attachment event.
 
 Expose stable boundary markers at user turns, every 10 completed cells, and
 on context pressure (cadence provisional, inherited from this harness).
@@ -323,10 +364,13 @@ calls; rejection of other stream reads; read-budget failure; and continued
 forced mode after a successful stderr read.
 
 ## 7. Scheduling, routing, interruption
-Exactly one outer request or Python cell active at a time. The Rust event loop
-must still service terminal input, IPC, output drains and cancellation.
+Exactly one foreground outer request or persistent-worker Python cell is
+active at a time. Independently managed background shell/isolated-Python jobs
+may run concurrently under section 29; they never enter the main namespace.
+The Rust event loop must still service terminal input, IPC, output drains,
+task controls, timer deadlines and cancellation during foreground and idle waits.
 The inner agent.llm call is supported during a Python cell; it is tracked as
-its own request, not a competing outer turn. No parallel subcalls in v1.
+its own request, not a competing outer turn. No parallel model subcalls in v1.
 
 Routing at the terminal (not within Python), frozen:
 - ordinary text: save complete H.user message, queue, deliver capped user task.
@@ -439,7 +483,9 @@ Minimum commands:
  /help /hotkeys /login /logout /auth /model /models /effort (/think alias)
  /status /config /interrupt /quit (/exit alias)
  /new /sessions /session /resume /recovery /reset /context /compact
-No /plugins, packages, skills, tool controls, or extension commands.
+ /tasks /task /bg /wakeups /wakeup
+No /plugins, packages, /skills management, tool controls, or extension commands.
+Durable entries use ordinary files (section 30); /config manages settings.
 Resolve /resume session-versus-request ambiguity before implementation;
 propose /session resume <id> for sessions and /resume for pending requests.
 Help must describe routing, no sandbox, explicit context, reset/resume loss,
@@ -532,6 +578,9 @@ Draft acceptance families (none fully verified):
   stdin correlation, EOF/cancel, no ANSI/prose, backpressure and ordering.
 - USAGE: cache tokens counted once, outer+inner cumulative totals, unknown
   partial/cancelled attempts, resume continuity, model/effort display.
+- BACKGROUND: isolated jobs, interleaved durable output, responsive controls,
+  stop settlement, idle/busy wakeups, draft preservation, crash uncertainty,
+  explicit recovered-wakeup confirmation and bounded shutdown (section 29).
 
 Representative tests to write, not green placeholder tests:
   context_print_is_not_insertion
@@ -561,6 +610,7 @@ Draft implementation checklist:
 [ ] R11 JSON input/output and command deduplication.
 [ ] R12 Usage accounting and request-only recovery.
 [ ] R13 Requirement-by-requirement passing tests and coverage audit.
+[ ] R14 Background-job lifecycle, service pump and one-shot wakeups.
 All boxes intentionally remain empty.
 
 ## 12. Collapsed provenance (confirmed)
@@ -583,7 +633,8 @@ event; that would hide the actual originals.
 The merged end user/summary text described in section 6 remains verbatim and
 carries its own provenance. Rendering distinguishes summarized originals from
 the preserved end text; later collapse unions both. Re-collapse must not
-duplicate end text or lose image references.
+duplicate end text or lose immutable H.raw references, but neither preserved
+text nor recursive provenance makes an old image attachment active again.
 Original ranges are immutable across resume. Removed context does not remove
 history. Reading originals back adds a new selected context item, not an undo.
 Test exact range unions across repeated collapse, adjacent and disjoint ranges,
@@ -774,8 +825,8 @@ again before implementation so no requirement is overlooked.
       Tests: collapse_requires_actual_reduction; evidence: not run; review: pending.
 [ ] R05.10 Stale revision/missing/reversed boundaries reject without deleting queued input.
       Tests: collapse_stale_or_invalid_boundaries; evidence: not run; review: pending.
-[ ] R05.11 Collapse evicts image attachments; explicit reread can reattach originals.
-      Tests: collapse_image_evict_and_reattach; evidence: not run; review: pending.
+[ ] R05.11 Collapse atomically detaches images from all consumed IDs, including retained-start and preserved-end IDs; explicit reread creates a fresh attachment.
+      Tests: collapse_image_evict_and_reattach, collapse_retained_start_detaches_image, collapse_preserved_end_detaches_image, resume_does_not_resurrect_collapsed_image; evidence: not run; review: pending.
 [ ] R05.12 Duplicate commits and resume neither replay collapse nor duplicate retained calls.
       Tests: collapse_idempotent_resume; evidence: not run; review: pending.
 [ ] R05.13 Forced mode allows only literal standalone collapse and restricted stderr reads.
@@ -1048,9 +1099,19 @@ Eligible items are context payloads explicitly classified as execution/helper
 output. A read_text selection is output unless its typed provenance identifies
 protected source/user material. Never automatically evict generated source,
 user messages, retained collapse calls/summaries, system instructions or raw
-attachments under this text-output policy. H is never truncated or rewritten.
+attachments under this text-output policy. In particular, read_raw must not be
+classified as ordinary evictable text merely because its context item has a
+textual `[image H.raw[n]]` label. H is never truncated or rewritten.
 Plain selected strings are journaled before insertion, so they also have a
 stable H event reference even if their original source provenance is unknown.
+
+Attachment membership is part of committed context state, not an independent
+append-only map that outlives its item. Every context replacement computes the
+active attachment set from the resulting items. If any future policy replaces
+an attachment-bearing item with a text-only omission reference, it must detach
+the binary in that same atomic transaction even when the replacement preserves
+the old context ID. Resume replays the latest committed membership and must not
+reactivate superseded attachment events.
 
 Replace each eligible old payload in place with a stable compact reference:
 H reference, selected offsets where known, original size/counts, and omission
@@ -1088,8 +1149,8 @@ cache hits are not a deterministic pass/fail substitute for request inspection.
 ### Batched-eviction E2E witnesses
 [ ] R04.15 Automatic old-output removal commits in batches at safe request boundaries.
       Tests: e2e_output_eviction_batches; evidence: not run; review: pending.
-[ ] R04.16 Between batches, historical rendering is stable; replacement refs preserve IDs and H originals.
-      Tests: e2e_output_eviction_cache_prefix_stability; evidence: not run; review: pending.
+[ ] R04.16 Between batches, historical rendering is stable; replacement refs preserve IDs and H originals, while raw attachment items remain active and ineligible for text eviction.
+      Tests: e2e_output_eviction_cache_prefix_stability, e2e_output_eviction_does_not_reclassify_or_detach_raw; evidence: not run; review: pending.
 [ ] R05.19 Insufficient batched eviction enters forced mode rather than incremental protected-content trimming.
       Tests: e2e_eviction_then_forced_collapse; evidence: not run; review: pending.
 
@@ -1481,6 +1542,460 @@ This supersedes browser-OAuth/no-style exclusions only for the witnessed paths.
 No live subscription login/invocation, Google/Gemini browser OAuth, exhaustive
 terminal/grapheme/vendor proof, configurable theme framework, reverse-search or
 external editor is claimed. Full R01-R13 migration acceptance remains unchecked.
+
+## 28. Inline completion menus (current user request)
+[x] R10.31 Ambiguous Tab completion renders a compact live fuzzy menu immediately
+      below the complete editable prompt, on the normal terminal screen. Keep
+      input and preceding output visible; never switch to the alternate screen
+      or clear the whole display for completion. Filtering/navigation/selection,
+      paste bounds and cancellation semantics are unchanged. Allocate bounded
+      menu rows; scrolling to reserve space at the bottom must preserve input.
+      Selection/cancel/error clears only the temporary menu and restores the
+      editable source/caret. Multiline and middle-of-input completion, narrow
+      terminals and resize must remain usable. JSON stdout stays machine-only;
+      JSON interactive menus use the existing UI terminal channel. Tiny screens
+      may decline an ambiguous menu when input plus choices cannot fit.
+Actual CLI/PTY screen-level witnesses (inline_picker_e2e):
+- e2e_inline_prompt_output_and_selection_cancel_coexist: recent output, source
+  prompt and filtered choices coexist in the normal screen; Enter chooses but
+  does not submit, cancellation clears the menu without changing the input.
+- e2e_inline_multiline_middle_caret_select_and_cancel: menu follows ALL visible
+  source lines, not the caret's line; both selected and cancelled completion
+  restore the exact middle-line caret and preserve closing syntax/suffixes.
+- e2e_inline_bottom_narrow_resize_and_repeated_close: reserve rows by natural
+  scrolling, clip to the UI terminal width, preserve the input across resize,
+  repeated Ctrl-C and subsequent execution. No alternate-screen/full-clear codes.
+- e2e_inline_height_shrink_closes_without_changing_source: a height shrink that
+  cannot hold the reserved menu cancels it, restores source/caret, and leaves
+  editing/submission usable. Width changes redraw clipped choices. Terminal
+  reflow is vendor-controlled; exhaustive reflow/terminal proof is not claimed.
+- e2e_inline_tiny_terminal_declines_without_losing_input: two-row terminal keeps
+  the prompt instead of opening an unusable menu or switching screen buffers.
+- e2e_inline_json_menu_uses_ui_terminal_not_stdout: inline menu uses stderr's
+  terminal while stdout remains JSONL, including the selected /models command.
+Tests include a small test-only VT screen model to check actual visible ordering,
+context retention and caret position, rather than merely matching menu labels.
+Post-restart baseline witness: the five initial tests all fail against the old
+release (alternate screen/input lost/JSON picker absent), 0/5 in
+/tmp/py-inline-baseline-red.log. New scope passes in /tmp/py-inline-edge.log.
+Existing CLI/PTY drivers now wait for menu-region cleanup/repaint instead of the
+old alternate-buffer exit; original source, selection, paste and control-safety
+assertions remain. Menu rows are bounded by eight and half the screen, leaving
+space for source and recent output where possible; preceding output scrolls
+naturally, never gets intentionally erased. Selection filtering is still bounded.
+Final validation: 172 tests pass in debug and release, 0 failed/ignored;
+171 actual-CLI/PTY witnesses and one bounded-table equivalence test. Inline
+scope passes 50/50 repeated six-test runs (300 CLI/PTY trials). Screen snapshots
+wait for completed menu/editor repaint frames, not just disappearance of labels
+or receipt of an earlier cursor marker; caret/source assertions are unchanged.
+Logs: /tmp/py-inline-full.log, /tmp/py-inline-release.log,
+/tmp/py-inline-repeat-{1..50}.log; Clippy all targets with -D warnings passes in
+/tmp/py-inline-clippy.log. This row supersedes only the alternate-screen picker;
+all section27 browser, privacy, semantic-state and source-routing rules remain.
+
+## 29. Background jobs and one-shot wakeups (approved scope)
+### Ownership, execution and history
+Background jobs are session-owned and managed only while this harness process
+is alive. They are not a daemon, sandbox, persistent Python cells or parallel
+model subcalls. Keep one foreground execution pipeline. Initial maximum is
+four live jobs per session; reject excess starts before dispatch. A task has a
+stable session-scoped ID, kind, optional name, state, source/intent reference,
+start/end times, exit/signal metadata, timeout and stdout/stderr references.
+States distinguish starting/running, succeeded/failed, cancelling/cancelled,
+killed/timed_out and outcome_unknown; never report cancellation as success.
+
+run validates literal option types before side effects. source is a string;
+kind is shell/python; cwd is an optional directory path; env is an optional
+string-to-string mapping merged into the inherited environment; timeout is an
+optional finite positive number, not bool. name is optional bounded text.
+Shell jobs use the same shell/cwd conventions as agent.sh. Python jobs use the
+configured Python executable in unbuffered mode with fresh globals, without
+agent/H bridge or main-worker heap sharing. Process isolation is lifecycle
+management, not security: jobs share filesystem/network/user permissions.
+Each job has a separate process group, stdin /dev/null, and private output
+capture. Reserve stable H.stdout/H.stderr entries at creation, including empty
+streams. Counts/snapshots may grow while live; stored byte chunks are immutable.
+Final completion/completeness distinguishes drained final capture from partial
+capture after failure/crash. No automatic stdout/stderr/exception/image payload
+selection into model context, including completion notifications and logs UI.
+
+Rust remains the single journal writer. Commit task intent before spawn,
+record task linkage and stream references durably, then commit terminal state
+once after output drain/child reap. Spawn failure is inspectable failure, not a
+running orphan or consumed concurrency slot. Concurrent capture must preserve
+separate task/stream attribution and global observed-event ordering; background
+activity must not overwrite foreground active-cell/UI state. Bound per-cycle
+capture work so continuous output cannot starve controls, input or deadlines.
+Disk persistence failure prevents new starts and triggers best-effort owned
+child cleanup; never assert complete capture or rollback of external effects.
+
+kill sends TERM then escalates to KILL after a bounded grace period; force
+sends KILL immediately. Timeout uses the same bounded termination machinery but
+retains timed_out status. Repeated cancellation is idempotent. Descendants that
+escape process groups are not guaranteed to die. Foreground Ctrl-C retains its
+existing priority; killing an unrelated background job requires its task ID.
+
+### Shared service pump and controls
+Use a host-owned bounded service pump for task output, child status, deadlines,
+queued completion notices and wakeups. It runs while idle and during worker
+IPC, foreground shell, provider HTTP/streaming, input-prompt and editor waits.
+Do not call run_agent recursively from a helper/poll checkpoint. Dispatch an
+outer continuation only at a safe boundary, never alongside an existing outer
+request or unsettled foreground cell. Task management remains responsive while
+foreground execution is busy; it must not simply queue behind a blocked cell.
+Editor servicing preserves partially typed multiline source, cursor and draft
+without submitting it or losing terminal modes. Asynchronous notices coordinate
+with redraw; JSON stdout remains machine-only. Both idle input modes must
+service timers without waiting for another submitted command.
+
+Python API is in section 5. User-local slash commands are:
+  /tasks [running|finished|all]
+  /task <id>
+  /task logs <id> [stdout|stderr|both]
+  /task kill <id> [--force]
+  /bg shell <command>
+  /bg python <source>
+  /wakeups
+  /wakeup cancel <id>
+  /wakeup run <id>
+Tasks list/inspection reports metadata; logs uses bounded human previews and
+full H references, never selects output into context. Background launches from
+local /bg controls are hidden interactions by default and never initiate model
+activity merely because they finish. Completion/help include IDs, states and
+valid subcommands. Versioned JSON input exposes equivalent task launch/list/
+inspect/log/kill and wakeup list/cancel/run controls with command ID validation,
+acceptance, deduplication and completion/error linkage. Helper and slash/JSON
+controls share one task registry, lifecycle rules and validation. JSON kinds:
+  bg_run {source, task_kind="shell"|"python", options={...}}
+  task_list {state?}; task_get/task_logs/task_kill {task_id, stream?/force?}
+  wakeup_list; wakeup_cancel/wakeup_run {wakeup_id}
+  new/resume {cancel_tasks?, session?}; quit {cancel_tasks?}
+Every command also carries a unique string id. Immediate task/wakeup controls
+are available over JSON during foreground waits; slash controls run at the
+interactive command boundary (a Python input() prompt retains ownership of tty
+input). Logs remain bounded user-only previews with full H references.
+
+### Wakeup scheduling, dispatch and stop settlement
+agent.loop.stop(wakeup=(seconds, reason)) stages an optional one-shot timer.
+seconds must be a finite positive non-bool number at most 604800 (7 days);
+reason is nonempty bounded text (at most 512 characters, without controls). Invalid options reject without
+replacing an existing valid staged request. Repeated valid stop calls replace
+that cell's staged request. Following statements run normally. Exceptions,
+worker failure and committed cancellation discard staged control effects;
+steering wins over stop and also discards that stop's timer. Only a successful
+cell and actual turn stop commits/arms the timer, atomically with stop settlement.
+The due time is measured from that settlement, not the helper invocation.
+A plain stop does not cancel unrelated previously committed wakeups.
+
+run(..., wakeup_reason=reason) explicitly opts into one continuation on terminal
+task completion, including failure/timeout/cancellation, with bounded nonempty
+reason. Default None is notification-only and does not wake the outer model.
+Completion wakeup creation and task completion commit atomically. A wakeup has a
+stable ID, originating operation/task, reason, due time and durable lifecycle
+(scheduled/pending/dispatching/consumed/cancelled or outcome_unknown). Its reason
+is an intentional bounded control-metadata selection; task outputs stay in H.
+Continuation context contains wakeup IDs/reasons and task status/counts/H refs,
+not repeated source or output. Counts/references must identify the actual task.
+
+Use monotonic deadlines while live plus durable wall-clock due times for
+recovery. Due events queue while busy. Coalesce simultaneously ready wakeups
+into one outer continuation; deliver each event ID at most once. Preserve
+existing user steering/follow-up ordering and give foreground user work priority.
+Forced-collapse gating still applies to requests triggered by wakeups. In
+--no-model mode mark due wakeups consumed with a UI notification, never invoke
+a provider. Wakeup cancellation is idempotent; missing IDs reject; /wakeup run
+explicitly authorizes a pending/scheduled wakeup for the next safe boundary.
+
+Commit dispatch intent before invoking a provider. Deduplicated local dispatch
+is not a guarantee of exactly-once remote execution/billing across crashes.
+An interrupted dispatch has unknown outcome and must not automatically retry.
+On explicit session resume restore unfinished tasks as outcome_unknown and
+unfired wakeups as pending notices requiring explicit /wakeup run confirmation;
+never automatically run jobs, overdue timers, or old cells. The harness is not
+a daemon and cannot wake itself while stopped. Never signal a PID reconstructed
+from an old journal: PID reuse makes that unsafe.
+
+### Session transitions and shutdown
+Refuse explicit /quit, /new, /resume or equivalent JSON/session transitions
+while owned jobs remain live unless the user explicitly requests cancellation.
+Cancellation authorization performs bounded termination/drain/reap before exit
+or replacement of Host. Handle terminal/JSON EOF and unavoidable shutdown with
+bounded best-effort cleanup and preservation of committed partial output.
+Fresh-worker /reset does not restart or otherwise mutate isolated background
+jobs. Preserve all pending wakeups/tasks as session history across transitions;
+loading reconstructs metadata without dispatching side effects.
+
+### Acceptance requirements (automated CLI/PTY witnesses; coverage review pending)
+Focused verification: PY_HARNESS_BIN=target/debug/py cargo test -j 4 background
+-- --test-threads=2. Fixtures use fake local providers, never live credentials.
+[ ] R14.01 Shell/Python jobs run concurrently with foreground work; isolated Python has no main globals/agent bridge; live limit and typed validation reject before spawn.
+      Tests: e2e_bgtasks_shell_python_isolation_and_limit; evidence: CLI witness passed; review: pending.
+[ ] R14.02 Immediate stable empty/nonempty stream refs, continuous capture and terminal counts/status are correct across interleaved task/foreground output without payload leakage.
+      Tests: e2e_bgtasks_stream_refs_and_context_privacy; evidence: CLI witness passed, including multi-megabyte capture; review: pending.
+[ ] R14.03 Task kill/timeout escalates, preserves partial output, reaps children and remains responsive during blocked foreground execution; duplicates are harmless.
+      Tests: e2e_bgtasks_busy_kill_timeout_and_idempotence; evidence: CLI Python/shell busy witnesses passed; review: pending.
+[ ] R14.04 Python/slash/JSON task and wakeup controls share validation, registry, command deduplication, completion linkage, help and completion coverage.
+      Tests: e2e_bgtasks_controls_and_command_deduplication, e2e_bgtasks_slash_controls_and_user_only_logs, background_completion_catalog_covers_ids_and_flags; evidence: CLI/unit witnesses passed; review: pending.
+[ ] R14.05 Timers fire while JSON/terminal input is idle; interactive multiline draft/cursor and terminal modes survive servicing and wakeup dispatch.
+      Tests: e2e_idle_json_services_background_completion_and_wakeup, e2e_idle_tty_wakeup_preserves_multiline_draft_and_cursor; evidence: JSON/PTY witnesses passed; review: pending.
+[ ] R14.06 Stop stages/replaces timers, arms only on successful actual stop, and obeys exception/cancellation/steering priority without killing the worker.
+      Tests: e2e_stop_wakeup_settlement_and_order; evidence: CLI exception/cancellation/replacement/steering witnesses passed; review: pending.
+[ ] R14.07 Opt-in task completion and coalesced timers queue at safe boundaries during Python/shell/provider/input waits; no competing outer turns, source/output leakage or no-model provider invocation.
+      Tests: e2e_bgtasks_wakeup_safe_boundaries_and_privacy; evidence: local provider wait/coalescing and Python-input boundary witnesses passed; review: pending.
+[ ] R14.08 Crash/recovery never replays task effects, signals stale PIDs or automatically dispatches recovered wakeups; dispatch uncertainty stays unknown.
+      Tests: e2e_bgtasks_wakeup_crash_resume_without_replay; evidence: crash/resume, stale PID and interrupted provider-dispatch witnesses passed; review: pending.
+[ ] R14.09 Session/quit guards, explicit cancellation, EOF and persistence-failure cleanup terminate owned groups with bounded partial capture and no false success.
+      Tests: e2e_bgtasks_session_shutdown_and_failure_cleanup, e2e_bgtasks_controls_and_command_deduplication; evidence: EOF, spawn failure, real journal-write failure, guarded quit/new and authorized cancellation witnesses passed; review: pending.
+
+## 30. Durable entries, initialization snapshots and active memory curation (approved scope)
+### One ordinary-file system
+Use one global directory, ${PY_HOME}/skills/ (default ~/.py/skills/), for
+memories, skills and reusable Python. Entries are ordinary UTF-8 Markdown
+files. The user and model create, edit, rename, split, merge and delete them
+using ordinary filesystem operations. There is no agent.skills API, CRUD
+helper, /skills command, plugin registration, executable hook discovery or
+project-environment manager. Rust only discovers, validates, snapshots,
+renders and initializes entries according to this section. This is a narrow
+exception to earlier exclusions of skills, not adoption of Pi/Pig skills or
+an extension framework. Other plugin/provider-hook exclusions remain intact.
+
+Initially discovery is flat: direct regular *.md files only, sorted by filename
+in deterministic lexical order. No recursion or symlink following. A discovered
+*.md symlink or non-regular file rejects initialization with its path; unrelated
+files are ignored. A missing directory is an empty collection; normal first
+startup creates the private directory. No mandatory per-project hierarchy.
+Filename stem is entry identity and title; a rename changes identity. There is
+no separate title, person, project or mandatory subject metadata field.
+
+Each file begins with --- front matter and ends that header with --- on its own
+line. Version 1 accepts a documented YAML scalar subset, not arbitrary YAML:
+exactly one key/value line for each required field, with no nested structures,
+anchors, duplicate keys, multiline scalars or unknown fields. Text values may
+be plain single-line text or JSON double-quoted strings with JSON escaping.
+core must be the unquoted literal true or false. Required fields are:
+  kind: memory | skill | python
+  created: UTC creation timestamp
+  updated: UTC last-update timestamp
+  origin: agent | user
+  description: nonempty short, single-line discovery text
+  core: true | false
+Timestamps are valid Gregorian YYYY-MM-DDTHH:MM:SSZ values (years 0001-9999); updated must not
+precede created. The writer maintains timestamps and valid metadata, including
+on manual edits. origin records original authorship, not authentication, trust
+or execution permission; editing does not require changing original authorship.
+Description and filename must not contain terminal/control characters.
+
+Example:
+  ---
+  kind: memory
+  created: 2026-10-10T09:00:00Z
+  updated: 2026-10-10T09:00:00Z
+  origin: user
+  description: Explicit user preferences for review responses.
+  core: true
+  ---
+  Prefer concise review summaries, with blockers first.
+
+memory and skill bodies are ordinary Markdown. A python entry contains exactly
+one fenced block opened by ```python and closed by ``` on their own lines
+(trailing whitespace and CRLF line endings are accepted). That block is the complete executable source; surrounding Markdown documents
+its scope and helpers. Never execute Markdown wholesale, concatenate inferred
+snippets or execute other fenced blocks. Missing, unterminated or multiple
+Python blocks reject initialization, including for non-core Python entries.
+
+### Immutable session initialization snapshot
+On /new or first new-session creation, load configuration, read each discovered
+file once into a bounded buffer, validate metadata/source and budgets, and
+construct a session-owned snapshot before dispatching startup Python or any
+outer provider request. Persist the exact effective system string, ordered
+inventory metadata and content hashes, configured skill limits/estimator, and
+exact core Python source. Core bodies are preserved in the rendered string.
+Rust commits the snapshot as a journal event (skills_snapshot) before execution;
+subsequent requests use the stored string, not a live directory-backed view.
+
+Core entries of all three kinds are rendered in full, including identifying
+wrappers and full Python source. Non-core entries contribute only filename,
+kind, description, core=false and path to the inventory. Non-core bodies and
+Python never execute or enter model payload automatically. Include a clear
+user-maintained section after harness instructions; entry content cannot alter
+harness execution/context/control rules. There is one outer system snapshot;
+inner agent.llm calls retain their own explicit system settings and receive no
+automatic entry injection.
+
+Files created, changed, deleted or renamed after initialization do not modify
+the current prompt, inventory or startup-source snapshot. /new observes current
+files and skill configuration. /resume restores the original snapshot even if
+files are missing or changed; /reset preserves that snapshot. Resume/reset do
+not silently refresh entries or render with newer metadata/defaults. A legacy
+session without a snapshot receives a frozen SYSTEM-only snapshot with empty
+inventory and no startup entries; it never loads current files. /new opts into
+the current entry collection. Record this compatibility snapshot in the journal.
+
+Ordinary explicit reads of newer files may append selected content via existing
+agent.context.read_text rules. Merely returning/printing a file's contents does
+not select them. New user/source/control items still append normally. This
+section freezes the system prefix and historical renderings, not the ability
+to add context. Collapse and approved output-payload eviction remain the only
+mechanisms that replace selected historical content; automatic eviction never
+discards arbitrary old user messages, source, summaries or this protected system
+snapshot. Control/usage updates append rather than mutate its text in place.
+
+### Core Python initialization and failure semantics
+Initialize only the main foreground worker, in its ordinary global namespace,
+after agent and H are available. Use the frozen snapshot's filename ordering.
+Precompile every core Python block before executing any block: a syntax error
+in a later file prevents all startup-source dispatch. Metadata/size/token
+validation likewise finishes before startup side effects. This does not make
+ordinary Python execution a sandbox or guarantee absence of interpreter/import
+side effects. Core source runs unrestricted as the current user.
+
+For each dispatched block, Rust durably commits source/identity/hash, generation
+and execution intent first, then captures complete stdout/stderr and commits
+completion/status separately. Full diagnostics remain inspectable through H
+and local error UI; only status/counts/refs are automatically model-visible.
+Startup output, exceptions, say-like events and helper results do not become
+alternative model-payload channels. Never label a partially initialized worker
+ready or invoke the outer agent after initialization fails. A resumed blocked
+session emits initialization_blocked instead of ready, with startup_ready=false;
+local commands remain available for inspection and explicit reset.
+
+During startup, agent/H bridge operations are limited to read-only history
+access (history and history_len). Reject context mutation, shell/provider/
+background calls, interactive input and lifecycle controls with captured
+diagnostics. This prevents startup from recursively invoking the outer loop,
+resetting itself, requesting input or silently selecting payloads. Ordinary
+Python file/network/subprocess operations remain unrestricted; the bridge
+restriction is lifecycle policy, not security.
+
+Every intentionally fresh main worker runs the frozen core source once: initial
+creation, explicit reset and successful explicit resume. This is declared
+initialization, not replay of prior user/model cells. Do not run it twice during
+one transition; background Python jobs never load it. Help and lifecycle notices
+must disclose that initializer side effects can repeat, and recommend imports/
+definitions rather than irreversible actions. After unexpected worker failure,
+replace the dead worker but block core initialization and the outer agent until
+explicit /reset; journal startup_blocked so resume cannot silently retry it.
+Previous ordinary variables remain undefined; only initialization deliberately
+defines new globals.
+
+A runtime error may leave prior initializer effects/globals; no rollback,
+automatic retry or automatic continuation. An interrupted intent has unknown
+outcome. startup_begin/startup_end record initialization settlement. A failed or
+unknown startup blocks the outer agent. On resume, do not automatically execute
+such startup again: preserve the blocked state, expose captured diagnostics and
+uncertainty, and require /reset to explicitly authorize a fresh initialization
+attempt using the frozen source. Corrected files/configuration take effect only
+in an explicitly new session. Initial startup errors may abort new-session
+creation; do not claim that initialization succeeded or dispatch outer requests.
+Snapshot/config failure before dispatch must not claim that any Python entry ran.
+
+### Configuration, budgets and user-local management
+Configuration lives in ${PY_HOME}/config.json (default ~/.py/config.json).
+On normal first startup create documented defaults if missing, atomically with
+owner-only permissions; do not overwrite existing files. --help/--version
+remain side-effect-free. Credentials stay in separate private auth.json and
+are not manageable or displayed through generic /config controls. Reject nested
+credential fields in config loading and writes, including parent-object or
+array writes; do not persist /config commands in editor history.
+
+Initial skills defaults:
+  {"skills":{"enabled":true,"max_system_tokens":8000,
+    "max_core_entry_tokens":2000,"max_inventory_entry_tokens":128,
+    "max_entries":128,"max_file_bytes":65536}}
+Missing individual keys use documented defaults. enabled is boolean; each
+limit is an integer in 1..=16777216, never bool. Unknown keys inside skills reject
+configuration; unrelated top-level/provider settings are preserved.
+With enabled=false, do not discover, validate or execute entries and do not
+instruct the agent to maintain this disabled store. Still persist a system
+snapshot for stable new-session/resume behavior.
+
+Token values are estimates, not claims of provider-tokenizer equality. Version
+1 uses ceil(Unicode-code-point-count / 3), labeled unicode-chars/3-v1, with explicit
+warning that the estimate is not a guaranteed upper bound across text/models.
+The aggregate skills allowance charges all added guidance, wrappers, full core
+bodies and non-core inventory. Per-core and per-inventory allowances charge the
+complete rendered entry including wrappers. File byte/count limits apply
+independently, including non-core bodies. Do not silently truncate, omit entries,
+mark oversized entries non-core or execute a budget-rejected initializer.
+Reject overflow before startup with path, estimated usage, limit and remedies.
+
+Overall context accounting must include the complete effective system prompt
+as well as history/control metadata and existing attachment allowances. Do not
+shrink or replace the snapshot when switching models or entering pressure mode;
+report an unsatisfiable protected-prefix budget rather than collapse it. Leave
+room for the existing 4096-token output reserve and an additional 1024 estimated
+tokens for useful continuation at initialization. Resolve CLI model/effort
+and /new inherited overrides before startup admission or core execution.
+/new inherits live model/effort only when their corresponding configured defaults
+have not changed since this session loaded them; changed defaults take precedence.
+
+User-local commands:
+  /config                          effective configuration, path and pending status
+  /config get <dotted-key>          effective value, including defaults
+  /config set <dotted-key> <JSON>   validate and atomically save an explicit value
+  /config unset <dotted-key>        remove explicit value; restore its default
+  /config reload                   validate externally edited configuration
+Before saving, detect configuration changes since the loaded version; reject
+conflicting writes instead of losing external edits. Preserve unrelated keys,
+never partially apply invalid input, and use owner-only atomic replacement.
+Display errors locally, not automatically as model context. Version 1 config
+commands change loading defaults only, not live model/effort/session settings;
+use existing /model and /effort commands for immediate session changes. All
+config loading changes apply on /new. Skills reload/set/unset never change an
+existing snapshot or reset/resume source. Configuration commands manage
+configuration only; entry creation and curation remain ordinary file operations.
+
+### Required system-prompt explanation and active curation guidance
+Explain the actual skills directory, exact metadata/body format, budgets,
+core behavior, frozen inventory and next-session activation rule. Explain
+ordinary file inspection and explicit context selection for non-core entries.
+No special entry-management functions are implied or exposed.
+
+Instruct the model to actively maintain useful durable knowledge: explicitly
+stated user preferences, recurring corrections, stable project conventions,
+reusable procedures and durable discoveries. Distinguish explicit statements
+from inferences; do not promote temporary task instructions into permanent
+preferences. Avoid secrets, unsupported personal facts and transient execution
+state. Scope information to where it is relevant.
+
+Actively curate, not merely accumulate: update stale information, remove obsolete
+or redundant entries, split unrelated/unwieldy entries and merge overlapping
+entries. Preserve still-relevant user preferences, useful details and scope;
+do not discard them merely to save space. Prefer a small, coherent, accurate
+collection rather than a growing archive.
+
+Prefer small focused entries, each covering one coherent subject: a person,
+project, preference, convention, procedure or Python helper. Avoid catch-all
+files and excessive fragmentation. Use descriptive filenames and identify
+person/project subject and applicability in the description/body. These are
+prompt conventions, not enforced kinds, fields, folder structures or a mandatory
+project schema. kind remains memory, skill or python. Use core sparingly for
+broadly useful knowledge. Warn explicitly that core Python executes automatically
+and prefer definitions/imports over side effects. origin is not a trust signal.
+
+### Acceptance requirements (verified 2026-10-10)
+Evidence: cargo build -j 8; PY_HARNESS_BIN=$PWD/target/debug/py cargo test -j 8
+-- --test-threads=8. Full suite: 212 passed, including 26 skills tests. Actual
+local-provider requests, filesystem effects and journal records are asserted;
+this does not claim live-provider parity or that a model always follows curation.
+[x] R15.01 Flat ordinary-file discovery, required metadata/scalar grammar, dates, UTF-8, filenames and Python-block validation reject malformed entries without dispatch.
+      Tests: skills_metadata_and_date_validation, skills_python_single_block, e2e_skills_invalid_metadata_and_python_fences_reject_initialization, e2e_skills_defaults_privacy_help_version_and_discovery_validation; review: negative paths inspected.
+[x] R15.02 Core bodies are fully present in actual outer provider requests; non-core bodies are absent, with complete bounded inventory and curation guidance.
+      Tests: e2e_skills_provider_wire_snapshot_edit_reset_resume_new, e2e_skills_full_core_and_inventory_only_noncore; review: wire body assertions inspected.
+[x] R15.03 File edits never mutate the current prompt; /new refreshes while reset/resume restore exact snapshots after edits/deletion.
+      Tests: e2e_skills_provider_wire_snapshot_edit_reset_resume_new, e2e_skills_resume_deleted_files_uses_original_snapshot, e2e_skills_file_edit_freezes_session_until_new; review: exact prompt/snapshot comparisons inspected.
+[x] R15.04 Core Python precompiles globally, initializes ordered main globals once per fresh generation, and never initializes isolated background Python.
+      Tests: e2e_skills_core_python_order_global_namespace_and_reset, e2e_skills_precompile_all_before_any_startup_side_effects, e2e_skills_inner_and_background_do_not_inherit_entries; review: globals, effects and isolated subprocess output inspected.
+[x] R15.05 Startup journals intent/source/completion and full diagnostics without payload selection; failed/unknown startup blocks invocation and never silently retries.
+      Tests: e2e_skills_core_python_order_global_namespace_and_reset, e2e_skills_runtime_failure_blocks_resume_and_requires_explicit_reset, e2e_skills_unknown_startup_intent_is_not_automatically_replayed, e2e_skills_worker_crash_does_not_repeat_initialization_implicitly; review: source/status journals and repeat-count assertions inspected.
+[x] R15.06 Aggregate/per-entry/file/count budgets reject before startup, never truncate; full protected system text participates in context accounting and model-pressure checks.
+      Tests: e2e_skills_budget_rejection_precedes_python_execution, e2e_skills_inventory_aggregate_byte_and_count_budgets_precede_execution, e2e_skills_protected_prefix_admission_model_override_and_accounting, e2e_skills_collapse_cannot_expand_history_using_system_allowance, e2e_forced_gate_blocks_side_effects_and_allows_stderr_read; review: pre-dispatch effect markers and protected accounting inspected.
+[x] R15.07 /config get/set/unset/reload validate, persist, preserve unrelated keys, detect external-edit conflicts and keep skills changes pending for /new.
+      Tests: e2e_skills_config_set_get_unset_persistence_and_invalid_value, e2e_skills_config_reload_affects_new_session_not_existing_snapshot, e2e_skills_config_conflicts_reload_and_private_atomic_save, e2e_skills_config_changed_model_effort_defaults_apply_on_new, e2e_skills_config_nested_credentials_refused_without_disclosure; review: persistence, conflicts and activation inspected.
+[x] R15.08 Defaults/private directories/files and side-effect-free help/version behave correctly; disabled storage neither loads files nor requests curation.
+      Tests: e2e_skills_defaults_privacy_help_version_and_discovery_validation, e2e_skills_disabled_ignores_entries_and_startup; review: permissions, absent directories and malformed disabled entry inspected.
+[x] R15.09 Prompt guidance explains active preference/project/person curation, stale removal, splitting/merging, small scoped entries and ordinary filesystem-only management.
+      Tests: skills_curation_prompt_contract, e2e_skills_provider_wire_snapshot_edit_reset_resume_new; review: instruction text and actual wire inclusion inspected.
 
 ## 26. Running this transition
 Build: cargo build --release --manifest-path transition/Cargo.toml
@@ -2020,7 +2535,7 @@ def wait_for(token,start=0):
         assert time.monotonic()<deadline,(token,data)
 wait_for(b'\x1b[?2004h')
 os.write(master,b'/he\t');wait_for(b'Fuzzy select')
-os.write(master,b'\r');wait_for(b'\x1b[?1049l')
+os.write(master,b'\r');wait_for(b'\x1b[0J')
 # First Enter selects /help from /help and /hotkeys; second submits it.
 os.write(master,b'\r');wait_for(b'H stores full history')
 start=len(data);os.write(master,b"@print('pty-result')\r");wait_for(b'status: ok',start)
@@ -2124,7 +2639,9 @@ finally:
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let mut stdin=child.stdin.take().unwrap();
         for c in [
-            py("a","agent.context.read_text('large selected output '*750,max_chars=17000)"),
+            // Leave room for the now-accounted immutable system prefix while
+            // crossing the forcing threshold, then permit a bounded stderr read.
+            py("a","agent.context.read_text('large selected output '*520,max_chars=17000)"),
             py("b","side_effect=1"),
             py("c","agent.context.read_text(H.stderr[1][:500])"),
             py("d","print('side_effect' in globals())")
@@ -2436,7 +2953,7 @@ assert p.returncode==0,p.stderr
         let home=std::env::temp_dir().join(format!("py-wire-e2e-{}",super::now_ms()));
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join("config.json"),json!({"providers":{provider:{
-            "base_url":format!("http://{address}"),"api_key":"fixture-key","api":api,
+            "base_url":format!("http://{address}"),"api":api,
             "models":[{"id":"fixture","api":api,"context_limit":100000}]}}}).to_string()).unwrap();
         let mut child=crate::test_command(std::env::var("PY_HARNESS_BIN").unwrap())
             .args(["--json","--json-input","--no-model"]).env("PY_HOME",&home)
@@ -2840,8 +3357,39 @@ class _Context:
     def items(self): return _rpc('context_items')
     def collapse(self,*args): raise RuntimeError('collapse must be a standalone literal call')
 class _Loop:
-    def stop(self): _rpc('stop')
+    def stop(self, *, wakeup=None):
+        if wakeup is not None:
+            if not isinstance(wakeup,(tuple,list)) or len(wakeup)!=2:
+                raise ValueError('wakeup must be (seconds, reason)')
+            if isinstance(wakeup[0],bool) or not isinstance(wakeup[0],(int,float)):
+                raise ValueError('wakeup duration must be a number')
+            import math
+            if not math.isfinite(wakeup[0]) or not 0 < wakeup[0] <= 604800:
+                raise ValueError('wakeup duration must be finite and positive, at most 7 days')
+            if not isinstance(wakeup[1],str): raise ValueError('wakeup reason must be a string')
+        return _rpc('stop',wakeup=wakeup)
     def reset_python(self): _rpc('reset')
+class _BgTasks:
+    def run(self,source,*,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None):
+        if not isinstance(source,str) or not isinstance(kind,str): raise TypeError('source and kind must be strings')
+        for value in (cwd,name,wakeup_reason):
+            if value is not None and not isinstance(value,str): raise TypeError('cwd, name and wakeup_reason must be strings or None')
+        if env is not None and (not isinstance(env,dict) or not all(isinstance(k,str) and isinstance(v,str) for k,v in env.items())):
+            raise TypeError('env must map strings to strings')
+        if timeout is not None:
+            import math
+            if isinstance(timeout,bool) or not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or not 0 < timeout <= 604800:
+                raise ValueError('timeout must be finite and positive, at most 7 days')
+        return _rpc('bg_run',source=source,task_kind=kind,options=dict(cwd=cwd,env=env,timeout=timeout,name=name,wakeup_reason=wakeup_reason))
+    def list(self,state=None):
+        if state is not None and not isinstance(state,str): raise TypeError('state must be a string or None')
+        return _rpc('task_list',state=state)
+    def get(self,task_id):
+        if not isinstance(task_id,str): raise TypeError('task_id must be a string')
+        return _rpc('task_get',task_id=task_id)
+    def kill(self,task_id,*,force=False):
+        if not isinstance(task_id,str) or not isinstance(force,bool): raise TypeError('task_id must be a string and force must be boolean')
+        return _rpc('task_kill',task_id=task_id,force=force)
 class _LLM:
     def __call__(self,prompt,**kwargs):
         import base64,io
@@ -2861,6 +3409,7 @@ class _LLM:
 agent=types.ModuleType('agent')
 agent.context=_Context()
 agent.loop=_Loop()
+agent.bgtasks=_BgTasks()
 agent.llm=_LLM()
 agent.say=lambda text:_rpc('say',text=str(text))
 agent.sh=lambda command,**kwargs:_rpc('sh',command=command,options=kwargs)
@@ -3001,7 +3550,7 @@ type Result<T> = std::result::Result<T,Box<dyn std::error::Error>>;
 #[derive(Clone)]
 struct Item { id:String, role:String, text:String, output:bool, ranges:Vec<(usize,usize)> }
 
-struct Journal { file:File, offsets:Vec<(u64,u64)>, path:PathBuf, seq:usize }
+struct Journal { file:File, offsets:Vec<(u64,u64)>, path:PathBuf, seq:usize, failed:bool }
 impl Journal {
     fn open(path:PathBuf)->Result<Self>{
         use std::io::Seek;
@@ -3026,7 +3575,7 @@ impl Journal {
         File::open(path.parent().ok_or("journal directory missing")?)?.sync_all()?;
         let seq=offsets.len();
         let _=reader.seek(std::io::SeekFrom::Start(0));
-        Ok(Self{file,offsets,path,seq})
+        Ok(Self{file,offsets,path,seq,failed:false})
     }
     fn event(&self,index:usize)->Result<Value>{
         use std::io::{Read,Seek,SeekFrom};
@@ -3036,13 +3585,17 @@ impl Journal {
         Ok(serde_json::from_slice(&bytes)?)
     }
     fn append(&mut self,kind:&str,payload:Value)->Result<usize>{
+        if self.failed{return Err("session journal write previously failed; restart and recover before continuing".into());}
         let n=self.seq;
         let v=json!({"schema_version":1,"seq":n,"kind":kind,"payload":payload,
             "session_id":self.path.file_stem().unwrap().to_string_lossy(),
             "timestamp_ms":now_ms()});
         let bytes=format!("{v}\n").into_bytes();
-        let offset=self.file.metadata()?.len();
-        self.file.write_all(&bytes)?;self.file.flush()?;self.file.sync_all()?;
+        let write=(||->io::Result<u64>{
+            let offset=self.file.metadata()?.len();
+            self.file.write_all(&bytes)?;self.file.flush()?;self.file.sync_all()?;Ok(offset)
+        })();
+        let offset=match write{Ok(offset)=>offset,Err(e)=>{self.failed=true;return Err(e.into());}};
         self.offsets.push((offset,bytes.len() as u64));self.seq+=1;Ok(n)
     }
 }
@@ -3102,6 +3655,9 @@ impl Capture {
     }
     fn finish(mut self,host:&mut Host,complete:bool)->Result<Value>{
         while self.drain(host)?{}
+        self.finish_metadata(host,complete)
+    }
+    fn finish_metadata(mut self,host:&mut Host,complete:bool)->Result<Value>{
         if self.index.is_none(){self.commit(host,&[])?;}
         if !self.carry.is_empty(){self.chars=None;}
         let index=self.index.ok_or("missing capture index")?;
@@ -3164,11 +3720,13 @@ struct Host {
     state:UiState,thinking_model:Option<String>,cells:usize,active_cell:Option<usize>,cancel_revision:u64,
     journal:Journal, worker:Worker, home:PathBuf, context:Vec<Item>,
     history:HashMap<String,Vec<Value>>, ids:HashSet<String>, json:bool,
-    stop:bool, reset:bool, generation:usize, revision:usize,
+    stop:bool, stop_wakeup:Option<(f64,String)>, reset:bool, reset_explicit:bool, generation:usize, revision:usize,
+    bg_tasks:HashMap<String,BgTask>, wakeups:HashMap<String,Wakeup>, servicing:bool,
     incoming:Option<std::sync::mpsc::Receiver<Value>>, input_closed:bool, pending:std::collections::VecDeque<Value>,
-    attachments:HashMap<String,usize>, queued:HashMap<String,Option<(usize,usize)>>, config:Value, auth:Value,
+    attachments:HashMap<String,usize>, queued:HashMap<String,Option<(usize,usize)>>, config:Value, config_defaults:Value, auth:Value,
     model:String, effort:String, no_model:bool, context_limit:usize,
     trigger:usize,retain:usize,current_code:Option<String>, usage:Value,
+    skills:Value, initializing:bool, startup_ready:bool,
 }
 impl Host {
     fn event(&self,kind:&str,payload:Value) {
@@ -3201,7 +3759,7 @@ impl Host {
             ranges:if ranges.is_empty(){vec![(n,n+1)]}else{ranges}});
         self.revision+=1;Ok(id)
     }
-    fn chars(&self)->usize{self.context.iter().map(|i|i.text.chars().count()+64).sum()}
+    fn chars(&self)->usize{self.system_prompt().chars().count()+512+self.context.iter().map(|i|i.text.chars().count()+64).sum::<usize>()}
     fn forced(&self)->bool{self.chars().div_ceil(3)>self.context_limit.saturating_sub(4096)*9/10}
     fn context_usage(&self)->Value{
         json!({"context_revision":self.revision,"item_count":self.context.len(),
@@ -3209,13 +3767,15 @@ impl Host {
             "measured_last_input_tokens":self.usage["last_input_tokens"],
             "model_context_limit":self.context_limit,"reserved_output_tokens":4096,
             "remaining_input_tokens":self.context_limit.saturating_sub(4096+self.chars().div_ceil(3)),
-            "forced":self.forced(),"force_threshold":0.9,"estimator":"conservative chars/3; image budget separate"})
+            "system_chars":self.system_prompt().chars().count(),"skills_estimated_tokens":self.skills["estimated_added_tokens"],
+            "forced":self.forced(),"force_threshold":0.9,"estimator":"unicode-chars/3-v1 estimate; system/control allowance included; image budget separate"})
     }
 }
 
 impl Host {
     fn rpc(&mut self,v:&Value)->Result<Value>{
         let op=v["op"].as_str().unwrap_or("");
+        if self.initializing && !["history","history_len"].contains(&op){return Err("startup entries may define/import helpers and read H, but cannot use agent bridge controls, context, input or side-effect helpers during initialization".into());}
         match op {
             "history"=>{
                 let name=v["collection"].as_str().ok_or("missing collection")?;
@@ -3250,8 +3810,21 @@ impl Host {
                 self.hist_push("say",json!(text));
                 self.event("say",json!({"text":text}));Ok(Value::Null)
             },
-            "stop"=>{self.stop=true;Ok(Value::Null)},
-            "reset"=>{self.reset=true;Ok(Value::Null)},
+            "stop"=>{
+                let wakeup=match v.get("wakeup").filter(|w|!w.is_null()){
+                    None=>None,
+                    Some(w)=>{let values=w.as_array().filter(|a|a.len()==2).ok_or("wakeup must be [seconds, reason]")?;
+                        let seconds=bg_seconds(&values[0],604800.0)?.ok_or("wakeup duration required")?;
+                        let reason=bg_text(&json!({"reason":values[1]}),"reason",512)?.ok_or("wakeup reason required")?.to_owned();
+                        Some((seconds,reason))}
+                };
+                self.stop=true;self.stop_wakeup=wakeup;Ok(Value::Null)
+            },
+            "bg_run"=>self.bg_run(v),
+            "task_list"=>self.bg_list(v.get("state").filter(|x|!x.is_null()).map(|x|x.as_str().ok_or("state must be a string")).transpose()?),
+            "task_get"=>self.bg_get(v["task_id"].as_str().ok_or("task_id required")?),
+            "task_kill"=>self.bg_kill(v["task_id"].as_str().ok_or("task_id required")?,v.get("force").map(|x|x.as_bool().ok_or("force must be boolean")).transpose()?.unwrap_or(false)),
+            "reset"=>{self.reset=true;self.reset_explicit=true;Ok(Value::Null)},
             "collapse"=>self.collapse(v),
             "sh"=>self.shell(v),
             "llm"=>self.inner_llm(v),
@@ -3284,7 +3857,7 @@ impl Host {
         let mut next=self.context.clone();
         next.splice(a..=b,[Item{id:id.clone(),role:"summary".into(),text:text.clone(),output:false,ranges:all_ranges.clone()}]);
         if let Some(own)=own{next.retain(|i|i.id!=own||i.id==id);}
-        let after:usize=next.iter().map(|i|i.text.chars().count()+64).sum();
+        let after=self.system_prompt().chars().count()+512+next.iter().map(|i|i.text.chars().count()+64).sum::<usize>();
         if after>=self.chars(){return Err("collapse must reduce rendered context size".into());}
         self.journal.append("context_replace",json!({"items":next.iter().map(item_json).collect::<Vec<_>>(),
             "summary":v["summary"],"ranges":merged}))?;
@@ -3307,12 +3880,12 @@ impl Host{
         self.with_cell("python",id,&source_ref,|host|host.execute_inner(id,source,retain_source))
     }
     fn execute_inner(&mut self,id:&str,source:&str,retain_source:bool)->Result<Value>{
-        self.stop=false;self.reset=false;
+        self.stop=false;self.stop_wakeup=None;self.reset=false;self.reset_explicit=false;
         let code_index=self.hist_push("code",json!(source));
         let n=self.journal.append("code",json!({"index":code_index,"source":source,
-            "operation":id,"worker_generation":self.generation}))?;
+            "operation":id,"worker_generation":self.generation,"initialization":self.initializing}))?;
         self.current_code=None;
-        let forced=self.forced();
+        let forced=!self.initializing&&self.forced();
         if retain_source{
             self.current_code=Some(self.add_context("assistant",source.into(),false,vec![(n,n+1)])?);
         }
@@ -3332,6 +3905,7 @@ impl Host{
         let mut prompt:Option<InputPrompt>=None;
         let mut input_rpc=Value::Null;
         let status=if !sent{complete=false;self.reset=true;"worker_crashed".to_string()}else{'execution:loop{
+            self.service_background()?;
             if let Some((stdout,stderr))=captures.as_mut(){
                 stdout.drain(self)?;stderr.drain(self)?;
             }
@@ -3397,7 +3971,7 @@ impl Host{
             if v["kind"]=="rpc"{
                 if !started||v["rpc_id"].as_u64().is_none(){complete=false;self.reset=true;break "worker_protocol_error".to_string();}
                 let response=if cancelled{input_exception("cancel")}else{
-                    if v["op"]=="input"{
+                    if v["op"]=="input" && !self.initializing{
                         input_rpc=v["rpc_id"].clone();
                         prompt=Some(self.begin_input(id,v["prompt"].as_str().unwrap_or(""))?);
                         continue;
@@ -3448,19 +4022,31 @@ impl Host{
             self.add_context("user",format!("[Execution metadata] {}",observation),false,vec![])?;
         }
         self.current_code=None;
-        if self.reset {self.reset_worker()?;}
+        if status!="ok"{self.stop=false;self.stop_wakeup=None;}
+        if self.reset && !self.initializing {
+            if self.reset_explicit{self.reset_worker()?;}else{
+                self.with_state(UiState::Running,None,|host|host.replace_worker(false))?;
+            }
+        }
         Ok(metadata)
     }
     fn reset_worker(&mut self)->Result<()>{
         self.with_state(UiState::Running,None,Self::reset_worker_inner)
     }
-    fn reset_worker_inner(&mut self)->Result<()>{
+    fn reset_worker_inner(&mut self)->Result<()>{self.replace_worker(true)}
+    fn replace_worker(&mut self,initialize:bool)->Result<()>{
+        self.startup_ready=false;
         self.generation+=1;
         self.worker=Worker::spawn(&self.home,self.generation)?;
         let notice="Session loaded into fresh Python. Previous variables are undefined; H and context are restored.";
         self.journal.append("worker_reset",json!({"generation":self.generation}))?;
         self.add_context("user",notice.into(),false,vec![])?;
-        self.event("notice",json!({"text":notice}));Ok(())
+        self.event("notice",json!({"text":notice}));
+        if !initialize&&self.skills["entries"].as_array().is_some_and(|entries|entries.iter().any(|e|e["core"]==true&&e["kind"]=="python")){
+            self.journal.append("startup_blocked",json!({"generation":self.generation,"reason":"worker failure; core initialization requires explicit reset"}))?;
+            self.event("notice",json!({"text":"Core Python was not automatically re-executed after worker failure. /reset explicitly authorizes initialization; the outer agent is blocked until then."}));
+            Ok(())
+        }else{self.initialize_skills()}
     }
     fn shell(&mut self,v:&Value)->Result<Value>{
         v["command"].as_str().ok_or("shell command required")?;
@@ -3546,20 +4132,49 @@ impl Host{
 }
 
 impl Host {
-    fn new(home:PathBuf,resume:Option<PathBuf>,json_mode:bool,no_model:bool)->Result<Self>{
+    fn new(home:PathBuf,resume:Option<PathBuf>,json_mode:bool,no_model:bool,model_override:Option<&str>,effort_override:Option<&str>)->Result<Self>{
         use std::os::unix::fs::PermissionsExt;
         fs::create_dir_all(home.join("sessions"))?;
         fs::set_permissions(&home,fs::Permissions::from_mode(0o700))?;
         fs::set_permissions(home.join("sessions"),fs::Permissions::from_mode(0o700))?;
         let resumed=resume.is_some();
         let path=resume.unwrap_or_else(||home.join("sessions").join(format!("{}-{}-{}.jsonl",now_ms(),std::process::id(),unique_id())));
-        let journal=Journal::open(path)?;
-        let worker=Worker::spawn(&home,0)?;
+        let config_path=home.join("config.json");
+        let config={
+            let lock=OpenOptions::new().create(true).read(true).write(true).truncate(false).mode(0o600).open(home.join("config.lock"))?;
+            if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX)}!=0{return Err(io::Error::last_os_error().into());}
+            if config_path.exists(){load_json(&config_path)?}else{
+                let defaults=json!({"skills":skills_defaults()});write_private_json(&config_path,&defaults)?;defaults
+            }
+        };
+        validate_config(&config)?;
+        let mut journal=Journal::open(path)?;
+        let mut snapshot=None;let mut unfinished_startup=false;let mut generation=0;
+        for sequence in 0..journal.seq{
+            let ev=journal.event(sequence)?;
+            match ev["kind"].as_str().unwrap_or(""){
+                "skills_snapshot"=>{if snapshot.is_some(){return Err("duplicate skills snapshot".into());}snapshot=Some(ev["payload"].clone());},
+                "worker_reset"=>generation=ev["payload"]["generation"].as_u64().ok_or("invalid worker generation")? as usize,
+                "startup_begin"|"startup_blocked"=>unfinished_startup=true,
+                "startup_end"=>unfinished_startup=ev["payload"]["status"]!="ok",
+                _=>{}
+            }
+        }
+        let skills=if let Some(snapshot)=snapshot{
+            if snapshot["version"]!=1||!snapshot["system"].is_string()||!snapshot["entries"].is_array(){return Err("invalid skills snapshot".into());}snapshot
+        }else{
+            let snapshot=if resumed{json!({"version":1,"system":SYSTEM,"entries":[],"options":{"enabled":false},"estimated_added_tokens":0,"legacy":true})}
+                else{build_skills_snapshot(&home,&config)?};
+            journal.append("skills_snapshot",snapshot.clone())?;snapshot
+        };
+        let worker=Worker::spawn(&home,if resumed{generation+1}else{0})?;
         let mut host=Self{state:UiState::Idle,thinking_model:None,cells:0,active_cell:None,cancel_revision:0,
             journal,worker,home,context:vec![],history:HashMap::new(),ids:HashSet::new(),
-            json:json_mode,stop:false,reset:false,generation:0,revision:0,
-            incoming:None,input_closed:false,pending:std::collections::VecDeque::new(),attachments:HashMap::new(),queued:HashMap::new(),config:json!({}),auth:json!({}),model:std::env::var("PY_MODEL").unwrap_or_else(|_|"openai/gpt-4.1".into()),
-            effort:"medium".into(),no_model,context_limit:std::env::var("PY_CONTEXT_LIMIT").ok().and_then(|s|s.parse().ok()).unwrap_or(128000),trigger:20,retain:10,current_code:None,usage:json!({})};
+            json:json_mode,stop:false,stop_wakeup:None,reset:false,reset_explicit:false,generation:0,revision:0,
+            bg_tasks:HashMap::new(),wakeups:HashMap::new(),servicing:false,
+            incoming:None,input_closed:false,pending:std::collections::VecDeque::new(),attachments:HashMap::new(),queued:HashMap::new(),config:json!({}),config_defaults:json!({}),auth:json!({}),model:std::env::var("PY_MODEL").unwrap_or_else(|_|"openai/gpt-4.1".into()),
+            effort:"medium".into(),no_model,context_limit:std::env::var("PY_CONTEXT_LIMIT").ok().and_then(|s|s.parse().ok()).unwrap_or(128000),trigger:20,retain:10,current_code:None,usage:json!({}),
+            skills,initializing:false,startup_ready:false};
         for name in ["code","user","stdout","stderr","stdin","raw","say","requests","responses","usage"]{
             host.history.insert(name.into(),vec![]);
         }
@@ -3573,6 +4188,7 @@ impl Host {
                 "stdin"=>{host.history.get_mut("stdin").unwrap().push(json!({"$event":sequence}));},
                 "worker_reset"=>{host.generation=p["generation"].as_u64().ok_or("invalid worker generation")? as usize;},
                 "settings_change"=>{settings=Some(p.clone());},
+                "task_state"|"task_settled"|"wakeup_state"=>host.bg_restore(ev["kind"].as_str().unwrap(),p)?,
                 "cell_start"=>{host.cells=host.cells.max(p["cell"].as_u64().ok_or("invalid session cell number")? as usize);},
                 "stream"=>{
                     let list=host.history.get_mut(p["collection"].as_str().unwrap()).ok_or("invalid stream collection")?;
@@ -3595,7 +4211,7 @@ impl Host {
                 _=>{}
             }
         }
-        host.config=load_json(&host.home.join("config.json"))?;
+        host.config_defaults=config.clone();host.config=config;
         host.auth=load_json(&host.home.join("auth.json"))?;
         host.configure()?;
         if let Some(settings)=settings{
@@ -3603,13 +4219,24 @@ impl Host {
             host.effort=settings["effort"].as_str().ok_or("invalid session effort")?.into();
             host.validate_effort(&host.effort)?;
         }
+        if let Some(model)=model_override{host.choose_model(model)?;}
+        if let Some(effort)=effort_override{host.change_effort(effort)?;}
+        host.check_system_budget(host.context_limit)?;
         if resumed {
-            host.reset_worker()?;
+            host.bg_recover()?;
+            host.generation+=1;
+            let notice="Session loaded into fresh Python. Previous variables are undefined; H and context are restored.";
+            host.journal.append("worker_reset",json!({"generation":host.generation}))?;
+            host.add_context("user",notice.into(),false,vec![])?;
+            host.event("notice",json!({"text":notice}));
             let recovery=host.recovery_status()?;
             if recovery["operations"].as_array().is_some_and(|ops|ops.iter().any(|v|v["state"]=="unknown")){
                 host.event("notice",json!({"text":"Interrupted session has unknown operation outcomes. No execution was replayed; /recovery shows captured partial streams."}));
             }
         }
+        if resumed&&unfinished_startup{
+            host.event("notice",json!({"text":"Previous startup failed or has unknown side effects. Startup was not replayed. Inspect /recovery; /reset explicitly authorizes a fresh initialization attempt."}));
+        }else{host.initialize_skills()?;}
         Ok(host)
     }
     fn user(&mut self,text:&str,visible:bool)->Result<usize>{
@@ -3651,7 +4278,15 @@ impl Host {
                         self.history_last("stderr")?);
                     self.user(&message,true)?;
                 }
+                if self.stop{self.commit_stop()?;}
                 self.event("completed",result);
+            },
+            "bg_run"=>{
+                let result=self.bg_run(&json!({"kind":v.get("task_kind").unwrap_or(&json!("shell")),"source":v["source"],"options":v["options"]}))?;
+                self.event("completed",json!({"command_id":id,"status":"ok","result":result}));
+            },
+            "task_list"|"task_get"|"task_logs"|"task_kill"|"wakeup_list"|"wakeup_cancel"|"wakeup_run"=>{
+                self.finish_background_control(&v)?;
             },
             "shell"=>{
                 let command=v["command"].as_str().ok_or("command required")?;
@@ -3700,7 +4335,14 @@ impl Host {
             "status"=>self.event("status",self.status()),
             "context"=>self.event("context",json!({"command_id":id,"usage":self.context_usage(),
                 "items":self.context.iter().map(item_json).collect::<Vec<_>>()})),
-            "quit"=>return Ok(false),
+            "new"|"resume"=>{
+                let cancel=v.get("cancel_tasks").map(|x|x.as_bool().ok_or("cancel_tasks must be boolean")).transpose()?.unwrap_or(false);
+                let query=if v["kind"]=="resume"{Some(v["session"].as_str().filter(|s|!s.is_empty()).ok_or("session path/query required")?)}else{None};
+                self.switch_session(query,cancel)?;
+                self.journal.append("accepted",json!({"command_id":id,"command":v}))?;self.ids.insert(id.clone());
+                self.event("completed",json!({"command_id":id,"status":"ok","session":self.journal.path}));
+            },
+            "quit"=>{self.bg_guard(v.get("cancel_tasks").map(|x|x.as_bool().ok_or("cancel_tasks must be boolean")).transpose()?.unwrap_or(false))?;return Ok(false);},
             _=>self.event("rejected",json!({"command_id":id,"error":"unknown command kind"}))
         }
         self.evict()?;Ok(true)
@@ -3712,7 +4354,7 @@ fn parse_item(p:&Value)->Item{
         text:p["text"].as_str().unwrap_or("").into(),output:p["output"].as_bool().unwrap_or(false),ranges}
 }
 
-const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences. Persistent CPython exposes agent and H. H.code/user/stdout/stderr contain full history. Only metadata is automatically observed. Explicitly select payload with agent.context.read_text(H.stderr[i][:4000]) or read_raw. agent.say(text) sends a user-only UI message without stdout/context duplication. agent.sh(command) returns status and H stream refs. agent.llm(prompt,model=...) returns data; agent.llm.list() lists models; agent.llm.image(prompt,model=...) generates image data. agent.context.items()/usage() inspect context metadata. agent.loop.stop() ends this turn after this cell; does not kill Python. Collapse must be standalone agent.context.collapse('start','end','summary'); successful output is silent. Retained call contains sole summary plus original ranges. In forced mode only collapse or literal agent.context.read_text(H.stderr[44][:4000]) allowed. No replay after resume. Execution is unrestricted.";
+const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences. Persistent CPython exposes agent and H. H.code/user/stdout/stderr contain full history. Only metadata is automatically observed. Explicitly select payload with agent.context.read_text(H.stderr[i][:4000]) or read_raw. agent.say(text) sends a user-only UI message without stdout/context duplication. agent.sh(command) returns status and H stream refs. agent.llm(prompt,model=...) returns data; agent.llm.list() lists models; agent.llm.image(prompt,model=...) generates image data. agent.context.items()/usage() inspect context metadata. agent.loop.stop(wakeup=None) ends this turn after a successful cell; optional wakeup=(seconds,reason) schedules one continuation. agent.bgtasks.run(source,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None) returns task metadata immediately; kind='python' uses a fresh isolated interpreter without agent or main variables. bgtasks.list(state=None),get(task_id),kill(task_id,force=False) manage jobs. Outputs stay in H; only explicit context reads select them. Completion wakeups are opt-in. Does not kill foreground Python. Collapse must be standalone agent.context.collapse('start','end','summary'); successful output is silent. Retained call contains sole summary plus original ranges. In forced mode only collapse or literal agent.context.read_text(H.stderr[44][:4000]) allowed. No replay after resume. Execution is unrestricted.";
 // Reasoning request fields follow the pinned Pi provider transformations, not
 // generic OpenAI-compatible guesses. This is a pure body-layout helper: it never
 // reads credentials, starts I/O or changes session state. A false/absent reasoning
@@ -4036,8 +4678,10 @@ impl Host {
     }
     fn run_agent(&mut self)->Result<()>{
         for _ in 0..100{
+            if !self.startup_ready{return Err("Python initialization is incomplete; inspect /recovery and explicitly /reset to retry startup".into());}
+            self.check_system_budget(self.context_limit)?;
             self.evict()?;
-            let mut messages=vec![json!({"role":"system","content":SYSTEM})];
+            let mut messages=vec![json!({"role":"system","content":self.system_prompt()})];
             messages.extend(self.context.iter().map(|i|{
                 let text=format!("[boundary {}]\n{}",i.id,i.text);
                 let content=if let Some(index)=self.attachments.get(&i.id){
@@ -4056,7 +4700,7 @@ impl Host {
             self.event("completed",result);
             if cancelled{return Ok(());}
             if self.deliver_steering()?{continue;}
-            if self.stop{return Ok(());}
+            if self.stop{self.commit_stop()?;return Ok(());}
         }
         Err("outer loop reached safety limit; return to user".into())
     }
@@ -4170,7 +4814,7 @@ impl Host{
         if self.json{self.event("info",json!({"title":title,"value":value}));}else{ui_json(title,value);}
     }
     fn announce_ready(&self){
-        self.event("ready",json!({"session":self.journal.path,"model":self.model,"effort":self.effort,"context_usage":self.context_usage()}));
+        self.event(if self.startup_ready{"ready"}else{"initialization_blocked"},json!({"session":self.journal.path,"model":self.model,"effort":self.effort,"startup_ready":self.startup_ready,"context_usage":self.context_usage()}));
         self.event("state",self.state_payload());
     }
     fn state_payload(&self)->Value{
@@ -4260,7 +4904,9 @@ impl Host{
             return Err(format!("Model query is ambiguous: {}. Use a full provider/model ID.",
                 found.iter().take(16).filter_map(|m|m["id"].as_str()).collect::<Vec<_>>().join(", ")).into());
         }
-        self.set_model(found[0]["id"].as_str().unwrap().into())?;
+        let model=found[0]["id"].as_str().unwrap();
+        self.check_system_budget(self.model_limit(model)?)?;
+        self.set_model(model.into())?;
         if self.validate_effort(&self.effort).is_err(){
             self.effort="medium".into();self.event("notice",json!({"text":"Previous effort unsupported by this model; reset to medium."}));
         }
@@ -4302,7 +4948,9 @@ impl Host{
             .filter(|p|p.extension().is_some_and(|e|e=="jsonl")).collect::<Vec<_>>();
         paths.sort();paths.reverse();Ok(paths)
     }
-    fn switch_session(&mut self,query:Option<&str>)->Result<()>{
+    fn switch_session(&mut self,query:Option<&str>,cancel_tasks:bool)->Result<()>{
+        if !self.pending.is_empty(){return Err("Pending accepted commands must be handled before switching sessions".into());}
+        self.bg_guard(cancel_tasks)?;
         let path=if let Some(query)=query{
             let query=query.trim_matches(|c|c=='\''||c=='"');
             let direct=PathBuf::from(query);
@@ -4316,20 +4964,22 @@ impl Host{
         if path.as_ref().is_some_and(|p|fs::canonicalize(&self.journal.path).ok().as_ref()==Some(p)){
             self.ui_text("Already in this session.");return Ok(());
         }
-        let mut next=Host::new(self.home.clone(),path.clone(),self.json,self.no_model)?;
-        if path.is_none(){
-            next.set_model(self.model.clone())?;next.effort=self.effort.clone();next.save_session_settings()?;
-        }
+        let defaults=if path.is_none(){load_json(&self.home.join("config.json"))?}else{Value::Null};
+        let model_override=if path.is_none()&&defaults["model"]==self.config["model"]{Some(self.model.as_str())}else{None};
+        let effort_override=if path.is_none()&&defaults["effort"]==self.config["effort"]{Some(self.effort.as_str())}else{None};
+        let mut next=Host::new(self.home.clone(),path.clone(),self.json,self.no_model,model_override,effort_override)?;
         next.announce_ready();
         self.ui_text(&format!("Session: {}",next.journal.path.display()));
+        next.incoming=self.incoming.take();next.input_closed=self.input_closed;
         *self=next;Ok(())
     }
     fn ui_command(&mut self,line:&str)->Result<bool>{
         self.reload_auth()?;
         let (command,args)=line.split_once(char::is_whitespace).map(|(c,a)|(c,a.trim())).unwrap_or((line,""));
         match command{
-            "/quit"|"/exit"=>return Ok(false),
-            "/help"|"/hotkeys"=>self.ui_text("py — ordinary persistent Python, unrestricted execution.\nOrdinary Python. No sandbox.\n! shell / @ Python: hidden from the model; !! / @@: visible.\nTab: fuzzy picker for commands, arguments, Python names, executables and files.\nType to filter; arrows/Tab move, Enter selects (not submits); Esc cancels.\nShift+Enter inserts newline on supported terminals; Ctrl-J is a fallback.\nContinuation lines align after the two-column > prompt.\nPython brackets/suites and bracketed multiline paste form a single cell.\nCtrl-D: exit idle editor. Ctrl-C: clear editor / cancel active operation.\n/model list [query] /models [query]: offline model inventory\n/model <provider/id or fuzzy query>: select, rejecting ambiguity\n/effort <off|minimal|low|medium|high|xhigh> (/think, /thinking)\n/login [provider] [browser|manual|device|api-key] /logout [provider] /auth\n/status /context /config /recovery /session /sessions\n/new /resume <path or fuzzy session> /reset /compact [instructions]\nH stores full history; previews show at most 12 original lines.\nSession resume restores H/context/settings, never Python variables or execution.\n/quit: exit. Browser OAuth: Codex callback, Anthropic hidden code paste.\nUnsupported provider protocols and live subscription parity are not claimed."),
+            "/quit"|"/exit"=>{self.bg_guard(transition_cancel(args)?)?;return Ok(false);},
+            "/tasks"|"/task"|"/bg"|"/wakeups"|"/wakeup"=>self.ui_background_command(command,args)?,
+            "/help"|"/hotkeys"=>self.ui_text("py — ordinary persistent Python, unrestricted execution.\nOrdinary Python. No sandbox.\n! shell / @ Python: hidden from the model; !! / @@: visible.\nTab: fuzzy picker for commands, arguments, Python names, executables and files.\nType to filter; arrows/Tab move, Enter selects (not submits); Esc cancels.\nShift+Enter inserts newline on supported terminals; Ctrl-J is a fallback.\nContinuation lines align after the two-column > prompt.\nPython brackets/suites and bracketed multiline paste form a single cell.\nCtrl-D: exit idle editor. Ctrl-C: clear editor / cancel active operation.\n/model list [query] /models [query]: offline model inventory\n/model <provider/id or fuzzy query>: select, rejecting ambiguity\n/effort <off|minimal|low|medium|high|xhigh> (/think, /thinking)\n/login [provider] [browser|manual|device|api-key] /logout [provider] /auth\n/status /context /config /recovery /session /sessions\n/config get <key> | set <key> <JSON-value> | unset <key> | reload\nDurable entries: ~/.py/skills/*.md (or PY_HOME); ordinary file editing, no skills API.\nCore entries and inventory freeze on /new; reset/resume preserve that snapshot.\nCore Python runs unrestricted in every fresh main worker; prefer definitions/imports.\n/new /resume <path or fuzzy session> /reset /compact [instructions]\n/tasks [state] /task <id> /task logs <id> [stdout|stderr|both]\n/task kill <id> [--force] /bg shell|python <source>\n/wakeups /wakeup cancel|run <id>\n/quit, /new and /resume require --cancel-tasks while jobs run.\nH stores full history; previews show at most 12 original lines.\nSession resume restores H/context/settings, never Python variables or execution.\n/quit: exit. Browser OAuth: Codex callback, Anthropic hidden code paste.\nUnsupported provider protocols and live subscription parity are not claimed."),
             "/model" if args.is_empty()=>self.ui_text(&self.model),
             "/model" if args=="list"||args.starts_with("list ")=>self.list_models(args.strip_prefix("list").unwrap().trim()),
             "/model"=>self.choose_model(args)?,
@@ -4344,12 +4994,12 @@ impl Host{
             "/auth"=>self.ui_json("Authentication (no secrets)",&self.auth_status()),
             "/status"=>self.ui_json("Status",&self.status()),
             "/context"=>self.ui_json("Context metadata",&self.context_usage()),
-            "/config"=>self.ui_json("Configuration",&self.config),
+            "/config"=>self.config_command(args)?,
             "/recovery"=>self.ui_json("Recovery: no automatic replay",&self.recovery_status()?),
             "/session"=>self.ui_text(&format!("Session: {}",self.journal.path.display())),
             "/sessions"|"/resume" if args.is_empty()=>{self.ui_text("Sessions — /resume <path or fuzzy filename>");for path in self.session_paths()?{self.ui_text(&path.to_string_lossy());}},
-            "/resume"=>self.switch_session(Some(args))?,
-            "/new"=>self.switch_session(None)?,
+            "/resume"=>{let (query,cancel)=transition_query(args)?;self.switch_session(Some(query),cancel)?;},
+            "/new"=>self.switch_session(None,transition_cancel(args)?)?,
             "/reset"=>self.reset_worker()?,
             "/interrupt"=>self.ui_text("No operation is running. Ctrl-C cancels an active operation."),
             "/compact"=>{
@@ -4360,6 +5010,184 @@ impl Host{
             _=>return Err(format!("Unknown command {command}; /help lists implemented commands").into())
         }
         Ok(true)
+    }
+}
+#[cfg(test)]
+mod background_ui_tests {
+    use super::*;
+    #[test]
+    fn transition_cancel_requires_explicit_choice(){
+        assert!(!transition_cancel("").unwrap());assert!(transition_cancel("--cancel-tasks").unwrap());
+        assert!(transition_cancel("yes").is_err());assert!(transition_cancel("--cancel-tasks extra").is_err());
+    }
+    #[test]
+    fn transition_resume_preserves_path_and_cancellation(){
+        assert_eq!(transition_query("/some path/session.jsonl --cancel-tasks").unwrap(),("/some path/session.jsonl",true));
+        assert_eq!(transition_query("session.jsonl").unwrap(),("session.jsonl",false));
+        assert!(transition_query("--cancel-tasks").is_err());assert!(transition_query("x--cancel-tasks").is_err());
+    }
+    fn fixture(body:&str){
+        let script=format!(r#"
+import os,sys,tempfile,subprocess,json,glob,time,queue,threading,pty,fcntl,termios,select
+home=tempfile.mkdtemp(prefix='py-background-ui-');env=dict(os.environ,PY_HOME=home,TERM='xterm-256color')
+for key in ('PY_MODEL','PY_CONTEXT_LIMIT'):env.pop(key,None)
+def records():
+ paths=glob.glob(home+'/sessions/*.jsonl')
+ if not paths:return []
+ result=[]
+ for line in open(paths[0]):
+  try:result.append(json.loads(line))
+  except ValueError:pass
+ return result
+def events(p):
+ q=queue.Queue()
+ def read():
+  for line in p.stdout:
+   try:q.put(json.loads(line))
+   except ValueError:pass
+ threading.Thread(target=read,daemon=True).start()
+ return q
+def wait_event(q,predicate):
+ end=time.monotonic()+8;seen=[]
+ while time.monotonic()<end:
+  try:v=q.get(timeout=max(.001,end-time.monotonic()))
+  except queue.Empty:break
+  seen.append(v)
+  if predicate(v):return v
+ raise AssertionError(('missing event',seen,records()))
+{body}
+"#);
+        let out=crate::test_command("python3").args(["-c",&script,&std::env::var("PY_HARNESS_BIN").expect("build CLI and set PY_HARNESS_BIN")]).output().unwrap();
+        assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+    }
+    #[test]
+    fn e2e_nonterminal_editor_does_not_read_ahead_input(){fixture(r#"
+p=subprocess.Popen([sys.argv[1],'--json','--no-model'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env)
+out,err=p.communicate("@print(input('question: '))\nanswer-kept-for-input\n/quit\n",timeout=8)
+assert p.returncode==0,(out,err)
+r=records();codes=[v['payload']['source'] for v in r if v['kind']=='code']
+assert codes==["print(input('question: '))"],codes
+assert any(v['kind']=='stream' and 'answer-kept-for-input' in v['payload']['text'] for v in r),r
+"#);}
+    #[test]
+    fn e2e_idle_json_services_background_completion_and_wakeup(){fixture(r#"
+p=subprocess.Popen([sys.argv[1],'--json','--json-input','--no-model'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env);q=events(p)
+try:
+ wait_event(q,lambda v:v.get('kind')=='ready')
+ p.stdin.write(json.dumps({'id':'launch','kind':'bg_run','task_kind':'shell','source':'sleep .06; printf background-private','options':{'wakeup_reason':'check result'}})+'\n');p.stdin.flush()
+ completed=wait_event(q,lambda v:v.get('kind')=='completed' and v.get('command_id')=='launch');task=completed['result']['id']
+ wait_event(q,lambda v:v.get('kind')=='task_state' and v.get('id')==task and v.get('status')=='succeeded')
+ wait_event(q,lambda v:v.get('kind')=='notice' and 'Wakeup:' in v.get('text',''))
+ time.sleep(.08);r=records()
+ assert len([v for v in r if v['kind']=='wakeup_state' and v['payload']['state']=='consumed'])==1,r
+ assert not any('background-private' in v['payload'].get('text','') for v in r if v['kind']=='context_add'),r
+ p.stdin.write(json.dumps({'id':'quit','kind':'quit'})+'\n');p.stdin.flush();p.wait(timeout=5)
+ assert p.returncode==0,p.stderr.read()
+finally:
+ if p.poll() is None:p.kill();p.wait()
+"#);}
+    #[test]
+    fn e2e_idle_tty_wakeup_preserves_multiline_draft_and_cursor(){fixture(r#"
+m,s=pty.openpty();fcntl.ioctl(m,termios.TIOCSWINSZ,__import__('struct').pack('HHHH',24,80,0,0))
+def session():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
+p=subprocess.Popen([sys.argv[1],'--json','--no-model'],stdin=s,stdout=subprocess.PIPE,stderr=s,text=True,env=env,preexec_fn=session);os.close(s);q=events(p);data=bytearray()
+def read_until(predicate):
+ end=time.monotonic()+8
+ while time.monotonic()<end:
+  if predicate():return
+  if select.select([m],[],[],.03)[0]:
+   try:data.extend(os.read(m,65536))
+   except OSError:break
+ raise AssertionError(('missing tty paint',bytes(data),records()))
+try:
+ wait_event(q,lambda v:v.get('kind')=='ready');read_until(lambda:b'\x1b[?2004h' in data)
+ os.write(m,b"@agent.loop.stop(wakeup=(.4,'check timer'))\r")
+ wait_event(q,lambda v:v.get('kind')=='completed' and v.get('status')=='ok')
+ read_until(lambda:data.count(b'\x1b[?2004h')>=2)
+ # Paste a multiline draft, then move into the second line before waking.
+ os.write(m,b'\x1b[200~@text = (\n    "ac"\n)\nprint(text)\x1b[201~\x1b[A\x1b[A\x01\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C')
+ wait_event(q,lambda v:v.get('kind')=='notice' and 'Wakeup:' in v.get('text',''))
+ read_until(lambda:data.count(b'\x1b[?2004h')>=3)
+ os.write(m,b'b\r')
+ wait_event(q,lambda v:v.get('kind')=='completed' and v.get('status')=='ok')
+ codes=[v['payload']['source'] for v in records() if v['kind']=='code']
+ assert codes[-1]=='text = (\n    "abc"\n)\nprint(text)',codes
+ read_until(lambda:data.count(b'\x1b[?2004h')>=4)
+ os.write(m,b'/quit\r');p.wait(timeout=5);assert p.returncode==0,p.returncode
+finally:
+ if p.poll() is None:p.kill();p.wait()
+ os.close(m)
+"#);}
+}
+fn transition_cancel(args:&str)->Result<bool>{
+    match args.trim(){""=>Ok(false),"--cancel-tasks"=>Ok(true),_=>Err("Only --cancel-tasks is accepted here".into())}
+}
+fn transition_query(args:&str)->Result<(&str,bool)>{
+    let (query,cancel)=if let Some(query)=args.strip_suffix("--cancel-tasks"){
+        if !query.ends_with(char::is_whitespace){return Err("Separate --cancel-tasks from the session path".into());}
+        (query.trim(),true)
+    }else{(args.trim(),false)};
+    if query.is_empty(){return Err("Usage: /resume <path or fuzzy session> [--cancel-tasks]".into());}
+    Ok((query,cancel))
+}
+impl Host{
+    fn ui_background_command(&mut self,command:&str,args:&str)->Result<()>{
+        let id=format!("ui{}",self.journal.seq);let words:Vec<_>=args.split_whitespace().collect();
+        let mut v=match command{
+            "/tasks" if words.len()<=1=>json!({"kind":"task_list","state":words.first()}),
+            "/task"=>match words.as_slice(){
+                [task]=>json!({"kind":"task_get","task_id":task}),
+                ["logs",task]=>json!({"kind":"task_logs","task_id":task,"stream":"both"}),
+                ["logs",task,stream] if ["stdout","stderr","both"].contains(stream)=>json!({"kind":"task_logs","task_id":task,"stream":stream}),
+                ["kill",task]=>json!({"kind":"task_kill","task_id":task,"force":false}),
+                ["kill",task,"--force"]=>json!({"kind":"task_kill","task_id":task,"force":true}),
+                _=>return Err("Usage: /task <id> | /task logs <id> [stdout|stderr|both] | /task kill <id> [--force]".into())
+            },
+            "/bg"=>{
+                let (kind,source)=args.split_once(char::is_whitespace).ok_or("Usage: /bg shell|python <source>")?;
+                if !["shell","python"].contains(&kind)||source.trim().is_empty(){return Err("Usage: /bg shell|python <source>".into());}
+                json!({"kind":"bg_run","task_kind":kind,"source":source.trim_start()})
+            },
+            "/wakeups" if words.is_empty()=>json!({"kind":"wakeup_list"}),
+            "/wakeup"=>match words.as_slice(){
+                ["cancel",wake]=>json!({"kind":"wakeup_cancel","wakeup_id":wake}),
+                ["run",wake]=>json!({"kind":"wakeup_run","wakeup_id":wake}),
+                _=>return Err("Usage: /wakeup cancel|run <id>".into())
+            },
+            _=>return Err("Unexpected arguments; /help lists background commands".into())
+        };
+        let previous:HashSet<_>=self.bg_tasks.keys().cloned().collect();
+        v["id"]=json!(id);self.dispatch(v.clone())?;
+        let result=match v["kind"].as_str().unwrap(){
+            "task_list"=>self.bg_list(v["state"].as_str())?,
+            "bg_run"=>self.bg_tasks.iter().find(|(id,_)|!previous.contains(*id)).map(|(_,task)|task.metadata.clone()).ok_or("background launch did not create a task")?,
+            "task_get"|"task_kill"=>self.bg_get(v["task_id"].as_str().unwrap())?,
+            "task_logs"=>{
+                let metadata=self.bg_get(v["task_id"].as_str().unwrap())?;
+                for stream in ["stdout","stderr"]{
+                    if v["stream"]!="both"&&v["stream"]!=stream{continue;}
+                    let index=metadata[stream]["index"].as_u64().ok_or("task has no output reference")? as usize;
+                    self.ui_text(&format!("{} — {}\n{}\n[{} bytes; preview only; full output in H]",stream,metadata[stream]["ref"].as_str().unwrap_or(""),self.ui_stream_preview(stream,index)?,metadata[stream]["bytes"]));
+                }
+                return Ok(());
+            },
+            _=>self.wakeup_list()?
+        };
+        self.ui_json("Background management",&result);Ok(())
+    }
+    fn ui_stream_preview(&self,stream:&str,index:usize)->Result<String>{
+        let value=self.history.get(stream).and_then(|values|values.get(index)).ok_or("missing task stream")?;
+        let mut bytes=Vec::new();
+        if let Some(chunks)=value["$chunks"].as_array(){
+            for seq in chunks{
+                let event=self.journal.event(seq.as_u64().ok_or("invalid stream chunk")? as usize)?;
+                let chunk=B64.decode(event["payload"]["base64"].as_str().ok_or("missing stream bytes")?)?;
+                bytes.extend_from_slice(&chunk[..chunk.len().min(16384-bytes.len())]);
+                if bytes.len()>=16384||bytes.iter().filter(|b|**b==b'\n').count()>=12{break;}
+            }
+        }else if let Some(text)=value.as_str(){bytes.extend_from_slice(&text.as_bytes()[..text.len().min(16384)]);}
+        else{return Err("invalid task stream".into());}
+        Ok(String::from_utf8_lossy(&bytes).lines().take(12).collect::<Vec<_>>().join("\n").chars().take(4000).collect())
     }
 }
 fn main(){
@@ -4410,9 +5238,7 @@ fn cli()->Result<()>{
     install_signals();
     let home=std::env::var_os("PY_HOME").map(PathBuf::from).unwrap_or_else(||
         PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".py"));
-    let mut host=Host::new(home,resume,json_mode,no_model)?;
-    if let Some(model)=model{host.choose_model(&model)?;}
-    if let Some(effort)=effort{host.change_effort(&effort)?;}
+    let mut host=Host::new(home,resume,json_mode,no_model,model.as_deref(),effort.as_deref())?;
     host.announce_ready();
     if json_input{
         let (tx,rx)=std::sync::mpsc::channel();
@@ -4430,8 +5256,16 @@ fn cli()->Result<()>{
         host.incoming=Some(rx);
         loop{
             INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
+            host.service_background()?;
             let command=if let Some(v)=host.pending.pop_front(){v}else{
-                match host.incoming.as_ref().unwrap().recv(){Ok(v)=>v,Err(_)=>break}
+                match host.incoming.as_ref().unwrap().recv_timeout(std::time::Duration::from_millis(25)){
+                    Ok(v)=>v,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected)=>break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)=>{
+                        if let Err(e)=host.dispatch_wakeups(){host.event("error",json!({"error":e.to_string()}));}
+                        continue;
+                    }
+                }
             };
             INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);
             let command_id=command["id"].as_str().unwrap_or("").to_string();
@@ -4450,11 +5284,14 @@ fn cli()->Result<()>{
             host.reload_auth()?;
             let prompt=if host.json{""}else{"> "};
             let models=host.models();let providers=host.login_providers();let current_model=host.model.clone();
-            editor.set_helper(Some(Completion::from_worker(&mut host.worker,models,host.home.clone(),current_model,providers)?));
+            let mut helper=Completion::from_worker(&mut host.worker,models,host.home.clone(),current_model,providers)?;
+            helper.catalog.task_ids=host.bg_tasks.keys().cloned().collect();
+            helper.catalog.wakeup_ids=host.wakeups.keys().cloned().collect();
+            editor.set_helper(Some(helper));
             editor.bind_sequence(rustyline::KeyEvent::from('\t'),editor.helper().unwrap().picker_handler());
             let line=match if terminal_editor_available(host.json){
-                terminal_readline(editor.helper().unwrap(),&editor.history().iter().cloned().collect::<Vec<_>>(),if host.json{2}else{1})
-            }else{editor.readline(prompt)}{
+                terminal_readline(editor.helper().unwrap(),&editor.history().iter().cloned().collect::<Vec<_>>(),if host.json{2}else{1},&mut host)
+            }else{serviceable_readline(editor.helper().unwrap(),prompt,&mut host)}{
                 Ok(s)=>s,Err(rustyline::error::ReadlineError::Interrupted)=>{
                     INTERRUPT.store(false,std::sync::atomic::Ordering::SeqCst);continue;
                 },
@@ -4464,7 +5301,7 @@ fn cli()->Result<()>{
             if line.trim().is_empty(){continue;}
             // Never persist authentication commands, let alone an accidentally
             // pasted credential. Keys are accepted only by the hidden tty prompt.
-            if !line.trim_start().starts_with("/login"){
+            if !line.trim_start().starts_with("/login")&&!line.trim_start().starts_with("/config"){
                 editor.add_history_entry(&line)?;
             }
             if line.starts_with('/'){
@@ -4484,6 +5321,7 @@ fn cli()->Result<()>{
         editor.save_history(&history)?;
         if history.exists(){fs::set_permissions(&history,std::os::unix::fs::PermissionsExt::from_mode(0o600))?;}
     }
+    host.bg_shutdown()?;
     Ok(())
 }
 
@@ -4668,7 +5506,7 @@ fn editor_report(code:u32,modifier:u32)->EditKey{
         _=>if let Some(c)=char::from_u32(code).filter(|c|!c.is_control()&&!(57344..=63743).contains(&(*c as u32))){return EditKey::Text(c.to_string());}
     }}EditKey::Ignore
 }
-fn editor_key(terminal:&mut EditTerminal)->rustyline::Result<Option<EditKey>>{
+fn editor_key(terminal:&mut EditTerminal,host:&mut Host)->rustyline::Result<Option<EditKey>>{
     let Some(byte)=terminal.byte(50)?else{return Ok(None);};
     if byte==27{
         let Some(first)=terminal.byte(35)?else{return Ok(Some(EditKey::Ignore));};
@@ -4687,6 +5525,7 @@ fn editor_key(terminal:&mut EditTerminal)->rustyline::Result<Option<EditKey>>{
         if sequence=="[200~"{
             let mut paste=vec![];let mut overflow=false;
             loop{
+                host.service_background().map_err(|e|io::Error::other(e.to_string()))?;
                 if INTERRUPT.load(std::sync::atomic::Ordering::SeqCst){return Err(rustyline::error::ReadlineError::Interrupted);}
                 let Some(b)=terminal.byte(50)?else{continue;};paste.push(b);
                 if paste.ends_with(b"\x1b[201~"){
@@ -4718,7 +5557,7 @@ fn editor_key(terminal:&mut EditTerminal)->rustyline::Result<Option<EditKey>>{
     let mut bytes=vec![byte];for _ in 1..length{if let Some(b)=terminal.byte(100)?{bytes.push(b);}else{return Ok(Some(EditKey::Ignore));}}
     Ok(Some(match String::from_utf8(bytes){Ok(text)=>EditKey::Text(text),Err(_)=>EditKey::Ignore}))
 }
-fn editor_complete(helper:&Completion,terminal:&mut EditTerminal,buffer:&mut EditBuffer)->rustyline::Result<()>{
+fn editor_complete(helper:&Completion,terminal:&mut EditTerminal,buffer:&mut EditBuffer,host:&mut Host)->rustyline::Result<()>{
     let (start,matching)=helper.catalog.candidates(&buffer.line,buffer.cursor,false)?;
     let selected=if matching.len()==1{Some(matching[0].replacement.clone())}
         else if matching.is_empty()||!terminal.display{None}else{
@@ -4728,12 +5567,51 @@ fn editor_complete(helper:&Completion,terminal:&mut EditTerminal,buffer:&mut Edi
             let (_,quote)=completion_token(prefix,offset);let query=completion_unescape(&prefix[start..],python,quote);
             // Picker has its own legacy decoder; temporarily restore the prior
             // keyboard protocol rather than feeding it reports it cannot parse.
-            terminal.keyboard(false)?;let choice=picker_select(&choices,&query);terminal.keyboard(true)?;
+            // A queued typing burst may not have been painted yet. Anchor below
+            // the complete visible input, not below the caret's current line.
+            terminal.draw(&buffer.line,buffer.cursor)?;
+            terminal.keyboard(false)?;
+            let choice=picker_select_service(&choices,&query,terminal.output.as_raw_fd(),terminal.rows,
+                terminal.rows.saturating_sub(terminal.cursor_row),||host.service_background());
+            terminal.keyboard(true)?;
             choice.map_err(|_|io::Error::other("selection failed"))?
         };
-    if let Some(value)=selected{buffer.replace(start,buffer.cursor,&value);}Ok(())
+    if let Some(value)=selected{buffer.replace(start,buffer.cursor,&value);}
+    terminal.draw(&buffer.line,buffer.cursor)?;
+    if terminal.display{terminal.output.write_all(b"\x1b[?25h")?;terminal.output.flush()?;}
+    Ok(())
 }
-fn terminal_readline(helper:&Completion,history:&[String],output_fd:i32)->rustyline::Result<String>{
+fn serviceable_readline(helper:&Completion,prompt:&str,host:&mut Host)->rustyline::Result<String>{
+    use rustyline::error::ReadlineError;
+    if unsafe{libc::isatty(0)==1}{print!("{prompt}");io::stdout().flush()?;}
+    let mut bytes=Vec::new();
+    let mut refreshed=None;
+    loop{
+        host.service_background().map_err(|e|io::Error::other(e.to_string()))?;
+        if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err(ReadlineError::Interrupted);}
+        let mut poll=libc::pollfd{fd:0,events:libc::POLLIN,revents:0};
+        let ready=unsafe{libc::poll(&mut poll,1,25)};
+        if ready<0{let error=io::Error::last_os_error();if error.kind()==io::ErrorKind::Interrupted{continue;}return Err(error.into());}
+        if ready==0{
+            let pending=host.wakeups.values().any(|w|w.metadata["state"]=="ready");
+            if let Err(e)=host.dispatch_wakeups(){host.event("error",json!({"error":e.to_string()}));}
+            if pending{refreshed=Some(editor_completion(host).map_err(|e|io::Error::other(e.to_string()))?);}
+            continue;
+        }
+        let helper=refreshed.as_ref().unwrap_or(helper);
+        // Never read ahead: foreground Python input() owns subsequent lines.
+        let mut byte=0u8;let size=unsafe{libc::read(0,(&mut byte as *mut u8).cast(),1)};
+        if size<0{let error=io::Error::last_os_error();if error.kind()==io::ErrorKind::Interrupted{continue;}return Err(error.into());}
+        if size==0{return if bytes.is_empty(){Err(ReadlineError::Eof)}else{String::from_utf8(bytes).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e).into())};}
+        if byte==b'\n'{
+            if bytes.last()==Some(&b'\r'){bytes.pop();}
+            let source=std::str::from_utf8(&bytes).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e))?;
+            if helper.incomplete(source)?{bytes.push(b'\n');}else{return Ok(source.into());}
+        }else{bytes.push(byte);}
+        if bytes.len()>1_048_576{return Err(io::Error::new(io::ErrorKind::InvalidData,"editor input exceeds one MiB").into());}
+    }
+}
+fn terminal_readline(helper:&Completion,history:&[String],output_fd:i32,host:&mut Host)->rustyline::Result<String>{
     use rustyline::error::ReadlineError;
     let mut terminal=EditTerminal::open(output_fd)?;
     let mut buffer=EditBuffer{line:String::new(),cursor:0,undo:std::collections::VecDeque::new(),killed:String::new(),history:None,draft:(String::new(),0)};
@@ -4741,10 +5619,23 @@ fn terminal_readline(helper:&Completion,history:&[String],output_fd:i32)->rustyl
     // This readiness marker is last: callers cannot race a half-configured tty.
     if terminal.display{terminal.output.write_all(b"\x1b[?2004h")?;terminal.output.flush()?;}
     let mut width=terminal.width();let mut height=terminal.height();
+    let mut refreshed=None;
     loop{
+        host.service_background().map_err(|e|io::Error::other(e.to_string()))?;
+        if host.wakeups.values().any(|w|w.metadata["state"]=="ready")&&!terminal.input_ready(){
+            // The entire edit state remains in buffer while the model owns the tty.
+            drop(terminal);
+            if let Err(e)=host.dispatch_wakeups(){host.event("error",json!({"error":e.to_string()}));}
+            refreshed=Some(editor_completion(host).map_err(|e|io::Error::other(e.to_string()))?);
+            terminal=EditTerminal::open(output_fd)?;
+            terminal.draw(&buffer.line,buffer.cursor)?;terminal.keyboard(true)?;
+            if terminal.display{terminal.output.write_all(b"\x1b[?2004h")?;terminal.output.flush()?;}
+            width=terminal.width();height=terminal.height();
+        }
+        let helper=refreshed.as_ref().unwrap_or(helper);
         if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err(ReadlineError::Interrupted);}
         if width!=terminal.width()||height!=terminal.height(){width=terminal.width();height=terminal.height();terminal.draw(&buffer.line,buffer.cursor)?;}
-        let key=match editor_key(&mut terminal){Err(ReadlineError::Io(e)) if e.kind()==io::ErrorKind::UnexpectedEof=>return Err(ReadlineError::Eof),other=>other?};
+        let key=match editor_key(&mut terminal,host){Err(ReadlineError::Io(e)) if e.kind()==io::ErrorKind::UnexpectedEof=>return Err(ReadlineError::Eof),other=>other?};
         let Some(key)=key else{continue;};
         match key{
             EditKey::Text(text)|EditKey::Paste(text)=>buffer.replace(buffer.cursor,buffer.cursor,&text),
@@ -4763,7 +5654,7 @@ fn terminal_readline(helper:&Completion,history:&[String],output_fd:i32)->rustyl
             EditKey::Byte(5)=>buffer.cursor=editor_line_end(&buffer.line,buffer.cursor),
             EditKey::Byte(2)=>buffer.cursor=editor_previous(&buffer.line,buffer.cursor),
             EditKey::Byte(6)=>buffer.cursor=editor_next(&buffer.line,buffer.cursor),
-            EditKey::Byte(9)=>editor_complete(helper,&mut terminal,&mut buffer)?,
+            EditKey::Byte(9)=>editor_complete(helper,&mut terminal,&mut buffer,host)?,
             EditKey::Byte(16)=>buffer.history(history,true),EditKey::Byte(14)=>buffer.history(history,false),
             EditKey::Byte(21|23|11)=>{
                 let (start,end)=match key{EditKey::Byte(21)=>(editor_line_start(&buffer.line,buffer.cursor),buffer.cursor),
@@ -4795,6 +5686,7 @@ impl Host {
         self.poll_target(self.worker.child.id() as i32,libc::SIGINT)
     }
     fn poll_target(&mut self,pid:i32,signal:i32)->Result<bool>{
+        self.service_background()?;
         let mut cancelled=false;
         if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){
             self.journal.append("cancel",json!({"generation":self.generation,"source":"SIGINT"}))?;
@@ -4816,7 +5708,7 @@ impl Host {
                 unsafe{libc::kill(-pid,signal);}
                 self.event("completed",json!({"command_id":id,"status":"ok"}));
                 cancelled=true;
-            }else{self.queue_arrival(command)?;}
+            }else if !self.background_control(&command)?{self.queue_arrival(command)?;}
         }
         Ok(cancelled)
     }
@@ -4909,7 +5801,7 @@ fn input_exception(action:&str)->Value{
 #[derive(Clone)]
 struct CompletionCatalog{
     names:Vec<String>,models:Value,home:PathBuf,python_cwd:PathBuf,
-    current_model:String,configured_providers:Vec<String>,
+    current_model:String,configured_providers:Vec<String>,task_ids:Vec<String>,wakeup_ids:Vec<String>,
 }
 struct Completion {
     catalog:CompletionCatalog,
@@ -4926,13 +5818,20 @@ impl Completion {
         if response["kind"]!="ide_names"{return Err("invalid idle worker inspection response".into());}
         let names=response["names"].as_array().map(|a|a.iter().filter_map(|v|v.as_str().map(str::to_string)).collect()).unwrap_or_default();
         let python_cwd=response["cwd"].as_str().map(PathBuf::from).unwrap_or(std::env::current_dir()?);
-        Ok(Self{catalog:CompletionCatalog{names,models,home,python_cwd,current_model,configured_providers},
+        Ok(Self{catalog:CompletionCatalog{names,models,home,python_cwd,current_model,configured_providers,task_ids:vec![],wakeup_ids:vec![]},
             selection:std::sync::Arc::new(std::sync::Mutex::new(None)),ipc:std::cell::RefCell::new((
             BufReader::new(worker.reader.get_ref().try_clone()?),worker.writer.try_clone()?))})
     }
     fn picker_handler(&self)->rustyline::EventHandler{
         rustyline::EventHandler::Conditional(Box::new(PickerTab{catalog:self.catalog.clone(),selection:self.selection.clone()}))
     }
+}
+fn editor_completion(host:&mut Host)->Result<Completion>{
+    let models=host.models();let providers=host.login_providers();
+    let mut helper=Completion::from_worker(&mut host.worker,models,host.home.clone(),host.model.clone(),providers)?;
+    helper.catalog.task_ids=host.bg_tasks.keys().cloned().collect();
+    helper.catalog.wakeup_ids=host.wakeups.keys().cloned().collect();
+    Ok(helper)
 }
 impl CompletionCatalog{
     fn providers(&self)->Vec<String>{
@@ -5101,7 +6000,7 @@ impl CompletionCatalog{
         ->rustyline::Result<(usize,Vec<rustyline::completion::Pair>)>{
         const COMMANDS:&[&str]=&["/help","/hotkeys","/model","/models","/effort","/think","/thinking","/status",
             "/context","/config","/login","/logout","/auth","/session","/sessions","/resume","/recovery",
-            "/reset","/new","/compact","/interrupt","/quit","/exit"];
+            "/reset","/new","/compact","/interrupt","/quit","/exit","/tasks","/task","/bg","/wakeups","/wakeup"];
         let Some(prefix)=line.get(..pos)else{return Ok((pos,vec![]));};
         let mut items=Vec::new();
         if prefix.starts_with('/'){
@@ -5157,6 +6056,27 @@ impl CompletionCatalog{
                     }.into_iter().map(str::to_string).collect()
                 }else{vec![]};
                 for provider in providers{if let Some(score)=fuzzy_score(word,&provider){items.push((score,provider.clone(),provider));}}
+            }else if matches!(command,"/tasks"|"/task"|"/bg"|"/wakeup"|"/quit"|"/exit"|"/new"){
+                let tokens:Vec<_>=args.split_whitespace().collect();
+                let at_new=args.ends_with(char::is_whitespace);
+                let slot=tokens.len().saturating_sub(usize::from(!at_new));
+                let task_slot=command=="/task"&&(slot==0||slot==1&&tokens.first().is_some_and(|s|["logs","kill"].contains(s)));
+                let wakeup_slot=command=="/wakeup"&&slot==1;
+                if task_slot||wakeup_slot{
+                    for id in if task_slot{&self.task_ids}else{&self.wakeup_ids}{
+                        if let Some(score)=fuzzy_score(word,id){items.push((score,id.clone(),id.clone()));}
+                    }
+                }
+                let suggestions:&[&str]=match command{
+                    "/tasks"=>&["all","running","finished","succeeded","failed","timed_out","cancelled","killed","outcome_unknown"],
+                    "/task" if args.starts_with("logs ")&&slot>=2=>&["stdout","stderr","both"],
+                    "/task" if args.starts_with("kill ")&&slot>=2=>&["--force"],
+                    "/task" if slot==0=>&["logs","kill"],"/task"=>&[],
+                    "/bg" if slot==0=>&["shell","python"],"/bg"=>&[],
+                    "/wakeup" if slot==0=>&["cancel","run"],"/wakeup"=>&[],
+                    _=>&["--cancel-tasks"]
+                };
+                for suggestion in suggestions{if let Some(score)=fuzzy_score(word,suggestion){items.push((score,suggestion.to_string(),suggestion.to_string()));}}
             }else if command=="/resume"{
                 let directory=self.home.join("sessions");
                 if let Ok(entries)=fs::read_dir(directory){for entry in entries.take(4096).flatten(){
@@ -5213,7 +6133,7 @@ impl rustyline::ConditionalEventHandler for PickerTab{
             let offset=if prefix.starts_with("@@")||prefix.starts_with("!!"){2}else if python||prefix.starts_with('!'){1}else{0};
             let (_,quote)=completion_token(prefix,offset);
             let query=completion_unescape(&prefix[start..],python,quote);
-            picker_select(&choices,&query).ok().flatten()
+            picker_select(&choices,&query,1,1,1).ok().flatten()
         };
         Some(if let Some(value)=selected{
             // Cmd::Replace is unsuitable here: Emacs redo overrides its count,
@@ -5223,24 +6143,47 @@ impl rustyline::ConditionalEventHandler for PickerTab{
         }else{rustyline::Cmd::Repaint})
     }
 }
-struct PickerTerminal{tty:File,previous:libc::termios,active:bool}
+struct PickerTerminal{
+    input:File,tty:File,previous:libc::termios,active:bool,
+    slots:usize,cursor_row:usize,origin_up:usize,prompt_rows:usize,
+}
 impl PickerTerminal{
-    fn open()->Result<Self>{
-        use std::os::fd::AsRawFd;
-        let tty=fs::OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    fn open(output_fd:i32,prompt_rows:usize,origin_up:usize)->Result<Option<Self>>{
+        use std::os::fd::FromRawFd;
+        let input=unsafe{libc::dup(0)};if input<0{return Err(io::Error::last_os_error().into());}
+        let input=unsafe{File::from_raw_fd(input)};
+        let tty=unsafe{libc::dup(output_fd)};if tty<0{return Err(io::Error::last_os_error().into());}
+        let tty=unsafe{File::from_raw_fd(tty)};
+        let mut size=unsafe{std::mem::zeroed::<libc::winsize>()};
+        let height=if unsafe{libc::ioctl(tty.as_raw_fd(),libc::TIOCGWINSZ,&mut size)}==0&&size.ws_row>0{size.ws_row as usize}else{24};
+        // At most half the screen: reserve room for the source and recent output.
+        // Multiline input can consume that room; a tiny screen declines the menu.
+        let slots=height.saturating_sub(prompt_rows).min((height/2).max(2)).min(8);
+        if slots<2{return Ok(None);}
         let mut previous=unsafe{std::mem::zeroed::<libc::termios>()};
-        if unsafe{libc::tcgetattr(tty.as_raw_fd(),&mut previous)}<0{return Err(io::Error::last_os_error().into());}
+        if unsafe{libc::tcgetattr(input.as_raw_fd(),&mut previous)}<0{return Err(io::Error::last_os_error().into());}
         let mut raw=previous;raw.c_lflag&=!(libc::ICANON|libc::ECHO|libc::ISIG);
         raw.c_cc[libc::VMIN]=1;raw.c_cc[libc::VTIME]=0;
-        if unsafe{libc::tcsetattr(tty.as_raw_fd(),libc::TCSANOW,&raw)}<0{return Err(io::Error::last_os_error().into());}
-        let mut guard=Self{tty,previous,active:true};
-        // A temporary alternate buffer preserves the entire original editor,
-        // cursor and scrollback even when its prompt is on the bottom row.
-        guard.tty.write_all(b"\x1b[?1049h\x1b[?25h")?;guard.tty.flush()?;Ok(guard)
+        if unsafe{libc::tcsetattr(input.as_raw_fd(),libc::TCSANOW,&raw)}<0{return Err(io::Error::last_os_error().into());}
+        let mut guard=Self{input,tty,previous,active:false,slots:0,cursor_row:0,origin_up:origin_up.max(1),prompt_rows};
+        guard.tty.write_all(b"\r")?;
+        if guard.origin_up>1{write!(guard.tty,"\x1b[{}B",guard.origin_up-1)?;}
+        // Newlines reserve owned rows and naturally scroll at the bottom. The
+        // source scrolls with them; no saved absolute cursor becomes stale.
+        for _ in 0..slots{
+            guard.tty.write_all(b"\r\n")?;
+            if guard.active{guard.cursor_row+=1;}guard.active=true;guard.slots+=1;
+        }
+        guard.top()?;guard.tty.flush()?;Ok(Some(guard))
+    }
+    fn top(&mut self)->io::Result<()>{
+        self.tty.write_all(b"\r")?;
+        if self.cursor_row>0{write!(self.tty,"\x1b[{}A",self.cursor_row)?;}
+        self.cursor_row=0;Ok(())
     }
     fn byte(&mut self,timeout:i32)->Result<Option<u8>>{
         use std::os::fd::AsRawFd;
-        let mut poll=libc::pollfd{fd:self.tty.as_raw_fd(),events:libc::POLLIN,revents:0};
+        let mut poll=libc::pollfd{fd:self.input.as_raw_fd(),events:libc::POLLIN,revents:0};
         let ready=unsafe{libc::poll(&mut poll,1,timeout)};
         if ready<0{
             let error=io::Error::last_os_error();
@@ -5248,7 +6191,7 @@ impl PickerTerminal{
             return Err(error.into());
         }
         if ready==0{return Ok(None);}
-        let mut byte=[0];if std::io::Read::read(&mut self.tty,&mut byte)?==0{return Err("selection input closed".into());}
+        let mut byte=[0];if std::io::Read::read(&mut self.input,&mut byte)?==0{return Err("selection input closed".into());}
         Ok(Some(byte[0]))
     }
     fn size(&self)->(usize,usize){
@@ -5261,8 +6204,14 @@ impl PickerTerminal{
 impl Drop for PickerTerminal{
     fn drop(&mut self){
         use std::os::fd::AsRawFd;
-        if self.active{let _=self.tty.write_all(b"\x1b[?1049l");let _=self.tty.flush();}
-        unsafe{libc::tcsetattr(self.tty.as_raw_fd(),libc::TCSANOW,&self.previous);}
+        if self.active{
+            let _=self.top();
+            // Clear only below the prompt, return to its original caret row.
+            let _=self.tty.write_all(b"\x1b[0J");
+            let _=write!(self.tty,"\x1b[{}A\r\x1b[?25h",self.origin_up);
+            let _=self.tty.flush();
+        }
+        unsafe{libc::tcsetattr(self.input.as_raw_fd(),libc::TCSANOW,&self.previous);}
     }
 }
 fn picker_clip(text:&str,width:usize)->String{
@@ -5281,32 +6230,44 @@ fn picker_filter(choices:&[rustyline::completion::Pair],query:&str)->Vec<usize>{
     ranked.into_iter().map(|p|p.1).collect()
 }
 fn picker_draw(terminal:&mut PickerTerminal,choices:&[rustyline::completion::Pair],query:&str,filtered:&[usize],selected:usize)->Result<()>{
-    let (width,rows)=terminal.size();let available=rows.saturating_sub(4).clamp(1,8);
+    let (width,_)=terminal.size();let slots=terminal.slots;
+    let mut lines=if slots==2{vec![format!("Fuzzy select · {query}")]}
+        else{vec!["Fuzzy select — Enter picks".into(),format!("Find: {query}")]};
+    if slots>=6{lines.push("↑↓/Tab move · Esc cancels".into());}
+    let footer=usize::from(slots>=5);let available=slots.saturating_sub(lines.len()+footer).max(1);
     let start=selected.saturating_sub(available/2).min(filtered.len().saturating_sub(available));
-    let mut lines=vec!["Fuzzy select — Enter picks".into(),format!("Find: {query}")];
-    if rows>=4{lines.push("↑↓/Tab move · Esc cancels".into());}
     if filtered.is_empty(){lines.push("No matches — edit query".into());}
     else{for (position,index) in filtered.iter().enumerate().skip(start).take(available){
         lines.push(format!("{}{}",if position==selected{"→ "}else{"  "},choices[*index].display));
     }}
-    if rows>=5{lines.push(format!("{}/{}",if filtered.is_empty(){0}else{selected+1},filtered.len()));}
-    terminal.tty.write_all(b"\x1b[H\x1b[2J")?;
-    for (index,line) in lines.into_iter().take(rows).enumerate(){
-        if index>0{terminal.tty.write_all(b"\r\n")?;}
-        let clipped=picker_clip(&line,width.saturating_sub(1).max(1));
-        let style=if index==0{"1;36"}else if index==1{"36"}else if line.starts_with("→ "){"1;7"}else if line.starts_with("  "){"0"}else{"2"};
-        terminal.tty.write_all(terminal_styled_for(&clipped,style,terminal.tty.as_raw_fd()).as_bytes())?;
+    if footer>0{lines.push(format!("{}/{}",if filtered.is_empty(){0}else{selected+1},filtered.len()));}
+    terminal.top()?;terminal.tty.write_all(b"\x1b[?25l")?;
+    for index in 0..slots{
+        if index>0{terminal.tty.write_all(b"\r\n")?;terminal.cursor_row+=1;}
+        terminal.tty.write_all(b"\x1b[2K")?;
+        if let Some(line)=lines.get(index){
+            let clipped=picker_clip(line,width.saturating_sub(1).max(1));
+            let style=if index==0{"1;36"}else if index==1&&slots>2{"36"}else if line.starts_with("→ "){"1;7"}else if line.starts_with("  "){"0"}else{"2"};
+            terminal.tty.write_all(terminal_styled_for(&clipped,style,terminal.tty.as_raw_fd()).as_bytes())?;
+        }
     }
-    let cursor=(terminal_clusters(&format!("Find: {}",terminal_safe(query))).iter().map(|p|p.1).sum::<usize>()+1).min(width);
-    write!(terminal.tty,"\x1b[{};{}H",2.min(rows),cursor)?;terminal.tty.flush()?;Ok(())
+    let query_row=usize::from(slots>2);
+    let query_line=if slots==2{format!("Fuzzy select · {}",terminal_safe(query))}else{format!("Find: {}",terminal_safe(query))};
+    let cursor=terminal_columns(&query_line).min(width.saturating_sub(1));
+    terminal.tty.write_all(b"\r")?;
+    let up=terminal.cursor_row-query_row;if up>0{write!(terminal.tty,"\x1b[{up}A")?;}
+    terminal.cursor_row=query_row;
+    if cursor>0{write!(terminal.tty,"\x1b[{cursor}C")?;}
+    terminal.tty.write_all(b"\x1b[?25h")?;terminal.tty.flush()?;Ok(())
 }
 // Nested selection keeps bracketed paste enabled. Consume it atomically so
 // pasted Enter/Escape/control bytes can never select, navigate or submit cells.
-fn picker_paste(terminal:&mut PickerTerminal)->Result<Option<String>>{
+fn picker_paste_service(terminal:&mut PickerTerminal,service:&mut impl FnMut()->Result<()>)->Result<Option<String>>{
     let mut paste=Vec::new();let mut overflow=false;
     loop{
+        service()?;
         if INTERRUPT.load(std::sync::atomic::Ordering::SeqCst){
-            unsafe{libc::tcflush(terminal.tty.as_raw_fd(),libc::TCIFLUSH);}
+            unsafe{libc::tcflush(terminal.input.as_raw_fd(),libc::TCIFLUSH);}
             return Ok(None);
         }
         let Some(byte)=terminal.byte(50)?else{continue;};paste.push(byte);
@@ -5323,14 +6284,22 @@ fn picker_paste(terminal:&mut PickerTerminal)->Result<Option<String>>{
         if paste.len()>1_048_576+6{overflow=true;paste.drain(..paste.len()-6);}
     }
 }
-fn picker_select(choices:&[rustyline::completion::Pair],initial_query:&str)->Result<Option<String>>{
-    if unsafe{libc::isatty(0)}!=1||unsafe{libc::isatty(1)}!=1||std::env::var("TERM").is_ok_and(|t|t=="dumb"){return Ok(None);}
-    let mut terminal=PickerTerminal::open()?;
+fn picker_select(choices:&[rustyline::completion::Pair],initial_query:&str,output_fd:i32,prompt_rows:usize,origin_up:usize)->Result<Option<String>>{
+    picker_select_service(choices,initial_query,output_fd,prompt_rows,origin_up,||Ok(()))
+}
+fn picker_select_service(choices:&[rustyline::completion::Pair],initial_query:&str,output_fd:i32,prompt_rows:usize,origin_up:usize,mut service:impl FnMut()->Result<()>)->Result<Option<String>>{
+    if unsafe{libc::isatty(0)}!=1||unsafe{libc::isatty(output_fd)}!=1||std::env::var("TERM").is_ok_and(|t|t=="dumb"){return Ok(None);}
+    let Some(mut terminal)=PickerTerminal::open(output_fd,prompt_rows,origin_up)?else{return Ok(None);};
     let mut query:String=initial_query.chars().take(512).collect();let mut filtered=picker_filter(choices,&query);
     let mut selected=0usize;let mut dirty=true;let mut size=terminal.size();
     loop{
+        service()?;
         if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Ok(None);}
-        if size!=terminal.size(){size=terminal.size();dirty=true;}
+        if size!=terminal.size(){
+            size=terminal.size();
+            if size.1.saturating_sub(terminal.prompt_rows)<terminal.slots{return Ok(None);}
+            dirty=true;
+        }
         if dirty{picker_draw(&mut terminal,choices,&query,&filtered,selected)?;dirty=false;}
         let Some(byte)=terminal.byte(50)?else{continue;};
         let mut edit=false;
@@ -5358,7 +6327,7 @@ fn picker_select(choices:&[rustyline::completion::Pair],initial_query:&str)->Res
                         selected=if selected==0{filtered.len()-1}else{selected-1};dirty=true;
                     },
                     b"[B"|b"OB" if !filtered.is_empty()=>{selected=(selected+1)%filtered.len();dirty=true;},
-                    b"[200~"=>if let Some(text)=picker_paste(&mut terminal)?{
+                    b"[200~"=>if let Some(text)=picker_paste_service(&mut terminal,&mut service)?{
                         if query.len()+text.len()<=2048{query.push_str(&text);edit=true;}
                     },
                     _=>{}
@@ -5392,7 +6361,7 @@ impl Host {
         self.select_user(command["text"].as_str().ok_or("queued text required")?,index,sequence)?;
         self.journal.append("queue_delivered",json!({"command_id":id,"mode":"steering"}))?;
         self.event("completed",json!({"command_id":id,"status":"delivered"}));
-        self.stop=false;
+        self.stop=false;self.stop_wakeup=None;
         Ok(true)
     }
 }
@@ -5424,12 +6393,13 @@ impl Host {
                 tokio::select!{
                     response=&mut future=>return response,
                     _=tokio::time::sleep(std::time::Duration::from_millis(15))=>{
+                        self.service_background()?;
                         let mut cancel=INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst);
                         while let Some(command)=self.incoming.as_ref().and_then(|r|r.try_recv().ok()){
                             if command["kind"]=="interrupt"{
                                 if !self.accept_input_control(&command)?{continue;}
                                 self.event("completed",json!({"command_id":command["id"],"status":"ok"}));cancel=true;
-                            }else{self.queue_arrival(command)?;}
+                            }else if !self.background_control(&command)?{self.queue_arrival(command)?;}
                         }
                         if cancel{
                             self.journal.append("provider_cancelled",json!({"operation":operation,"billing":"unknown"}))?;
@@ -5513,18 +6483,24 @@ impl Host{
         self.set_model(self.model.clone())?;
         Ok(())
     }
-    fn set_model(&mut self,model:String)->Result<()>{
+    fn model_limit(&self,model:&str)->Result<usize>{
         let models=self.models();
-        if let Some(descriptor)=models.as_array().unwrap().iter().find(|v|v["id"]==model){
-            if let Some(limit)=descriptor["context_limit"].as_u64(){self.context_limit=limit as usize;}
-        }
-        if let Ok(limit)=std::env::var("PY_CONTEXT_LIMIT"){self.context_limit=limit.parse()?;}
-        self.model=model;Ok(())
+        let mut limit=models.as_array().unwrap().iter().find(|v|v["id"]==model)
+            .and_then(|descriptor|descriptor["context_limit"].as_u64()).map_or(self.context_limit,|n|n as usize);
+        if let Ok(value)=std::env::var("PY_CONTEXT_LIMIT"){limit=value.parse()?;}
+        Ok(limit)
+    }
+    fn set_model(&mut self,model:String)->Result<()>{
+        let limit=self.model_limit(&model)?;
+        if self.startup_ready{self.check_system_budget(limit)?;}
+        self.context_limit=limit;self.model=model;Ok(())
     }
     fn status(&self)->Value{json!({"state":self.state.label(),"cells":self.cells,"active_cell":self.active_cell,
         "model":self.model,"effort":self.effort,
         "context_usage":self.context_usage(),"usage":self.usage,"queue_depth":self.pending.len(),
-        "worker_generation":self.generation,"session":self.journal.path})}
+        "worker_generation":self.generation,"startup_ready":self.startup_ready,"session":self.journal.path,
+        "background_tasks":self.bg_tasks.len(),"active_background_tasks":self.bg_tasks.values().filter(|t|t.child.is_some()).count(),
+        "pending_wakeups":self.wakeups.values().filter(|w|matches!(w.metadata["state"].as_str(),Some("scheduled"|"ready"|"pending_confirmation"))).count()})}
 }
 const CATALOG:&str=r####"[{"id":"anthropic/claude-haiku-4-5","name":"Claude Haiku 4.5 (latest)","provider":"anthropic","base_url":"https://api.anthropic.com","api":"anthropic-messages","context_limit":200000,"max_tokens":64000,"image_input":true,"reasoning":true,"image_output":false},{"id":"anthropic/claude-opus-4-6","name":"Claude Opus 4.6","provider":"anthropic","base_url":"https://api.anthropic.com","api":"anthropic-messages","context_limit":200000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"anthropic/claude-sonnet-4-6","name":"Claude Sonnet 4.6","provider":"anthropic","base_url":"https://api.anthropic.com","api":"anthropic-messages","context_limit":200000,"max_tokens":64000,"image_input":true,"reasoning":true,"image_output":false},{"id":"cerebras/gpt-oss-120b","name":"GPT OSS 120B","provider":"cerebras","base_url":"https://api.cerebras.ai/v1","api":"openai-completions","context_limit":131072,"max_tokens":32768,"image_input":false,"reasoning":true,"image_output":false},{"id":"google/gemini-2.5-flash","name":"Gemini 2.5 Flash","provider":"google","base_url":"https://generativelanguage.googleapis.com/v1beta","api":"google-generative-ai","context_limit":1048576,"max_tokens":65536,"image_input":true,"reasoning":true,"image_output":false},{"id":"google/gemini-2.5-pro","name":"Gemini 2.5 Pro","provider":"google","base_url":"https://generativelanguage.googleapis.com/v1beta","api":"google-generative-ai","context_limit":1048576,"max_tokens":65536,"image_input":true,"reasoning":true,"image_output":false},{"id":"google/gemini-3-pro-preview","name":"Gemini 3 Pro Preview","provider":"google","base_url":"https://generativelanguage.googleapis.com/v1beta","api":"google-generative-ai","context_limit":1000000,"max_tokens":64000,"image_input":true,"reasoning":true,"image_output":false},{"id":"groq/llama-3.3-70b-versatile","name":"Llama 3.3 70B Versatile","provider":"groq","base_url":"https://api.groq.com/openai/v1","api":"openai-completions","context_limit":131072,"max_tokens":32768,"image_input":false,"reasoning":false,"image_output":false},{"id":"mistral/mistral-large-latest","name":"Mistral Large","provider":"mistral","base_url":"https://api.mistral.ai/v1","api":"openai-completions","context_limit":262144,"max_tokens":262144,"image_input":true,"reasoning":false,"image_output":false},{"id":"openai/gpt-4.1","name":"GPT-4.1","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":1047576,"max_tokens":32768,"image_input":true,"reasoning":false,"image_output":false},{"id":"openai/gpt-4o","name":"GPT-4o","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":128000,"max_tokens":16384,"image_input":true,"reasoning":false,"image_output":false},{"id":"openai/gpt-5","name":"GPT-5","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":400000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"openai/gpt-5.2","name":"GPT-5.2","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":400000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"openai/o3","name":"o3","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":200000,"max_tokens":100000,"image_input":true,"reasoning":true,"image_output":false},{"id":"openrouter/anthropic/claude-sonnet-4.6","name":"Anthropic: Claude Sonnet 4.6","provider":"openrouter","base_url":"https://openrouter.ai/api/v1","api":"openai-completions","context_limit":1000000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"xai/grok-4","name":"Grok 4","provider":"xai","base_url":"https://api.x.ai/v1","api":"openai-completions","context_limit":256000,"max_tokens":64000,"image_input":false,"reasoning":true,"image_output":false},{"id":"zai/glm-4.7","name":"GLM-4.7","provider":"zai","base_url":"https://api.z.ai/api/coding/paas/v4","api":"openai-completions","context_limit":204800,"max_tokens":131072,"image_input":false,"reasoning":true,"image_output":false},{"id":"openai/gpt-image-1","provider":"openai","name":"GPT Image 1","api":"image-generation","image_input":true,"image_output":true,"context_limit":128000}]"####;
 
@@ -5602,7 +6578,7 @@ impl Host {
             "manual"|"--manual" if browser=>self.browser_login(&provider,true)?,
             "device"|"oauth" if device=>self.oauth_login(&provider)?,
             "api-key"|"--api-key" if provider!="openai-codex"&&provider!="github-copilot"=>{
-                let key=terminal_secret("API key (hidden): ")?;self.key_login(&provider,&key)?;
+                let key=terminal_secret_service("API key (hidden): ",None,||{if self.codex_cancel("auth")?{Err("login cancelled".into())}else{Ok(())}})?;self.key_login(&provider,&key)?;
             },
             _=>return Err(format!("Unsupported login method for {provider}; /login lists available methods (never put a credential in the command)").into())
         }
@@ -5636,7 +6612,7 @@ impl Host{
         loop{
             if std::time::Instant::now()>=deadline{return Err("device login expired".into());}
             for _ in 0..interval*10{
-                if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err("login cancelled".into());}
+                if self.codex_cancel("auth")?{return Err("login cancelled".into());}
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             let token=self.auth_http(client.post(format!("{base}/login/oauth/access_token")).header("Accept","application/json")
@@ -5704,7 +6680,7 @@ impl Host{
                             "state":"unknown","replay_allowed":false,"intent_event":sequence}));
                     }
                 },
-                "completion"|"shell_completion"|"operation_complete"|"provider_cancelled"=>{
+                "completion"|"shell_completion"|"operation_complete"|"task_settled"|"provider_cancelled"=>{
                     if let Some(id)=p["operation"].as_str().or(p["command_id"].as_str()){
                         if let Some(op)=operations.get_mut(id){
                             op["state"]=json!(if p["stdout"]["complete"]==false||p["status"]=="worker_crashed"{
@@ -6395,6 +7371,7 @@ impl Host{
         write_private_json(&path,&auth)?;self.auth=auth;Ok(())
     }
     fn codex_cancel(&mut self,operation:&str)->Result<bool>{
+        self.service_background()?;
         let mut cancel=INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst);
         loop{
             let command=match self.incoming.as_ref().map(|r|r.try_recv()){
@@ -6406,7 +7383,7 @@ impl Host{
                 if self.accept_input_control(&command)?{
                     self.event("completed",json!({"command_id":command["id"],"status":"ok"}));cancel=true;
                 }
-            }else{self.queue_arrival(command)?;}
+            }else if !self.background_control(&command)?{self.queue_arrival(command)?;}
         }
         if cancel{
             self.journal.append("provider_cancelled",json!({"operation":operation,"billing":"unknown"}))?;
@@ -6870,9 +7847,9 @@ def enter(s):
   end=time.monotonic()+.5
   while time.monotonic()<end and select.select([master],[],[],.04)[0]:pump()
   start=len(transcript);send('\t')
-  wait_for(lambda:b'\x1b[?1049h' in transcript[start:] or b'\r\x1b[K' in transcript[start:],'completion response')
-  if b'\x1b[?1049h' in transcript[start:]:
-   send('\r');wait_for(lambda:b'\x1b[?1049l' in transcript[start:],'completion picker selection')
+  wait_for(lambda:b'\x1b[?25l' in transcript[start:] or b'\x1b[?25h' in transcript[start:],'completion response')
+  if b'\x1b[?25l' in transcript[start:]:
+   send('\r');wait_for(lambda:b'\x1b[0J' in transcript[start:],'completion picker selection')
  send(pieces[-1]+'\r')
 def paste(s):
  global last_prompt_count
@@ -7024,7 +8001,7 @@ thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
 providers={}
 for c in cases:
  p,id=c['model'].split('/',1)
- cfg=providers.setdefault(p,{'base_url':'http://127.0.0.1:'+str(server.server_port),'api_key':'fixture-key','models':[]})
+ cfg=providers.setdefault(p,{'base_url':'http://127.0.0.1:'+str(server.server_port),'models':[]})
  meta=dict(c.get('metadata',{}),id=id,api=c['api'])
  if not any(m['id']==id for m in cfg['models']):cfg['models'].append(meta)
 with open(home+'/config.json','w') as f:json.dump({'effort':'medium','providers':providers},f)
@@ -7270,8 +8247,7 @@ impl Drop for SecretBytes {
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
     }
 }
-fn terminal_secret(prompt:&str)->Result<String> {terminal_secret_until(prompt,None)}
-fn terminal_secret_until(prompt:&str,deadline:Option<std::time::Instant>)->Result<String> {
+fn terminal_secret_service(prompt:&str,deadline:Option<std::time::Instant>,mut service:impl FnMut()->Result<()>)->Result<String> {
     let tty=OpenOptions::new().read(true).write(true)
         .custom_flags(libc::O_NOCTTY|libc::O_CLOEXEC|libc::O_NONBLOCK).open("/dev/tty")
         .map_err(|_|"API-key entry requires a controlling terminal; use an environment variable or JSON login for automation")?;
@@ -7297,6 +8273,7 @@ fn terminal_secret_until(prompt:&str,deadline:Option<std::time::Instant>)->Resul
         // A partial line returned by Ctrl-D is cancellation, never a stored key.
         let mut bytes=SecretBytes(vec![0;65536]);
         loop {
+            service()?;
             if deadline.is_some_and(|d|std::time::Instant::now()>=d){return Err("browser login timed out; retry /login <provider> manual".into());}
             if INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst){return Err("login cancelled".into());}
             let mut poll=libc::pollfd{fd,events:libc::POLLIN,revents:0};
@@ -7927,7 +8904,7 @@ def probe(model,want_max):
    if select.select([m],[],[],.02)[0]:data.extend(os.read(m,65536))
  try:
   ready(0);start=len(data);os.write(m,b'/effort ma\t');drain()
-  if b'\x1b[?1049h' in data[start:]:os.write(m,b'\r');drain()
+  if b'\x1b[?25l' in data[start:]:os.write(m,b'\r');drain()
   assert (b'/effort max' in data[start:])==want_max,(model,data[start:])
   os.write(m,b'\x03');ready(start)
   start=len(data);os.write(m,b'/logout cstmted\t\r');ready(start)
@@ -8108,7 +9085,7 @@ impl Host{
         }
         oauth_browser_open(url.as_str());
         let code=if let Some(listener)=listener.as_ref(){self.browser_callback(listener,&state,deadline)?}
-            else{let pasted=terminal_secret_until("Authorization code (hidden): ",Some(deadline))?;
+            else{let pasted=terminal_secret_service("Authorization code (hidden): ",Some(deadline),||{if self.codex_cancel("auth")?{Err("login cancelled".into())}else{Ok(())}})?;
                 oauth_pasted_code(&pasted,&redirect,&state)?};
         // Drop the loopback listener before any exchange: no second callback can
         // influence an exchange or be falsely acknowledged as another login.
@@ -8530,7 +9507,7 @@ def code(source):
 def menu(line):
  start=len(data);send(line+'\t');wait(lambda:b'Fuzzy select' in data[start:],'picker opens');return start
 def choose(query=''):
- start=len(data);send(query+'\r');wait(lambda:b'\x1b[?1049l' in data[start:],'picker closes on selection')
+ start=len(data);send(query+'\r');wait(lambda:b'\x1b[0J' in data[start:],'picker closes on selection')
 wait(lambda:b'\x1b[?2004h' in data,'editor ready')
 try:
 "#;
@@ -8586,7 +9563,7 @@ menu('@print(zz_picker_');send('discard-me\x1b');time.sleep(.15);pump();command(
 assert 'print(zz_picker_alpha)' in sources() and all('discard-me' not in s for s in sources()),sources()
 menu('@print(zz_picker_');send('discard-me\x03');time.sleep(.08);pump();command('beta)')
 assert sources().count('print(zz_picker_beta)')==2 and streams().count('22\n')==2,(sources(),streams())
-start=menu('@print(zz_picker_');os.kill(p.pid,2);wait(lambda:b'\x1b[?1049l' in data[start:],'external SIGINT closes picker')
+start=menu('@print(zz_picker_');os.kill(p.pid,2);wait(lambda:b'\x1b[0J' in data[start:],'external SIGINT closes picker')
 command('alpha)');assert sources().count('print(zz_picker_alpha)')==2 and streams().count('11\n')==2,(sources(),streams())
 "#);}
     #[test]
@@ -8594,8 +9571,8 @@ command('alpha)');assert sources().count('print(zz_picker_alpha)')==2 and stream
 fcntl.ioctl(m,termios.TIOCSWINSZ,struct.pack('HHHH',9,28,0,0));os.kill(p.pid,28)
 start=menu('/model ');send('haiku');time.sleep(.05);pump();choose()
 segment=bytes(data[start:]);assert not re.search(rb'\x1b\[[0-9;]*m',segment),segment
-for frame in segment.split(b'\x1b[H\x1b[2J')[1:]:
- text=re.sub(rb'\x1b\[[0-9;?]*[a-zA-Z]',b'',frame.split(b'\x1b[?1049l')[0]).decode(errors='replace')
+for frame in segment.split(b'\x1b[?25l')[1:]:
+ text=re.sub(rb'\x1b\[[0-9;?]*[a-zA-Z]',b'',frame.split(b'\x1b[0J')[0]).decode(errors='replace')
  for line in text.splitlines():
   if not line:continue
   width=sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ('W','F') else 1 for c in line)
@@ -8976,10 +9953,10 @@ finally:
 start=menu('/mo')
 paste('del\r\r@print("paste-must-not-run")\r\x1b[A\x03\x04')
 time.sleep(.15);pump()
-assert b'\x1b[?1049l' not in data[start:],('paste selected/cancelled picker',bytes(data[start:]))
+assert b'\x1b[0J' not in data[start:],('paste selected/cancelled picker',bytes(data[start:]))
 assert b'openai/gpt-5' not in data[start:],('paste dispatched /model',bytes(data[start:]))
 assert not any(v['kind'] in ('cell_start','code','user','settings_change') for v in records()),records()
-send('\x1b');wait(lambda:b'\x1b[?1049l' in data[start:],'Escape restores original')
+send('\x1b');wait(lambda:b'\x1b[0J' in data[start:],'Escape restores original')
 command('del')
 assert b'openai/gpt-5' in data[start:],('original /mo input was not restored',bytes(data[start:]))
 assert not any(v['kind']=='code' for v in records()),records()
@@ -8988,22 +9965,22 @@ assert not any(v['kind']=='code' for v in records()),records()
     fn e2e_picker_pasted_query_requires_separate_physical_selection_and_submit(){fixture(r#"
 start=menu('/mo');send('\x15');paste('model\r\n\t')
 time.sleep(.12);pump()
-assert b'\x1b[?1049l' not in data[start:],('pasted newline selected',bytes(data[start:]))
-send('\r');wait(lambda:b'\x1b[?1049l' in data[start:],'physical Enter selects')
+assert b'\x1b[0J' not in data[start:],('pasted newline selected',bytes(data[start:]))
+send('\r');wait(lambda:b'\x1b[0J' in data[start:],'physical Enter selects')
 assert b'openai/gpt-5' not in data[start:],('selection submitted',bytes(data[start:]))
 command('');assert b'openai/gpt-5' in data[start:],bytes(data[start:])
 start=menu('/mo');send('\x15');paste(b'model\xff\r')
-time.sleep(.1);pump();assert b'\x1b[?1049l' not in data[start:],bytes(data[start:])
-send('\x15model\r');wait(lambda:b'\x1b[?1049l' in data[start:],'invalid UTF8 recoverable')
+time.sleep(.1);pump();assert b'\x1b[0J' not in data[start:],bytes(data[start:])
+send('\x15model\r');wait(lambda:b'\x1b[0J' in data[start:],'invalid UTF8 recoverable')
 command('')
 "#);}
     #[test]
     fn e2e_picker_oversized_paste_is_discarded_and_recoverable(){fixture(r#"
 start=menu('/mo');paste(b'model '+b'x'*1_048_577+b'\r\r')
 time.sleep(.1);pump()
-assert b'\x1b[?1049l' not in data[start:],('oversized paste selected',bytes(data[start:]))
+assert b'\x1b[0J' not in data[start:],('oversized paste selected',bytes(data[start:]))
 assert b'openai/gpt-5' not in data[start:],bytes(data[start:])
-send('del\r');wait(lambda:b'\x1b[?1049l' in data[start:],'oversized paste left original query unchanged')
+send('del\r');wait(lambda:b'\x1b[0J' in data[start:],'oversized paste left original query unchanged')
 command('');assert b'openai/gpt-5' in data[start:],bytes(data[start:])
 "#);}
     #[test]
@@ -9012,7 +9989,7 @@ start=len(data);send('/login anthr b\t')
 wait(lambda:b'/login anthr browser' in data[start:],'fuzzy provider browser argument completion')
 assert b'Fuzzy select' not in data[start:],bytes(data[start:])
 send('\x15');command('/help')
-start=menu('/login anthr ');send('man\r');wait(lambda:b'\x1b[?1049l' in data[start:],'fuzzy provider manual method selected')
+start=menu('/login anthr ');send('man\r');wait(lambda:b'\x1b[0J' in data[start:],'fuzzy provider manual method selected')
 wait(lambda:b'/login anthr manual' in data[start:],'selected method inserted without submission')
 send('\x15');command('/help')
 for command_name in ('/logout','/auth'):
@@ -9244,5 +10221,1611 @@ assert all('openai/fixture' not in line for line in visible.splitlines() if line
 assert visible.rstrip().endswith('· idle'),visible
 srv.shutdown()
 "#);}
+}
+
+#[cfg(test)]
+mod inline_picker_e2e {
+    fn fixture(body:&str){
+        let setup=r#"
+import os,sys,pty,fcntl,termios,struct,subprocess,select,time,json,tempfile,re,glob,unicodedata,codecs
+home=tempfile.mkdtemp(prefix='py-inline-picker-');env=dict(os.environ,PY_HOME=home,TERM='xterm-256color',NO_COLOR='1')
+class Screen:
+ def __init__(self,rows=24,cols=80):
+  self.rows=rows;self.cols=cols;self.r=0;self.c=0;self.grid=[[' ']*cols for _ in range(rows)];self.pending='';self.decoder=codecs.getincrementaldecoder('utf8')('replace')
+ def resize(self,rows,cols):
+  self.grid=[(line+[' ']*cols)[:cols] for line in self.grid[:rows]]+[ [' ']*cols for _ in range(max(0,rows-len(self.grid))) ];self.rows=rows;self.cols=cols;self.r=min(self.r,rows-1);self.c=min(self.c,cols-1)
+ def lf(self):
+  self.r+=1
+  if self.r==self.rows:self.grid.pop(0);self.grid.append([' ']*self.cols);self.r-=1
+ def feed(self,data):
+  self.pending+=self.decoder.decode(data)
+  while self.pending:
+   s=self.pending
+   if s[0]=='\x1b':
+    if len(s)<2:break
+    if s[1]=='[':
+     match=re.match(r'\x1b\[([0-9;:?<>=]*)([ -/]*)([@-~])',s)
+     if match is None:break
+     raw,_,cmd=match.groups();self.pending=s[match.end():]
+     if raw.startswith(('?','>','<','=')):continue
+     values=[int(x or 0) for x in raw.split(';')] if ':' not in raw else [0];n=values[0] or 1
+     if cmd=='A':self.r=max(0,self.r-n)
+     elif cmd=='B':self.r=min(self.rows-1,self.r+n)
+     elif cmd=='C':self.c=min(self.cols-1,self.c+n)
+     elif cmd=='D':self.c=max(0,self.c-n)
+     elif cmd=='G':self.c=min(self.cols-1,n-1)
+     elif cmd in ('H','f'):self.r=min(self.rows-1,n-1);self.c=min(self.cols-1,(values[1] or 1)-1 if len(values)>1 else 0)
+     elif cmd=='K':
+      mode=values[0];start,end=(0,self.cols) if mode==2 else (0,self.c+1) if mode==1 else (self.c,self.cols)
+      self.grid[self.r][start:end]=[' ']*(end-start)
+     elif cmd=='J':
+      mode=values[0]
+      if mode==2:self.grid=[[' ']*self.cols for _ in range(self.rows)]
+      elif mode==0:
+       self.grid[self.r][self.c:]=[' ']*(self.cols-self.c)
+       for row in range(self.r+1,self.rows):self.grid[row]=[' ']*self.cols
+     continue
+    self.pending=s[2:];continue
+   self.pending=s[1:];c=s[0]
+   if c=='\r':self.c=0
+   elif c=='\n':self.lf()
+   elif c=='\b':self.c=max(0,self.c-1)
+   elif c>=' ':
+    width=0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ('W','F') else 1
+    if width==0:continue
+    if self.c+width>self.cols:self.c=0;self.lf()
+    self.grid[self.r][self.c]=c
+    if width==2 and self.c+1<self.cols:self.grid[self.r][self.c+1]=''
+    self.c+=width
+ def text(self):return '\n'.join(''.join(row).rstrip() for row in self.grid)
+screen=Screen();m,s=pty.openpty();fcntl.ioctl(s,termios.TIOCSWINSZ,struct.pack('HHHH',24,80,0,0))
+def controlling():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
+json_mode=os.environ.get('INLINE_JSON_FIXTURE')=='1'
+p=subprocess.Popen([sys.argv[1],'--no-model',*(['--json'] if json_mode else [])],stdin=s,stdout=subprocess.PIPE if json_mode else s,stderr=s,env=env,preexec_fn=controlling);os.close(s);data=bytearray()
+def pump():
+ if select.select([m],[],[],.03)[0]:
+  try:chunk=os.read(m,65536);data.extend(chunk);screen.feed(chunk)
+  except OSError:pass
+ return screen.text()
+def wait(predicate,label):
+ end=time.monotonic()+6
+ while time.monotonic()<end:
+  pump()
+  if predicate():return
+  if p.poll() is not None:break
+ raise AssertionError((label,screen.text(),bytes(data[-7000:])))
+def send(value):os.write(m,value.encode() if isinstance(value,str) else value)
+def command(value):
+ count=data.count(b'\x1b[?2004h');send(value+'\r');wait(lambda:data.count(b'\x1b[?2004h')>count,'next editor')
+def records():return [json.loads(l) for f in glob.glob(home+'/sessions/*.jsonl') for l in open(f) if l.endswith('\n')]
+def sources():return [v['payload']['source'] for v in records() if v['kind']=='code']
+def menu(value):
+ start=len(data);send(value+'\t');wait(lambda:'Fuzzy select' in screen.text(),'menu visible')
+ assert b'\x1b[?1049' not in data[start:] and b'\x1b[2J' not in data[start:] and b'\x1b[H' not in data[start:],bytes(data[start:])
+ return start
+def close_picker(value):
+ start=len(data);send(value)
+ def repainted():
+  segment=bytes(data[start:]).rsplit(b'\x1b[0J',1)
+  return len(segment)==2 and b'\x1b[K\x1b[J' in segment[1] and re.search(rb'\x1b\[[0-9]+C(?:\x1b\[\?25h)?$',segment[1]) and 'Fuzzy select' not in screen.text()
+ wait(repainted,'picker closed and source repainted')
+wait(lambda:b'\x1b[?2004h' in data,'ready')
+try:
+"#;
+        let end=r#"
+ send('/quit\r');p.wait(timeout=4)
+ assert p.returncode==0,bytes(data)
+ if json_mode:
+  output=p.stdout.read();assert b'\x1b' not in output,output
+  events=[json.loads(line) for line in output.splitlines()];assert any(v['kind']=='say' for v in events),events
+finally:
+ if p.poll() is None:p.kill();p.wait()
+ os.close(m)
+"#;
+        let mut command=crate::test_command("python3");
+        let json_mode=body.contains("# JSON");
+        if json_mode{command.env("INLINE_JSON_FIXTURE","1");}else{command.env_remove("INLINE_JSON_FIXTURE");}
+        let script=format!("{setup}{}{end}",body.lines().map(|l|format!(" {l}\n")).collect::<String>());
+        let out=command.args(["-c",&script,&std::env::var("PY_HARNESS_BIN").unwrap()]).output().unwrap();
+        assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+    }
+    #[test]
+    fn e2e_inline_prompt_output_and_selection_cancel_coexist(){fixture(r#"
+command('@print("inline_keep")')
+menu('/mod');visible=screen.text();assert 'inline_keep' in visible,visible
+assert visible.index('> /mod')<visible.index('Fuzzy select')<visible.index('Find:'),visible
+count=len(sources());close_picker('el\r');assert len(sources())==count and '> /model' in screen.text(),(sources(),screen.text())
+assert '/models' not in screen.text(),screen.text()
+send('\x15');menu('/mod');close_picker('discard\x1b');assert '> /mod' in screen.text(),screen.text()
+command('els');assert len(sources())==count,sources()
+"#);}
+    #[test]
+    fn e2e_inline_multiline_middle_caret_select_and_cancel(){fixture(r#"
+command('@inline_alpha=11;inline_beta=22')
+send('\x1b[200~@answer=(\ninline_)\nprint(answer)\x1b[201~');send('\x01\x1b[A\x1b[F\x1b[D')
+menu('');visible=screen.text();assert visible.index('> @answer=(')<visible.index('  inline_)')<visible.index('  print(answer)')<visible.index('Fuzzy select'),visible
+close_picker('bt\r');assert '  inline_beta)' in screen.text(),screen.text()
+assert ''.join(screen.grid[screen.r]).startswith('  inline_beta)') and screen.c==13,(screen.r,screen.c,screen.text())
+command('.real');assert 'answer=(\ninline_beta.real)\nprint(answer)' in sources(),sources()
+send('\x1b[200~@answer=(\ninline_)\nprint(answer)\x1b[201~');send('\x01\x1b[A\x1b[F\x1b[D');menu('')
+close_picker('discard\x1b');assert ''.join(screen.grid[screen.r]).startswith('  inline_)') and screen.c==9,(screen.r,screen.c,screen.text())
+command('alpha');assert 'answer=(\ninline_alpha)\nprint(answer)' in sources() and all('discard' not in s for s in sources()),sources()
+stdout=''.join(v['payload']['text'] for v in records() if v['kind']=='stream' and v['payload']['collection']=='stdout');assert stdout=='22\n11\n',stdout
+"#);}
+    #[test]
+    fn e2e_inline_bottom_narrow_resize_and_repeated_close(){fixture(r#"
+fcntl.ioctl(m,termios.TIOCSWINSZ,struct.pack('HHHH',6,32,0,0));screen.resize(6,32)
+command('@print("bottom-edge")')
+menu('/');assert '> /' in screen.text() and '· idle' in screen.text(),screen.text()
+fcntl.ioctl(m,termios.TIOCSWINSZ,struct.pack('HHHH',8,22,0,0));screen.resize(8,22)
+send('model');wait(lambda:'Find: /model' in screen.text(),'resize/filter');assert '> /' in screen.text(),screen.text()
+close_picker('\r');assert '> /model' in screen.text(),screen.text();send('\x15')
+for _ in range(4):
+ menu('/');close_picker('\x03');assert '> /' in screen.text(),screen.text();send('\x15')
+command('@print("after-inline")');assert any(v['kind']=='stream' and 'after-inline' in v['payload']['text'] for v in records()),records()
+"#);}
+    #[test]
+    fn e2e_inline_tiny_terminal_declines_without_losing_input(){fixture(r#"
+fcntl.ioctl(m,termios.TIOCSWINSZ,struct.pack('HHHH',2,32,0,0));screen.resize(2,32)
+start=len(data);send('/mod\t');wait(lambda:b'\x1b[?25h' in data[start:],'completion handled')
+assert '> /mod' in screen.text() and 'Fuzzy select' not in screen.text(),screen.text()
+assert b'\x1b[?1049' not in data[start:] and b'\x1b[2J' not in data[start:],bytes(data[start:])
+command('els')
+"#);}
+    #[test]
+    fn e2e_inline_json_menu_uses_ui_terminal_not_stdout(){fixture(r#"
+# JSON
+menu('/mo');assert '> /mo' in screen.text(),screen.text();close_picker('dels\r');assert '> /models' in screen.text(),screen.text()
+command('');assert not any(v['kind']=='code' for v in records()),records()
+"#);}
+}
+
+
+// Session-owned isolated processes. All capture/journal mutation remains on Host's thread.
+struct BgTask {
+    child:Option<Child>, stdout:Option<Capture>, stderr:Option<Capture>, dir:PathBuf,
+    metadata:Value, deadline:Option<std::time::Instant>,
+    cancel_at:Option<std::time::Instant>, terminal_status:Option<String>,
+    reaped:Option<std::process::ExitStatus>,
+}
+impl Drop for BgTask {
+    fn drop(&mut self){
+        if let Some(mut child)=self.child.take(){
+            if self.reaped.is_none(){
+                unsafe{libc::kill(-(child.id() as i32),libc::SIGKILL);}
+                let _=child.kill();let _=child.wait();
+            }
+        }
+        if !self.dir.as_os_str().is_empty(){let _=fs::remove_dir_all(&self.dir);}
+    }
+}
+struct Wakeup { metadata:Value, deadline:Option<std::time::Instant> }
+impl Host {
+    fn commit_stop(&mut self)->Result<()> {
+        if let Some((seconds,reason))=self.stop_wakeup.take(){
+            // One durable event commits both settled stop and its timer.
+            self.schedule_wakeup(seconds,&reason,None)?;
+        }
+        Ok(())
+    }
+    fn background_control(&mut self,v:&Value)->Result<bool>{
+        if !matches!(v["kind"].as_str(),Some("task_list"|"task_get"|"task_logs"|"task_kill"|"wakeup_list"|"wakeup_cancel"|"wakeup_run")){return Ok(false);}
+        if !self.accept_input_control(v)?{return Ok(true);}
+        if let Err(e)=self.finish_background_control(v){self.event("error",json!({"command_id":v["id"],"error":e.to_string()}));}
+        Ok(true)
+    }
+    fn finish_background_control(&mut self,v:&Value)->Result<()> {
+        let result=match v["kind"].as_str().unwrap_or(""){
+            "task_list"=>self.bg_list(v.get("state").filter(|x|!x.is_null()).map(|x|x.as_str().ok_or("state must be a string")).transpose()?)?,
+            "task_get"|"task_logs"=>{
+                let metadata=self.bg_get(v["task_id"].as_str().ok_or("task_id required")?)?;
+                if v["kind"]=="task_logs"{
+                    let stream=v.get("stream").map(|x|x.as_str().ok_or("stream must be a string")).transpose()?.unwrap_or("both");
+                    if !["both","stdout","stderr"].contains(&stream){return Err("stream must be stdout, stderr or both".into());}
+                    let mut logs=json!({"task":metadata});
+                    for name in ["stdout","stderr"]{if stream=="both"||stream==name{
+                        logs[name]=json!({"ref":logs["task"][name]["ref"],"preview":self.ui_stream_preview(name,logs["task"][name]["index"].as_u64().ok_or("missing stream index")? as usize)?});
+                    }}
+                    logs
+                }else{metadata}
+            },
+            "task_kill"=>self.bg_kill(v["task_id"].as_str().ok_or("task_id required")?,v.get("force").map(|x|x.as_bool().ok_or("force must be boolean")).transpose()?.unwrap_or(false))?,
+            "wakeup_list"=>self.wakeup_list()?,
+            "wakeup_cancel"=>self.wakeup_cancel(v["wakeup_id"].as_str().ok_or("wakeup_id required")?)?,
+            "wakeup_run"=>self.wakeup_run(v["wakeup_id"].as_str().ok_or("wakeup_id required")?)?,
+            _=>return Err("unknown background control".into())
+        };
+        self.event("completed",json!({"command_id":v["id"],"status":"ok","result":result}));Ok(())
+    }
+}
+fn bg_text<'a>(v:&'a Value,key:&str,max:usize)->Result<Option<&'a str>>{
+    match v.get(key){
+        None|Some(Value::Null)=>Ok(None),
+        Some(Value::String(s)) if !s.trim().is_empty()&&s.chars().count()<=max=>Ok(Some(s)),
+        _=>Err(format!("{key} must be a nonempty string of at most {max} characters").into())
+    }
+}
+fn bg_seconds(v:&Value,max:f64)->Result<Option<f64>>{
+    if v.is_null(){return Ok(None);}
+    let seconds=v.as_f64().ok_or("duration must be a number")?;
+    if !seconds.is_finite()||seconds<=0.0||seconds>max{return Err(format!("duration must be finite, positive and at most {max} seconds").into());}
+    Ok(Some(seconds))
+}
+impl Host {
+    fn bg_save_task(&mut self,metadata:&Value)->Result<()>{
+        self.journal.append("task_state",metadata.clone())?;
+        self.event("task_state",metadata.clone());Ok(())
+    }
+    fn bg_save_wakeup(&mut self,metadata:&Value)->Result<()>{
+        self.journal.append("wakeup_state",metadata.clone())?;
+        self.event("wakeup_state",metadata.clone());Ok(())
+    }
+    fn bg_run(&mut self,v:&Value)->Result<Value>{
+        self.service_background()?;
+        if self.bg_tasks.values().filter(|t|t.child.is_some()).count()>=4{return Err("at most four active background jobs".into());}
+        let source=v["source"].as_str().ok_or("background source required")?;
+        if source.trim().is_empty(){return Err("background source must not be empty".into());}
+        let kind=match v.get("task_kind").or_else(||v.get("kind")){None=>"shell",Some(value)=>value.as_str().ok_or("background kind must be a string")?};
+        if !["shell","python"].contains(&kind){return Err("background kind must be shell or python".into());}
+        let options=v.get("options").filter(|p|!p.is_null()).unwrap_or(v);
+        if !options.is_object(){return Err("background options must be an object".into());}
+        let name=bg_text(options,"name",128)?.map(str::to_owned);
+        let wakeup_reason=bg_text(options,"wakeup_reason",512)?.map(str::to_owned);
+        let timeout=bg_seconds(&options["timeout"],604800.0)?;
+        let cwd=match options.get("cwd"){
+            None|Some(Value::Null)=>None,
+            Some(Value::String(s))=>Some(s.clone()),
+            _=>return Err("cwd must be a string".into())
+        };
+        let mut env=Vec::new();
+        if let Some(value)=options.get("env").filter(|p|!p.is_null()){
+            for (key,value) in value.as_object().ok_or("env must be an object")?{
+                if key.is_empty()||key.contains(['=','\0']){return Err("invalid environment key".into());}
+                let value=value.as_str().ok_or("environment values must be strings")?;
+                if value.contains('\0'){return Err("invalid environment value".into());}
+                env.push((key.clone(),value.to_owned()));
+            }
+        }
+        let id=format!("task{}",self.journal.seq);
+        let dir=self.home.join(format!("background-{}-{}",std::process::id(),unique_id()));
+        fs::create_dir(&dir)?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir,fs::Permissions::from_mode(0o700))?;
+        let out=dir.join("stdout");let err=dir.join("stderr");
+        let outfile=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&out)?;
+        let errfile=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&err)?;
+        let mut stdout=Capture::open(&out,"stdout",&id)?;
+        let mut stderr=Capture::open(&err,"stderr",&id)?;
+        // Commit empty chunks now so all running jobs have stable, distinct refs.
+        stdout.commit(self,&[])?;stderr.commit(self,&[])?;
+        let mut metadata=json!({"id":id,"kind":kind,"name":name,"status":"starting",
+            "created_ms":now_ms(),"wakeup_reason":wakeup_reason,
+            "stdout":{"ref":format!("H.stdout[{}]",stdout.index.unwrap()),"index":stdout.index,"bytes":0,"complete":false},
+            "stderr":{"ref":format!("H.stderr[{}]",stderr.index.unwrap()),"index":stderr.index,"bytes":0,"complete":false}});
+        self.bg_save_task(&metadata)?;
+        self.journal.append("intent",json!({"operation":id,"type":"background","kind":kind,"source":source,"cwd":cwd}))?;
+        let mut task=BgTask{child:None,stdout:Some(stdout),stderr:Some(stderr),dir,
+            metadata:metadata.clone(),deadline:timeout.map(|s|std::time::Instant::now()+std::time::Duration::from_secs_f64(s)),
+            cancel_at:None,terminal_status:None,reaped:None};
+        let mut command=if kind=="shell"{let mut c=Command::new("/bin/sh");c.args(["-c",source]);c}
+            else{let mut c=Command::new(std::env::var("PY_PYTHON").unwrap_or_else(|_|"python3".into()));c.args(["-u","-c",source]);c};
+        if let Some(cwd)=cwd{command.current_dir(cwd);}
+        command.envs(env).stdin(std::process::Stdio::null()).stdout(outfile).stderr(errfile);
+        unsafe{command.pre_exec(||{if libc::setsid()<0{return Err(io::Error::last_os_error());}Ok(())});}
+        match command.spawn(){
+            Ok(child)=>{metadata["status"]=json!("running");metadata["pid"]=json!(child.id());task.child=Some(child);},
+            Err(error)=>{
+                metadata["status"]=json!("failed");
+                task.stderr.as_mut().unwrap().commit(self,format!("Background launch failed: {error}\n").as_bytes())?;
+                metadata["stdout"]=task.stdout.take().unwrap().finish(self,true)?;
+                metadata["stderr"]=task.stderr.take().unwrap().finish(self,true)?;
+                for key in ["stdout","stderr"]{metadata[key].as_object_mut().unwrap().remove("preview");}
+                metadata["finished_ms"]=json!(now_ms());
+            }
+        }
+        task.metadata=metadata.clone();self.bg_tasks.insert(id.clone(),task);
+        if metadata["status"]=="failed"{self.bg_settle(&metadata)?;}else{self.bg_save_task(&metadata)?;}
+        Ok(metadata)
+    }
+    fn bg_list(&mut self,state:Option<&str>)->Result<Value>{
+        self.service_background()?;
+        if state.is_some_and(|s|!["all","starting","running","cancelling","finished","succeeded","failed","cancelled","killed","timed_out","outcome_unknown"].contains(&s)){return Err("unknown task state filter".into());}
+        let mut tasks:Vec<_>=self.bg_tasks.values().map(|t|t.metadata.clone())
+            .filter(|m|state.is_none_or(|s|s=="all"||m["status"]==s||s=="finished"&&!matches!(m["status"].as_str(),Some("starting"|"running"|"cancelling")))) .collect();
+        tasks.sort_by_key(|m|m["created_ms"].as_u64().unwrap_or(0));Ok(json!(tasks))
+    }
+    fn bg_get(&mut self,id:&str)->Result<Value>{
+        self.service_background()?;Ok(self.bg_tasks.get(id).ok_or("unknown task ID")?.metadata.clone())
+    }
+    fn bg_kill(&mut self,id:&str,force:bool)->Result<Value>{
+        self.service_background()?;
+        let task=self.bg_tasks.get_mut(id).ok_or("unknown task ID")?;
+        if let Some(child)=task.child.as_ref().filter(|_|task.reaped.is_none()){
+            let signal=if force{libc::SIGKILL}else{libc::SIGTERM};
+            if unsafe{libc::kill(-(child.id() as i32),signal)}<0&&io::Error::last_os_error().raw_os_error()!=Some(libc::ESRCH){return Err(io::Error::last_os_error().into());}
+            if task.cancel_at.is_none(){task.cancel_at=Some(std::time::Instant::now());task.terminal_status=Some(if force{"killed"}else{"cancelled"}.into());}
+            else if force&&task.terminal_status.as_deref()!=Some("timed_out"){task.terminal_status=Some("killed".into());}
+            task.metadata["status"]=json!("cancelling");
+            let metadata=task.metadata.clone();self.bg_save_task(&metadata)?;
+        }
+        Ok(self.bg_tasks.get(id).unwrap().metadata.clone())
+    }
+    fn bg_settle(&mut self,metadata:&Value)->Result<()>{
+        let wakeup=metadata["wakeup_reason"].as_str().map(|reason|json!({
+            "id":format!("wake{}",self.journal.seq),"reason":reason,"due_ms":now_ms(),
+            "state":"ready","task":metadata}));
+        // Terminal status and opt-in wakeup creation are one durable transition.
+        self.journal.append("task_settled",json!({"operation":metadata["id"],"status":metadata["status"],"task":metadata,"wakeup":wakeup}))?;
+        self.event("task_state",metadata.clone());
+        if let Some(w)=wakeup{
+            self.event("wakeup_state",w.clone());
+            self.wakeups.insert(w["id"].as_str().unwrap().into(),Wakeup{metadata:w,deadline:None});
+        }
+        Ok(())
+    }
+    fn service_background(&mut self)->Result<()>{
+        if self.journal.failed{
+            self.bg_abort();return Err("session journal failed; owned background jobs terminated, capture may be partial".into());
+        }
+        if self.servicing{return Ok(());}
+        self.servicing=true;
+        let result=self.service_background_inner();self.servicing=false;
+        if result.is_err(){self.bg_abort();}
+        result
+    }
+    fn bg_abort(&mut self){
+        // No more journal writes after a persistence failure, not even cleanup.
+        for task in self.bg_tasks.values_mut(){
+            if let Some(mut child)=task.child.take(){
+                if task.reaped.is_none(){
+                    unsafe{libc::kill(-(child.id() as i32),libc::SIGKILL);}
+                    let _=child.kill();let _=child.wait();
+                }
+                task.metadata["status"]=json!("outcome_unknown");
+                task.metadata.as_object_mut().unwrap().remove("pid");
+                for name in ["stdout","stderr"]{task.metadata[name]["complete"]=json!(false);}
+            }
+        }
+    }
+    fn service_background_inner(&mut self)->Result<()>{
+        let ids:Vec<_>=self.bg_tasks.iter().filter_map(|(id,t)|t.child.as_ref().map(|_|id.clone())).collect();
+        for id in ids{
+            let mut task=self.bg_tasks.remove(&id).unwrap();
+            let result=(||->Result<bool>{
+                let more_out=if let Some(out)=task.stdout.as_mut(){let more=out.drain(self)?;task.metadata["stdout"]["bytes"]=json!(out.bytes);more}else{false};
+                let more_err=if let Some(err)=task.stderr.as_mut(){let more=err.drain(self)?;task.metadata["stderr"]["bytes"]=json!(err.bytes);more}else{false};
+                let now=std::time::Instant::now();
+                let child=task.child.as_mut().unwrap();
+                let mut exit=if let Some(exit)=task.reaped{Some(exit)}else{child.try_wait()?};
+                if exit.is_none(){
+                    if task.cancel_at.is_none()&&task.deadline.is_some_and(|d|now>=d){
+                        unsafe{libc::kill(-(child.id() as i32),libc::SIGTERM);}
+                        task.cancel_at=Some(now);task.terminal_status=Some("timed_out".into());task.metadata["status"]=json!("cancelling");
+                        self.bg_save_task(&task.metadata)?;
+                    }
+                    if task.cancel_at.is_some_and(|t|now.duration_since(t)>=std::time::Duration::from_millis(500)){
+                        unsafe{libc::kill(-(child.id() as i32),libc::SIGKILL);}
+                        exit=child.try_wait()?;
+                    }
+                }
+                if let Some(exit)=exit{
+                    // Reap once, then finish the backlog across bounded pump ticks.
+                    if task.reaped.is_none(){
+                        unsafe{libc::kill(-(child.id() as i32),libc::SIGKILL);}
+                        task.reaped=Some(exit);
+                        return Ok(false);
+                    }
+                    if more_out||more_err{return Ok(false);}
+                    task.child.take();
+                    task.metadata["stdout"]=task.stdout.take().unwrap().finish_metadata(self,true)?;
+                    task.metadata["stderr"]=task.stderr.take().unwrap().finish_metadata(self,true)?;
+                    for key in ["stdout","stderr"]{task.metadata[key].as_object_mut().unwrap().remove("preview");}
+                    task.metadata["status"]=json!(task.terminal_status.clone().unwrap_or_else(||if exit.success(){"succeeded"}else{"failed"}.into()));
+                    task.metadata["exit_code"]=json!(exit.code());task.metadata["finished_ms"]=json!(now_ms());
+                    self.bg_settle(&task.metadata)?;
+                    return Ok(true);
+                }
+                Ok(false)
+            })();
+            self.bg_tasks.insert(id,task);
+            result?;
+        }
+        let mut ready=Vec::new();
+        for wakeup in self.wakeups.values_mut(){
+            if wakeup.metadata["state"]=="scheduled"&&wakeup.deadline.is_some_and(|due|due<=std::time::Instant::now()){
+                wakeup.metadata["state"]=json!("ready");ready.push(wakeup.metadata.clone());
+            }
+        }
+        for metadata in ready{self.bg_save_wakeup(&metadata)?;}
+        Ok(())
+    }
+    fn schedule_wakeup(&mut self,seconds:f64,reason:&str,task:Option<Value>)->Result<Value>{
+        bg_seconds(&json!(seconds),604800.0)?;
+        bg_text(&json!({"reason":reason}),"reason",512)?;
+        let metadata=json!({"id":format!("wake{}",self.journal.seq),"reason":reason,
+            "due_ms":now_ms()+(seconds*1000.0).ceil() as u128,"state":"scheduled","task":task,"stop_settled":task.is_none()});
+        self.bg_save_wakeup(&metadata)?;
+        self.wakeups.insert(metadata["id"].as_str().unwrap().into(),Wakeup{metadata:metadata.clone(),
+            deadline:Some(std::time::Instant::now()+std::time::Duration::from_secs_f64(seconds))});Ok(metadata)
+    }
+    fn wakeup_list(&mut self)->Result<Value>{
+        self.service_background()?;let mut entries:Vec<_>=self.wakeups.values().map(|w|w.metadata.clone()).collect();
+        entries.sort_by_key(|m|m["due_ms"].as_u64().unwrap_or(0));Ok(json!(entries))
+    }
+    fn wakeup_cancel(&mut self,id:&str)->Result<Value>{
+        let w=self.wakeups.get_mut(id).ok_or("unknown wakeup ID")?;
+        if w.metadata["state"]=="cancelled"{return Ok(w.metadata.clone());}
+        if !matches!(w.metadata["state"].as_str(),Some("scheduled"|"ready"|"pending_confirmation")){return Err("wakeup is already settled".into());}
+        w.metadata["state"]=json!("cancelled");let metadata=w.metadata.clone();self.bg_save_wakeup(&metadata)?;Ok(metadata)
+    }
+    fn wakeup_run(&mut self,id:&str)->Result<Value>{
+        let w=self.wakeups.get_mut(id).ok_or("unknown wakeup ID")?;
+        if !matches!(w.metadata["state"].as_str(),Some("scheduled"|"ready"|"pending_confirmation")){return Err("wakeup is already settled".into());}
+        w.metadata["state"]=json!("ready");let metadata=w.metadata.clone();self.bg_save_wakeup(&metadata)?;Ok(metadata)
+    }
+    // Called only at an idle/safe boundary, never from servicing a busy operation.
+    fn dispatch_wakeups(&mut self)->Result<bool>{
+        self.service_background()?;
+        if !self.pending.is_empty(){return Ok(false);}
+        if let Some(command)=self.incoming.as_ref().and_then(|r|r.try_recv().ok()){
+            if !self.background_control(&command)?{self.queue_arrival(command)?;}
+            return Ok(false);
+        }
+        let mut ids:Vec<_>=self.wakeups.iter().filter_map(|(id,w)|(w.metadata["state"]=="ready").then_some(id.clone())).collect();
+        ids.sort();if ids.is_empty(){return Ok(false);}
+        let mut batch=Vec::new();
+        for id in &ids{
+            let w=self.wakeups.get_mut(id).unwrap();w.metadata["state"]=json!("dispatching");
+            let metadata=w.metadata.clone();self.bg_save_wakeup(&metadata)?;batch.push(metadata);
+        }
+        let notice=json!({"wakeups":batch});
+        if self.no_model{self.event("notice",json!({"text":format!("Wakeup: {notice}")}));}
+        else{
+            self.add_context("user",format!("Scheduled continuation (metadata only): {notice}"),false,vec![])?;
+        }
+        // A crash while dispatched remains outcome_unknown on resume, never replayed.
+        let result=if self.no_model{Ok(())}else{self.run_agent()};
+        for id in ids{
+            let w=self.wakeups.get_mut(&id).unwrap();w.metadata["state"]=json!("consumed");
+            let metadata=w.metadata.clone();self.bg_save_wakeup(&metadata)?;
+        }
+        result?;Ok(true)
+    }
+    fn bg_restore(&mut self,kind:&str,p:&Value)->Result<()>{
+        if kind=="task_settled"{
+            self.bg_restore("task_state",&p["task"])?;
+            if !p["wakeup"].is_null(){self.bg_restore("wakeup_state",&p["wakeup"])?;}
+            return Ok(());
+        }
+        let id=p["id"].as_str().ok_or("invalid background journal ID")?.to_owned();
+        match kind{
+            "task_state"=>{self.bg_tasks.insert(id,BgTask{child:None,stdout:None,stderr:None,dir:PathBuf::new(),
+                metadata:p.clone(),deadline:None,cancel_at:None,terminal_status:None,reaped:None});},
+            "wakeup_state"=>{self.wakeups.insert(id,Wakeup{metadata:p.clone(),deadline:None});},_=>{}
+        }
+        Ok(())
+    }
+    fn bg_recover(&mut self)->Result<()>{
+        let mut tasks=Vec::new();let mut wakeups=Vec::new();
+        for task in self.bg_tasks.values_mut(){
+            if matches!(task.metadata["status"].as_str(),Some("starting"|"running"|"cancelling")){
+                task.metadata["status"]=json!("outcome_unknown");task.metadata["replay_allowed"]=json!(false);
+                task.metadata.as_object_mut().unwrap().remove("pid");
+                for name in ["stdout","stderr"]{
+                    let mut bytes=0usize;
+                    if let Some(index)=task.metadata[name]["index"].as_u64(){
+                        if let Some(chunks)=self.history[name].get(index as usize).and_then(|v|v["$chunks"].as_array()){
+                            for seq in chunks{
+                                let event=self.journal.event(seq.as_u64().ok_or("invalid stream chunk")? as usize)?;
+                                let data=event["payload"]["base64"].as_str().ok_or("invalid stream bytes")?;
+                                bytes+=data.len()/4*3-data.bytes().rev().take_while(|b|*b==b'=').count();
+                            }
+                        }
+                    }
+                    task.metadata[name]["bytes"]=json!(bytes);task.metadata[name]["complete"]=json!(false);
+                }
+                tasks.push(task.metadata.clone());
+            }
+        }
+        for w in self.wakeups.values_mut(){
+            if matches!(w.metadata["state"].as_str(),Some("scheduled"|"ready"|"dispatching")){
+                w.metadata["state"]=json!(if w.metadata["state"]=="dispatching"{"outcome_unknown"}else{"pending_confirmation"});wakeups.push(w.metadata.clone());
+            }
+        }
+        for metadata in tasks{self.bg_save_task(&metadata)?;}
+        for metadata in wakeups{self.bg_save_wakeup(&metadata)?;}
+        Ok(())
+    }
+    fn bg_guard(&mut self,cancel:bool)->Result<()>{
+        self.service_background()?;
+        if self.bg_tasks.values().any(|t|t.child.is_some()){
+            if !cancel{return Err("background jobs are running; kill them first or request --cancel-tasks".into());}
+            self.bg_shutdown()?;
+        }
+        Ok(())
+    }
+    fn bg_shutdown(&mut self)->Result<()>{
+        let ids:Vec<_>=self.bg_tasks.iter().filter_map(|(id,t)|t.child.as_ref().map(|_|id.clone())).collect();
+        for id in &ids{self.bg_kill(id,false)?;}
+        let deadline=std::time::Instant::now()+std::time::Duration::from_millis(750);
+        while self.bg_tasks.values().any(|t|t.child.is_some())&&std::time::Instant::now()<deadline{
+            self.service_background()?;std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for id in &ids{
+            if self.bg_tasks.get(id).is_some_and(|t|t.child.is_some()){
+                self.bg_kill(id,true)?;
+            }
+        }
+        let deadline=std::time::Instant::now()+std::time::Duration::from_millis(250);
+        while self.bg_tasks.values().any(|t|t.child.is_some())&&std::time::Instant::now()<deadline{
+            self.service_background()?;std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // A large backlog or escaped writer must not make shutdown unbounded.
+        // Preserve captured bytes explicitly as partial rather than claiming EOF.
+        for id in ids{
+            let mut task=self.bg_tasks.remove(&id).unwrap();
+            let result=(||->Result<()>{
+                if let Some(mut child)=task.child.take(){
+                    if task.reaped.is_none(){child.wait()?;}
+                    task.metadata["stdout"]=task.stdout.take().unwrap().finish_metadata(self,false)?;
+                    task.metadata["stderr"]=task.stderr.take().unwrap().finish_metadata(self,false)?;
+                    for name in ["stdout","stderr"]{task.metadata[name].as_object_mut().unwrap().remove("preview");}
+                    task.metadata["status"]=json!(task.terminal_status.clone().unwrap_or_else(||"cancelled".into()));
+                    task.metadata["finished_ms"]=json!(now_ms());self.bg_settle(&task.metadata)?;
+                }
+                Ok(())
+            })();
+            self.bg_tasks.insert(id,task);result?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod background_e2e {
+    fn check(body:&str){
+        let prelude=r#"
+import os,sys,tempfile,subprocess,json,glob,time,queue,threading,signal,http.server
+home=tempfile.mkdtemp(prefix='py-bgtasks-');env=dict(os.environ,PY_HOME=home)
+for k in ('PY_MODEL','PY_CONTEXT_LIMIT'):env.pop(k,None)
+p=None;seen=[];counter=0
+q=queue.Queue()
+def records():
+ return [json.loads(l) for f in glob.glob(home+'/sessions/*.jsonl') for l in open(f)]
+def start(extra=(),model=False,preexec=None):
+ global p,q,seen
+ q=queue.Queue();seen=[]
+ p=subprocess.Popen([sys.argv[1],'--json','--json-input']+([] if model else ['--no-model'])+list(extra),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env,preexec_fn=preexec)
+ def read():
+  for line in p.stdout:q.put(json.loads(line))
+ threading.Thread(target=read,daemon=True).start()
+ wait(lambda v:v['kind']=='ready')
+def wait(predicate,seconds=6):
+ end=time.monotonic()+seconds
+ while time.monotonic()<end:
+  try:v=q.get(timeout=max(.001,end-time.monotonic()))
+  except queue.Empty:break
+  seen.append(v)
+  if predicate(v):return v
+ raise AssertionError(('missing event',seen[-12:],records()[-12:]))
+def wait_record(predicate):
+ end=time.monotonic()+6
+ while time.monotonic()<end:
+  found=next((v for v in records() if predicate(v)),None)
+  if found:return found
+  time.sleep(.01)
+ raise AssertionError(('missing journal record',records()[-12:]))
+def send(kind,id=None,**kwargs):
+ global counter
+ counter+=1;id=id or 'cmd'+str(counter)
+ p.stdin.write(json.dumps(dict(id=id,kind=kind,**kwargs))+'\n');p.stdin.flush();return id
+def call(kind,id=None,**kwargs):
+ id=send(kind,id,**kwargs)
+ return wait(lambda v:v.get('command_id')==id and v['kind'] in ('completed','error','rejected'))
+def terminal(task,status=None):
+ predicate=lambda v:v['kind']=='task_state' and v.get('id')==task and v.get('status') in ([status] if status else ['succeeded','failed','cancelled','killed','timed_out'])
+ return next((v for v in reversed(seen) if predicate(v)),None) or wait(predicate)
+def finish():
+ send('quit',cancel_tasks=True);p.wait(timeout=5);assert p.returncode==0,p.stderr.read()
+def launches():return [v for v in records() if v['kind']=='intent' and v['payload'].get('type')=='background']
+def model_server(codes):
+ requests=[]
+ class Handler(http.server.BaseHTTPRequestHandler):
+  def log_message(self,*args):pass
+  def do_POST(self):
+   requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+   code=codes.pop(0) if codes else 'agent.loop.stop()'
+   if isinstance(code,tuple):delay,code=code;time.sleep(delay)
+   self.send_response(200);self.end_headers()
+   try:self.wfile.write(json.dumps({'choices':[{'message':{'content':code}}]}).encode())
+   except BrokenPipeError:pass
+ server=http.server.HTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=server.serve_forever,daemon=True).start()
+ json.dump({'model':'local/m','providers':{'local':{'base_url':'http://127.0.0.1:'+str(server.server_port),'models':[{'id':'m','api':'openai-completions'}]}}},open(home+'/config.json','w'))
+ return server,requests
+"#;
+        let script=format!("{prelude}\ntry:\n{}\nfinally:\n if p is not None and p.poll() is None:p.kill();p.wait()\n",body.lines().map(|l|format!(" {l}")).collect::<Vec<_>>().join("\n"));
+        let out=crate::test_command("python3").args(["-c",&script,&std::env::var("PY_HARNESS_BIN").unwrap()]).output().unwrap();
+        assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+    }
+    #[test]
+    fn e2e_bgtasks_shell_python_isolation_and_limit(){check(r#"
+start()
+result=call('python',source="secret_main=42\nt=agent.bgtasks.run(\"import sys,os;print('secret_main' in globals());print('agent' in sys.modules);print(os.environ['BG_KEY']);print(repr(sys.stdin.read()))\",kind='python',env={'BG_KEY':'isolated'})\nprint(t['id'])")
+assert result['status']=='ok',result
+task=next(v['payload']['id'] for v in records() if v['kind']=='task_state');terminal(task,'succeeded')
+m=call('task_get',task_id=task)['result'];assert m['stdout']['bytes']>0 and m['stdout']['complete'],m
+assert call('task_logs',task_id=task,stream='stdout')['result']['stdout']['preview']=='False\nFalse\nisolated\n\'\'',records()
+for _ in range(4):assert call('bg_run',source='sleep 20')['kind']=='completed'
+assert call('bg_run',source='echo too-many')['kind']=='error'
+call('task_kill',task_id=call('task_list',state='running')['result'][0]['id'],force=True)
+time.sleep(.1)
+for options in ({'timeout':True},{'timeout':0},{'timeout':-1},{'env':{'BAD':1}},{'name':''},{'wakeup_reason':''}):
+ assert call('bg_run',source='true',options=options)['kind']=='error',options
+assert call('python',source="for x in (float('nan'),float('inf'),True,0,-1):\n try:agent.bgtasks.run('true',timeout=x)\n except ValueError:pass\n else:raise AssertionError('invalid timeout accepted')\nassert secret_main==42")['status']=='ok'
+assert len(launches())==5,launches()
+assert call('task_list',state='typo')['kind']=='error'
+finish()
+"#);}
+    #[test]
+    fn e2e_bgtasks_stream_refs_and_context_privacy(){check(r#"
+start()
+a=call('bg_run',source="printf alpha-private; printf alpha-error >&2")['result'];b=call('bg_run',source="printf beta-private; printf beta-error >&2")['result']
+assert a['stdout']['ref']!=b['stdout']['ref'] and a['stderr']['ref']!=b['stderr']['ref']
+call('python',source="print('foreground-private')")
+# Queries service the pump too; inspect final metadata without relying on earlier event ordering.
+for task in (a,b):
+ end=time.monotonic()+3
+ while True:
+  m=call('task_get',task_id=task['id'])['result']
+  if m['status']=='succeeded':break
+  assert time.monotonic()<end,m
+  time.sleep(.02)
+ assert m['stdout']['complete'] and m['stderr']['complete'],m
+ logs=call('task_logs',task_id=task['id'])['result'];prefix='alpha' if task is a else 'beta'
+ assert logs['stdout']['preview']==prefix+'-private' and logs['stderr']['preview']==prefix+'-error',logs
+ assert m['stdout']['bytes']==len(prefix+'-private'),m
+r=records();assert not any('-private' in v['payload'].get('text','') or '-error' in v['payload'].get('text','') for v in r if v['kind']=='context_add'),r
+assert not any(v['kind']=='wakeup_state' for v in r),r
+assert len([v for v in r if v['kind']=='task_settled'])==2,r
+large=call('bg_run',task_kind='python',source="import os;os.write(1,b'x'*2000000);os.write(2,b'y'*1500000)")['result']
+call('python',source="print('responsive-during-large-capture')")
+terminal(large['id'],'succeeded');m=call('task_get',task_id=large['id'])['result']
+assert m['stdout']['bytes']==2000000 and m['stderr']['bytes']==1500000 and m['stdout']['complete'],m
+assert call('python',source="assert len(H.stdout[%d])==2000000;assert len(H.stderr[%d])==1500000"%(m['stdout']['index'],m['stderr']['index']))['status']=='ok'
+finish()
+"#);}
+    #[test]
+    fn e2e_bgtasks_busy_kill_timeout_and_idempotence(){check(r#"
+start()
+t=call('bg_run',source="trap '' TERM; printf partial; while :; do sleep .05; done",options={'timeout':.12})['result']
+busy=send('python',source="import time;time.sleep(1.2);print('foreground-done')")
+terminal(t['id'],'timed_out')
+assert not any(v.get('command_id')==busy and v['kind']=='completed' for v in seen),seen
+m=call('task_get',task_id=t['id'])['result'];assert m['stdout']['bytes']==7 and m['stdout']['complete'],m
+assert call('task_kill',task_id=t['id'])['result']['status']=='timed_out'
+wait(lambda v:v.get('command_id')==busy and v['kind']=='completed')
+t=call('bg_run',source="trap '' TERM; printf killed-partial; sleep 20")['result']
+busy=send('shell',command='sleep 1.2');began=time.monotonic()
+assert call('task_kill',task_id=t['id'])['result']['status']=='cancelling'
+terminal(t['id'],'cancelled');assert time.monotonic()-began<1,seen
+assert call('task_kill',task_id=t['id'],force=True)['result']['status']=='cancelled'
+wait(lambda v:v.get('command_id')==busy and v['kind']=='completed')
+finish()
+"#);}
+    #[test]
+    fn background_completion_catalog_covers_ids_and_flags(){
+        let catalog=crate::CompletionCatalog{names:vec![],models:serde_json::json!([]),home:std::env::temp_dir(),
+            python_cwd:std::env::temp_dir(),current_model:String::new(),configured_providers:vec![],
+            task_ids:vec!["task7".into()],wakeup_ids:vec!["wake9".into()]};
+        for (prefix,wanted) in [("/b","/bg"),("/task t","task7"),("/task logs t","task7"),
+            ("/task logs task7 ","stdout"),("/task kill task7 ","--force"),
+            ("/wakeup run w","wake9"),("/tasks out","outcome_unknown"),("/bg p","python")]{
+            let (_,items)=catalog.candidates(prefix,prefix.len(),false).unwrap();
+            assert!(items.iter().any(|i|i.replacement==wanted),"{prefix}: missing {wanted}");
+        }
+    }
+    #[test]
+    fn e2e_bgtasks_slash_controls_and_user_only_logs(){check(r#"
+p=subprocess.Popen([sys.argv[1],'--json','--no-model'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env)
+def read():
+ for line in p.stdout:q.put(json.loads(line))
+threading.Thread(target=read,daemon=True).start();wait(lambda v:v['kind']=='ready')
+def line(text):p.stdin.write(text+'\n');p.stdin.flush()
+line('/bg shell printf slash-private');m=wait(lambda v:v['kind']=='completed')['result']
+line('@import time;time.sleep(.08)');wait(lambda v:v['kind']=='completed')
+line('/task logs '+m['id']);logs=wait(lambda v:v['kind']=='completed')['result'];assert logs['stdout']['preview']=='slash-private',logs
+line('/tasks');assert len(wait(lambda v:v['kind']=='info')['value'])==1
+line('/task kill '+m['id']+' --force');assert wait(lambda v:v['kind']=='info')['value']['status']=='succeeded'
+line('@agent.loop.stop(wakeup=(20,"ui-later"))');wait(lambda v:v['kind']=='completed')
+line('/wakeups');w=wait(lambda v:v['kind']=='info')['value'];assert len(w)==1,w
+line('/wakeup cancel '+w[0]['id']);assert wait(lambda v:v['kind']=='info')['value'][0]['state']=='cancelled'
+line('/help');assert '/bg shell|python' in wait(lambda v:v['kind']=='notice')['text']
+assert not any(v['kind']=='context_add' and 'slash-private' in v['payload']['text'] for v in records())
+line('/quit');p.wait(timeout=3);assert p.returncode==0,p.stderr.read()
+"#);}
+    #[test]
+    fn e2e_bgtasks_controls_and_command_deduplication(){check(r#"
+start()
+a=call('bg_run',id='launch',source='sleep 20')['result'];assert call('bg_run',id='launch',source='echo duplicate')['kind']=='rejected'
+assert len(launches())==1
+assert call('task_get',task_id='missing')['kind']=='error'
+assert call('task_kill',task_id=a['id'],force='yes')['kind']=='error'
+assert call('quit')['kind']=='error' and p.poll() is None
+assert call('new')['kind']=='error'
+v=call('python',source="agent.loop.stop(wakeup=(20,'later'))");assert v['status']=='ok'
+w=call('wakeup_list')['result'][0];assert w['state']=='scheduled',w
+assert call('wakeup_cancel',wakeup_id=w['id'])['result']['state']=='cancelled'
+assert call('wakeup_cancel',wakeup_id=w['id'])['result']['state']=='cancelled'
+assert call('wakeup_run',wakeup_id=w['id'])['kind']=='error'
+assert call('new',cancel_tasks=True)['kind']=='completed'
+assert call('task_list')['result']==[]
+assert call('wakeup_list')['result']==[]
+finish()
+"#);}
+    #[test]
+    fn e2e_stop_wakeup_settlement_and_order(){check(r#"
+start()
+assert call('python',source="agent.loop.stop(wakeup=(20,'failed'));raise Exception('after-stop')")['status']=='error'
+assert call('wakeup_list')['result']==[]
+assert call('python',source="for x in (float('nan'),float('inf'),True,0,-1):\n try:agent.loop.stop(wakeup=(x,'invalid'))\n except ValueError:pass\n else:raise AssertionError('invalid wakeup accepted')")['status']=='ok'
+busy=send('python',source="import time;agent.loop.stop(wakeup=(20,'cancelled'));print('staged');time.sleep(20)")
+wait_record(lambda v:v['kind']=='stream' and 'staged' in v['payload'].get('text',''))
+call('interrupt');wait(lambda v:v.get('command_id')==busy and v['kind']=='completed')
+assert call('wakeup_list')['result']==[]
+v=call('python',source="agent.loop.stop(wakeup=(20,'replaced'));agent.loop.stop(wakeup=(20,'retained'));\ntry:agent.loop.stop(wakeup=(True,'invalid'))\nexcept ValueError:pass\nprint('following-statements')")
+assert v['status']=='ok'
+w=call('wakeup_list')['result'];assert len(w)==1 and w[0]['reason']=='retained',w
+call('python',source='agent.loop.stop()');assert len(call('wakeup_list')['result'])==1
+call('wakeup_run',wakeup_id=w[0]['id']);wait(lambda v:v['kind']=='notice' and 'Wakeup:' in v.get('text',''))
+assert call('wakeup_list')['result'][0]['state']=='consumed'
+finish()
+# Model steering wins even after a successful stop request in the current cell.
+server,requests=model_server(["import time;agent.loop.stop(wakeup=(20,'discarded'));print('stage-ready');time.sleep(.3)","agent.loop.stop()"])
+start(model=True)
+first=send('submit',text='initial')
+wait_record(lambda v:v['kind']=='stream' and 'stage-ready' in v['payload'].get('text',''))
+steer=send('submit',text='steer-now',mode='steering')
+wait(lambda v:v.get('command_id')==first and v['kind']=='completed')
+assert len(requests)==2 and 'steer-now' in json.dumps(requests[1]),requests
+assert call('wakeup_list')['result']==[]
+finish();server.shutdown()
+"#);}
+    #[test]
+    fn e2e_bgtasks_wakeup_safe_boundaries_and_privacy(){check(r#"
+server,requests=model_server(["import time;agent.loop.stop(wakeup=(.04,'first'));time.sleep(.1)","agent.loop.stop()"])
+start(model=True)
+call('submit',text='initial')
+wait(lambda v:v['kind']=='wakeup_state' and v.get('state')=='consumed')
+assert len(requests)==2 and 'Scheduled continuation' in json.dumps(requests[1]),requests
+finish();server.shutdown()
+# Capture and immediate controls continue while the provider is blocked;
+# simultaneously ready completion wakeups coalesce into just one continuation.
+server,requests=model_server([(.5,'agent.loop.stop()'),'agent.loop.stop()'])
+start(model=True)
+a=call('bg_run',source='sleep .06;printf provider-private-a',options={'wakeup_reason':'review-a'})['result']
+b=call('bg_run',source='sleep .06;printf provider-private-b',options={'wakeup_reason':'review-b'})['result']
+fg=send('submit',text='provider-busy')
+terminal(a['id'],'succeeded');terminal(b['id'],'succeeded')
+assert len(requests)==1,requests
+assert call('task_get',task_id=a['id'])['result']['status']=='succeeded'
+assert not any(v['kind']=='completed' and v.get('command_id')==fg for v in seen),seen
+wait(lambda v:v['kind']=='wakeup_state' and v.get('state')=='consumed')
+w=call('wakeup_list')['result'];assert sum(v['state']=='consumed' for v in w)==2,w
+assert len(requests)==2 and 'review-a' in json.dumps(requests[1]) and 'review-b' in json.dumps(requests[1]),requests
+assert 'provider-private' not in json.dumps(requests),requests
+finish();server.shutdown()
+start()
+a=call('bg_run',source='sleep .08;printf optin-private',options={'wakeup_reason':'review'})['result']
+b=call('bg_run',source='sleep .08;printf silent-private')['result']
+fg=send('python',source="input('hold boundary: ')")
+prompt=wait(lambda v:v['kind']=='input_prompt')
+terminal(a['id'],'succeeded');time.sleep(.1)
+assert not any(v['kind']=='notice' and 'Wakeup:' in v.get('text','') for v in seen),seen
+call('stdin_reply',prompt_id=prompt['prompt_id'],operation=prompt['operation'],worker_generation=prompt['worker_generation'],value='release')
+wait(lambda v:v['kind']=='notice' and 'Wakeup:' in v.get('text',''))
+r=records();settled=[v['payload'] for v in r if v['kind']=='task_settled' and v['payload']['task']['id']==a['id'] and v['payload']['task']['created_ms']==a['created_ms']]
+assert len(settled)==1 and settled[0]['wakeup']['task']['stdout']['bytes']==13,settled
+assert 'optin-private' not in json.dumps(settled) and 'silent-private' not in json.dumps(settled),settled
+finish()
+"#);}
+    #[test]
+    fn e2e_bgtasks_wakeup_crash_resume_without_replay(){check(r#"
+start()
+t=call('bg_run',source='sleep 20; touch '+home+'/must-not-replay')['result']
+pid=t['pid'];call('python',source="agent.loop.stop(wakeup=(.2,'resume-needs-confirmation'))")
+p.kill();p.wait()
+path=glob.glob(home+'/sessions/*.jsonl')[0]
+# Explicitly simulate stale/reused saved PID: restore must not ever signal it.
+r=records();states=[v for v in r if v['kind']=='task_state' and v['payload']['id']==t['id']]
+last=states[-1];last['payload']['pid']=os.getpid()
+lines=open(path).readlines();lines[last['seq']]=json.dumps(last)+'\n';open(path,'w').writelines(lines)
+start(['--resume',path]);time.sleep(.25)
+m=call('task_get',task_id=t['id'])['result'];assert m['status']=='outcome_unknown' and 'pid' not in m,m
+assert call('task_kill',task_id=t['id'])['result']['status']=='outcome_unknown'
+w=call('wakeup_list')['result'];assert w[-1]['state']=='pending_confirmation',w
+assert not any(v['kind']=='notice' and 'Wakeup:' in v.get('text','') for v in seen),seen
+call('wakeup_run',wakeup_id=w[-1]['id']);wait(lambda v:v['kind']=='notice' and 'Wakeup:' in v.get('text',''))
+assert not os.path.exists(home+'/must-not-replay') and len(launches())==1
+finish()
+try:os.killpg(pid,signal.SIGKILL)
+except ProcessLookupError:pass
+# A crash during a dispatched provider request is uncertain, never replayed.
+server,requests=model_server(["agent.loop.stop(wakeup=(.02,'uncertain'))",(.8,'agent.loop.stop()')])
+start(model=True);call('submit',text='schedule interrupted dispatch')
+end=time.monotonic()+3
+while len(requests)<2:
+ assert time.monotonic()<end,requests
+ time.sleep(.01)
+p.kill();p.wait();path=max(glob.glob(home+'/sessions/*.jsonl'),key=os.path.getmtime)
+start(['--resume',path],model=True);time.sleep(.1)
+w=call('wakeup_list')['result'];assert any(v['state']=='outcome_unknown' for v in w),w
+unknown=next(v for v in w if v['state']=='outcome_unknown')
+assert call('wakeup_run',wakeup_id=unknown['id'])['kind']=='error'
+assert len(requests)==2,requests
+finish();server.shutdown()
+"#);}
+    #[test]
+    fn e2e_bgtasks_session_shutdown_and_failure_cleanup(){check(r#"
+start()
+t=call('bg_run',source="printf eof-partial; trap '' TERM; sleep 20")['result'];time.sleep(.05)
+p.stdin.close();p.wait(timeout=4);assert p.returncode==0,p.stderr.read()
+try:os.kill(t['pid'],0);raise AssertionError('child not reaped')
+except ProcessLookupError:pass
+r=records();m=next(v['payload']['task'] for v in r if v['kind']=='task_settled' and v['payload']['task']['id']==t['id'])
+assert m['status']=='cancelled' and m['stdout']['bytes']==11,m
+start()
+m=call('bg_run',source='true',options={'cwd':home+'/missing'})['result'];assert m['status']=='failed' and m['stderr']['bytes']>0,m
+assert call('task_get',task_id=m['id'])['result']['status']=='failed'
+finish()
+# A real journal I/O failure must not leave an owned process running.
+def limit_file_size():
+ import resource
+ signal.signal(signal.SIGXFSZ,signal.SIG_IGN)
+ resource.setrlimit(resource.RLIMIT_FSIZE,(65536,65536))
+start(preexec=limit_file_size)
+t=call('bg_run',source="printf before-disk-failure; sleep .1; python3 -c \"print('x'*50000)\"; sleep 20")['result']
+p.wait(timeout=4);assert p.returncode!=0
+try:os.kill(t['pid'],0);raise AssertionError('journal failure left owned child')
+except ProcessLookupError:pass
+path=max(glob.glob(home+'/sessions/*.jsonl'),key=os.path.getmtime)
+r=[json.loads(l) for l in open(path) if l.endswith('\n')]
+assert not any(v['kind']=='task_settled' for v in r),r[-3:]
+"#);}
+}
+
+// Durable entries remain ordinary files; only initialization interprets them.
+fn skills_defaults()->Value{json!({"enabled":true,"max_system_tokens":8000,"max_core_entry_tokens":2000,
+    "max_inventory_entry_tokens":128,"max_entries":128,"max_file_bytes":65536})}
+fn skills_options(config:&Value)->Result<Value>{
+    if !config.is_object(){return Err("config.json must contain an object".into());}
+    let mut result=skills_defaults();
+    if let Some(options)=config.get("skills"){
+        for (key,value) in options.as_object().ok_or("skills config must be an object")?{
+            if result.get(key).is_none(){return Err(format!("unknown skills setting: {key}").into());}
+            if key=="enabled"{if !value.is_boolean(){return Err("skills.enabled must be boolean".into());}}
+            else if !value.as_u64().is_some_and(|n|n>0&&n<=16_777_216){return Err(format!("skills.{key} must be an integer in 1..=16777216").into());}
+            result[key]=value.clone();
+        }
+    }
+    Ok(result)
+}
+fn config_secret_key(key:&str)->bool{
+    matches!(key.to_ascii_lowercase().replace('-',"_").as_str(),"auth"|"credentials"|"key"|"api_key"|"apikey"|"access"|"refresh"|"token"|"password"|"access_token"|"refresh_token"|"secret"|"client_secret"|"authorization")
+}
+fn config_has_secrets(value:&Value)->bool{
+    match value{
+        Value::Object(object)=>object.iter().any(|(key,value)|config_secret_key(key)||config_has_secrets(value)),
+        Value::Array(values)=>values.iter().any(config_has_secrets),_=>false
+    }
+}
+fn validate_config(config:&Value)->Result<()>{
+    if config_has_secrets(config){return Err("credentials belong in auth.json and /login, not config.json".into());}
+    skills_options(config)?;
+    for key in ["model","effort"]{if let Some(value)=config.get(key){
+        if !value.as_str().is_some_and(|s|!s.trim().is_empty()){return Err(format!("{key} must be a nonempty string").into());}
+    }}
+    if let Some(effort)=config["effort"].as_str(){if !["off","minimal","low","medium","high","xhigh","max"].contains(&effort){return Err("invalid configured effort".into());}}
+    if let Some(providers)=config.get("providers"){if !providers.is_object(){return Err("providers must be an object".into());}}
+    Ok(())
+}
+fn effective_config(config:&Value)->Result<Value>{let mut value=config.clone();value["skills"]=skills_options(config)?;Ok(value)}
+fn skills_tokens(text:&str)->usize{text.chars().count().div_ceil(3)}
+fn valid_skill_date(date:&str)->bool{
+    if date.len()!=20||!date.is_ascii(){return false;}
+    let b=date.as_bytes();if b[4]!=b'-'||b[7]!=b'-'||b[10]!=b'T'||b[13]!=b':'||b[16]!=b':'||b[19]!=b'Z'{return false;}
+    if b.iter().enumerate().any(|(i,c)|![4,7,10,13,16,19].contains(&i)&&!c.is_ascii_digit()){return false;}
+    let number=|a,b|date[a..b].parse::<u32>().ok();
+    let (Some(y),Some(m),Some(d),Some(h),Some(min),Some(s))=(number(0,4),number(5,7),number(8,10),number(11,13),number(14,16),number(17,19)) else{return false};
+    let days=match m{1|3|5|7|8|10|12=>31,4|6|9|11=>30,2=>if y%4==0&&(y%100!=0||y%400==0){29}else{28},_=>0};
+    y>0&&d>0&&d<=days&&h<24&&min<60&&s<60
+}
+fn parse_skill(name:&str,text:&str)->Result<Value>{
+    let mut lines=text.split_inclusive('\n');
+    if lines.next().map(str::trim_end)!=Some("---"){return Err("missing --- front matter".into());}
+    let mut metadata=json!({});let mut closed=false;
+    for line in lines.by_ref(){
+        let line=line.trim_end();if line=="---"{closed=true;break;}
+        if line.trim().is_empty(){continue;}
+        let (key,raw)=line.split_once(':').ok_or("expected key: value front matter")?;
+        if !["kind","created","updated","origin","description","core"].contains(&key){return Err(format!("unknown metadata field {key}").into());}
+        if metadata.get(key).is_some(){return Err(format!("duplicate metadata field {key}").into());}
+        let raw=raw.trim();
+        metadata[key]=if key=="core"{match raw{"true"=>json!(true),"false"=>json!(false),_=>return Err("core must be true or false".into())}}
+            else if raw.starts_with('"'){let s:String=serde_json::from_str(raw)?;json!(s)}else{
+                if raw.is_empty()||raw.starts_with(['\'','|','>','[','{','&','*','!','#']){return Err("use a plain single-line or JSON-quoted string".into());}json!(raw)
+            };
+    }
+    if !closed{return Err("unterminated front matter".into());}
+    for key in ["kind","created","updated","origin","description","core"]{if metadata.get(key).is_none(){return Err(format!("missing metadata field {key}").into());}}
+    if !["memory","skill","python"].contains(&metadata["kind"].as_str().unwrap_or("")){return Err("kind must be memory, skill or python".into());}
+    if !["agent","user"].contains(&metadata["origin"].as_str().unwrap_or("")){return Err("origin must be agent or user".into());}
+    for key in ["created","updated"]{if !valid_skill_date(metadata[key].as_str().unwrap_or("")){return Err(format!("{key} must be a valid YYYY-MM-DDTHH:MM:SSZ timestamp").into());}}
+    if metadata["updated"].as_str()<metadata["created"].as_str(){return Err("updated precedes created".into());}
+    let description=metadata["description"].as_str().unwrap();
+    if description.trim().is_empty()||description.chars().any(|c|c.is_control()||c=='\u{2028}'||c=='\u{2029}'){
+        return Err("description must be nonempty, single-line and control-free".into());
+    }
+    let body=lines.collect::<String>();let mut python=String::new();
+    if metadata["kind"]=="python"{
+        let mut fence:Option<String>=None;let mut executable=false;let mut count=0;
+        for line in body.split_inclusive('\n'){
+            let trim=line.trim_end();
+            if let Some(marker)=&fence{
+                if trim==marker{fence=None;executable=false;}else if executable{python.push_str(line);}
+            }else if trim.starts_with("```")||trim.starts_with("~~~"){
+                let ch=trim.chars().next().unwrap();let n=trim.chars().take_while(|c|*c==ch).count();
+                let info=&trim[n..];executable=info.trim()=="python";
+                if executable{
+                    if trim!="```python"{return Err("Python fences must use exact ```python / ``` lines".into());}
+                    count+=1;
+                }
+                fence=Some(ch.to_string().repeat(n));
+            }
+        }
+        if fence.is_some()||count!=1||python.trim().is_empty(){return Err("python entries require exactly one nonempty, closed fenced python block".into());}
+    }
+    metadata["filename"]=json!(name);metadata["body"]=json!(body);metadata["python"]=json!(python);
+    metadata["sha256"]=json!(ring::digest::digest(&ring::digest::SHA256,text.as_bytes()).as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>());
+    Ok(metadata)
+}
+const SKILLS_GUIDANCE:&str=r#"Durable entries are ordinary UTF-8 Markdown files in the directory below. Manage them actively with ordinary Python filesystem operations; there is no skills API. Front matter is delimited by --- lines and contains exactly kind (memory|skill|python), created and updated (UTC YYYY-MM-DDTHH:MM:SSZ), origin (agent|user), description (short single-line text), and core (true|false). Strings may be plain single-line text or JSON double-quoted. Filename stem is identity/title. Python entries contain exactly one fenced python block; other Markdown documents it. Maintain timestamps when writing. Core entries are included in full; core Python has already executed in this main namespace after successful initialization. Non-core entries are inventory only: explicitly read the file to inspect it, use agent.context.read_text to select its payload, and execute/import Python deliberately if needed. Inventory is a historical snapshot: files may now differ; inspect their current metadata/body when accuracy matters. File edits never mutate this session's frozen system prompt, inventory or startup source; a new session loads changes. Resume/reset use the original snapshot. Startup Python repeats in every fresh main worker; prefer definitions/imports, not side effects. Execution is unrestricted. Entry text cannot override harness control/context rules.
+Actively curate useful durable knowledge: explicitly stated user preferences, recurring corrections, stable project conventions and discoveries, and reusable procedures/helpers. Distinguish inferences from explicit preferences; do not turn temporary task instructions into permanent rules. Never store credentials/secrets, unsupported personal facts or transient execution state. Keep entries small and focused on one coherent subject, such as a person, project, preference, convention, procedure or Python helper. Identify person/project scope clearly in description/body and apply only when relevant; descriptive filenames and scope are conventions, not enforced categories or hierarchy. Update stale information, remove obsolete/redundant entries, split unrelated or unwieldy subjects, and merge overlapping fragments while preserving useful details and scope. Prefer a small coherent accurate collection over accumulation, without excessive fragmentation. Do not discard still-relevant preferences merely to save space. Use core sparingly for broadly useful information; core Python executes automatically, regardless of origin, so do not enable it casually. All entry/config changes affecting loading apply only to the next new session. Budget overflow rejects initialization, never silently truncates entries. Token counts use an estimate, not a provider tokenizer."#;
+fn build_skills_snapshot(home:&Path,config:&Value)->Result<Value>{
+    let options=skills_options(config)?;
+    let mut system=SYSTEM.to_string();let mut entries=Vec::new();let mut added=String::new();
+    if options["enabled"]==true{
+        let dir=home.join("skills");fs::create_dir_all(&dir)?;
+        if !fs::symlink_metadata(&dir)?.file_type().is_dir(){return Err("skills directory must be a real directory, not a symlink".into());}
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir,fs::Permissions::from_mode(0o700))?;
+        let location=serde_json::to_string(&dir.to_string_lossy())?;
+        added=format!("\n\n[Durable entry instructions]\n{SKILLS_GUIDANCE}\nDirectory: {location}\nInitialization limits (estimated tokens): {options}\n[Entry snapshot]\n");
+        let mut paths=Vec::new();for path in fs::read_dir(&dir)?{let path=path?.path();if path.extension().is_some_and(|e|e=="md")||path.file_name().is_some_and(|n|n==".md"){paths.push(path);}}
+        paths.sort();if paths.len()>options["max_entries"].as_u64().unwrap() as usize{return Err(format!("{}: {} entries exceed skills.max_entries={}; remove/merge entries or increase the limit",dir.display(),paths.len(),options["max_entries"]).into());}
+        for path in paths{
+            let name=path.file_name().and_then(|s|s.to_str()).ok_or("entry filename must be UTF-8")?;
+            if name==".md"||name.chars().any(char::is_control){return Err("entry filename must have a nonempty, printable stem".into());}
+            let meta=fs::symlink_metadata(&path)?;if !meta.file_type().is_file(){return Err(format!("{} must be a regular file, not a symlink/directory",path.display()).into());}
+            let max=options["max_file_bytes"].as_u64().unwrap() as usize;
+            if meta.len()>max as u64{return Err(format!("{}: {} bytes exceed skills.max_file_bytes={max}; shorten/split the entry or increase the limit",path.display(),meta.len()).into());}
+            // Bound reads even if another writer grows a discovered file.
+            let file=OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&path)?;
+            if !file.metadata()?.file_type().is_file(){return Err(format!("{name} must be a regular file").into());}
+            let mut bytes=Vec::new();std::io::Read::read_to_end(&mut std::io::Read::take(file,max as u64+1),&mut bytes)?;
+            if bytes.len()>max{return Err(format!("{} exceeds skills.max_file_bytes={max}; shorten/split the entry or increase the limit",path.display()).into());}
+            let text=std::str::from_utf8(&bytes)?;
+            let mut entry=parse_skill(name,text).map_err(|e|format!("{}: {e}",path.display()))?;
+            entry["path"]=json!(path);let core=entry["core"]==true;
+            let inventory=json!({"filename":name,"kind":entry["kind"],"description":entry["description"],"core":core,"path":path});
+            let rendered=if core{format!("\n[Core entry {}]\n{}\n{}\n[End core entry]\n",serde_json::to_string(name)?,inventory,entry["body"].as_str().unwrap())}
+                else{format!("\n[Available entry] {inventory}\n")};
+            let key=if core{"max_core_entry_tokens"}else{"max_inventory_entry_tokens"};
+            if skills_tokens(&rendered)>options[key].as_u64().unwrap() as usize{return Err(format!("{}: {} estimated tokens exceed skills.{key}={}; shorten/split the entry or increase the limit",path.display(),skills_tokens(&rendered),options[key]).into());}
+            added.push_str(&rendered);
+            if !core{entry.as_object_mut().unwrap().remove("body");entry.as_object_mut().unwrap().remove("python");}
+            entries.push(entry);
+        }
+        if skills_tokens(&added)>options["max_system_tokens"].as_u64().unwrap() as usize{return Err(format!("{}: {} estimated tokens including guidance exceed skills.max_system_tokens={}; shorten/remove entries or increase the limit",dir.display(),skills_tokens(&added),options["max_system_tokens"]).into());}
+        system.push_str(&added);
+    }
+    Ok(json!({"version":1,"system":system,"entries":entries,"options":options,
+        "estimated_added_tokens":skills_tokens(&added),"estimator":"unicode-chars/3-v1 (estimate, not a guarantee)"}))
+}
+impl Host{
+    fn system_prompt(&self)->&str{self.skills["system"].as_str().unwrap_or(SYSTEM)}
+    fn check_system_budget(&self,limit:usize)->Result<()>{
+        let protected=(self.system_prompt().chars().count()+512).div_ceil(3);
+        if protected+4096+1024>=limit{return Err(format!("Unsatisfiable protected system-prefix budget: {protected} estimated tokens plus 4096 output and 1024 continuation reserve do not fit context limit {limit}; choose a larger-context model or start a new session with fewer core entries").into());}
+        Ok(())
+    }
+    fn initialize_skills(&mut self)->Result<()>{
+        self.startup_ready=false;
+        self.check_system_budget(self.context_limit)?;
+        let entries=self.skills["entries"].as_array().ok_or("invalid skills snapshot entries")?.iter()
+            .filter(|e|e["core"]==true&&e["kind"]=="python").cloned().collect::<Vec<_>>();
+        if entries.is_empty(){self.startup_ready=true;return Ok(());}
+        self.journal.append("startup_begin",json!({"generation":self.generation,"entries":entries.iter().map(|e|&e["filename"]).collect::<Vec<_>>()}))?;
+        self.initializing=true;
+        let outcome=(||->Result<()>{
+            let mut validation=String::new();
+            for entry in &entries{validation.push_str(&format!("compile({}, {}, 'exec')\n",serde_json::to_string(&entry["python"])?,serde_json::to_string(&entry["path"])?));}
+            let id=format!("startup-validate-{}",self.journal.seq);
+            let result=self.execute(&id,&validation,false)?;
+            if result["status"]!="ok"{return Err(format!("startup precompilation failed; diagnostics in {}",result["stderr"]["ref"]).into());}
+            for entry in entries{
+                let id=format!("startup-{}",self.journal.seq);
+                self.journal.append("startup_entry",json!({"operation":id,"generation":self.generation,"filename":entry["filename"],"sha256":entry["sha256"],"source":entry["python"]}))?;
+                let result=self.execute(&id,entry["python"].as_str().ok_or("missing startup source")?,false)?;
+                if result["status"]!="ok"{return Err(format!("startup {} failed; diagnostics in {}; earlier side effects are not rolled back",entry["filename"],result["stderr"]["ref"]).into());}
+            }
+            Ok(())
+        })();
+        self.initializing=false;
+        self.journal.append("startup_end",json!({"generation":self.generation,"status":if outcome.is_ok(){"ok"}else{"error"}}))?;
+        self.startup_ready=outcome.is_ok();outcome
+    }
+    fn config_command(&mut self,args:&str)->Result<()>{
+        let (verb,rest)=args.split_once(char::is_whitespace).map(|(a,b)|(a,b.trim())).unwrap_or((args,""));
+        if verb.is_empty(){self.ui_json("Configuration (loading changes apply on /new)",&json!({"path":self.home.join("config.json"),"effective":effective_config(&self.config_defaults)?,"session_skills_options":self.skills["options"],"skills_changes_pending":skills_options(&self.config_defaults)?!=self.skills["options"],"config_changes_pending":self.config_defaults!=self.config}));return Ok(());}
+        if verb=="reload"{
+            if !rest.is_empty(){return Err("usage: /config reload".into());}
+            let next=load_json(&self.home.join("config.json"))?;validate_config(&next)?;self.config_defaults=next;
+            self.ui_text("Configuration reloaded. Session prompt/startup snapshot unchanged; loading defaults apply on /new.");return Ok(());
+        }
+        let (key,value)=rest.split_once(char::is_whitespace).map(|(a,b)|(a,b.trim())).unwrap_or((rest,""));
+        let parts=key.split('.').collect::<Vec<_>>();
+        if key.is_empty()||parts.iter().any(|p|p.is_empty()||!p.chars().all(|c|c.is_ascii_alphanumeric()||c=='_'||c=='-')){return Err("use a dotted configuration key".into());}
+        if parts.iter().any(|p|config_secret_key(p)){return Err("credentials belong in auth.json and /login, not /config".into());}
+        if verb=="get"{
+            if !value.is_empty(){return Err("usage: /config get <key>".into());}
+            let effective=effective_config(&self.config_defaults)?;let mut found=&effective;
+            for part in &parts{found=found.get(*part).ok_or("unknown configuration key")?;}
+            self.ui_json(key,found);return Ok(());
+        }
+        if verb!="set"&&verb!="unset"{return Err("usage: /config [get <key> | set <key> <JSON-value> | unset <key> | reload]".into());}
+        if verb=="unset"&&!value.is_empty(){return Err("usage: /config unset <key>".into());}
+        let mut next=self.config_defaults.clone();let mut target=&mut next;
+        for part in &parts[..parts.len()-1]{
+            let object=target.as_object_mut().ok_or("configuration key crosses a non-object")?;
+            target=object.entry((*part).to_string()).or_insert_with(||json!({}));
+        }
+        let object=target.as_object_mut().ok_or("configuration parent must be an object")?;
+        if verb=="set"{object.insert(parts.last().unwrap().to_string(),serde_json::from_str(value)?);}else{object.remove(*parts.last().unwrap());}
+        validate_config(&next)?;
+        let lock=OpenOptions::new().create(true).read(true).write(true).truncate(false).mode(0o600).open(self.home.join("config.lock"))?;
+        if unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX)}!=0{return Err(io::Error::last_os_error().into());}
+        let path=self.home.join("config.json");
+        if load_json(&path)?!=self.config_defaults{return Err("config.json changed externally; /config reload before editing".into());}
+        write_private_json(&path,&next)?;self.config_defaults=next;
+        self.ui_text("Configuration saved. Current session snapshot unchanged; loading defaults apply on /new.");Ok(())
+    }
+}
+
+#[cfg(test)]
+mod skills_e2e {
+    fn check(body: &str) {
+        let script = format!(
+            r#"
+import os,sys,tempfile,subprocess,json,glob,pathlib,select,time
+root=tempfile.mkdtemp(prefix='py-skills-');home=os.path.join(root,'home')
+os.makedirs(home+'/skills')
+env=dict(os.environ,PY_HOME=home)
+for k in ('PY_MODEL','PY_CONTEXT_LIMIT'):env.pop(k,None)
+def entry(name,kind='memory',core=False,description='Focused entry.',body='Useful knowledge.'):
+ text='---\nkind: '+kind+'\ncreated: 2026-10-10T09:00:00Z\nupdated: 2026-10-10T09:00:00Z\norigin: user\ndescription: '+description+'\ncore: '+str(core).lower()+'\n---\n\n'+body+'\n'
+ pathlib.Path(home+'/skills/'+name+'.md').write_text(text)
+def run(lines='',args=None):
+ return subprocess.run([sys.argv[1],'--json','--no-model',*(args or [])],input=lines,text=True,capture_output=True,timeout=10,env=env)
+def events(p):
+ assert p.returncode==0,(p.stdout,p.stderr)
+ return [json.loads(l) for l in p.stdout.splitlines()]
+def records(path=None):
+ return [json.loads(l) for f in ([path] if path else glob.glob(home+'/sessions/*.jsonl')) for l in open(f)]
+def snapshot(path=None):
+ snapshots=[v['payload'] for v in records(path) if v['kind']=='skills_snapshot']
+ assert len(snapshots)==1,snapshots
+ return snapshots[0]
+def passed(ev):
+ done=[v for v in ev if v['kind']=='completed']
+ assert done,ev
+ assert all(v['status']=='ok' for v in done),ev
+{body}
+"#
+        );
+        let p = crate::test_command("python3")
+            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            p.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&p.stdout),
+            String::from_utf8_lossy(&p.stderr)
+        );
+    }
+
+    #[test]
+    fn e2e_skills_full_core_and_inventory_only_noncore() {
+        check(
+            r#"
+entry('preferences',core=True,body='CORE_BODY_UNIQUE: prefer concise answers.')
+entry('project-testing',kind='skill',description='Project testing conventions.',body='NONCORE_BODY_MUST_NOT_APPEAR')
+entry('python-util',kind='python',description='Reusable helper.',body='```python\nraise RuntimeError("NONCORE_PYTHON_MUST_NOT_RUN")\n```')
+events(run())
+s=snapshot()['system']
+assert 'CORE_BODY_UNIQUE' in s,s
+assert 'project-testing' in s and 'Project testing conventions.' in s,s
+assert 'python-util' in s and 'Reusable helper.' in s,s
+assert 'NONCORE_BODY_MUST_NOT_APPEAR' not in s,s
+assert 'NONCORE_PYTHON_MUST_NOT_RUN' not in s,s
+"#,
+        );
+    }
+
+    #[test]
+    fn e2e_skills_core_python_order_global_namespace_and_reset() {
+        check(
+            r#"
+entry('a-helpers',kind='python',core=True,body='```python\nseed=40\ndef add_two(value):\n    return value+2\n```')
+entry('b-dependent',kind='python',core=True,body='```python\nassert agent is not None and len(H.code)>0\nanswer=add_two(seed)\n```')
+ev=events(run('@assert answer==42 and add_two(3)==5\n@answer=0\n/reset\n@assert answer==42\n'))
+passed(ev)
+assert 'def add_two' in snapshot()['system']
+r=records()
+assert len([v for v in r if v['kind']=='startup_begin'])==2,r
+assert len([v for v in r if v['kind']=='startup_end' and v['payload']['status']=='ok'])==2,r
+initializers=[v['payload'] for v in r if v['kind']=='startup_entry']
+assert [v['filename'] for v in initializers]==['a-helpers.md','b-dependent.md']*2,initializers
+assert all(v['source'] and len(v['sha256'])==64 for v in initializers),initializers
+assert not any('def add_two' in v['payload'].get('text','') for v in r if v['kind']=='context_add'),r
+"#,
+        );
+    }
+
+    #[test]
+    fn e2e_skills_resume_deleted_files_uses_original_snapshot() {
+        check(
+            r#"
+entry('helper',kind='python',core=True,body='```python\nanswer=42\n```')
+entry('preferences',core=True,body='ORIGINAL_SESSION_PREFERENCE')
+passed(events(run('@assert answer==42\n')))
+path=glob.glob(home+'/sessions/*.jsonl')[0]
+original=snapshot(path)
+for f in glob.glob(home+'/skills/*.md'):os.unlink(f)
+entry('other',core=True,body='NEW_FILE_MUST_NOT_CHANGE_RESUME')
+passed(events(run('@assert answer==42\n',args=['--session',path])))
+assert snapshot(path)==original
+assert 'NEW_FILE_MUST_NOT_CHANGE_RESUME' not in snapshot(path)['system']
+"#,
+        );
+    }
+
+    #[test]
+    fn e2e_skills_file_edit_freezes_session_until_new() {
+        check(
+            r#"
+entry('preferences',core=True,body='BEFORE_FILE_EDIT')
+# Editing uses ordinary Python/filesystem operations, not a skills API.
+p=home+'/skills/preferences.md'
+source='from pathlib import Path; p=Path('+repr(p)+'); p.write_text(p.read_text().replace("BEFORE_FILE_EDIT","AFTER_FILE_EDIT"))'
+ev=events(run('@'+source+'\n/reset\n/new\n'))
+snapshots=[v['payload']['system'] for v in records() if v['kind']=='skills_snapshot']
+assert len(snapshots)==2,snapshots
+assert any('BEFORE_FILE_EDIT' in s and 'AFTER_FILE_EDIT' not in s for s in snapshots),snapshots
+assert any('AFTER_FILE_EDIT' in s and 'BEFORE_FILE_EDIT' not in s for s in snapshots),snapshots
+"#,
+        );
+    }
+
+    #[test]
+    fn e2e_skills_precompile_all_before_any_startup_side_effects() {
+        check(
+            r#"
+marker=home+'/must-not-exist'
+entry('a-effect',kind='python',core=True,body='```python\nopen('+repr(marker)+',"w").write("ran")\n```')
+entry('z-invalid',kind='python',core=True,body='```python\ndef broken(:\n```')
+p=run();assert p.returncode!=0,(p.stdout,p.stderr)
+assert not os.path.exists(marker)
+assert not any(v['kind']=='ready' for v in [json.loads(l) for l in p.stdout.splitlines()]),p.stdout
+"#,
+        );
+    }
+
+    #[test]
+    fn e2e_skills_budget_rejection_precedes_python_execution() {
+        check(
+            r#"
+marker=home+'/must-not-exist'
+entry('helper',kind='python',core=True,body='```python\nopen('+repr(marker)+',"w").write("ran")\n```')
+entry('large',core=True,body='budget '*500)
+json.dump({'skills':{'max_core_entry_tokens':16}},open(home+'/config.json','w'))
+p=run();assert p.returncode!=0,(p.stdout,p.stderr)
+assert not os.path.exists(marker)
+assert 'budget' in (p.stdout+p.stderr).lower() or 'tokens' in (p.stdout+p.stderr).lower(),(p.stdout,p.stderr)
+"#,
+        );
+    }
+
+    #[test]
+    fn e2e_skills_invalid_metadata_and_python_fences_reject_initialization() {
+        check(
+            r#"
+for bad in ['kind: unknown', 'origin: unknown', 'core: maybe', 'created: not-a-date', 'description: ']:
+ entry('bad',core=True)
+ pth=pathlib.Path(home+'/skills/bad.md')
+ key=bad.split(':')[0]+':'
+ lines=pth.read_text().splitlines()
+ pth.write_text('\n'.join(bad if l.startswith(key) else l for l in lines)+'\n')
+ p=run();assert p.returncode!=0,(bad,p.stdout,p.stderr)
+ os.unlink(pth)
+for body in ['Documentation without Python.', '```python\nx=1\n```\n```python\ny=2\n```']:
+ entry('bad',kind='python',core=True,body=body)
+ p=run();assert p.returncode!=0,(body,p.stdout,p.stderr)
+ os.unlink(home+'/skills/bad.md')
+"#,
+        );
+    }
+
+    #[test]
+    fn e2e_skills_disabled_ignores_entries_and_startup() {
+        check(
+            r#"
+entry('helper',kind='python',core=True,body='```python\nraise RuntimeError("disabled Python ran")\n```')
+pathlib.Path(home+'/skills/malformed.md').write_text('invalid front matter')
+json.dump({'skills':{'enabled':False}},open(home+'/config.json','w'))
+passed(events(run('@assert "helper" not in globals()\n')))
+assert 'disabled Python ran' not in snapshot()['system']
+assert 'Durable entry instructions' not in snapshot()['system']
+assert snapshot()['entries']==[]
+assert not any(v['kind']=='startup_begin' for v in records())
+"#,
+        );
+    }
+
+    #[test]
+    fn e2e_skills_config_set_get_unset_persistence_and_invalid_value() {
+        check(
+            r#"
+json.dump({'custom_key':{'preserve':True}},open(home+'/config.json','w'))
+ev=events(run('/config set skills.max_core_entry_tokens 1000\n/config get skills.max_core_entry_tokens\n'))
+assert json.load(open(home+'/config.json'))['skills']['max_core_entry_tokens']==1000
+assert json.load(open(home+'/config.json'))['custom_key']=={'preserve':True}
+assert any(v['kind']=='info' and v.get('value')==1000 for v in ev),ev
+before=pathlib.Path(home+'/config.json').read_bytes()
+ev=events(run('/config set skills.max_core_entry_tokens -1\n'))
+assert any(v['kind']=='error' for v in ev),ev
+assert pathlib.Path(home+'/config.json').read_bytes()==before
+# unset restores defaults, without discarding unrelated keys.
+ev=events(run('/config unset skills.max_core_entry_tokens\n/config get skills.max_core_entry_tokens\n'))
+assert 'max_core_entry_tokens' not in json.load(open(home+'/config.json')).get('skills',{})
+assert any(v['kind']=='info' and v.get('value')==2000 for v in ev),ev
+assert json.load(open(home+'/config.json'))['custom_key']=={'preserve':True}
+"#,
+        );
+    }
+
+    #[test]
+    fn e2e_skills_config_reload_affects_new_session_not_existing_snapshot() {
+        check(
+            r#"
+entry('preferences',core=True,body='FROZEN_EVEN_WHEN_DISABLED')
+source='import json; json.dump({"skills":{"enabled":False}},open('+repr(home+'/config.json')+',"w"))'
+ev=events(run('@'+source+'\n/config reload\n/reset\n/new\n'))
+snapshots=[v['payload']['system'] for v in records() if v['kind']=='skills_snapshot']
+assert len(snapshots)==2,snapshots
+assert sum('FROZEN_EVEN_WHEN_DISABLED' in s for s in snapshots)==1,snapshots
+"#,
+        );
+    }
+
+    #[test]
+    fn e2e_skills_provider_wire_snapshot_edit_reset_resume_new() {
+        check(r#"
+import http.server,threading
+requests=[]
+class Handler(http.server.BaseHTTPRequestHandler):
+ def log_message(self,*args):pass
+ def do_POST(self):
+  requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+  self.send_response(200);self.end_headers()
+  self.wfile.write(json.dumps({'choices':[{'message':{'content':'agent.loop.stop()'}}]}).encode())
+server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+threading.Thread(target=server.serve_forever,daemon=True).start()
+json.dump({'model':'local/m','providers':{'local':{'base_url':'http://127.0.0.1:'+str(server.server_port),'models':[{'id':'m','api':'openai-completions','context_limit':32000}]}}},open(home+'/config.json','w'))
+entry('preferences',core=True,body='WIRE_ORIGINAL_CORE')
+entry('noncore',description='Noncore inventory description.',body='WIRE_NONCORE_BODY_NOT_SELECTED')
+pth=home+'/skills/preferences.md'
+edit='from pathlib import Path; p=Path('+repr(pth)+'); p.write_text(p.read_text().replace("WIRE_ORIGINAL_CORE","WIRE_CHANGED_CORE"))'
+p=subprocess.run([sys.argv[1],'--json'],input='first task\n@'+edit+'\n/reset\nsecond task\n/new\nthird task\n',text=True,capture_output=True,timeout=12,env=env)
+ev=events(p)
+assert len(requests)==3,(requests,p.stdout,p.stderr)
+def system(request):
+ systems=[m['content'] for m in request['messages'] if m['role']=='system']
+ assert len(systems)==1,request
+ return systems[0]
+a,b,c=map(system,requests)
+assert a==b and 'WIRE_ORIGINAL_CORE' in a and 'WIRE_CHANGED_CORE' not in a,(a,b)
+assert 'WIRE_CHANGED_CORE' in c and 'WIRE_ORIGINAL_CORE' not in c,c
+for request in requests:
+ assert 'WIRE_NONCORE_BODY_NOT_SELECTED' not in json.dumps(request),request
+ assert 'Noncore inventory description.' in system(request),request
+ready=[v for v in ev if v['kind']=='ready']
+assert len(ready)==2,ev
+original_path=ready[0]['session']
+assert a==snapshot(original_path)['system']
+os.unlink(pth)
+p=subprocess.run([sys.argv[1],'--json','--session',original_path],input='resumed task\n',text=True,capture_output=True,timeout=12,env=env)
+events(p)
+assert len(requests)==4,requests
+assert system(requests[-1])==a,requests[-1]
+assert 'system_chars' in ready[0]['context_usage'],ready
+assert ready[0]['context_usage']['system_chars']==len(a),ready
+server.shutdown()
+"#);
+    }
+
+    #[test]
+    fn e2e_skills_inner_and_background_do_not_inherit_entries() {
+        check(r#"
+import http.server,threading
+requests=[]
+class Handler(http.server.BaseHTTPRequestHandler):
+ def log_message(self,*args):pass
+ def do_POST(self):
+  requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+  self.send_response(200);self.end_headers()
+  self.wfile.write(json.dumps({'choices':[{'message':{'content':'INNER_RESULT'}}]}).encode())
+server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+threading.Thread(target=server.serve_forever,daemon=True).start()
+json.dump({'model':'local/m','providers':{'local':{'base_url':'http://127.0.0.1:'+str(server.server_port),'models':[{'id':'m','api':'openai-completions'}]}}},open(home+'/config.json','w'))
+entry('python-global',kind='python',core=True,body='```python\ncore_only_global=42\n```')
+entry('preference',core=True,body='INNER_MUST_NOT_INHERIT_CORE_MEMORY')
+source='assert core_only_global==42; assert agent.llm("inner prompt",system="INNER_SYSTEM_ONLY")=="INNER_RESULT"; t=agent.bgtasks.run("print(\\\"core_only_global\\\" in globals())",kind="python"); print(t["id"])'
+ev=events(run('@'+source+'\n@import time; time.sleep(.2)\n/tasks\n/quit --cancel-tasks\n'))
+passed(ev)
+assert len(requests)==1,requests
+request=requests[0]
+assert [m['content'] for m in request['messages'] if m['role']=='system']==['INNER_SYSTEM_ONLY'],request
+assert 'INNER_MUST_NOT_INHERIT_CORE_MEMORY' not in json.dumps(request),request
+assert 'core_only_global=42' not in json.dumps(request),request
+r=records()
+settled=[v['payload'] for v in r if v['kind']=='task_settled']
+assert len(settled)==1 and settled[0]['status']=='succeeded',settled
+# The isolated subprocess output must be captured, not inserted into model context.
+chunks=[v['payload']['text'] for v in r if v['kind']=='stream' and v['payload'].get('collection')=='stdout']
+assert any('False' in chunk for chunk in chunks),r
+server.shutdown()
+"#);
+    }
+
+    #[test]
+    fn e2e_skills_runtime_failure_blocks_resume_and_requires_explicit_reset() {
+        check(r#"
+marker=home+'/startup-count'
+source='from pathlib import Path\np=Path('+repr(marker)+')\np.write_text(str(int(p.read_text())+1) if p.exists() else "1")\nprint("STARTUP_PRIVATE_DIAGNOSTIC")\nraise RuntimeError("startup deliberately fails")'
+entry('fails',kind='python',core=True,body='```python\n'+source+'\n```')
+p=run();assert p.returncode!=0,(p.stdout,p.stderr)
+assert pathlib.Path(marker).read_text()=='1'
+assert not any(v['kind']=='ready' for v in map(json.loads,p.stdout.splitlines())),p.stdout
+path=glob.glob(home+'/sessions/*.jsonl')[0]
+ev=events(run('/status\n/recovery\n',args=['--session',path]))
+assert pathlib.Path(marker).read_text()=='1',ev
+assert any(v['kind']=='info' and v.get('value',{}).get('startup_ready') is False for v in ev),ev
+assert not any(v['kind']=='ready' and v.get('startup_ready',True) for v in ev),ev
+assert not any('STARTUP_PRIVATE_DIAGNOSTIC' in v['payload'].get('text','') for v in records(path) if v['kind']=='context_add'),records(path)
+ev=events(run('/reset\n/status\n',args=['--session',path]))
+assert pathlib.Path(marker).read_text()=='2',ev
+assert any(v['kind']=='error' and 'startup' in v.get('error','').lower() for v in ev),ev
+assert any(v['kind']=='info' and v.get('value',{}).get('startup_ready') is False for v in ev),ev
+"#);
+    }
+
+    #[test]
+    fn e2e_skills_unknown_startup_intent_is_not_automatically_replayed() {
+        check(r#"
+marker=home+'/startup-count'
+source='from pathlib import Path\np=Path('+repr(marker)+')\np.write_text(str(int(p.read_text())+1) if p.exists() else "1")'
+entry('initializer',kind='python',core=True,body='```python\n'+source+'\n```')
+events(run())
+assert pathlib.Path(marker).read_text()=='1'
+path=glob.glob(home+'/sessions/*.jsonl')[0]
+# Crash witness: retain a valid journal prefix through the startup intent, but no settlement.
+lines=pathlib.Path(path).read_text().splitlines(keepends=True)
+cut=next(i for i,line in enumerate(lines) if json.loads(line)['kind']=='startup_begin')
+pathlib.Path(path).write_text(''.join(lines[:cut+1]))
+ev=events(run('/status\n',args=['--session',path]))
+assert pathlib.Path(marker).read_text()=='1',ev
+assert any(v['kind']=='info' and v.get('value',{}).get('startup_ready') is False for v in ev),ev
+ev=events(run('/reset\n/status\n@assert True\n',args=['--session',path]))
+passed(ev)
+assert any(v['kind']=='info' and v.get('value',{}).get('startup_ready') is True for v in ev),ev
+assert pathlib.Path(marker).read_text()=='2'
+"#);
+    }
+
+    #[test]
+    fn e2e_skills_worker_crash_does_not_repeat_initialization_implicitly() {
+        check(r#"
+marker=home+'/startup-count'
+source='from pathlib import Path\np=Path('+repr(marker)+')\np.write_text(str(int(p.read_text())+1) if p.exists() else "1")\nhelper_value=42'
+entry('initializer',kind='python',core=True,body='```python\n'+source+'\n```')
+ev=events(run('@import os; os._exit(17)\n/status\n/reset\n@assert helper_value==42\n'))
+assert pathlib.Path(marker).read_text()=='2',(pathlib.Path(marker).read_text(),ev)
+assert any(v['kind']=='info' and v.get('value',{}).get('startup_ready') is False for v in ev),ev
+assert any(v['kind']=='completed' and v.get('status')=='worker_crashed' for v in ev),ev
+assert [v for v in ev if v['kind']=='completed'][-1]['status']=='ok',ev
+"#);
+    }
+
+    #[test]
+    fn e2e_skills_inventory_aggregate_byte_and_count_budgets_precede_execution() {
+        check(r#"
+marker=home+'/must-not-exist'
+entry('initializer',kind='python',core=True,body='```python\nopen('+repr(marker)+',"w").write("ran")\n```')
+entry('knowledge',description='Available knowledge.',body='body remains unselected')
+for options,needle in [({'max_inventory_entry_tokens':1},'max_inventory_entry_tokens'),({'max_system_tokens':1},'max_system_tokens'),({'max_file_bytes':64},'max_file_bytes'),({'max_entries':1},'max_entries')]:
+ json.dump({'skills':options},open(home+'/config.json','w'))
+ p=run();assert p.returncode!=0,(options,p.stdout,p.stderr)
+ assert needle in p.stdout+p.stderr,(options,p.stdout,p.stderr)
+ assert not os.path.exists(marker),options
+ assert not any(v['kind']=='ready' for v in map(json.loads,p.stdout.splitlines())),p.stdout
+"#);
+    }
+
+    #[test]
+    fn e2e_skills_config_conflicts_reload_and_private_atomic_save() {
+        check(r#"
+# The first startup creates default configuration. Ordinary file changes then cause conflicts.
+external={'custom':{'preserved':'external'},'skills':{'max_entries':7}}
+source='import json; json.dump('+repr(external)+',open('+repr(home+'/config.json')+',"w"))'
+ev=events(run('@'+source+'\n/config set skills.max_entries 8\n/config reload\n/config get skills.max_entries\n/config set skills.max_entries 9\n'))
+assert any(v['kind']=='error' and 'changed' in v.get('error','').lower() for v in ev),ev
+assert any(v['kind']=='info' and v.get('value')==7 for v in ev),ev
+saved=json.load(open(home+'/config.json'))
+assert saved['custom']==external['custom'] and saved['skills']['max_entries']==9,saved
+assert os.stat(home+'/config.json').st_mode & 0o777==0o600
+assert not glob.glob(home+'/config.tmp-*'),glob.glob(home+'/*')
+"#);
+    }
+
+    #[test]
+    fn e2e_skills_config_nested_credentials_refused_without_disclosure() {
+        check(r#"
+events(run())
+before=pathlib.Path(home+'/config.json').read_bytes()
+secret='CREDENTIAL_SHOULD_NOT_BE_DISPLAYED'
+ev=events(run('/config set providers.local {"api_key":"'+secret+'"}\n/config set custom [{"access_token":"'+secret+'"}]\n/config\n'))
+assert len([v for v in ev if v['kind']=='error'])==2,ev
+assert pathlib.Path(home+'/config.json').read_bytes()==before
+assert secret not in json.dumps(ev),ev
+assert secret not in pathlib.Path(home+'/editor-history').read_text() if os.path.exists(home+'/editor-history') else True
+# Reject externally edited sensitive fields on reload rather than displaying them.
+source='import json; json.dump({"providers":{"local":{"API_KEY":'+repr(secret)+'}}},open('+repr(home+'/config.json')+',"w"))'
+ev=events(run('@'+source+'\n/config reload\n/config\n'))
+assert any(v['kind']=='error' and 'credential' in v.get('error','').lower() for v in ev),ev
+# Ordinary Python source is previewed/journaled by design; config/error
+# channels must not disclose sensitive fields loaded from disk.
+assert secret not in json.dumps([v for v in ev if v['kind'] in ('info','error')]),ev
+"#);
+    }
+    #[test]
+    fn e2e_skills_protected_prefix_admission_model_override_and_accounting() {
+        check(r#"
+marker=home+'/initializer-ran'
+entry('initializer',kind='python',core=True,body='```python\nopen('+repr(marker)+',"w").write("ran")\n```')
+json.dump({'model':'local/tiny','providers':{'local':{'base_url':'http://127.0.0.1:1','api':'openai-responses','models':[{'id':'tiny','context_limit':5000},{'id':'large','context_limit':32000}]}}},open(home+'/config.json','w'))
+p=run();assert p.returncode!=0,(p.stdout,p.stderr)
+assert 'protected system-prefix budget' in p.stdout+p.stderr,(p.stdout,p.stderr)
+assert not os.path.exists(marker)
+ev=events(run('/model local/tiny\n/status\n',args=['--model','local/large']))
+assert os.path.exists(marker)
+assert any(v['kind']=='error' and 'protected system-prefix budget' in v.get('error','') for v in ev),ev
+ready=next(v for v in ev if v['kind']=='ready')
+assert ready['model']=='local/large',ready
+usage=ready['context_usage'];system=snapshot(ready['session'])['system']
+assert usage['system_chars']==len(system),usage
+assert usage['rendered_chars']>=len(system)+512,usage
+assert usage['estimated_input_tokens']>=(len(system)+512+2)//3,usage
+"#);
+    }
+
+    #[test]
+    fn e2e_skills_collapse_cannot_expand_history_using_system_allowance() {
+        check(r#"
+entry('core',core=True,body='Protected frozen knowledge.')
+ev=events(run('@agent.context.read_text("a",max_chars=100)\n@agent.context.read_text("b",max_chars=100)\n'));passed(ev)
+path=glob.glob(home+'/sessions/*.jsonl')[0]
+ids=[v['payload']['id'] for v in records(path) if v['kind']=='context_add']
+assert len(ids)==2,ids
+source='agent.context.collapse('+repr(ids[0])+','+repr(ids[1])+','+repr('x'*600)+')'
+ev=events(run('@'+source+'\n',args=['--resume',path]))
+assert any(v['kind']=='completed' and v['status']=='error' for v in ev),ev
+assert 'collapse must reduce rendered context size' in json.dumps(ev),ev
+assert not any(v['kind']=='context_replace' for v in records(path)),records(path)
+"#);
+    }
+
+    #[test]
+    fn e2e_skills_config_changed_model_effort_defaults_apply_on_new() {
+        check(r#"
+ev=events(run('/config set model "openai/gpt-4o"\n/config set effort "high"\n/new\n'))
+ready=[v for v in ev if v['kind']=='ready']
+assert ready[0]['model']=='openai/gpt-4.1' and ready[0]['effort']=='medium',ready
+assert ready[1]['model']=='openai/gpt-4o' and ready[1]['effort']=='high',ready
+# Unchanged defaults preserve explicit live session settings on /new.
+ev=events(run('/model openai/gpt-4.1\n/effort low\n/new\n'))
+ready=[v for v in ev if v['kind']=='ready'];assert ready[-1]['model']=='openai/gpt-4.1' and ready[-1]['effort']=='low',ready
+"#);
+    }
+
+    #[test]
+    fn e2e_skills_defaults_privacy_help_version_and_discovery_validation() {
+        check(r#"
+untouched=home+'/untouched'
+for flag in ['--help','--version']:
+ p=subprocess.run([sys.argv[1],flag],env=dict(env,PY_HOME=untouched),capture_output=True,text=True,timeout=5)
+ assert p.returncode==0,(p.stdout,p.stderr)
+ assert not os.path.exists(untouched)
+events(run())
+config=json.load(open(home+'/config.json'));assert config['skills']['enabled'] is True and config['skills']['max_system_tokens']==8000,config
+for path in [home,home+'/skills']:assert os.stat(path).st_mode & 0o777==0o700,path
+assert os.stat(home+'/config.json').st_mode & 0o777==0o600
+# Flat discovery ignores subdirectories and non-Markdown files.
+os.makedirs(home+'/skills/project');pathlib.Path(home+'/skills/project/ignored.md').write_text('invalid')
+pathlib.Path(home+'/skills/ignored.txt').write_text('invalid');events(run())
+for case in ['directory','symlink','invalid-utf8','empty-stem','non-utf8-name']:
+ if case=='directory':
+  path=home+'/skills/bad.md';os.mkdir(path)
+ elif case=='symlink':
+  path=home+'/skills/bad.md';os.symlink(home+'/skills/ignored.txt',path)
+ elif case=='invalid-utf8':
+  path=home+'/skills/bad.md';pathlib.Path(path).write_bytes(b'\xff')
+ elif case=='empty-stem':
+  entry('');path=home+'/skills/.md'
+ else:
+  path=os.fsencode(home+'/skills/')+b'bad\xff.md';open(path,'wb').write(b'invalid')
+ p=run();assert p.returncode!=0,(case,p.stdout,p.stderr)
+ assert not any(v['kind']=='ready' for v in map(json.loads,p.stdout.splitlines())),(case,p.stdout)
+ if case=='directory':os.rmdir(path)
+ else:os.unlink(path)
+# The skills directory itself must not be a symlink.
+os.rename(home+'/skills',home+'/saved-skills');os.symlink(home+'/saved-skills',home+'/skills')
+p=run();assert p.returncode!=0 and 'real directory' in p.stdout+p.stderr,(p.stdout,p.stderr)
+"#);
+    }
+}
+
+#[cfg(test)]
+mod skills_unit_tests {
+    use super::*;
+    fn entry(kind:&str,body:&str)->String{format!("---\nkind: {kind}\ncreated: 2024-02-29T12:00:00Z\nupdated: 2024-03-01T12:00:00Z\norigin: agent\ndescription: Focused entry.\ncore: false\n---\n{body}")}
+    #[test]
+    fn skills_metadata_and_date_validation(){
+        let text=entry("memory","Small body.");
+        let parsed=parse_skill("person-preferences.md",&text).unwrap();
+        assert_eq!(parsed["body"],"Small body.");assert_eq!(parsed["origin"],"agent");
+        assert_eq!(parsed["sha256"].as_str().unwrap().len(),64);
+        assert!(valid_skill_date("2024-02-29T00:00:00Z"));
+        for date in ["2023-02-29T00:00:00Z","2024-13-01T00:00:00Z","2024-01-00T00:00:00Z","2024-01-01T24:00:00Z","2024-01-01T00:60:00Z","2024-01-01T00:00:60Z","0000-01-01T00:00:00Z","+024-01-01T00:00:00Z","2024-+1-01T00:00:00Z"]{assert!(!valid_skill_date(date),"{date}");}
+        for modified in [text.replace("origin: agent","origin: agent\norigin: user"),text.replace("origin: agent","origin: agent\ntitle: unwanted"),text.replace("updated: 2024-03-01T12:00:00Z","updated: 2024-02-28T12:00:00Z"),text.replace("core: false","core: \"false\""),text.replace("description: Focused entry.","description: \"line\\nline\""),text.replace("description: Focused entry.","description: \"\\u0000\""),text.replace("description: Focused entry.","description: \"\\u2028\"")]{assert!(parse_skill("bad.md",&modified).is_err());}
+    }
+    #[test]
+    fn skills_python_single_block(){
+        let parsed=parse_skill("helpers.md",&entry("python","Explanation.\n```python\nx=42\n```\n")).unwrap();
+        assert_eq!(parsed["python"],"x=42\n");
+        for body in ["No block.","```python\nx=1\n","```python\nx=1\n```\n```python\ny=2\n```\n","~~~python\nx=1\n~~~\n","````python\nx=1\n````\n","``` python\nx=1\n```\n"]{assert!(parse_skill("bad.md",&entry("python",body)).is_err());}
+    }
+    #[test]
+    fn skills_options_validate_and_preserve_defaults(){
+        assert_eq!(skills_options(&json!({})).unwrap(),skills_defaults());
+        let options=skills_options(&json!({"custom":42,"skills":{"max_core_entry_tokens":1000}})).unwrap();
+        assert_eq!(options["max_core_entry_tokens"],1000);assert_eq!(options["enabled"],true);
+        for config in [json!([]),json!({"skills":[]}),json!({"skills":{"unknown":1}}),json!({"skills":{"enabled":1}}),json!({"skills":{"max_entries":true}}),json!({"skills":{"max_entries":0}})]{assert!(skills_options(&config).is_err());}
+        assert_eq!(skills_tokens("é界a"),1);assert_eq!(skills_tokens("é界ab"),2);
+    }
+    #[test]
+    fn skills_curation_prompt_contract(){
+        for fragment in ["ordinary Python filesystem operations","user preferences","small and focused","person, project","Update stale information","remove obsolete","split unrelated","merge overlapping","preserving useful details and scope","do not turn temporary task instructions","Never store credentials/secrets"]{assert!(SKILLS_GUIDANCE.contains(fragment),"{fragment}");}
+    }
 }
 
