@@ -241,10 +241,12 @@ impl Host {
             if transient&&self.status_line.replace(false){print!("\r\x1b[K");}
             match kind {
                 "state"=>for line in terminal_state(&v,terminal_width()){println!("{line}");},
-                // A cell gets one durable visual boundary, at completion. While
-                // active, the transient prompt communicates running/thinking.
                 "cell_start"=>{},
-                "cell_end"=>for line in terminal_cell_end(&v,terminal_width()){println!("{line}");},
+                // Interactive completion is shown by the single footer below
+                // the answer. Only noninteractive output needs a printed end.
+                "cell_end"=>if self.incoming.is_some()||!terminal_editor_available(false){
+                    for line in terminal_cell_end(&v,terminal_width()){println!("{line}");}
+                },
                 "say"=>for line in terminal_markdown(v["text"].as_str().unwrap_or(""),terminal_width()){println!("{line}");},
                 "final"=>for line in terminal_style_lines(terminal_markdown(v["text"].as_str().unwrap_or(""),terminal_width()),"1;97"){println!("{line}");},
                 "input_prompt"=>{print!("{}",terminal_wrap(v["prompt"].as_str().unwrap_or(""),terminal_width()).0.join("\n"));let _=io::stdout().flush();},
@@ -1478,7 +1480,7 @@ fn terminal_status(v:&Value,width:usize)->Vec<String>{
     }else{cell.map(|cell|format!("cell {cell} · ")).unwrap_or_default()};
     let mut label=format!("{identity}{state}");
     if state=="idle"{
-        if let Some(result)=v["last_cell"]["status"].as_str(){label.push_str(&format!(" · {result}"));}
+        if let Some(result)=v["last_cell"]["status"].as_str(){label.push_str(&format!(" · status: {result}"));}
         if let Some(ms)=v["last_cell"]["elapsed_ms"].as_u64(){
             label.push_str(&format!(" · {} {ms}ms",v["last_cell"]["language"].as_str().unwrap_or("cell")));
         }
@@ -1489,7 +1491,10 @@ fn terminal_status(v:&Value,width:usize)->Vec<String>{
         }
     }
     label.push_str(" · ");label.push_str(&terminal_metrics(v));
-    terminal_style_lines(terminal_wrap(&label,width).0,"2")
+    let label=format!("── {label} ");
+    let separator=format!("{label}{}","─".repeat(width.saturating_sub(terminal_columns(&label))));
+    let style=if state=="idle"{v["last_cell"]["status"].as_str().map(terminal_result_style).unwrap_or("2")}else{"2"};
+    terminal_style_lines(terminal_wrap(&separator,width).0,style)
 }
 fn terminal_cell_end(v:&Value,width:usize)->Vec<String>{
     let status=v["status"].as_str().unwrap_or("error");
@@ -2066,7 +2071,8 @@ impl BusyInput{
         let kind=event["kind"].as_str().unwrap_or("");
         let lines=match kind{
             "source"|"preview"=>terminal_preview(event,display.terminal.width()),
-            "cell_end"=>terminal_cell_end(event,display.terminal.width()),
+            // Status updates redraw the footer; they are not transcript output.
+            "cell_end"=>Vec::new(),
             "say"=>terminal_markdown(event["text"].as_str().unwrap_or(""),display.terminal.width()),
             "final"=>terminal_style_lines(terminal_markdown(event["text"].as_str().unwrap_or(""),display.terminal.width()),"1;97"),
             "queued"|"queue_sent"=>terminal_queue(event,display.terminal.width()),
@@ -4067,6 +4073,7 @@ fn terminal_preview(v:&Value,width:usize)->Vec<String>{
             lines.extend(terminal_style_lines(terminal_wrap(&info,width).0,"2"));
         }
     }
+    if lines.len()==1{return Vec::new();}
     lines.push(String::new());lines
 }
 
@@ -6753,9 +6760,10 @@ Human preview:
   H.cells[number].source/stdout/stderr reference.
   Render source before execution (including before nested helper output), then
   stdout/stderr and completion metadata, all as secondary/dim material.
-  agent.say may communicate and continue; buffer agent.final presentation until
-  after completion status, making the strong final answer the turn's last
-  semantic output.
+  agent.say may communicate and continue; buffer agent.final until completion.
+  In the interactive editor, one status separator lives below the answer and
+  directly above the prompt. Redraw that footer, never also print a duplicate
+  completed-cell separator into the transcript.
   Never make preview truncation alter history or select payload for the model.
   A noninteractive JSON client receives typed preview fields/events rather
   than terminal-rendered prose. Full payloads remain available through H.
@@ -12071,7 +12079,8 @@ os.write(m,b'steer now\r');wait(lambda:len(requests)>=2,'steered request')
 wait(lambda:data.count(idle_ready)>prompts,'final prompt')
 assert 'steer now' in json.dumps(requests[1]),requests
 visible=data.decode(errors='replace');assert 'queued steering › steer now' in visible and 'sent steering › steer now' in visible,visible
-assert visible.rfind('steered')>visible.rfind('status: ok'),visible
+assert visible.rfind('steered')<visible.rfind('status: ok'),visible
+assert visible.rfind('── cell')>visible.rfind('steered'),visible
 os.write(m,b'/quit\r');assert p.wait(timeout=5)==0;os.close(m);srv.shutdown()
 ev=events();assert any(v['kind']=='queue_arrival' and v['payload']['command']['text']=='steer now' for v in ev),ev
 assert any(v['kind']=='queue_delivered' for v in ev),ev
@@ -12570,6 +12579,18 @@ count=len(sources());close_picker('el\r');assert len(sources())==count and '> /m
 assert '/models' not in screen.text(),screen.text()
 send('\x15');menu('/mod');close_picker('discard\x1b');assert '> /mod' in screen.text(),screen.text()
 command('els');assert len(sources())==count,sources()
+"#);}
+    #[test]
+    fn e2e_inline_single_cell_separator_is_below_answer_above_prompt(){fixture(r#"
+command('@agent.final("ANSWER-ONE")')
+visible=screen.text();assert visible.count('── cell 1 ·')==1,visible
+assert visible.index('\nANSWER-ONE\n')<visible.index('── cell 1 ·')<visible.rfind('>'),visible
+assert 'status: ok' in visible and 'ctx ~' in visible and 'cache hit ∑' in visible,visible
+send('@draft');wait(lambda:'> @draft' in screen.text(),'draft visible')
+assert screen.text().count('── cell 1 ·')==1,screen.text()
+send('\x15');command('@agent.final("ANSWER-TWO")')
+visible=screen.text();assert visible.count('── cell 1 ·')==1 and visible.count('── cell 2 ·')==1,visible
+assert visible.index('\nANSWER-TWO\n')<visible.index('── cell 2 ·')<visible.rfind('>'),visible
 "#);}
     #[test]
     fn e2e_inline_multiline_middle_caret_select_and_cancel(){fixture(r#"
