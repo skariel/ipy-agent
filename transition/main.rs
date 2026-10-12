@@ -12347,65 +12347,266 @@ impl TerminalFrontend {
         self.editor_cache.lock().unwrap().remember(line);
     }
 }
-struct BusyCompletionMenu {
-    original: EditBuffer,
-    catalog: CompletionCatalog,
-    start: usize,
+// Both frontends own different input lifetimes, but share the complete picker
+// model and presentation. Query editing never changes the underlying draft.
+struct PickerState {
     choices: Vec<rustyline::completion::Pair>,
+    query: String,
+    filtered: Vec<usize>,
     selected: usize,
 }
-impl BusyCompletionMenu {
-    fn refresh(&mut self, buffer: &EditBuffer) {
-        if let Ok((start, choices)) = self.catalog.candidates(&buffer.line, buffer.cursor, false) {
-            self.start = start;
-            self.choices = choices;
-            self.selected = 0;
+enum PickerAction {
+    Append(String),
+    Backspace,
+    Clear,
+    EraseWord,
+    Next,
+    Previous,
+    Accept,
+    Cancel,
+    Ignore,
+}
+enum PickerDecision {
+    Changed,
+    Accepted(String),
+    Cancelled,
+    Unchanged,
+}
+impl PickerAction {
+    fn from_edit_key(key: EditKey) -> Self {
+        match key {
+            EditKey::Text(text) => Self::Append(text),
+            EditKey::Paste(text) => Self::Append(normalize_picker_paste(&text)),
+            EditKey::Byte(13 | 10) => Self::Accept,
+            EditKey::Byte(27 | 4) => Self::Cancel,
+            EditKey::Byte(9 | 14) => Self::Next,
+            EditKey::Byte(16) => Self::Previous,
+            EditKey::Byte(8 | 127) => Self::Backspace,
+            EditKey::Byte(21) => Self::Clear,
+            EditKey::Byte(23) => Self::EraseWord,
+            EditKey::Byte(byte) if (32..127).contains(&byte) => {
+                Self::Append((byte as char).to_string())
+            }
+            EditKey::Sequence(value) => match value.as_str() {
+                "escape" => Self::Cancel,
+                "alt:enter" | "shift:enter" => Self::Accept,
+                "[A" | "OA" | "[Z" => Self::Previous,
+                "[B" | "OB" => Self::Next,
+                _ => Self::Ignore,
+            },
+            _ => Self::Ignore,
         }
     }
-    fn lines(&self, width: usize, room: usize) -> Vec<String> {
-        if room == 0 {
-            return vec![];
+}
+// Clipboard data is one query edit, never navigation or selection. Keep this
+// normalization identical for the editor-owned and standalone picker readers.
+fn normalize_picker_paste(text: &str) -> String {
+    let text: String = text
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect();
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+impl PickerState {
+    fn new(choices: Vec<rustyline::completion::Pair>, query: &str) -> Self {
+        let query: String = query
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(512)
+            .collect();
+        let filtered = picker_filter(&choices, &query);
+        Self {
+            choices,
+            query,
+            filtered,
+            selected: 0,
         }
-        if room == 1 {
-            let label = self
-                .choices
-                .get(self.selected)
-                .map(|choice| format!("› {}", choice.display))
-                .unwrap_or_else(|| "completion · no matches".into());
-            return terminal_style_lines(
-                terminal_wrap(&label, width).0.into_iter().take(1).collect(),
-                "1;36",
-            );
+    }
+    fn choice(&self) -> Option<&rustyline::completion::Pair> {
+        self.filtered
+            .get(self.selected)
+            .map(|index| &self.choices[*index])
+    }
+    fn apply(&mut self, action: PickerAction) -> PickerDecision {
+        let edited = match action {
+            PickerAction::Accept => {
+                return self
+                    .choice()
+                    .map(|choice| PickerDecision::Accepted(choice.replacement.clone()))
+                    .unwrap_or(PickerDecision::Unchanged)
+            }
+            PickerAction::Cancel => return PickerDecision::Cancelled,
+            PickerAction::Next | PickerAction::Previous => {
+                if self.filtered.is_empty() {
+                    return PickerDecision::Unchanged;
+                }
+                self.selected = if matches!(action, PickerAction::Next) {
+                    (self.selected + 1) % self.filtered.len()
+                } else {
+                    (self.selected + self.filtered.len() - 1) % self.filtered.len()
+                };
+                return PickerDecision::Changed;
+            }
+            PickerAction::Append(text) => {
+                let text: String = text
+                    .chars()
+                    .map(|c| if c.is_whitespace() { ' ' } else { c })
+                    .filter(|c| !c.is_control())
+                    .collect();
+                let room = 512usize.saturating_sub(self.query.chars().count());
+                self.query.extend(text.chars().take(room));
+                true
+            }
+            PickerAction::Backspace => {
+                self.query.pop();
+                true
+            }
+            PickerAction::Clear => {
+                self.query.clear();
+                true
+            }
+            PickerAction::EraseWord => {
+                while self.query.ends_with(char::is_whitespace) {
+                    self.query.pop();
+                }
+                while !self.query.is_empty() && !self.query.ends_with(char::is_whitespace) {
+                    self.query.pop();
+                }
+                true
+            }
+            PickerAction::Ignore => false,
+        };
+        if edited {
+            self.filtered = picker_filter(&self.choices, &self.query);
+            self.selected = 0;
+            PickerDecision::Changed
+        } else {
+            PickerDecision::Unchanged
         }
-        let heading = terminal_wrap("completion · ↑↓/Tab · Enter choose · Esc cancel", width)
-            .0
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        let mut lines = terminal_style_lines(vec![heading], "2");
-        let count = room.saturating_sub(1);
-        let start = self.selected.saturating_sub(count.saturating_sub(1));
-        for (index, choice) in self.choices.iter().enumerate().skip(start).take(count) {
-            let label = format!(
-                "{} {}",
-                if index == self.selected { "›" } else { " " },
-                choice.display
-            );
-            let label = terminal_wrap(&label, width)
-                .0
-                .into_iter()
-                .next()
-                .unwrap_or_default();
-            lines.extend(terminal_style_lines(
-                vec![label],
-                if index == self.selected { "1;36" } else { "2" },
+    }
+    fn layout(&self, width: usize, slots: usize) -> PickerLayout {
+        PickerLayout::new(
+            &self.choices,
+            &self.query,
+            &self.filtered,
+            self.selected,
+            width,
+            slots,
+        )
+    }
+}
+struct PickerLayout {
+    lines: Vec<(String, &'static str)>,
+    query_row: usize,
+    cursor_column: usize,
+}
+impl PickerLayout {
+    fn new(
+        choices: &[rustyline::completion::Pair],
+        query: &str,
+        filtered: &[usize],
+        selected: usize,
+        width: usize,
+        slots: usize,
+    ) -> Self {
+        let mut lines = if slots == 2 {
+            vec![format!("Fuzzy select · {query}")]
+        } else {
+            vec![
+                "Fuzzy select — Enter picks".into(),
+                format!("Find: {query}"),
+            ]
+        };
+        if slots >= 6 {
+            lines.push("↑↓/Tab move · Esc cancels".into());
+        }
+        let footer = usize::from(slots >= 5);
+        let available = slots.saturating_sub(lines.len() + footer).max(1);
+        let start = selected
+            .saturating_sub(available / 2)
+            .min(filtered.len().saturating_sub(available));
+        if filtered.is_empty() {
+            lines.push("No matches — edit query".into());
+        } else {
+            for (position, index) in filtered.iter().enumerate().skip(start).take(available) {
+                lines.push(format!(
+                    "{}{}",
+                    if position == selected { "→ " } else { "  " },
+                    choices[*index].display
+                ));
+            }
+        }
+        if footer > 0 {
+            lines.push(format!(
+                "{}/{}",
+                if filtered.is_empty() { 0 } else { selected + 1 },
+                filtered.len()
             ));
         }
-        if self.choices.is_empty() && count > 0 {
-            lines.push("  no matches".into());
+        let lines = (0..slots)
+            .map(|index| {
+                let line = lines.get(index).map(String::as_str).unwrap_or("");
+                let style = if index == 0 {
+                    "1;36"
+                } else if index == 1 && slots > 2 {
+                    "36"
+                } else if line.starts_with("→ ") {
+                    "1;7"
+                } else if line.starts_with("  ") {
+                    "0"
+                } else {
+                    "2"
+                };
+                (picker_clip(line, width.saturating_sub(1).max(1)), style)
+            })
+            .collect();
+        let query_row = usize::from(slots > 2);
+        let query_line = if slots == 2 {
+            format!("Fuzzy select · {}", terminal_safe(query))
+        } else {
+            format!("Find: {}", terminal_safe(query))
+        };
+        Self {
+            lines,
+            query_row,
+            cursor_column: terminal_columns(&query_line).min(width.saturating_sub(1)),
         }
-        lines
     }
+}
+fn picker_slots(height: usize, prompt_rows: usize) -> usize {
+    height
+        .saturating_sub(prompt_rows)
+        .min((height / 2).max(2))
+        .min(8)
+}
+fn completion_picker(
+    catalog: &CompletionCatalog,
+    line: &str,
+    cursor: usize,
+    start: usize,
+) -> rustyline::Result<PickerState> {
+    let (_, choices) = catalog.candidates(line, cursor, true)?;
+    let prefix = &line[..cursor];
+    let python = prefix.starts_with('@');
+    let offset = if prefix.starts_with("@@") || prefix.starts_with("!!") {
+        2
+    } else if python || prefix.starts_with('!') {
+        1
+    } else {
+        0
+    };
+    let (_, quote) = completion_token(prefix, offset);
+    Ok(PickerState::new(
+        choices,
+        &completion_unescape(&prefix[start..], python, quote),
+    ))
+}
+struct BusyCompletionMenu {
+    original: EditBuffer,
+    start: usize,
+    end: usize,
+    picker: PickerState,
 }
 enum BusyEditResult {
     None,
@@ -12445,6 +12646,7 @@ mod busy_editor_tests {
                 keyboard: false,
                 display: false,
                 headers: vec![],
+                picker_active: false,
             },
             buffer: EditBuffer::default(),
             status: json!({"state":"thinking"}),
@@ -12521,7 +12723,13 @@ mod busy_editor_tests {
         display.buffer.cursor = 3;
         display.key(EditKey::Byte(9));
         assert!(display.completion.is_some());
-        let selected = display.completion.as_ref().unwrap().choices[0]
+        let selected = display
+            .completion
+            .as_ref()
+            .unwrap()
+            .picker
+            .choice()
+            .unwrap()
             .replacement
             .clone();
         assert!(matches!(
@@ -12544,7 +12752,8 @@ mod busy_editor_tests {
         let original = display.buffer.clone();
         display.key(EditKey::Byte(9));
         display.key(EditKey::Text("dels".into()));
-        assert_ne!(display.buffer.line, original.line);
+        assert_eq!(display.buffer.line, original.line);
+        assert_eq!(display.completion.as_ref().unwrap().picker.query, "/models");
         display.key(EditKey::Sequence("escape".into()));
         assert_eq!(display.buffer.line, original.line);
         assert_eq!(display.buffer.cursor, original.cursor);
@@ -12559,17 +12768,299 @@ mod busy_editor_tests {
         display.key(EditKey::Byte(9));
         display.key(EditKey::Text("dels".into()));
         assert_eq!(
-            display.completion.as_ref().unwrap().choices[0].replacement,
+            display
+                .completion
+                .as_ref()
+                .unwrap()
+                .picker
+                .choice()
+                .unwrap()
+                .replacement,
             "/models"
         );
         display.key(EditKey::Byte(127));
-        let count = display.completion.as_ref().unwrap().choices.len();
+        let count = display.completion.as_ref().unwrap().picker.filtered.len();
         assert!(count >= 2);
         display.key(EditKey::Sequence("[B".into()));
-        assert_eq!(display.completion.as_ref().unwrap().selected, 1);
+        assert_eq!(display.completion.as_ref().unwrap().picker.selected, 1);
         display.key(EditKey::Sequence("[A".into()));
-        assert_eq!(display.completion.as_ref().unwrap().selected, 0);
-        assert!(display.completion.as_ref().unwrap().lines(80, 3).len() <= 3);
+        assert_eq!(display.completion.as_ref().unwrap().picker.selected, 0);
+        display.key(EditKey::Sequence("[A".into()));
+        assert_eq!(
+            display.completion.as_ref().unwrap().picker.selected,
+            count - 1
+        );
+        assert_eq!(
+            display
+                .completion
+                .as_ref()
+                .unwrap()
+                .picker
+                .layout(80, 3)
+                .lines
+                .len(),
+            3
+        );
+    }
+    #[test]
+    fn idle_and_busy_picker_rows_and_query_cursor_are_identical() {
+        let mut display = display();
+        display.buffer.line = "/mo".into();
+        display.buffer.cursor = 3;
+        let catalog = display.cache.lock().unwrap().catalog.clone().unwrap();
+        display.key(EditKey::Byte(9));
+        let idle =
+            completion_picker(&catalog, &display.buffer.line, display.buffer.cursor, 0).unwrap();
+        let busy = &display.completion.as_ref().unwrap().picker;
+        for width in [4, 12, 80] {
+            for slots in [2, 3, 5, 8] {
+                let idle_layout = idle.layout(width, slots);
+                let busy_layout = busy.layout(width, slots);
+                assert_eq!(idle_layout.lines, busy_layout.lines);
+                assert_eq!(
+                    (idle_layout.query_row, idle_layout.cursor_column),
+                    (busy_layout.query_row, busy_layout.cursor_column)
+                );
+            }
+        }
+    }
+    #[test]
+    fn picker_query_is_bounded_and_editing_does_not_mutate_the_saved_draft() {
+        let mut display = display();
+        display.buffer.line = "/mo tail".into();
+        display.buffer.cursor = 3;
+        display.key(EditKey::Byte(9));
+        display.key(EditKey::Text("λ".repeat(1000)));
+        assert_eq!(
+            display
+                .completion
+                .as_ref()
+                .unwrap()
+                .picker
+                .query
+                .chars()
+                .count(),
+            512
+        );
+        assert_eq!(display.buffer.line, "/mo tail");
+        assert_eq!(display.buffer.cursor, 3);
+        display.key(EditKey::Byte(21));
+        assert!(display.completion.as_ref().unwrap().picker.query.is_empty());
+        display.key(EditKey::Text("/models".into()));
+        display.key(EditKey::Byte(13));
+        assert_eq!(display.buffer.line, "/models tail");
+    }
+    #[test]
+    fn picker_paste_is_query_data_and_navigation_wraps_in_both_frontends() {
+        let choices = vec![
+            rustyline::completion::Pair {
+                display: "one".into(),
+                replacement: "one".into(),
+            },
+            rustyline::completion::Pair {
+                display: "two".into(),
+                replacement: "two".into(),
+            },
+        ];
+        let mut picker = PickerState::new(choices, "");
+        picker.apply(PickerAction::from_edit_key(EditKey::Byte(16)));
+        assert_eq!(picker.selected, 1);
+        picker.apply(PickerAction::from_edit_key(EditKey::Byte(14)));
+        assert_eq!(picker.selected, 0);
+        picker.apply(PickerAction::from_edit_key(EditKey::Paste(
+            "one\n\x1b\rtwo".into(),
+        )));
+        assert_eq!(picker.query, "one two");
+        assert!(matches!(
+            picker.apply(PickerAction::Accept),
+            PickerDecision::Unchanged
+        ));
+        picker.apply(PickerAction::Clear);
+        picker.apply(PickerAction::Append("two".into()));
+        assert!(
+            matches!(picker.apply(PickerAction::Accept),PickerDecision::Accepted(value) if value=="two")
+        );
+    }
+    #[test]
+    fn shared_footer_places_menu_after_all_visible_prompt_rows_and_owns_query_cursor() {
+        let choices = vec![rustyline::completion::Pair {
+            display: "example".into(),
+            replacement: "example".into(),
+        }];
+        let picker = PickerState::new(choices, "ex");
+        for (width, height) in [(80, 24), (12, 10), (4, 8), (80, 4)] {
+            let prompt = EditorFooterLayout::new(
+                &["status".into()],
+                "first line\nsecond line",
+                3,
+                width,
+                height,
+            );
+            if let Some(menu) = prompt.picker_layout(&picker) {
+                let query_row = prompt.rows() + menu.query_row;
+                assert!(query_row >= prompt.rows());
+                assert!(prompt.rows() + menu.lines.len() <= height);
+                assert!(menu.cursor_column < width);
+                assert_eq!(
+                    menu.lines[0].0,
+                    picker_clip(
+                        if menu.lines.len() == 2 {
+                            "Fuzzy select · ex"
+                        } else {
+                            "Fuzzy select — Enter picks"
+                        },
+                        width.saturating_sub(1).max(1)
+                    )
+                );
+            }
+        }
+        let tiny = EditorFooterLayout::new(&[], "line", 4, 4, 2);
+        assert!(tiny.picker_layout(&picker).is_none());
+    }
+    #[test]
+    fn pasted_query_collapses_trailing_whitespace_but_typed_spaces_remain_literal() {
+        let choices = vec![
+            rustyline::completion::Pair {
+                display: "model".into(),
+                replacement: "model".into(),
+            },
+            rustyline::completion::Pair {
+                display: "models".into(),
+                replacement: "models".into(),
+            },
+        ];
+        let mut picker = PickerState::new(choices, "");
+        assert!(matches!(
+            picker.apply(PickerAction::from_edit_key(EditKey::Paste(
+                "  model\n\t\r \x1b".into()
+            ))),
+            PickerDecision::Changed
+        ));
+        assert_eq!(picker.query, "model");
+        assert!(
+            matches!(picker.apply(PickerAction::Accept), PickerDecision::Accepted(value) if value == "model")
+        );
+        picker.apply(PickerAction::from_edit_key(EditKey::Text(" ".into())));
+        assert_eq!(picker.query, "model ");
+        assert_eq!(normalize_picker_paste("one\n\t two\r "), "one two");
+    }
+    #[test]
+    fn picker_teardown_clears_owned_rows_once_and_not_during_filter_or_event_redraw() {
+        let directory = crate::test_support::TestDirectory::new("py-picker-teardown");
+        let output = directory.join("output");
+        let mut display = display();
+        display.terminal.output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&output)
+            .unwrap();
+        display.terminal.display = true;
+        display.buffer.line = "/mo tail".into();
+        display.buffer.cursor = 3;
+        display.draw().unwrap();
+        display.key(EditKey::Byte(9));
+        display.draw().unwrap();
+        assert!(display.terminal.picker_active);
+        display.key(EditKey::Text("dels".into()));
+        display.draw().unwrap();
+        assert_eq!(
+            fs::read(&output)
+                .unwrap()
+                .windows(4)
+                .filter(|bytes| *bytes == b"\x1b[0J")
+                .count(),
+            0
+        );
+        display.hide().unwrap();
+        display
+            .terminal
+            .output
+            .write_all(b"agent event\r\n")
+            .unwrap();
+        display.draw().unwrap();
+        assert!(display.terminal.picker_active);
+        assert_eq!(
+            fs::read(&output)
+                .unwrap()
+                .windows(4)
+                .filter(|bytes| *bytes == b"\x1b[0J")
+                .count(),
+            0
+        );
+        display.key(EditKey::Sequence("escape".into()));
+        display.draw().unwrap();
+        assert!(!display.terminal.picker_active);
+        assert_eq!(
+            (&display.buffer.line, display.buffer.cursor),
+            (&"/mo tail".to_owned(), 3)
+        );
+        let bytes = fs::read(&output).unwrap();
+        assert_eq!(
+            bytes
+                .windows(4)
+                .filter(|bytes| *bytes == b"\x1b[0J")
+                .count(),
+            1
+        );
+        assert!(String::from_utf8(bytes).unwrap().contains("> /mo tail"));
+        display.draw().unwrap();
+        assert_eq!(
+            fs::read(&output)
+                .unwrap()
+                .windows(4)
+                .filter(|bytes| *bytes == b"\x1b[0J")
+                .count(),
+            1
+        );
+        display.key(EditKey::Byte(9));
+        display.draw().unwrap();
+        display.key(EditKey::Byte(13));
+        display.draw().unwrap();
+        assert_eq!(
+            fs::read(&output)
+                .unwrap()
+                .windows(4)
+                .filter(|bytes| *bytes == b"\x1b[0J")
+                .count(),
+            2
+        );
+    }
+    #[test]
+    fn tiny_resize_cancels_busy_picker_without_changing_the_saved_draft() {
+        let (_master, slave) = crate::shared_editor_engine_tests::pty();
+        let mut size = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+            0
+        );
+        let mut display = display();
+        display.terminal.output = slave;
+        display.terminal.display = true;
+        display.buffer.line = "/mo tail".into();
+        display.buffer.cursor = 3;
+        display.key(EditKey::Byte(9));
+        display.draw().unwrap();
+        assert!(display.completion.is_some());
+        assert!(display.terminal.picker_active);
+        size.ws_row = 2;
+        size.ws_col = 8;
+        assert_eq!(
+            unsafe { libc::ioctl(display.terminal.output.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+            0
+        );
+        display.draw().unwrap();
+        assert!(display.completion.is_none());
+        assert!(!display.terminal.picker_active);
+        assert_eq!(
+            (&display.buffer.line, display.buffer.cursor),
+            (&"/mo tail".to_owned(), 3)
+        );
     }
     #[test]
     fn busy_path_completion_uses_cached_cwd_and_shell_escaping() {
@@ -12755,9 +13246,6 @@ impl BusyDisplay {
         let Some(catalog) = catalog else {
             return;
         };
-        if self.terminal.display && self.terminal.height() < 3 {
-            return;
-        }
         let Ok((start, choices)) = catalog.candidates(&self.buffer.line, self.buffer.cursor, false)
         else {
             return;
@@ -12766,68 +13254,46 @@ impl BusyDisplay {
             self.buffer
                 .replace(start, self.buffer.cursor, &choices[0].replacement);
         } else if !choices.is_empty() {
+            let headers = terminal_status(&self.status, self.terminal.width());
+            let prompt =
+                self.terminal
+                    .footer_layout(&headers, &self.buffer.line, self.buffer.cursor);
+            if picker_slots(self.terminal.height(), prompt.rows()) < 2 {
+                return;
+            }
+            let Ok(picker) =
+                completion_picker(&catalog, &self.buffer.line, self.buffer.cursor, start)
+            else {
+                return;
+            };
             self.completion = Some(BusyCompletionMenu {
                 original: self.buffer.clone(),
-                catalog,
                 start,
-                choices,
-                selected: 0,
+                end: self.buffer.cursor,
+                picker,
             });
         }
     }
     fn key(&mut self, key: EditKey) -> BusyEditResult {
         if let Some(mut menu) = self.completion.take() {
-            match &key {
-                EditKey::Byte(27) => {
+            // Busy Ctrl-C interrupts the active operation; idle Ctrl-C only
+            // cancels its picker. All query/navigation actions are shared.
+            if matches!(key, EditKey::Byte(3)) {
+                self.buffer = EditBuffer::default();
+                return BusyEditResult::Interrupt;
+            }
+            match menu.picker.apply(PickerAction::from_edit_key(key)) {
+                PickerDecision::Cancelled => {
                     self.buffer = menu.original;
-                    return BusyEditResult::None;
                 }
-                EditKey::Sequence(value) if value == "escape" => {
+                PickerDecision::Accepted(value) => {
                     self.buffer = menu.original;
-                    return BusyEditResult::None;
+                    self.buffer.replace(menu.start, menu.end, &value);
                 }
-                EditKey::Byte(3) => {
-                    self.buffer = EditBuffer::default();
-                    return BusyEditResult::Interrupt;
-                }
-                EditKey::Byte(13) => {
-                    if let Some(choice) = menu.choices.get(menu.selected) {
-                        self.buffer
-                            .replace(menu.start, self.buffer.cursor, &choice.replacement);
-                    }
-                    return BusyEditResult::None;
-                }
-                EditKey::Sequence(value) if value == "alt:enter" => {
-                    if let Some(choice) = menu.choices.get(menu.selected) {
-                        self.buffer
-                            .replace(menu.start, self.buffer.cursor, &choice.replacement);
-                    }
-                    return BusyEditResult::None;
-                }
-                EditKey::Byte(9 | 14) => {
-                    if !menu.choices.is_empty() {
-                        menu.selected = (menu.selected + 1) % menu.choices.len();
-                    }
-                }
-                EditKey::Byte(16) => {
-                    menu.selected = menu.selected.saturating_sub(1);
-                }
-                EditKey::Sequence(value) if matches!(value.as_str(), "[A" | "OA") => {
-                    menu.selected = menu.selected.saturating_sub(1);
-                }
-                EditKey::Sequence(value) if matches!(value.as_str(), "[B" | "OB") => {
-                    if !menu.choices.is_empty() {
-                        menu.selected = (menu.selected + 1) % menu.choices.len();
-                    }
-                }
-                _ => {
-                    if let Some(action) = EditAction::decode(key, EditMode::Busy) {
-                        self.buffer.apply(action);
-                        menu.refresh(&self.buffer);
-                    }
+                PickerDecision::Changed | PickerDecision::Unchanged => {
+                    self.completion = Some(menu);
                 }
             }
-            self.completion = Some(menu);
             return BusyEditResult::None;
         }
         match editor_intent(EditMode::Busy, key, self.buffer.line.is_empty()) {
@@ -12905,23 +13371,19 @@ impl BusyDisplay {
             status["cell_elapsed_ms"] = json!(base
                 .saturating_add(self.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64));
         }
-        let mut lines = terminal_status(&status, self.terminal.width());
-        if let Some(menu) = &self.completion {
-            let max_headers = self.terminal.height().saturating_sub(2);
-            if max_headers.saturating_sub(lines.len()) < 2 {
-                lines.truncate(max_headers.saturating_sub(2));
-            }
-            let room = max_headers.saturating_sub(lines.len()).min(6);
-            lines.extend(menu.lines(self.terminal.width(), room));
+        let lines = terminal_status(&status, self.terminal.width());
+        let prompt = self
+            .terminal
+            .footer_layout(&lines, &self.buffer.line, self.buffer.cursor);
+        if self.completion.is_some() && picker_slots(self.terminal.height(), prompt.rows()) < 2 {
+            self.cancel_completion();
         }
-        if self.completion.is_some() {
-            let limit = self.terminal.height().saturating_sub(2);
-            self.terminal
-                .draw_footer_limit(&lines, &self.buffer.line, self.buffer.cursor, limit)
-        } else {
-            self.terminal
-                .draw_footer(&lines, &self.buffer.line, self.buffer.cursor)
-        }
+        self.terminal.draw_footer_picker(
+            &lines,
+            &self.buffer.line,
+            self.buffer.cursor,
+            self.completion.as_ref().map(|menu| &menu.picker),
+        )
     }
 }
 struct BusyInput {
@@ -12947,6 +13409,7 @@ impl BusyInput {
             keyboard: false,
             display: false,
             headers: vec![],
+            picker_active: false,
         };
         terminal.output.write_all(b"\x1b[?2004h")?;
         terminal.keyboard(true)?;
@@ -13220,6 +13683,54 @@ impl TerminalIo {
         (terminal_width_for(output_fd).max(1), rows.max(1))
     }
 }
+struct EditorFooterLayout {
+    headers: Vec<String>,
+    shown: Vec<EditRow>,
+    cursor_row: usize,
+    cursor_column: usize,
+    pad: usize,
+    width: usize,
+    height: usize,
+}
+impl EditorFooterLayout {
+    fn new(headers: &[String], line: &str, cursor: usize, width: usize, height: usize) -> Self {
+        let limit = height.saturating_sub(4).min(2);
+        let headers = headers[..headers.len().min(limit)].to_vec();
+        let pad = if width >= 4 {
+            2
+        } else {
+            width.saturating_sub(2)
+        };
+        let layout = editor_rows(line, width.saturating_sub(pad + 1).max(1));
+        let row = layout.iter().rposition(|r| r.start <= cursor).unwrap_or(0);
+        let visible = height.saturating_sub(headers.len() + 2).clamp(1, 24);
+        let first = row
+            .saturating_sub(visible / 2)
+            .min(layout.len().saturating_sub(visible));
+        let shown = layout[first..(first + visible).min(layout.len())].to_vec();
+        let cursor_column = (pad
+            + terminal_columns(&terminal_safe(
+                &line[layout[row].start..cursor.min(layout[row].end)],
+            )))
+        .min(width.saturating_sub(1));
+        Self {
+            cursor_row: row - first + headers.len(),
+            headers,
+            shown,
+            cursor_column,
+            pad,
+            width,
+            height,
+        }
+    }
+    fn rows(&self) -> usize {
+        self.headers.len() + self.shown.len()
+    }
+    fn picker_layout(&self, picker: &PickerState) -> Option<PickerLayout> {
+        let slots = picker_slots(self.height, self.rows());
+        (slots >= 2).then(|| picker.layout(self.width, slots))
+    }
+}
 struct EditTerminal {
     io: TerminalIo,
     output: File,
@@ -13228,6 +13739,8 @@ struct EditTerminal {
     keyboard: bool,
     display: bool,
     headers: Vec<String>,
+    // Owned modal presentation survives hide/redraw while agent events arrive.
+    picker_active: bool,
 }
 impl EditTerminal {
     fn open(output_fd: i32) -> io::Result<Self> {
@@ -13244,6 +13757,7 @@ impl EditTerminal {
             keyboard: false,
             display,
             headers: vec![],
+            picker_active: false,
         })
     }
     fn keyboard(&mut self, enabled: bool) -> io::Result<()> {
@@ -13271,69 +13785,56 @@ impl EditTerminal {
     fn draw(&mut self, line: &str, cursor: usize) -> io::Result<()> {
         self.draw_footer(&self.headers.clone(), line, cursor)
     }
-    fn draw_footer(&mut self, headers: &[String], line: &str, cursor: usize) -> io::Result<()> {
-        if !self.display {
-            return Ok(());
-        }
-        // Idle status reserves space for its separate picker. Busy completion
-        // supplies its own bounded inline rows through draw_footer_limit.
-        let limit = self.height().saturating_sub(4).min(2);
-        self.draw_footer_limit(headers, line, cursor, limit)
+    fn footer_layout(&self, headers: &[String], line: &str, cursor: usize) -> EditorFooterLayout {
+        EditorFooterLayout::new(headers, line, cursor, self.width(), self.height())
     }
-    fn draw_footer_limit(
+    fn draw_footer(&mut self, headers: &[String], line: &str, cursor: usize) -> io::Result<()> {
+        self.draw_footer_picker(headers, line, cursor, None)
+    }
+    fn draw_footer_picker(
         &mut self,
         headers: &[String],
         line: &str,
         cursor: usize,
-        limit: usize,
+        picker: Option<&PickerState>,
     ) -> io::Result<()> {
         if !self.display {
             return Ok(());
         }
-        let headers = &headers[..headers
-            .len()
-            .min(limit.min(self.height().saturating_sub(2)))];
-        let width = self.width();
-        let pad = if width >= 4 {
-            2
-        } else {
-            width.saturating_sub(2)
-        };
-        let layout = editor_rows(line, width.saturating_sub(pad + 1).max(1));
-        let row = layout.iter().rposition(|r| r.start <= cursor).unwrap_or(0);
-        let visible = self.height().saturating_sub(headers.len() + 2).clamp(1, 24);
-        let first = row
-            .saturating_sub(visible / 2)
-            .min(layout.len().saturating_sub(visible));
-        let shown = &layout[first..(first + visible).min(layout.len())];
+        let prompt = self.footer_layout(headers, line, cursor);
+        let menu = picker.and_then(|picker| prompt.picker_layout(picker));
+        let has_picker = menu.is_some();
+        if has_picker {
+            self.output.write_all(b"\x1b[?25l")?;
+        }
         self.output.write_all(b"\r")?;
         if self.cursor_row > 0 {
             write!(self.output, "\x1b[{}A", self.cursor_row)?;
         }
-        self.output.write_all(b"\x1b[K\x1b[J")?;
-        for header in headers {
+        // Clear the whole owned region from its top. Use the explicit erase-
+        // below form only when a visible modal actually closes; ordinary menu
+        // edits must not signal teardown to terminal clients or test fixtures.
+        self.output
+            .write_all(if self.picker_active && !has_picker {
+                b"\x1b[K\x1b[0J"
+            } else {
+                b"\x1b[K\x1b[J"
+            })?;
+        for header in &prompt.headers {
             write!(self.output, "{header}\r\n")?;
         }
-        for (i, item) in shown.iter().enumerate() {
-            if i > 0 {
+        for (index, item) in prompt.shown.iter().enumerate() {
+            if index > 0 {
                 self.output.write_all(b"\r\n")?;
             }
-            let prefix = if i == 0 {
-                if pad == 2 {
-                    "> "
-                } else if pad == 1 {
-                    ">"
-                } else {
-                    ""
-                }
-            } else if pad == 2 {
-                "  "
-            } else if pad == 1 {
-                " "
-            } else {
-                ""
+            let prefix = match (index == 0, prompt.pad) {
+                (true, 2) => "> ",
+                (true, 1) => ">",
+                (false, 2) => "  ",
+                (false, 1) => " ",
+                _ => "",
             };
-            if i == 0 {
+            if index == 0 {
                 self.output.write_all(
                     terminal_styled_for(prefix, "1;36", self.output.as_raw_fd()).as_bytes(),
                 )?;
@@ -13342,14 +13843,23 @@ impl EditTerminal {
             }
             self.output.write_all(item.text.as_bytes())?;
         }
-        let local = row - first + headers.len();
-        let columns = (pad
-            + terminal_columns(&terminal_safe(
-                &line[layout[row].start..cursor.min(layout[row].end)],
-            )))
-        .min(width.saturating_sub(1));
+        // The exact same rows/cursor as PickerTerminal, below all visible input.
+        let (rows, local, columns) = if let Some(menu) = menu {
+            for (text, style) in &menu.lines {
+                self.output.write_all(b"\r\n")?;
+                self.output.write_all(
+                    terminal_styled_for(text, style, self.output.as_raw_fd()).as_bytes(),
+                )?;
+            }
+            (
+                prompt.rows() + menu.lines.len(),
+                prompt.rows() + menu.query_row,
+                menu.cursor_column,
+            )
+        } else {
+            (prompt.rows(), prompt.cursor_row, prompt.cursor_column)
+        };
         self.output.write_all(b"\r")?;
-        let rows = headers.len() + shown.len();
         let up = rows - 1 - local;
         if up > 0 {
             write!(self.output, "\x1b[{up}A")?;
@@ -13360,6 +13870,11 @@ impl EditTerminal {
         self.output.flush()?;
         self.cursor_row = local;
         self.rows = rows;
+        self.picker_active = has_picker;
+        if has_picker {
+            self.output.write_all(b"\x1b[?25h")?;
+            self.output.flush()?;
+        }
         Ok(())
     }
 }
@@ -13378,6 +13893,7 @@ impl Drop for EditTerminal {
         // TerminalIo's raw lease restores termios after presentation cleanup.
     }
 }
+#[derive(Clone)]
 struct EditRow {
     start: usize,
     end: usize,
@@ -13916,7 +14432,7 @@ mod shared_editor_engine_tests {
             );
         }
     }
-    fn pty() -> (File, File) {
+    pub(super) fn pty() -> (File, File) {
         use std::os::fd::FromRawFd;
         let mut master = -1;
         let mut slave = -1;
@@ -14184,35 +14700,19 @@ fn editor_complete(
     } else if matching.is_empty() || !terminal.display {
         None
     } else {
-        let (_, choices) = helper
-            .catalog
-            .candidates(&buffer.line, buffer.cursor, true)?;
-        let prefix = &buffer.line[..buffer.cursor];
-        let python = prefix.starts_with('@');
-        let offset = if prefix.starts_with("@@") || prefix.starts_with("!!") {
-            2
-        } else if python || prefix.starts_with('!') {
-            1
-        } else {
-            0
-        };
-        let (_, quote) = completion_token(prefix, offset);
-        let query = completion_unescape(&prefix[start..], python, quote);
-        // Picker has its own legacy decoder; temporarily restore the prior
-        // keyboard protocol rather than feeding it reports it cannot parse.
-        // A queued typing burst may not have been painted yet. Anchor below
-        // the complete visible input, not below the caret's current line.
-        terminal.draw(&buffer.line, buffer.cursor)?;
+        let mut picker = completion_picker(&helper.catalog, &buffer.line, buffer.cursor, start)?;
+        // Keep the idle protocol transition, but share the editor's decoder,
+        // footer geometry and picker model with the busy frontend.
         terminal.keyboard(false)?;
-        let choice = picker_select_service(
-            &choices,
-            &query,
-            terminal.output.as_raw_fd(),
-            terminal.rows,
-            terminal.rows.saturating_sub(terminal.cursor_row),
-            || host.service_background(),
-        );
+        let choice = editor_pick_completion(terminal, buffer, &mut picker, host);
         terminal.keyboard(true)?;
+        if choice.is_err() {
+            // Clear owned modal rows on exceptional exits, just as the
+            // standalone picker's guard does before restoring its caller.
+            terminal.draw(&buffer.line, buffer.cursor)?;
+            terminal.output.write_all(b"\x1b[?25h")?;
+            terminal.output.flush()?;
+        }
         choice.map_err(|_| io::Error::other("selection failed"))?
     };
     if let Some(value) = selected {
@@ -14224,6 +14724,72 @@ fn editor_complete(
         terminal.output.flush()?;
     }
     Ok(())
+}
+fn editor_pick_completion(
+    terminal: &mut EditTerminal,
+    buffer: &EditBuffer,
+    picker: &mut PickerState,
+    host: &mut Host,
+) -> Result<Option<String>> {
+    let mut dirty = true;
+    let mut size = (terminal.width(), terminal.height());
+    loop {
+        host.service_background()?;
+        if INTERRUPT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let new_size = (terminal.width(), terminal.height());
+        if size != new_size {
+            size = new_size;
+            dirty = true;
+        }
+        if dirty {
+            terminal.headers = terminal_status(&host.state_payload(), terminal.width());
+            let prompt = terminal.footer_layout(&terminal.headers, &buffer.line, buffer.cursor);
+            if picker_slots(prompt.height, prompt.rows()) < 2 {
+                return Ok(None);
+            }
+            terminal.draw_footer_picker(
+                &terminal.headers.clone(),
+                &buffer.line,
+                buffer.cursor,
+                Some(picker),
+            )?;
+            dirty = false;
+        }
+        let mut service = || -> rustyline::Result<()> {
+            host.service_background()
+                .map_err(|error| io::Error::other(error.to_string()).into())
+        };
+        let key = match editor_key_with(terminal, &mut service, false) {
+            Ok(key) => key,
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                // Match standalone picker paste cancellation: do not let its
+                // buffered suffix become a command after the modal closes.
+                unsafe {
+                    libc::tcflush(terminal.io.input.as_raw_fd(), libc::TCIFLUSH);
+                }
+                INTERRUPT.store(false, std::sync::atomic::Ordering::SeqCst);
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let Some(key) = key else {
+            continue;
+        };
+        let action = if matches!(key, EditKey::Byte(3)) {
+            INTERRUPT.store(false, std::sync::atomic::Ordering::SeqCst);
+            PickerAction::Cancel
+        } else {
+            PickerAction::from_edit_key(key)
+        };
+        match picker.apply(action) {
+            PickerDecision::Accepted(value) => return Ok(Some(value)),
+            PickerDecision::Cancelled => return Ok(None),
+            PickerDecision::Changed => dirty = true,
+            PickerDecision::Unchanged => {}
+        }
+    }
 }
 fn serviceable_readline(
     helper: &Completion,
@@ -15538,10 +16104,7 @@ impl PickerTerminal {
         let height = TerminalIo::size(tty.as_raw_fd()).1;
         // At most half the screen: reserve room for the source and recent output.
         // Multiline input can consume that room; a tiny screen declines the menu.
-        let slots = height
-            .saturating_sub(prompt_rows)
-            .min((height / 2).max(2))
-            .min(8);
+        let slots = picker_slots(height, prompt_rows);
         if slots < 2 {
             return Ok(None);
         }
@@ -15638,90 +16201,28 @@ fn picker_filter(choices: &[rustyline::completion::Pair], query: &str) -> Vec<us
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     ranked.into_iter().map(|p| p.1).collect()
 }
-fn picker_draw(
-    terminal: &mut PickerTerminal,
-    choices: &[rustyline::completion::Pair],
-    query: &str,
-    filtered: &[usize],
-    selected: usize,
-) -> Result<()> {
-    let (width, _) = terminal.size();
-    let slots = terminal.slots;
-    let mut lines = if slots == 2 {
-        vec![format!("Fuzzy select · {query}")]
-    } else {
-        vec![
-            "Fuzzy select — Enter picks".into(),
-            format!("Find: {query}"),
-        ]
-    };
-    if slots >= 6 {
-        lines.push("↑↓/Tab move · Esc cancels".into());
-    }
-    let footer = usize::from(slots >= 5);
-    let available = slots.saturating_sub(lines.len() + footer).max(1);
-    let start = selected
-        .saturating_sub(available / 2)
-        .min(filtered.len().saturating_sub(available));
-    if filtered.is_empty() {
-        lines.push("No matches — edit query".into());
-    } else {
-        for (position, index) in filtered.iter().enumerate().skip(start).take(available) {
-            lines.push(format!(
-                "{}{}",
-                if position == selected { "→ " } else { "  " },
-                choices[*index].display
-            ));
-        }
-    }
-    if footer > 0 {
-        lines.push(format!(
-            "{}/{}",
-            if filtered.is_empty() { 0 } else { selected + 1 },
-            filtered.len()
-        ));
-    }
+fn picker_draw(terminal: &mut PickerTerminal, picker: &PickerState) -> Result<()> {
+    let layout = picker.layout(terminal.size().0, terminal.slots);
     terminal.top()?;
     terminal.tty.write_all(b"\x1b[?25l")?;
-    for index in 0..slots {
+    for (index, (text, style)) in layout.lines.iter().enumerate() {
         if index > 0 {
             terminal.tty.write_all(b"\r\n")?;
             terminal.cursor_row += 1;
         }
         terminal.tty.write_all(b"\x1b[2K")?;
-        if let Some(line) = lines.get(index) {
-            let clipped = picker_clip(line, width.saturating_sub(1).max(1));
-            let style = if index == 0 {
-                "1;36"
-            } else if index == 1 && slots > 2 {
-                "36"
-            } else if line.starts_with("→ ") {
-                "1;7"
-            } else if line.starts_with("  ") {
-                "0"
-            } else {
-                "2"
-            };
-            terminal.tty.write_all(
-                terminal_styled_for(&clipped, style, terminal.tty.as_raw_fd()).as_bytes(),
-            )?;
-        }
+        terminal
+            .tty
+            .write_all(terminal_styled_for(text, style, terminal.tty.as_raw_fd()).as_bytes())?;
     }
-    let query_row = usize::from(slots > 2);
-    let query_line = if slots == 2 {
-        format!("Fuzzy select · {}", terminal_safe(query))
-    } else {
-        format!("Find: {}", terminal_safe(query))
-    };
-    let cursor = terminal_columns(&query_line).min(width.saturating_sub(1));
     terminal.tty.write_all(b"\r")?;
-    let up = terminal.cursor_row - query_row;
+    let up = terminal.cursor_row - layout.query_row;
     if up > 0 {
         write!(terminal.tty, "\x1b[{up}A")?;
     }
-    terminal.cursor_row = query_row;
-    if cursor > 0 {
-        write!(terminal.tty, "\x1b[{cursor}C")?;
+    terminal.cursor_row = layout.query_row;
+    if layout.cursor_column > 0 {
+        write!(terminal.tty, "\x1b[{}C", layout.cursor_column)?;
     }
     terminal.tty.write_all(b"\x1b[?25h")?;
     terminal.tty.flush()?;
@@ -15757,12 +16258,7 @@ fn picker_paste_service(
             };
             // Pasted multiline text is one query edit. Collapse whitespace and
             // drop other controls; they are data, never picker key commands.
-            let text: String = text
-                .chars()
-                .map(|c| if c.is_whitespace() { ' ' } else { c })
-                .filter(|c| !c.is_control())
-                .collect();
-            return Ok(Some(text.split_whitespace().collect::<Vec<_>>().join(" ")));
+            return Ok(Some(normalize_picker_paste(&text)));
         }
         if paste.len() > 1_048_576 + 6 {
             overflow = true;
@@ -15803,9 +16299,7 @@ fn picker_select_service(
     let Some(mut terminal) = PickerTerminal::open(output_fd, prompt_rows, origin_up)? else {
         return Ok(None);
     };
-    let mut query: String = initial_query.chars().take(512).collect();
-    let mut filtered = picker_filter(choices, &query);
-    let mut selected = 0usize;
+    let mut picker = PickerState::new(choices.to_vec(), initial_query);
     let mut dirty = true;
     let mut size = terminal.size();
     loop {
@@ -15821,55 +16315,16 @@ fn picker_select_service(
             dirty = true;
         }
         if dirty {
-            picker_draw(&mut terminal, choices, &query, &filtered, selected)?;
+            picker_draw(&mut terminal, &picker)?;
             dirty = false;
         }
         let Some(byte) = terminal.byte(50)? else {
             continue;
         };
-        let mut edit = false;
-        match byte {
+        let action = match byte {
             3 | 4 => {
                 INTERRUPT.store(false, std::sync::atomic::Ordering::SeqCst);
-                return Ok(None);
-            }
-            b'\r' | b'\n' => {
-                if let Some(index) = filtered.get(selected) {
-                    return Ok(Some(choices[*index].replacement.clone()));
-                }
-            }
-            b'\t' | 14 => {
-                if !filtered.is_empty() {
-                    selected = (selected + 1) % filtered.len();
-                    dirty = true;
-                }
-            }
-            16 => {
-                if !filtered.is_empty() {
-                    selected = if selected == 0 {
-                        filtered.len() - 1
-                    } else {
-                        selected - 1
-                    };
-                    dirty = true;
-                }
-            }
-            8 | 127 => {
-                query.pop();
-                edit = true;
-            }
-            21 => {
-                query.clear();
-                edit = true;
-            }
-            23 => {
-                while query.ends_with(char::is_whitespace) {
-                    query.pop();
-                }
-                while !query.is_empty() && !query.ends_with(char::is_whitespace) {
-                    query.pop();
-                }
-                edit = true;
+                PickerAction::Cancel
             }
             27 => {
                 let Some(next) = terminal.byte(35)? else {
@@ -15891,34 +16346,18 @@ fn picker_select_service(
                 if !sequence.last().is_some_and(|b| (0x40..=0x7e).contains(b)) {
                     return Err("oversized picker terminal key report".into());
                 }
-                match sequence.as_slice() {
-                    b"[A" | b"[Z" | b"OA" if !filtered.is_empty() => {
-                        selected = if selected == 0 {
-                            filtered.len() - 1
-                        } else {
-                            selected - 1
-                        };
-                        dirty = true;
-                    }
-                    b"[B" | b"OB" if !filtered.is_empty() => {
-                        selected = (selected + 1) % filtered.len();
-                        dirty = true;
-                    }
-                    b"[200~" => {
-                        if let Some(text) = picker_paste_service(&mut terminal, &mut service)? {
-                            if query.len() + text.len() <= 2048 {
-                                query.push_str(&text);
-                                edit = true;
-                            }
-                        }
-                    }
-                    _ => {}
+                if sequence.as_slice() == b"[200~" {
+                    picker_paste_service(&mut terminal, &mut service)?
+                        .map(PickerAction::Append)
+                        .unwrap_or(PickerAction::Ignore)
+                } else {
+                    PickerAction::from_edit_key(EditKey::Sequence(
+                        String::from_utf8(sequence).unwrap_or_default(),
+                    ))
                 }
             }
-            c if c >= 32 => {
-                let length = if c < 128 {
-                    1
-                } else if c & 0xe0 == 0xc0 {
+            c if c >= 128 => {
+                let length = if c & 0xe0 == 0xc0 {
                     2
                 } else if c & 0xf0 == 0xe0 {
                     3
@@ -15927,29 +16366,31 @@ fn picker_select_service(
                 } else {
                     0
                 };
-                if length > 0 {
-                    let mut bytes = vec![c];
-                    for _ in 1..length {
-                        if let Some(c) = terminal.byte(100)? {
-                            bytes.push(c);
-                        } else {
-                            break;
-                        }
-                    }
-                    if let Ok(text) = std::str::from_utf8(&bytes) {
-                        if query.len() + text.len() <= 2048 && !text.chars().any(char::is_control) {
-                            query.push_str(text);
-                            edit = true;
-                        }
+                let mut bytes = vec![c];
+                for _ in 1..length {
+                    if let Some(byte) = terminal.byte(100)? {
+                        bytes.push(byte);
+                    } else {
+                        break;
                     }
                 }
+                if length > 0 {
+                    std::str::from_utf8(&bytes)
+                        .ok()
+                        .filter(|text| !text.chars().any(char::is_control))
+                        .map(|text| PickerAction::Append(text.into()))
+                        .unwrap_or(PickerAction::Ignore)
+                } else {
+                    PickerAction::Ignore
+                }
             }
-            _ => {}
-        }
-        if edit {
-            filtered = picker_filter(choices, &query);
-            selected = 0;
-            dirty = true;
+            byte => PickerAction::from_edit_key(EditKey::Byte(byte)),
+        };
+        match picker.apply(action) {
+            PickerDecision::Accepted(value) => return Ok(Some(value)),
+            PickerDecision::Cancelled => return Ok(None),
+            PickerDecision::Changed => dirty = true,
+            PickerDecision::Unchanged => {}
         }
     }
 }
@@ -22351,6 +22792,7 @@ mod scheduler_frontend_tests {
             keyboard: false,
             display: false,
             headers: Vec::new(),
+            picker_active: false,
         };
         let mut buffer = EditBuffer::default();
         buffer.line = "draft-middle-tail".into();
@@ -36850,6 +37292,37 @@ tty_wait(lambda:idle in data,'idle editor ready')
     }
 
     #[test]
+    fn e2e_idle_and_busy_completion_have_identical_below_prompt_panels() {
+        tty_editor_fixture(
+            r###"
+import re
+ansi=re.compile(rb'\x1b\[[0-?]*[ -/]*[@-~]')
+def panel(start):
+ frames=bytes(data[start:]).split(b'\x1b[K\x1b[J')[1:]
+ complete=[frame for frame in frames if b'\x1b[?25h' in frame and b'Find: /mo' in frame]
+ if not complete:return None
+ frame=complete[-1].split(b'\x1b[?25h')[0]
+ lines=ansi.sub(b'',frame).decode().split('\r\n')
+ prompt=next(index for index,line in enumerate(lines) if line.startswith('> /mo'))
+ menu=next(index for index,line in enumerate(lines) if line.startswith('Fuzzy select'))
+ assert menu==prompt+1,lines
+ rows=[line.rstrip('\r') for line in lines[menu:menu+8]]
+ assert rows[1]=='Find: /mo',rows
+ return rows
+start=len(data);send('/mo\t');tty_wait(lambda:panel(start) is not None,'complete idle menu frame')
+idle_panel=panel(start)
+closed=len(data);send('\x1b');tty_wait(lambda:b'\x1b[0J' in data[closed:],'idle picker closed')
+send('\x15parity task\r');tty_wait(lambda:request_started.is_set() and busy in data,'held provider')
+start=len(data);send('/mo\t');tty_wait(lambda:panel(start) is not None,'complete busy menu frame')
+assert panel(start)==idle_panel,(panel(start),idle_panel)
+closed=len(data);send('\x1b');tty_wait(lambda:b'\x1b[0J' in data[closed:],'busy picker closed')
+assert arrivals()==[],arrivals()
+finish('fixture-result')
+"###,
+        );
+    }
+
+    #[test]
     fn e2e_busy_tty_history_restores_draft_cursor_and_recalls_busy_submissions() {
         tty_editor_fixture(
             r###"
@@ -36876,10 +37349,10 @@ started=pathlib.Path(home,'completion-worker-started');announce=pathlib.Path(hom
 codes[:]=['import pathlib,time\npathlib.Path('+repr(str(started))+').write_text("ready")\nwhile not pathlib.Path('+repr(str(announce))+').exists(): time.sleep(.01)\nagent.say("EVENT-WHILE-COMPLETING")\nwhile not pathlib.Path('+repr(str(release))+').exists(): time.sleep(.01)\nagent.final("before-steering")','agent.final("python-completion-done")']
 answer_idle=3
 first_release.set();send('complete a Python name\r');tty_wait(lambda:started.exists() and busy in data,'active worker and busy prompt')
-menu_from=len(data);send('@busy_he\t');tty_wait(lambda:b'completion' in data[menu_from:] and b'busy_helper' in data[menu_from:],'cached Python completion menu')
+menu_from=len(data);send('@busy_he\t');tty_wait(lambda:b'Fuzzy select' in data[menu_from:] and b'busy_helper' in data[menu_from:],'cached Python completion menu')
 announce_from=len(data);announce.write_text('announce')
 tty_wait(lambda:any(v['kind']=='say' and v['payload']['text']=='EVENT-WHILE-COMPLETING' for v in records()) and b'EVENT-WHILE-COMPLETING' in data[announce_from:],'agent output remains live during selection')
-tty_wait(lambda:data.rfind(b'completion')>data.rfind(b'EVENT-WHILE-COMPLETING'),'completion menu redrawn below agent event')
+tty_wait(lambda:data.rfind(b'Fuzzy select')>data.rfind(b'EVENT-WHILE-COMPLETING'),'completion menu redrawn below agent event')
 send('\r');time.sleep(.05);pump();assert arrivals()==[],arrivals()
 send('\r');tty_wait(lambda:arrivals()==['@busy_helper'],'second enter submits completed draft')
 assert not release.exists();release.write_text('finish')
@@ -36896,7 +37369,7 @@ assert '@busy_helper' in json.dumps(requests[1]),requests[1]
             r###"
 filename=pathlib.Path(home,'unique spaced.txt');filename.write_text('BUSY_COMPLETED_PATH')
 send('local autocomplete task\r');tty_wait(lambda:request_started.is_set() and busy in data,'held provider and busy input')
-menu_from=len(data);send('/mo\t');tty_wait(lambda:b'completion' in data[menu_from:],'slash command menu')
+menu_from=len(data);send('/mo\t');tty_wait(lambda:b'Fuzzy select' in data[menu_from:],'slash command menu')
 send('dels\r');time.sleep(.05);pump()
 assert not any(v['kind']=='local_command_accepted' for v in records()),records()[-15:]
 send('\r');tty_wait(lambda:any(v['kind']=='local_command_completed' for v in records()),'completed models command executes while provider held')
