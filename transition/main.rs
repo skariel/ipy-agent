@@ -1,14 +1,15 @@
 // py transition harness
 //
-// File map (kept in one handwritten Rust source file by design):
-//   1. Core types and durable storage
-//   2. Python worker, session state, and model loop
-//   3. CLI, terminal UI, editor, completion, and picker
-//   4. Provider transport and authentication
-//   5. Background tasks and wakeups
-//   6. Model catalog and durable skills
-//   7. Embedded specification and Python worker source
-//   8. Tests and external-process fixtures
+// Ownership map (one handwritten Rust source file by design):
+//   ContextStore: selected items, admission, eviction and collapse.
+//   Journal / JournalEvent: durable storage and shared version-aware decoding.
+//   HistoryArchive / HistoryIndex / RecoveryIndex: derived record/cell projections.
+//   ExecutionController / WorkerTransport: lifecycle decisions and bounded IPC.
+//   ProviderClient: model capabilities, credentials, request attempts and usage.
+//   TaskScheduler: background jobs and wakeups.
+//   TerminalFrontend: input ownership, editing, completion/pickers and rendering.
+//   ControlPump / Host: shared waiting behavior and explicit orchestration.
+//   Embedded specification/Python and test_support: contracts and shared fixtures.
 
 // =============================================================================
 // Imports and shared aliases
@@ -41,6 +42,1464 @@ struct Item {
     // Attachment lifetime is exactly the lifetime of this selected item.
     // Replacement summaries are text-only, including preserved boundary text.
     raw_index: Option<usize>,
+}
+
+// Selected context is owned here. Preparing a transition never admits data;
+// persisting it commits the journal before publishing the new in-memory view.
+mod context_store {
+    use super::*;
+
+    pub(super) struct ContextStore {
+        items: Vec<Item>,
+        revision: usize,
+        trigger: usize,
+        retain: usize,
+    }
+    enum ContextChange {
+        Add(Item),
+        Replace(Vec<Item>),
+    }
+    pub(super) struct ContextTransition {
+        expected_revision: usize,
+        expected_sequence: Option<usize>,
+        next_revision: usize,
+        change: ContextChange,
+        event_kind: &'static str,
+        payload: Value,
+    }
+    pub(super) struct UserOriginal<'a> {
+        pub(super) sequence: usize,
+        pub(super) index: usize,
+        pub(super) text: &'a str,
+    }
+    pub(super) struct UserUpgrade {
+        pub(super) transition: Option<ContextTransition>,
+        pub(super) ambiguous: Vec<String>,
+    }
+    impl Default for ContextStore {
+        fn default() -> Self {
+            Self {
+                items: Vec::new(),
+                revision: 0,
+                trigger: 20,
+                retain: 10,
+            }
+        }
+    }
+    impl ContextStore {
+        pub(super) fn items(&self) -> &[Item] {
+            &self.items
+        }
+        pub(super) fn snapshot(&self) -> Vec<Item> {
+            self.items.clone()
+        }
+        pub(super) fn revision(&self) -> usize {
+            self.revision
+        }
+        pub(super) fn metadata(&self) -> Value {
+            json!(self
+                .items
+                .iter()
+                .map(|i| json!({"id":i.id,"role":i.role,
+                "chars":i.text.chars().count(),"ranges":i.ranges,"raw_index":i.raw_index}))
+                .collect::<Vec<_>>())
+        }
+        pub(super) fn rendered_chars(&self, system_chars: usize) -> usize {
+            Self::item_chars(&self.items) + system_chars + 512
+        }
+        fn item_chars(items: &[Item]) -> usize {
+            items.iter().map(|i| i.text.chars().count() + 64).sum()
+        }
+        pub(super) fn attachment_count(&self) -> usize {
+            self.items.iter().filter(|i| i.raw_index.is_some()).count()
+        }
+        pub(super) fn raw_indices(&self) -> Vec<usize> {
+            self.items.iter().filter_map(|i| i.raw_index).collect()
+        }
+        pub(super) fn validate_text_selection<'a>(
+            &self,
+            v: &'a Value,
+            system_chars: usize,
+            input_budget: usize,
+        ) -> Result<&'a str> {
+            if v.get("max_chars").is_some() {
+                return Err("max_chars is no longer supported; use required start and stop".into());
+            }
+            let start = v["start"]
+                .as_u64()
+                .ok_or("start must be a nonnegative integer")?;
+            let stop = v["stop"]
+                .as_u64()
+                .ok_or("stop must be a nonnegative integer")?;
+            let width = stop
+                .checked_sub(start)
+                .ok_or("stop must be greater than or equal to start")?;
+            if width > READ_TEXT_MAX_CHARS as u64 {
+                return Err("read_text range exceeds fixed 8000-character limit".into());
+            }
+            // The payload is already the selected Unicode slice. Its bounds
+            // constrain admission, but are not independently verified provenance.
+            let text = v["selected_text"]
+                .as_str()
+                .ok_or("selected_text required")?;
+            let chars = text.chars().count();
+            if chars as u64 > width {
+                return Err("selected text exceeds requested range".into());
+            }
+            if (self.rendered_chars(system_chars) + chars + 64).div_ceil(3) >= input_budget {
+                return Err("selection exceeds next-request context budget".into());
+            }
+            Ok(text)
+        }
+        fn transition(
+            &self,
+            change: ContextChange,
+            event_kind: &'static str,
+            payload: Value,
+        ) -> Result<ContextTransition> {
+            Ok(ContextTransition {
+                expected_revision: self.revision,
+                expected_sequence: None,
+                next_revision: self
+                    .revision
+                    .checked_add(1)
+                    .ok_or("context revision exhausted")?,
+                change,
+                event_kind,
+                payload,
+            })
+        }
+        pub(super) fn prepare_add(
+            &self,
+            role: &str,
+            text: String,
+            output: bool,
+            ranges: Vec<(usize, usize)>,
+            raw_index: Option<usize>,
+            sequence: usize,
+        ) -> Result<(String, ContextTransition)> {
+            let id = format!("c{sequence}");
+            let ranges = if ranges.is_empty() {
+                vec![(sequence, sequence + 1)]
+            } else {
+                ranges
+            };
+            let item = Item {
+                id: id.clone(),
+                role: role.into(),
+                text,
+                output,
+                ranges,
+                raw_index,
+            };
+            let payload = item_json(&item);
+            let mut transition =
+                self.transition(ContextChange::Add(item), "context_add", payload)?;
+            transition.expected_sequence = Some(sequence);
+            Ok((id, transition))
+        }
+        pub(super) fn prepare_replace(
+            &self,
+            items: Vec<Item>,
+            mut payload: Value,
+        ) -> Result<ContextTransition> {
+            payload["items"] = json!(items.iter().map(item_json).collect::<Vec<_>>());
+            self.transition(ContextChange::Replace(items), "context_replace", payload)
+        }
+        pub(super) fn persist(
+            &mut self,
+            journal: &mut Journal,
+            transition: ContextTransition,
+        ) -> Result<()> {
+            if transition.expected_revision != self.revision {
+                return Err("context changed before prepared transition".into());
+            }
+            if transition
+                .expected_sequence
+                .is_some_and(|sequence| sequence != journal.seq)
+            {
+                return Err("journal changed before prepared context addition".into());
+            }
+            journal.append(transition.event_kind, transition.payload)?;
+            match transition.change {
+                ContextChange::Add(item) => self.items.push(item),
+                ContextChange::Replace(items) => self.items = items,
+            }
+            self.revision = transition.next_revision;
+            Ok(())
+        }
+        pub(super) fn prepare_collapse(
+            &self,
+            v: &Value,
+            own: Option<&str>,
+        ) -> Result<ContextTransition> {
+            let a = self
+                .items
+                .iter()
+                .position(|i| i.id == v["start"])
+                .ok_or("missing start boundary")?;
+            let b = self
+                .items
+                .iter()
+                .position(|i| i.id == v["end"])
+                .ok_or("missing end boundary")?;
+            if a >= b {
+                return Err("collapse requires ordered distinct boundaries".into());
+            }
+            let source = v["source"].as_str().ok_or("missing retained call")?;
+            let mut ranges = self.items[a..b]
+                .iter()
+                .flat_map(|i| i.ranges.clone())
+                .collect::<Vec<_>>();
+            ranges.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::new();
+            for (start, stop) in ranges {
+                if let Some(last) = merged.last_mut() {
+                    if start <= last.1 {
+                        last.1 = last.1.max(stop);
+                        continue;
+                    }
+                }
+                merged.push((start, stop));
+            }
+            let end = &self.items[b];
+            let preserve = end.role == "user" || end.role == "summary";
+            let mut text = format!("[Collapsed originals: {:?}]\n{}", merged, source);
+            if preserve {
+                text.push_str("\n[Preserved boundary]\n");
+                text.push_str(&end.text);
+            }
+            let mut all_ranges = merged.clone();
+            if preserve {
+                all_ranges.extend(end.ranges.clone());
+            }
+            let id = self.items[a].id.clone();
+            let mut next = self.snapshot();
+            next.splice(
+                a..=b,
+                [Item {
+                    id: id.clone(),
+                    role: "summary".into(),
+                    text,
+                    output: false,
+                    ranges: all_ranges,
+                    raw_index: None,
+                }],
+            );
+            if let Some(own) = own {
+                next.retain(|i| i.id != own || i.id == id);
+            }
+            if Self::item_chars(&next) >= Self::item_chars(&self.items) {
+                return Err("collapse must reduce rendered context size".into());
+            }
+            self.prepare_replace(next, json!({"summary":v["summary"],"ranges":merged}))
+        }
+        pub(super) fn prepare_evict(&self) -> Result<Option<ContextTransition>> {
+            let eligible = self
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(n, i)| i.output.then_some(n))
+                .collect::<Vec<_>>();
+            if eligible.len() < self.trigger {
+                return Ok(None);
+            }
+            let mut next = self.snapshot();
+            for &n in eligible
+                .iter()
+                .take(eligible.len().saturating_sub(self.retain))
+            {
+                let i = &mut next[n];
+                i.text = format!(
+                    "[Output omitted: originals {:?}; {} chars]",
+                    i.ranges,
+                    i.text.chars().count()
+                );
+                i.output = false;
+                i.raw_index = None;
+            }
+            Ok(Some(
+                self.prepare_replace(next, json!({"reason":"output_batch"}))?,
+            ))
+        }
+        pub(super) fn restore_add(&mut self, item: Item) -> Result<()> {
+            let revision = self
+                .revision
+                .checked_add(1)
+                .ok_or("context revision exhausted")?;
+            self.items.push(item);
+            self.revision = revision;
+            Ok(())
+        }
+        pub(super) fn restore_replace(&mut self, items: &[Value]) -> Result<()> {
+            let next = items
+                .iter()
+                .map(|item| parse_replaced_item(item, &self.items))
+                .collect::<Result<Vec<_>>>()?;
+            let revision = self
+                .revision
+                .checked_add(1)
+                .ok_or("context revision exhausted")?;
+            self.items = next;
+            self.revision = revision;
+            Ok(())
+        }
+        pub(super) fn restore_attachment(&mut self, id: &str, index: usize) -> Result<()> {
+            if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
+                if item.role != "user" {
+                    return Err("attachment receipt cannot bind a non-user context item".into());
+                }
+                if item.raw_index.is_some_and(|owned| owned != index) {
+                    return Err("attachment receipt contradicts committed context ownership".into());
+                }
+                item.raw_index = Some(index);
+            }
+            Ok(())
+        }
+        pub(super) fn prepare_full_users(&self, users: &[UserOriginal<'_>]) -> Result<UserUpgrade> {
+            let mut next = self.snapshot();
+            let mut restored = Vec::new();
+            let mut ambiguous = Vec::new();
+            for item in &mut next {
+                if item.role != "user" || item.output || item.raw_index.is_some() {
+                    continue;
+                }
+                let has_provenance = |sequence| {
+                    item.ranges
+                        .iter()
+                        .any(|&(start, stop)| start <= sequence && sequence < stop)
+                };
+                if users
+                    .iter()
+                    .any(|u| has_provenance(u.sequence) && u.text == item.text)
+                {
+                    continue;
+                }
+                let mut candidates = Vec::new();
+                let mut known_legacy = false;
+                for u in users {
+                    if item.text == u.text {
+                        continue;
+                    }
+                    let prefix = u.text.chars().take(8000).collect::<String>();
+                    let count = u.text.chars().count();
+                    let suffix = format!(
+                        "{} chars; {} lines; omitted {} chars;",
+                        count,
+                        u.text.lines().count(),
+                        count.saturating_sub(8000)
+                    );
+                    if !["H.records.user", "H.user"].iter().any(|archive| {
+                        item.text == format!("{prefix}\n[{suffix} {archive}[{}]]", u.index)
+                    }) {
+                        continue;
+                    }
+                    known_legacy = true;
+                    if has_provenance(u.sequence) {
+                        candidates.push((u.index, u.text));
+                    }
+                }
+                match candidates.as_slice() {
+                    [(index, full)] => {
+                        item.text = (*full).to_owned();
+                        restored.push(json!({"context_id":item.id,"user_record_index":index}));
+                    }
+                    [] if !known_legacy => {}
+                    _ => ambiguous.push(item.id.clone()),
+                }
+            }
+            let transition = if restored.is_empty() {
+                None
+            } else {
+                Some(self.prepare_replace(
+                    next,
+                    json!({"reason":"user_messages_full","restored":restored}),
+                )?)
+            };
+            Ok(UserUpgrade {
+                transition,
+                ambiguous,
+            })
+        }
+        #[cfg(test)]
+        pub(super) fn from_items(items: Vec<Item>) -> Self {
+            Self {
+                items,
+                ..Self::default()
+            }
+        }
+        #[cfg(test)]
+        pub(super) fn configure_eviction(&mut self, trigger: usize, retain: usize) {
+            self.trigger = trigger;
+            self.retain = retain;
+        }
+    }
+}
+use context_store::{ContextStore, UserOriginal};
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+    use std::{
+        io::Read,
+        net::{TcpListener, TcpStream},
+        os::unix::fs::{DirBuilderExt, MetadataExt},
+        process::{Output, Stdio},
+        time::{Duration, Instant},
+    };
+
+    #[derive(Debug)]
+    pub(super) struct TestDirectory {
+        path: PathBuf,
+        identity: (u64, u64),
+    }
+    impl TestDirectory {
+        pub(super) fn new(prefix: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "{prefix}-{}-{}-{}",
+                std::process::id(),
+                now_ms(),
+                unique_id()
+            ));
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(&path).unwrap();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            Self {
+                path,
+                identity: (metadata.dev(), metadata.ino()),
+            }
+        }
+        pub(super) fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+    impl std::ops::Deref for TestDirectory {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            self.path()
+        }
+    }
+    impl AsRef<Path> for TestDirectory {
+        fn as_ref(&self) -> &Path {
+            self.path()
+        }
+    }
+    impl AsRef<std::ffi::OsStr> for TestDirectory {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.path.as_os_str()
+        }
+    }
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            if fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+                metadata.is_dir() && (metadata.dev(), metadata.ino()) == self.identity
+            }) {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) enum SessionSelection<'a> {
+        Only,
+        All,
+        Path(&'a Path),
+    }
+    #[derive(Clone, Copy)]
+    pub(super) enum TornTailPolicy {
+        Strict,
+        IgnoreUnterminatedTail,
+    }
+    // Selection is explicit: never guess the newest or an arbitrary first file.
+    // Only permits an empty pre-start snapshot, but rejects multiple sessions.
+    pub(super) fn read_journal(
+        home: &Path,
+        selection: SessionSelection<'_>,
+        tail: TornTailPolicy,
+    ) -> Result<Vec<Value>> {
+        let mut paths = match selection {
+            SessionSelection::Path(path) => vec![path.to_path_buf()],
+            SessionSelection::Only | SessionSelection::All => {
+                let directory = home.join("sessions");
+                let mut paths = match fs::read_dir(directory) {
+                    Ok(entries) => entries
+                        .map(|entry| entry.map(|entry| entry.path()))
+                        .collect::<std::result::Result<Vec<_>, _>>()?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => vec![],
+                    Err(error) => return Err(error.into()),
+                };
+                paths.retain(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "jsonl")
+                });
+                if matches!(selection, SessionSelection::Only) && paths.len() > 1 {
+                    return Err("fixture journal selection 'only' found multiple sessions".into());
+                }
+                paths
+            }
+        };
+        paths.sort();
+        let mut events = Vec::new();
+        for path in paths {
+            let mut reader = BufReader::new(File::open(path)?);
+            loop {
+                let mut line = Vec::new();
+                if reader.read_until(b'\n', &mut line)? == 0 {
+                    break;
+                }
+                if !line.ends_with(b"\n") && matches!(tail, TornTailPolicy::IgnoreUnterminatedTail)
+                {
+                    break;
+                }
+                events.push(serde_json::from_slice(&line)?);
+            }
+        }
+        Ok(events)
+    }
+
+    pub(super) struct JournalFixture {
+        pub(super) journal: Journal,
+        pub(super) directory: TestDirectory,
+    }
+    impl JournalFixture {
+        pub(super) fn new() -> Self {
+            Self::named("py-journal-fixture")
+        }
+        pub(super) fn named(prefix: &str) -> Self {
+            let directory = TestDirectory::new(prefix);
+            let journal = Journal::open(directory.join("session.jsonl")).unwrap();
+            Self { journal, directory }
+        }
+        pub(super) fn envelope(kind: &str, payload: Value) -> Value {
+            json!({"schema_version":1,"seq":0,"session_id":"fixture-session","kind":kind,"payload":payload,"timestamp_ms":123})
+        }
+        pub(super) fn start(&mut self, cell: usize, operation: &str, parent: Option<usize>) {
+            self.journal.append("cell_start", json!({"cell":cell,"operation":operation,"parent_cell":parent,"language":"python"})).unwrap();
+        }
+        pub(super) fn end(&mut self, cell: usize) {
+            self.journal
+                .append(
+                    "cell_end",
+                    json!({"cell":cell,"status":"ok","elapsed_ms":1}),
+                )
+                .unwrap();
+        }
+    }
+
+    pub(super) struct HostFixture {
+        host: Option<Host>,
+        pub(super) directory: TestDirectory,
+    }
+    impl HostFixture {
+        pub(super) fn new() -> Self {
+            Self::named("py-host-fixture", None)
+        }
+        pub(super) fn named(prefix: &str, config: Option<Value>) -> Self {
+            let directory = TestDirectory::new(prefix);
+            if let Some(config) = config {
+                fs::write(directory.join("config.json"), config.to_string()).unwrap();
+            }
+            let host = Host::new(directory.to_path_buf(), None, true, true, None, None).unwrap();
+            Self {
+                host: Some(host),
+                directory,
+            }
+        }
+        pub(super) fn from_host(directory: TestDirectory, host: Host) -> Self {
+            Self {
+                host: Some(host),
+                directory,
+            }
+        }
+        pub(super) fn host(&mut self) -> &mut Host {
+            self.host.as_mut().unwrap()
+        }
+        pub(super) fn take_host(&mut self) -> Host {
+            self.host.take().unwrap()
+        }
+    }
+    impl std::ops::Deref for HostFixture {
+        type Target = Host;
+        fn deref(&self) -> &Host {
+            self.host.as_ref().unwrap()
+        }
+    }
+    impl std::ops::DerefMut for HostFixture {
+        fn deref_mut(&mut self) -> &mut Host {
+            self.host()
+        }
+    }
+    impl Drop for HostFixture {
+        fn drop(&mut self) {
+            drop(self.host.take());
+        }
+    }
+
+    // One bounded process owner serves both Rust JSONL scenarios and Python
+    // behavioral scripts. Concurrent nonblocking pipe draining prevents a large
+    // diagnostic stream or input frame from deadlocking the fixture itself.
+    pub(super) struct ProcessSession {
+        child: Child,
+        reaped: bool,
+    }
+    impl ProcessSession {
+        pub(super) fn spawn(mut command: Command) -> Self {
+            command
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let child = command.spawn().unwrap();
+            for fd in [
+                child.stdin.as_ref().unwrap().as_raw_fd(),
+                child.stdout.as_ref().unwrap().as_raw_fd(),
+                child.stderr.as_ref().unwrap().as_raw_fd(),
+            ] {
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                assert!(
+                    flags >= 0
+                        && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0
+                );
+            }
+            Self {
+                child,
+                reaped: false,
+            }
+        }
+        fn drain(pipe: &mut impl Read, bytes: &mut Vec<u8>) -> io::Result<()> {
+            let mut chunk = [0; 8192];
+            for _ in 0..8 {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(size) => {
+                        if bytes.len() + size > 64 * 1024 * 1024 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "fixture output exceeded 64 MiB",
+                            ));
+                        }
+                        bytes.extend_from_slice(&chunk[..size]);
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        break
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }
+        pub(super) fn collect(mut self, input: &[u8], timeout: Duration) -> Output {
+            let deadline = Instant::now() + timeout;
+            let mut used = 0;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture subprocess deadline exceeded"
+                );
+                if used == input.len() {
+                    self.child.stdin.take();
+                }
+                if let Some(stdin) = self.child.stdin.as_mut() {
+                    match stdin.write(&input[used..]) {
+                        Ok(size) => used += size,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                            self.child.stdin.take();
+                        }
+                        Err(error) => panic!("fixture input transport failed: {error}"),
+                    }
+                }
+                Self::drain(self.child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+                Self::drain(self.child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    self.reaped = true;
+                    // A pipe can still have more than one drain batch buffered.
+                    loop {
+                        let before = stdout.len() + stderr.len();
+                        Self::drain(self.child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+                        Self::drain(self.child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+                        if stdout.len() + stderr.len() == before {
+                            break;
+                        }
+                    }
+                    return Output {
+                        status,
+                        stdout,
+                        stderr,
+                    };
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+    impl Drop for ProcessSession {
+        fn drop(&mut self) {
+            if !self.reaped {
+                // Worker/background children may acquire their own groups.
+                // On Linux, clean currently owned descendants before killing
+                // the direct fixture child; otherwise kill its owned group.
+                let mut owned = vec![self.child.id()];
+                let mut cursor = 0;
+                while cursor < owned.len() && owned.len() < 256 {
+                    let pid = owned[cursor];
+                    cursor += 1;
+                    if let Ok(children) =
+                        fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+                    {
+                        for child in children
+                            .split_whitespace()
+                            .filter_map(|child| child.parse::<u32>().ok())
+                        {
+                            if owned.len() < 256 && !owned.contains(&child) {
+                                owned.push(child);
+                            }
+                        }
+                    }
+                }
+                for pid in owned.into_iter().rev() {
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                }
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+    pub(super) fn jsonl_input(commands: &[Value]) -> Vec<u8> {
+        let mut input = Vec::new();
+        for command in commands {
+            serde_json::to_writer(&mut input, command).unwrap();
+            input.push(b'\n');
+        }
+        input
+    }
+    pub(super) fn jsonl_events(output: &Output) -> Vec<Value> {
+        assert!(
+            output.status.success(),
+            "fixture CLI failed with {}",
+            output.status
+        );
+        std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("fixture stdout must be JSONL"))
+            .collect()
+    }
+    // Scenario templates still own their protocol, terminal policy and timing
+    // assertions. The common bootstrap owns subprocesses and temporary paths.
+    const PY_TEST_SUPPORT: &str = r#"
+import atexit, os, signal, subprocess, sys, tempfile
+def fixture_journal(home, *, selection, torn_tail):
+ import glob, json
+ if torn_tail not in ('strict', 'ignore-final'):raise ValueError('invalid fixture journal torn-tail policy')
+ if selection in ('only', 'all'):
+  paths = sorted(glob.glob(os.path.join(home, 'sessions', '*.jsonl')))
+  if selection == 'only' and len(paths) > 1:raise ValueError("fixture journal selection 'only' found multiple sessions")
+ else:paths = [os.fspath(selection)]
+ events = []
+ for path in paths:
+  with open(path, 'rb') as journal:
+   for line in journal:
+    if not line.endswith(b'\n') and torn_tail == 'ignore-final':break
+    events.append(json.loads(line))
+ return events
+_fixture_root = os.environ['PY_TEST_HOME']
+_fixture_mkdtemp = tempfile.mkdtemp
+_fixture_processes = []
+def _owned_mkdtemp(*args, **kwargs):
+ root = os.fsencode(_fixture_root) if any(isinstance(value, bytes) for value in (*args[:2], kwargs.get('prefix'), kwargs.get('suffix'))) else _fixture_root
+ if len(args) >= 3:
+  if args[2] is None:args = (*args[:2], root, *args[3:])
+ elif kwargs.get('dir') is None:kwargs['dir'] = root
+ return _fixture_mkdtemp(*args, **kwargs)
+tempfile.mkdtemp = _owned_mkdtemp
+def _fixture_identity(pid):
+ try:
+  with open('/proc/%d/stat' % pid) as record:
+   return record.read().rpartition(')')[2].split()[19]
+ except (OSError, IndexError):return None
+def _fixture_descendants(root):
+ owned = [root];cursor = 0
+ while cursor < len(owned) and len(owned) < 256:
+  pid = owned[cursor];cursor += 1
+  try:
+   with open('/proc/%d/task/%d/children' % (pid, pid)) as children:
+    descendants = children.read().split()
+  except OSError:descendants = []
+  for child in descendants:
+   child = int(child)
+   if child not in owned and len(owned) < 256:owned.append(child)
+ return owned[1:]
+def _fixture_kill(pid):
+ for target in (-pid, pid):
+  try:os.kill(target, signal.SIGKILL)
+  except ProcessLookupError:pass
+_fixture_popen = subprocess.Popen
+class _OwnedPopen(_fixture_popen):
+ def __init__(self, *args, **kwargs):
+  self._fixture_owned = {}
+  super().__init__(*args, **kwargs)
+  _fixture_processes.append(self)
+ def _fixture_snapshot(self):
+  root = getattr(self, 'pid', None)
+  if self.returncode is not None or root is None:return
+  for pid in _fixture_descendants(root):
+   identity = _fixture_identity(pid)
+   if identity is not None:self._fixture_owned[pid] = identity
+ def poll(self):
+  self._fixture_snapshot()
+  return super().poll()
+ def send_signal(self, sig):
+  if sig in (signal.SIGTERM, signal.SIGKILL):self._fixture_snapshot()
+  if sig == signal.SIGKILL:
+   for pid, identity in reversed(list(self._fixture_owned.items())):
+    if _fixture_identity(pid) == identity:_fixture_kill(pid)
+  return super().send_signal(sig)
+subprocess.Popen = _OwnedPopen
+def _cleanup_fixture_processes():
+ for process in reversed(_fixture_processes):
+  alive = process.poll() is None
+  # Remember descendants observed before a scenario kills its direct child.
+  # Verify process identity before cleanup, never signal a reused PID.
+  for pid, identity in reversed(list(process._fixture_owned.items())):
+   if _fixture_identity(pid) == identity:_fixture_kill(pid)
+  if not alive:continue
+  _fixture_kill(process.pid)
+  try:process.wait(timeout=3)
+  except (OSError, subprocess.TimeoutExpired):pass
+atexit.register(_cleanup_fixture_processes)
+"#;
+
+    // Common terminal mechanisms only; each scenario retains its own reads,
+    // readiness markers, dimensions, Enter policy and cancellation assertions.
+    const PTY_SCRIPT_SUPPORT: &str = r#"
+import fcntl, pty, struct, termios
+def fixture_pty(rows=None, cols=None):
+ master, slave = pty.openpty()
+ if rows is not None:
+  fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+ return master, slave
+def fixture_controlling_terminal():
+ os.setsid()
+ fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+"#;
+    pub(super) fn run_python_fixture(prefix: &str, script: &str, timeout: Duration) -> Output {
+        run_python_fixture_with(prefix, script, timeout, |_| {})
+    }
+    pub(super) fn run_python_fixture_with(
+        prefix: &str,
+        script: &str,
+        timeout: Duration,
+        configure: impl FnOnce(&mut Command),
+    ) -> Output {
+        let directory = TestDirectory::new(prefix);
+        let script = format!("{PY_TEST_SUPPORT}\n{PTY_SCRIPT_SUPPORT}\n{script}");
+        let mut command = crate::test_command("python3");
+        command.env("PY_TEST_HOME", &directory);
+        command.args([
+            "-c",
+            &script,
+            &std::env::var("PY_HARNESS_BIN").expect("build CLI and set PY_HARNESS_BIN"),
+        ]);
+        configure(&mut command);
+        ProcessSession::spawn(command).collect(&[], timeout)
+    }
+    pub(super) fn assert_python_fixture(prefix: &str, script: &str, timeout: Duration) {
+        let output = run_python_fixture(prefix, script, timeout);
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    pub(super) fn run_python_check(script: &str, timeout: Duration) {
+        let output = run_python_fixture("py-python-fixture", script, timeout);
+        // Scenario assertions remain in the script. Do not automatically dump
+        // recorded provider headers or arguments from a shared failure helper.
+        assert!(
+            output.status.success(),
+            "Python fixture failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(4096)
+                .collect::<String>()
+        );
+    }
+
+    pub(super) struct MockProvider {
+        pub(super) address: std::net::SocketAddr,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        server: Option<std::thread::JoinHandle<std::result::Result<Vec<Value>, &'static str>>>,
+    }
+    impl MockProvider {
+        pub(super) fn json(
+            count: usize,
+            mut response: impl FnMut(Value) -> String + Send + 'static,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal = stop.clone();
+            let server = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                for _ in 0..count {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let mut socket = loop {
+                        if signal.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err("mock provider stopped");
+                        }
+                        if Instant::now() >= deadline {
+                            return Err("mock provider accept deadline exceeded");
+                        }
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(2))
+                            }
+                            Err(_) => return Err("mock provider accept failed"),
+                        }
+                    };
+                    let request = Self::request(&mut socket)?;
+                    let body = response(request.clone());
+                    requests.push(request);
+                    if body.len() > 64 * 1024 * 1024 {
+                        return Err("mock provider response too large");
+                    }
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let mut written = 0;
+                    while written < response.len() {
+                        if Instant::now() >= deadline {
+                            return Err("mock provider response deadline exceeded");
+                        }
+                        match socket.write(&response.as_bytes()[written..]) {
+                            Ok(0) => return Err("mock provider response disconnected"),
+                            Ok(size) => written += size,
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                                ) =>
+                            {
+                                std::thread::sleep(Duration::from_millis(2))
+                            }
+                            Err(_) => return Err("mock provider response failed"),
+                        }
+                    }
+                }
+                Ok(requests)
+            });
+            Self {
+                address,
+                stop,
+                server: Some(server),
+            }
+        }
+        fn request(socket: &mut TcpStream) -> std::result::Result<Value, &'static str> {
+            socket
+                .set_nonblocking(true)
+                .map_err(|_| "mock provider nonblocking setup failed")?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut bytes = Vec::new();
+            let mut frame = None;
+            let mut chunk = [0; 8192];
+            loop {
+                if Instant::now() >= deadline {
+                    return Err("mock provider request deadline exceeded");
+                }
+                match socket.read(&mut chunk) {
+                    Ok(0) => return Err("mock provider truncated request"),
+                    Ok(size) => bytes.extend_from_slice(&chunk[..size]),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => return Err("mock provider request failed"),
+                }
+                if frame.is_none() {
+                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        if end > 64 * 1024 {
+                            return Err("mock provider headers too large");
+                        }
+                        let headers = std::str::from_utf8(&bytes[..end])
+                            .map_err(|_| "mock provider invalid headers")?;
+                        let mut length = None;
+                        for line in headers.split("\r\n").skip(1) {
+                            if line.to_ascii_lowercase().starts_with("content-length:") {
+                                length = Some(
+                                    line.split_once(':')
+                                        .unwrap()
+                                        .1
+                                        .trim()
+                                        .parse::<usize>()
+                                        .map_err(|_| "mock provider invalid content length")?,
+                                );
+                            }
+                        }
+                        let length = length.ok_or("mock provider content length missing")?;
+                        if length > 64 * 1024 * 1024 {
+                            return Err("mock provider body too large");
+                        }
+                        frame = Some((end + 4, length));
+                    } else if bytes.len() > 64 * 1024 {
+                        return Err("mock provider headers too large");
+                    }
+                }
+                if let Some((start, length)) = frame {
+                    if bytes.len() >= start + length {
+                        if bytes.len() != start + length {
+                            return Err("mock provider trailing request bytes");
+                        }
+                        return serde_json::from_slice(&bytes[start..])
+                            .map_err(|_| "mock provider invalid JSON");
+                    }
+                }
+            }
+        }
+        pub(super) fn finish(mut self) -> Vec<Value> {
+            self.server
+                .take()
+                .unwrap()
+                .join()
+                .expect("mock provider panicked")
+                .expect("mock provider failed")
+        }
+    }
+    impl Drop for MockProvider {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+    mod tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        #[test]
+        fn journal_reader_selects_only_all_or_explicit_paths_without_guessing() {
+            let directory = TestDirectory::new("py-journal-selection");
+            assert!(
+                read_journal(&directory, SessionSelection::Only, TornTailPolicy::Strict)
+                    .unwrap()
+                    .is_empty()
+            );
+            let sessions = directory.join("sessions");
+            fs::create_dir(&sessions).unwrap();
+            let first = sessions.join("a.jsonl");
+            let second = sessions.join("z.jsonl");
+            fs::write(&second, "{\"file\":\"z\"}\n").unwrap();
+            fs::write(&first, "{\"file\":\"a\"}\n").unwrap();
+            assert!(
+                read_journal(&directory, SessionSelection::Only, TornTailPolicy::Strict).is_err()
+            );
+            assert_eq!(
+                read_journal(&directory, SessionSelection::All, TornTailPolicy::Strict).unwrap(),
+                vec![json!({"file":"a"}), json!({"file":"z"})]
+            );
+            assert_eq!(
+                read_journal(
+                    &directory,
+                    SessionSelection::Path(&second),
+                    TornTailPolicy::Strict
+                )
+                .unwrap(),
+                vec![json!({"file":"z"})]
+            );
+            let outside = directory.join("explicit.txt");
+            fs::write(&outside, "{\"outside\":true}\n").unwrap();
+            assert_eq!(
+                read_journal(
+                    &directory,
+                    SessionSelection::Path(&outside),
+                    TornTailPolicy::Strict
+                )
+                .unwrap(),
+                vec![json!({"outside":true})]
+            );
+        }
+        #[test]
+        fn journal_reader_ignores_only_an_unterminated_final_line() {
+            let directory = TestDirectory::new("py-journal-tail");
+            let path = directory.join("selected.jsonl");
+            fs::write(&path, "{\"marker\":1}\n{\"marker\":").unwrap();
+            assert!(read_journal(
+                &directory,
+                SessionSelection::Path(&path),
+                TornTailPolicy::Strict
+            )
+            .is_err());
+            assert_eq!(
+                read_journal(
+                    &directory,
+                    SessionSelection::Path(&path),
+                    TornTailPolicy::IgnoreUnterminatedTail
+                )
+                .unwrap(),
+                vec![json!({"marker":1})]
+            );
+            fs::write(&path, "{\"marker\":1}\n{\"marker\":2}").unwrap();
+            assert_eq!(
+                read_journal(
+                    &directory,
+                    SessionSelection::Path(&path),
+                    TornTailPolicy::Strict
+                )
+                .unwrap()
+                .len(),
+                2
+            );
+            assert_eq!(
+                read_journal(
+                    &directory,
+                    SessionSelection::Path(&path),
+                    TornTailPolicy::IgnoreUnterminatedTail
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+            fs::write(
+                &path,
+                "{\"marker\":1}\nmalformed complete line\n{\"marker\":",
+            )
+            .unwrap();
+            assert!(read_journal(
+                &directory,
+                SessionSelection::Path(&path),
+                TornTailPolicy::IgnoreUnterminatedTail
+            )
+            .is_err());
+        }
+        #[test]
+        fn python_journal_reader_preserves_explicit_selection_and_torn_tail_policies() {
+            run_python_check(
+                r#"
+import json, pathlib
+home=tempfile.mkdtemp(prefix='journal-policies-')
+sessions=pathlib.Path(home,'sessions');sessions.mkdir()
+assert fixture_journal(home,selection='only',torn_tail='strict')==[]
+a=sessions/'a.jsonl';z=sessions/'z.jsonl'
+z.write_text('{"file":"z"}\n');a.write_text('{"file":"a"}\n')
+assert fixture_journal(home,selection='all',torn_tail='strict')==[{'file':'a'},{'file':'z'}]
+try:fixture_journal(home,selection='only',torn_tail='strict')
+except ValueError:pass
+else:raise AssertionError('only must reject multiple sessions')
+assert fixture_journal(home,selection=z,torn_tail='strict')==[{'file':'z'}]
+explicit=pathlib.Path(home,'outside.txt');explicit.write_bytes(b'{"marker":1}\n{"marker":')
+try:fixture_journal(home,selection=explicit,torn_tail='strict')
+except json.JSONDecodeError:pass
+else:raise AssertionError('strict must reject an invalid torn tail')
+assert fixture_journal(home,selection=explicit,torn_tail='ignore-final')==[{'marker':1}]
+explicit.write_bytes(b'{"marker":1}\n{"marker":2}')
+assert len(fixture_journal(home,selection=explicit,torn_tail='strict'))==2
+assert len(fixture_journal(home,selection=explicit,torn_tail='ignore-final'))==1
+explicit.write_bytes(b'{"marker":1}\ninvalid complete line\n{"marker":')
+try:fixture_journal(home,selection=explicit,torn_tail='ignore-final')
+except json.JSONDecodeError:pass
+else:raise AssertionError('complete malformed lines must not be hidden')
+explicit.write_bytes(b'{"marker":1}\n\xf0')
+assert fixture_journal(home,selection=explicit,torn_tail='ignore-final')==[{'marker':1}]
+"#,
+                Duration::from_secs(10),
+            );
+        }
+        #[test]
+        fn python_fixture_cleans_its_default_tempdirs_on_success() {
+            let output = run_python_fixture(
+                "py-script-success",
+                r#"
+import json
+paths = [tempfile.mkdtemp(prefix='first-'), tempfile.mkdtemp('', 'second-', None)]
+print(json.dumps([os.environ['PY_TEST_HOME'], *paths]))
+"#,
+                Duration::from_secs(10),
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let paths: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(paths[1..]
+                .iter()
+                .all(|path| Path::new(path).starts_with(&paths[0])));
+            assert!(paths.iter().all(|path| !Path::new(path).exists()));
+        }
+        #[test]
+        fn python_fixture_cleans_processes_and_tempdirs_on_script_failure() {
+            let output = run_python_fixture(
+                "py-script-failure",
+                r#"
+import json, sys
+home = tempfile.mkdtemp(prefix='failure-')
+child = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(60)'])
+print(json.dumps({'root':os.environ['PY_TEST_HOME'],'home':home,'pid':child.pid}), flush=True)
+raise RuntimeError('intentional fixture failure')
+"#,
+                Duration::from_secs(10),
+            );
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("intentional fixture failure"));
+            let state: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(!Path::new(state["root"].as_str().unwrap()).exists());
+            assert!(!Path::new(state["home"].as_str().unwrap()).exists());
+            assert!(!Path::new(&format!("/proc/{}", state["pid"].as_u64().unwrap())).exists());
+        }
+        #[test]
+        fn shared_pty_fixture_applies_only_the_requested_dimensions() {
+            let output = run_python_fixture(
+                "py-script-pty",
+                r#"
+master, slave = fixture_pty(7, 21)
+try:
+ assert struct.unpack('HHHH', fcntl.ioctl(slave, termios.TIOCGWINSZ, b'\0'*8))[:2] == (7, 21)
+finally:os.close(master);os.close(slave)
+"#,
+                Duration::from_secs(10),
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        #[test]
+        fn directories_are_private_and_drop_does_not_remove_a_replacement() {
+            let parent = TestDirectory::new("py-fixture-owner");
+            let owned = TestDirectory::new("py-fixture-owned");
+            assert_eq!(
+                fs::metadata(owned.path()).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            let path = owned.to_path_buf();
+            fs::rename(&path, parent.join("original")).unwrap();
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("not-owned"), "keep").unwrap();
+            drop(owned);
+            assert_eq!(fs::read_to_string(path.join("not-owned")).unwrap(), "keep");
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        fn host_fixture_keeps_home_alive_for_resume_and_drops_processes_before_directory() {
+            let mut fixture =
+                HostFixture::named("py-fixture-host", Some(json!({"skills":{"enabled":false}})));
+            let path = fixture.directory.to_path_buf();
+            let journal = fixture.journal.path.clone();
+            drop(fixture.take_host());
+            assert!(path.exists());
+            // Dropping the process/journal must release its lock while the
+            // fixture continues owning the home used by sequential resumes.
+            let resumed = Host::new(path.clone(), Some(journal), true, true, None, None).unwrap();
+            drop(resumed);
+            drop(fixture);
+            assert!(!path.exists());
+        }
+        #[test]
+        fn subprocess_fixture_drains_input_stdout_and_stderr_without_pipe_deadlock() {
+            let mut command = crate::test_command("python3");
+            command.args(["-c", "import sys; data=sys.stdin.buffer.read(); sys.stdout.buffer.write(data+b'x'*150000); sys.stderr.buffer.write(b'y'*120000)"]);
+            let output =
+                ProcessSession::spawn(command).collect(b"input-frame", Duration::from_secs(5));
+            assert!(output.status.success());
+            assert!(output.stdout.starts_with(b"input-frame"));
+            assert_eq!(output.stdout.len(), 150000 + b"input-frame".len());
+            assert_eq!(output.stderr, vec![b'y'; 120000]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod context_store_tests {
+    use super::*;
+    fn item(id: &str, text: &str, output: bool, raw_index: Option<usize>) -> Item {
+        Item {
+            id: id.into(),
+            role: "user".into(),
+            text: text.into(),
+            output,
+            ranges: vec![(0, 1)],
+            raw_index,
+        }
+    }
+    use crate::test_support::JournalFixture as Fixture;
+    #[test]
+    fn admission_is_prepared_then_durable_and_stale_plans_do_not_append() {
+        let mut fixture = Fixture::new();
+        let mut store = ContextStore::default();
+        let (id, first) = store
+            .prepare_add("user", "full user text".into(), false, vec![], None, 0)
+            .unwrap();
+        let (_, stale) = store
+            .prepare_add("user", "other".into(), false, vec![], None, 0)
+            .unwrap();
+        assert!(store.items().is_empty());
+        assert_eq!(store.revision(), 0);
+        assert_eq!(fixture.journal.seq, 0);
+        store.persist(&mut fixture.journal, first).unwrap();
+        assert_eq!(store.items()[0].id, id);
+        assert_eq!(store.items()[0].ranges, vec![(0, 1)]);
+        assert_eq!(store.revision(), 1);
+        assert_eq!(
+            fixture.journal.event(0).unwrap()["payload"]["text"],
+            "full user text"
+        );
+        assert!(store.persist(&mut fixture.journal, stale).is_err());
+        assert_eq!(fixture.journal.seq, 1);
+        assert_eq!(store.items().len(), 1);
+    }
+    #[test]
+    fn prepared_boundary_requires_its_original_journal_position() {
+        let mut fixture = Fixture::new();
+        let mut store = ContextStore::default();
+        let (_, prepared) = store
+            .prepare_add("user", "text".into(), false, vec![], None, 0)
+            .unwrap();
+        fixture.journal.append("extension", json!({})).unwrap();
+        assert!(store.persist(&mut fixture.journal, prepared).is_err());
+        assert!(store.items().is_empty());
+        assert_eq!(store.revision(), 0);
+        assert_eq!(fixture.journal.seq, 1);
+    }
+    #[test]
+    fn failed_commit_never_admits_text_or_detaches_attachment_or_advances_revision() {
+        let mut fixture = Fixture::new();
+        let mut store = ContextStore::from_items(vec![item("c0", "image", true, Some(3))]);
+        store.configure_eviction(1, 0);
+        let transition = store.prepare_evict().unwrap().unwrap();
+        fixture.journal.failed = true;
+        assert!(store.persist(&mut fixture.journal, transition).is_err());
+        assert_eq!(store.items()[0].text, "image");
+        assert_eq!(store.raw_indices(), vec![3]);
+        assert_eq!(store.revision(), 0);
+        assert_eq!(fixture.journal.seq, 0);
+        let (_, add) = store
+            .prepare_add("user", "not admitted".into(), true, vec![], None, 0)
+            .unwrap();
+        assert!(store.persist(&mut fixture.journal, add).is_err());
+        assert_eq!(store.items().len(), 1);
+    }
+    #[test]
+    fn default_batch_policy_keeps_ten_recent_selected_outputs_and_never_selects_payload_implicitly()
+    {
+        let mut fixture = Fixture::new();
+        let outputs = (0..20)
+            .map(|n| item(&format!("c{n}"), &format!("selected {n}"), true, None))
+            .collect();
+        let mut store = ContextStore::from_items(outputs);
+        let prepared = store.prepare_evict().unwrap().unwrap();
+        assert_eq!(store.items().iter().filter(|i| i.output).count(), 20);
+        store.persist(&mut fixture.journal, prepared).unwrap();
+        assert_eq!(store.items().iter().filter(|i| i.output).count(), 10);
+        assert!(store.items()[0].text.starts_with("[Output omitted:"));
+        assert_eq!(store.items()[19].text, "selected 19");
+        assert_eq!(store.revision(), 1);
+        assert_eq!(
+            fixture.journal.event(0).unwrap()["payload"]["reason"],
+            "output_batch"
+        );
+        let metadata = store.metadata().to_string();
+        assert!(!metadata.contains("selected 19"));
+    }
+    #[test]
+    fn collapse_owns_range_and_attachment_changes_and_keeps_endpoint_text_only() {
+        let mut fixture = Fixture::new();
+        let mut first = item("start", &"x".repeat(2000), true, Some(0));
+        first.ranges = vec![(0, 2)];
+        let mut end = item("end", "preserved endpoint", true, Some(1));
+        end.ranges = vec![(2, 3)];
+        let outside = item("outside", "still attached", true, Some(2));
+        let mut store = ContextStore::from_items(vec![first, end, outside]);
+        let collapse = json!({"start":"start","end":"end","summary":"brief","source":"agent.context.collapse('start','end','brief')"});
+        let transition = store.prepare_collapse(&collapse, None).unwrap();
+        assert_eq!(store.raw_indices(), vec![0, 1, 2]);
+        store.persist(&mut fixture.journal, transition).unwrap();
+        assert_eq!(store.items()[0].role, "summary");
+        assert!(!store.items()[0].output);
+        assert!(store.items()[0]
+            .text
+            .contains("[Preserved boundary]\npreserved endpoint"));
+        assert_eq!(store.items()[0].ranges, vec![(0, 2), (2, 3)]);
+        assert_eq!(store.raw_indices(), vec![2]);
+        assert_eq!(
+            fixture.journal.event(0).unwrap()["payload"]["ranges"],
+            json!([[0, 2]])
+        );
+        assert!(store
+            .prepare_collapse(
+                &json!({"start":"outside","end":"start","source":"short"}),
+                None
+            )
+            .is_err());
+    }
+    #[test]
+    fn restoration_keeps_legacy_attachment_inheritance_without_resurrecting_replaced_text() {
+        let mut store = ContextStore::from_items(vec![item("c0", "original", false, Some(3))]);
+        let mut legacy = item_json(&store.items()[0]);
+        legacy.as_object_mut().unwrap().remove("raw_index");
+        store.restore_replace(&[legacy.clone()]).unwrap();
+        assert_eq!(store.raw_indices(), vec![3]);
+        legacy["text"] = json!("replacement");
+        store.restore_replace(&[legacy]).unwrap();
+        assert!(store.raw_indices().is_empty());
+        assert_eq!(store.revision(), 2);
+        store.restore_attachment("missing", 7).unwrap();
+        assert!(store.raw_indices().is_empty());
+        store.restore_attachment("c0", 4).unwrap();
+        assert!(store.restore_attachment("c0", 5).is_err());
+        assert_eq!(store.raw_indices(), vec![4]);
+        assert_eq!(store.revision(), 2);
+    }
+    #[test]
+    fn bounded_selection_counts_unicode_and_metadata_contains_no_selected_payload() {
+        let store =
+            ContextStore::from_items(vec![item("c0", "PRIVATE_SELECTED_TEXT", false, None)]);
+        let valid = json!({"start":1,"stop":3,"selected_text":"🙂λ"});
+        assert_eq!(
+            store.validate_text_selection(&valid, 0, 1000).unwrap(),
+            "🙂λ"
+        );
+        assert!(store.validate_text_selection(&valid, 0, 1).is_err());
+        assert!(store
+            .validate_text_selection(
+                &json!({"start":0,"stop":8001,"selected_text":"a"}),
+                0,
+                10000
+            )
+            .is_err());
+        assert!(store
+            .validate_text_selection(
+                &json!({"start":false,"stop":1,"selected_text":"a"}),
+                0,
+                1000
+            )
+            .is_err());
+        assert!(!store
+            .metadata()
+            .to_string()
+            .contains("PRIVATE_SELECTED_TEXT"));
+    }
 }
 
 // Cache percentages are ratios of cumulative token counts, never an average
@@ -321,6 +1780,1019 @@ mod cache_accounting_tests {
     }
 }
 
+// Decode once at the journal boundary. Projections interpret ownership and
+// recovery separately, but share event names, versions and structural fields.
+macro_rules! journal_event_kinds {
+    ($($variant:ident => $name:literal),* $(,)?) => {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum JournalEventKind { $($variant,)* Unknown(String) }
+        impl JournalEventKind {
+            fn decode(name: &str) -> Self {
+                match name { $($name => Self::$variant,)* _ => Self::Unknown(name.into()) }
+            }
+            fn label(&self) -> &str {
+                match self { $(Self::$variant => $name,)* Self::Unknown(name) => name }
+            }
+        }
+    };
+}
+journal_event_kinds! {
+    Accepted => "accepted", Attachment => "attachment", Cancel => "cancel",
+    CellEnd => "cell_end", CellRecord => "cell_record", CellStart => "cell_start",
+    Code => "code", Completion => "completion", ContextAdd => "context_add",
+    ContextExported => "context_exported", ContextReplace => "context_replace",
+    InputClosed => "input_closed", InputPrompt => "input_prompt", Intent => "intent",
+    LocalCommandAccepted => "local_command_accepted", LocalCommandCancelled => "local_command_cancelled",
+    LocalCommandCompleted => "local_command_completed", ModelCatalogRefresh => "model_catalog_refresh",
+    OperationComplete => "operation_complete", ProviderAttempt => "provider_attempt",
+    ProviderAttemptFailed => "provider_attempt_failed", ProviderCancelled => "provider_cancelled",
+    ProviderResponseDiscarded => "provider_response_discarded", ProviderRetry => "provider_retry",
+    ProviderRetrySuperseded => "provider_retry_superseded", QueueArrival => "queue_arrival",
+    QueueDelivered => "queue_delivered", QueueDispatched => "queue_dispatched",
+    QueueRestored => "queue_restored", QueueCancelled => "queue_cancelled", Raw => "raw",
+    Request => "request", Response => "response", Say => "say", SettingsChange => "settings_change",
+    SettingsInitial => "settings_initial", ShellCompletion => "shell_completion",
+    ShellTimeout => "shell_timeout", SkillsSnapshot => "skills_snapshot", StartupBegin => "startup_begin",
+    StartupBlocked => "startup_blocked", StartupEnd => "startup_end", StartupEntry => "startup_entry",
+    Stdin => "stdin", Stream => "stream", StreamClosed => "stream_closed", StreamComplete => "stream_complete",
+    TaskSettled => "task_settled", TaskState => "task_state", Usage => "usage", User => "user",
+    WakeupState => "wakeup_state", WorkerReset => "worker_reset",
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JournalVersion {
+    Legacy,
+    V1,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RecordCollection {
+    Code,
+    User,
+    Stdout,
+    Stderr,
+    Stdin,
+    Raw,
+    Say,
+    Requests,
+    Responses,
+    Usage,
+    Events,
+}
+impl RecordCollection {
+    fn decode(name: &str) -> Result<Self> {
+        match name {
+            "code" => Ok(Self::Code),
+            "user" => Ok(Self::User),
+            "stdout" => Ok(Self::Stdout),
+            "stderr" => Ok(Self::Stderr),
+            "stdin" => Ok(Self::Stdin),
+            "raw" => Ok(Self::Raw),
+            "say" => Ok(Self::Say),
+            "requests" => Ok(Self::Requests),
+            "responses" => Ok(Self::Responses),
+            "usage" => Ok(Self::Usage),
+            "events" => Ok(Self::Events),
+            _ => Err("invalid journal record collection".into()),
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::User => "user",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+            Self::Stdin => "stdin",
+            Self::Raw => "raw",
+            Self::Say => "say",
+            Self::Requests => "requests",
+            Self::Responses => "responses",
+            Self::Usage => "usage",
+            Self::Events => "events",
+        }
+    }
+}
+#[derive(Clone, Debug)]
+enum ArchivedRecord {
+    Value(Value),
+    EventReference(usize),
+    StreamChunks(Vec<usize>),
+}
+#[derive(Default)]
+struct HistoryArchive {
+    records: HashMap<RecordCollection, Vec<ArchivedRecord>>,
+}
+impl HistoryArchive {
+    fn len(&self, collection: RecordCollection) -> usize {
+        self.records.get(&collection).map_or(0, Vec::len)
+    }
+    fn append_record(
+        &mut self,
+        collection: RecordCollection,
+        value: Value,
+        journal_sequence: usize,
+    ) -> usize {
+        let record = if matches!(
+            collection,
+            RecordCollection::Raw
+                | RecordCollection::Requests
+                | RecordCollection::Responses
+                | RecordCollection::Say
+                | RecordCollection::Usage
+                | RecordCollection::Stdin
+        ) && journal_sequence > 0
+        {
+            ArchivedRecord::EventReference(journal_sequence - 1)
+        } else {
+            ArchivedRecord::Value(value)
+        };
+        self.append(collection, record)
+    }
+    fn append(&mut self, collection: RecordCollection, record: ArchivedRecord) -> usize {
+        assert_ne!(
+            collection,
+            RecordCollection::Events,
+            "events are journal coordinates"
+        );
+        let records = self.records.entry(collection).or_default();
+        let index = records.len();
+        records.push(record);
+        index
+    }
+    fn restore_reference(&mut self, collection: RecordCollection, sequence: usize) -> usize {
+        self.append(collection, ArchivedRecord::EventReference(sequence))
+    }
+    fn set_stream_snapshot(
+        &mut self,
+        collection: RecordCollection,
+        index: usize,
+        sequence: usize,
+    ) -> Result<()> {
+        if !matches!(
+            collection,
+            RecordCollection::Stdout | RecordCollection::Stderr
+        ) {
+            return Err("invalid stream collection".into());
+        }
+        let records = self.records.entry(collection).or_default();
+        while records.len() <= index {
+            records.push(ArchivedRecord::StreamChunks(Vec::new()));
+        }
+        let ArchivedRecord::StreamChunks(chunks) = &mut records[index] else {
+            return Err("invalid stream history".into());
+        };
+        chunks.push(sequence);
+        Ok(())
+    }
+    fn stream_chunks(&self, collection: RecordCollection, index: usize) -> Option<&[usize]> {
+        match self.records.get(&collection)?.get(index)? {
+            ArchivedRecord::StreamChunks(chunks) => Some(chunks),
+            _ => None,
+        }
+    }
+    fn preview_bytes(
+        &self,
+        collection: RecordCollection,
+        index: usize,
+        journal: &Journal,
+    ) -> Result<Vec<u8>> {
+        let record = self
+            .records
+            .get(&collection)
+            .and_then(|records| records.get(index))
+            .ok_or("missing task stream")?;
+        let mut bytes = Vec::new();
+        match record {
+            ArchivedRecord::StreamChunks(chunks) => {
+                for sequence in chunks {
+                    let event = journal.decoded_event(*sequence)?;
+                    let JournalEventData::Stream(stream) = event.data else {
+                        return Err("invalid stream chunk event".into());
+                    };
+                    let chunk =
+                        B64.decode(stream.base64.as_deref().ok_or("missing stream bytes")?)?;
+                    bytes.extend_from_slice(&chunk[..chunk.len().min(16384 - bytes.len())]);
+                    if bytes.len() >= 16384
+                        || bytes.iter().filter(|byte| **byte == b'\n').count() >= 12
+                    {
+                        break;
+                    }
+                }
+            }
+            ArchivedRecord::Value(value) => {
+                let text = value.as_str().ok_or("invalid task stream")?;
+                bytes.extend_from_slice(&text.as_bytes()[..text.len().min(16384)]);
+            }
+            _ => return Err("invalid task stream".into()),
+        }
+        Ok(bytes)
+    }
+    fn literal_text(&self, collection: RecordCollection, index: usize) -> Option<&str> {
+        match self.records.get(&collection)?.get(index)? {
+            ArchivedRecord::Value(value) => value.as_str(),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.records.values().all(Vec::is_empty)
+    }
+    fn value(
+        &self,
+        collection: RecordCollection,
+        index: usize,
+        journal: &Journal,
+    ) -> Result<Value> {
+        if collection == RecordCollection::Events {
+            return journal.event(index);
+        }
+        let record = self
+            .records
+            .get(&collection)
+            .and_then(|records| records.get(index))
+            .ok_or("history index missing")?;
+        match record {
+            ArchivedRecord::Value(value) => Ok(value.clone()),
+            ArchivedRecord::EventReference(sequence) => {
+                let event = journal.decoded_event(*sequence)?;
+                Ok(match collection {
+                    RecordCollection::Code => event.payload()["source"].clone(),
+                    RecordCollection::User | RecordCollection::Stdin | RecordCollection::Say => {
+                        event.payload()["text"].clone()
+                    }
+                    _ => event.payload().clone(),
+                })
+            }
+            ArchivedRecord::StreamChunks(chunks) => {
+                let mut bytes = Vec::new();
+                for sequence in chunks {
+                    let event = journal.decoded_event(*sequence)?;
+                    let JournalEventData::Stream(stream) = event.data else {
+                        return Err("invalid stream chunk event".into());
+                    };
+                    bytes.extend(
+                        B64.decode(stream.base64.as_deref().ok_or("missing stream bytes")?)?,
+                    );
+                }
+                Ok(json!(String::from_utf8_lossy(&bytes)))
+            }
+        }
+    }
+}
+#[cfg(test)]
+mod history_archive_recovery_tests {
+    use super::*;
+    use crate::test_support::{JournalFixture, TestDirectory};
+
+    #[test]
+    fn archive_records_remain_zero_based_and_event_payloads_stay_opaque() {
+        let mut fixture = JournalFixture::new();
+        let mut archive = HistoryArchive::default();
+        fixture.start(7, "cell-seven", None);
+        assert_eq!(
+            archive.append_record(
+                RecordCollection::Code,
+                json!("print('seven')"),
+                fixture.journal.seq
+            ),
+            0
+        );
+        assert_eq!(
+            archive
+                .value(RecordCollection::Code, 0, &fixture.journal)
+                .unwrap(),
+            json!("print('seven')")
+        );
+        let sequence = fixture
+            .journal
+            .append(
+                "response",
+                json!({"operation":"provider-seven", "body":{"$event":123,"opaque":[1,2]}}),
+            )
+            .unwrap();
+        assert_eq!(
+            archive.append_record(
+                RecordCollection::Responses,
+                Value::Null,
+                fixture.journal.seq
+            ),
+            0
+        );
+        assert_eq!(
+            archive
+                .value(RecordCollection::Responses, 0, &fixture.journal)
+                .unwrap(),
+            fixture.journal.event(sequence).unwrap()["payload"]
+        );
+        assert_eq!(archive.len(RecordCollection::Events), 0);
+        assert_eq!(
+            archive
+                .value(RecordCollection::Events, sequence, &fixture.journal)
+                .unwrap()["kind"],
+            "response"
+        );
+        assert!(RecordCollection::decode("not-a-collection").is_err());
+    }
+
+    #[test]
+    fn archive_capture_and_resume_share_typed_stream_references() {
+        let mut fixture = JournalFixture::new();
+        let mut archive = HistoryArchive::default();
+        for text in ["hello ", "λ🙂"] {
+            CaptureSession { journal: &mut fixture.journal, history: &mut archive, owner: None }
+                .commit_stream("stdout", 0, json!({"operation":"shell-one","collection":"stdout","index":0,"base64":B64.encode(text)})).unwrap();
+        }
+        assert_eq!(
+            archive
+                .value(RecordCollection::Stdout, 0, &fixture.journal)
+                .unwrap(),
+            json!("hello λ🙂")
+        );
+        let path = fixture.journal.path.clone();
+        drop(fixture.journal);
+        let journal = Journal::open(path).unwrap();
+        let mut restored = HistoryArchive::default();
+        for sequence in 0..journal.seq {
+            let event = journal.decoded_event(sequence).unwrap();
+            if let JournalEventData::Stream(stream) = event.data {
+                restored
+                    .set_stream_snapshot(stream.collection, stream.record_index, sequence)
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            restored.stream_chunks(RecordCollection::Stdout, 0),
+            Some(&[0, 1][..])
+        );
+        assert_eq!(
+            restored
+                .value(RecordCollection::Stdout, 0, &journal)
+                .unwrap(),
+            json!("hello λ🙂")
+        );
+    }
+
+    #[test]
+    fn recovery_projection_is_incremental_stable_on_resume_and_never_replays() {
+        let mut fixture = JournalFixture::new();
+        fixture
+            .journal
+            .append(
+                "intent",
+                json!({"operation":"done","type":"shell","command":"SECRET_BODY"}),
+            )
+            .unwrap();
+        fixture
+            .journal
+            .append(
+                "operation_complete",
+                json!({"operation":"done","type":"shell"}),
+            )
+            .unwrap();
+        fixture
+            .journal
+            .append("intent", json!({"operation":"pending","type":"provider"}))
+            .unwrap();
+        fixture.journal.append("provider_attempt_failed", json!({"operation":"pending","attempt":2,"retry":1,"billing_unknown":true,"body":"SECRET_BODY"})).unwrap();
+        fixture
+            .journal
+            .append(
+                "queue_arrival",
+                json!({"command_id":"queued","command":{"kind":"submit"},"user_index":0}),
+            )
+            .unwrap();
+        fixture
+            .journal
+            .append("queue_restored", json!({"command_id":"queued"}))
+            .unwrap();
+        let snapshot = fixture.journal.recovery_index.snapshot().unwrap();
+        assert_eq!(snapshot["operations"][0]["state"], "completed");
+        assert_eq!(snapshot["operations"][0]["intent_event"], 0);
+        assert_eq!(snapshot["operations"][0]["completion_event"], 1);
+        assert_eq!(snapshot["operations"][1]["state"], "unknown");
+        assert_eq!(snapshot["unknown_provider_attempts"][0]["attempt"], 2);
+        assert_eq!(snapshot["unknown_provider_attempts"][0]["retry"], 1);
+        assert_eq!(snapshot["queues"][0]["state"], "restored");
+        assert!(!snapshot.to_string().contains("SECRET_BODY"));
+        assert!(snapshot["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|value| value["replay_allowed"] == false));
+        let path = fixture.journal.path.clone();
+        drop(fixture.journal);
+        let restored = Journal::open(path).unwrap();
+        assert_eq!(snapshot, restored.recovery_index.snapshot().unwrap());
+    }
+
+    #[test]
+    fn recovery_uses_decoder_version_and_does_not_apply_failed_appends() {
+        let directory = TestDirectory::new("py-recovery-legacy");
+        let path = directory.join("legacy.jsonl");
+        let mut event = JournalFixture::envelope("future-extension", json!({"opaque":true}));
+        event.as_object_mut().unwrap().remove("schema_version");
+        fs::write(&path, format!("{event}\n")).unwrap();
+        let mut journal = Journal::open(path).unwrap();
+        assert_eq!(
+            journal.recovery_index.snapshot().unwrap()["legacy_events"],
+            1
+        );
+        let before = journal.recovery_index.snapshot().unwrap();
+        journal.failed = true;
+        assert!(journal
+            .append(
+                "intent",
+                json!({"operation":"not-committed","type":"shell"})
+            )
+            .is_err());
+        assert_eq!(before, journal.recovery_index.snapshot().unwrap());
+    }
+}
+#[derive(Clone, Debug)]
+struct JournalCellStart {
+    cell: usize,
+    parent_cell: Option<usize>,
+    operation: String,
+    // None differs from Some(empty): legacy events infer input attribution.
+    user_record_indices: Option<Vec<usize>>,
+    input_raw_indices: Option<Vec<usize>>,
+    generation_request: Option<String>,
+    explicit_generation: bool,
+}
+#[derive(Clone, Debug)]
+struct JournalCellEnd {
+    cell: usize,
+    status: String,
+    elapsed_ms: u64,
+}
+#[derive(Clone, Debug)]
+struct JournalCellRecord {
+    cell: usize,
+    collection: RecordCollection,
+    record_index: usize,
+}
+#[derive(Clone, Debug)]
+struct JournalTextRecord {
+    text: String,
+    record_index: Option<usize>,
+    operation: Option<String>,
+}
+#[derive(Clone, Debug)]
+struct JournalStream {
+    collection: RecordCollection,
+    record_index: usize,
+    operation: Option<String>,
+    // The base64 bytes stay opaque until history selection needs their payload.
+    base64: Option<String>,
+    complete: Option<bool>,
+}
+#[derive(Clone, Debug)]
+struct JournalProviderRecord {
+    operation: Option<String>,
+    attempt: Option<u64>,
+    retry: Option<u64>,
+    billing_unknown: bool,
+}
+#[derive(Clone, Debug)]
+struct JournalIntent {
+    operation: Option<String>,
+    operation_type: Option<String>,
+}
+#[derive(Clone)]
+enum JournalEventData {
+    CellStart(JournalCellStart),
+    CellEnd(JournalCellEnd),
+    CellRecord(JournalCellRecord),
+    TextRecord(JournalTextRecord),
+    Stream(JournalStream),
+    Intent(JournalIntent),
+    ProviderRecord(JournalProviderRecord),
+    ContextAdd(Item),
+    ContextReplace(Vec<Value>),
+    WorkerReset {
+        generation: usize,
+        active_cell: Option<usize>,
+        explicit_active_cell: bool,
+    },
+    // Auth/provider bodies, task metadata, Python-facing data and unknown
+    // extensions retain JSON. Their domain-specific owners validate semantics.
+    Opaque,
+}
+#[derive(Clone)]
+struct JournalEvent {
+    seq: usize,
+    schema_version: JournalVersion,
+    session_id: Option<String>,
+    kind: JournalEventKind,
+    data: JournalEventData,
+    raw: Value,
+}
+fn journal_index(value: &Value, error: &'static str) -> Result<usize> {
+    value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| error.into())
+}
+fn journal_optional_index(
+    payload: &Value,
+    name: &str,
+    error: &'static str,
+) -> Result<Option<usize>> {
+    match payload.get(name).filter(|value| !value.is_null()) {
+        Some(value) => journal_index(value, error).map(Some),
+        None => Ok(None),
+    }
+}
+fn journal_optional_string(
+    payload: &Value,
+    name: &str,
+    error: &'static str,
+) -> Result<Option<String>> {
+    match payload.get(name).filter(|value| !value.is_null()) {
+        Some(value) => Ok(Some(value.as_str().ok_or(error)?.to_owned())),
+        None => Ok(None),
+    }
+}
+fn journal_indices(payload: &Value, name: &str, error: &'static str) -> Result<Option<Vec<usize>>> {
+    payload
+        .get(name)
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or(error)?
+                .iter()
+                .map(|value| journal_index(value, error))
+                .collect()
+        })
+        .transpose()
+}
+impl JournalEvent {
+    fn decode(raw: Value, expected_sequence: usize) -> Result<Self> {
+        let envelope = raw.as_object().ok_or("journal event must be an object")?;
+        let schema_version = match envelope.get("schema_version") {
+            None => JournalVersion::Legacy,
+            Some(value) => match value.as_u64().ok_or("invalid journal schema version")? {
+                0 => JournalVersion::Legacy,
+                1 => JournalVersion::V1,
+                _ => return Err("unsupported journal schema version".into()),
+            },
+        };
+        let seq = journal_index(&raw["seq"], "invalid journal sequence")?;
+        if seq != expected_sequence {
+            return Err("invalid journal sequence".into());
+        }
+        let kind = JournalEventKind::decode(
+            raw["kind"]
+                .as_str()
+                .filter(|kind| !kind.is_empty())
+                .ok_or("journal event kind missing")?,
+        );
+        let session_id = journal_optional_string(&raw, "session_id", "invalid journal session ID")?;
+        if session_id
+            .as_deref()
+            .is_some_and(|identity| !valid_journal_session_id(identity))
+        {
+            return Err("invalid journal session ID".into());
+        }
+        let payload = envelope
+            .get("payload")
+            .ok_or("journal event payload missing")?;
+        if !matches!(&kind, JournalEventKind::Unknown(_)) && !payload.is_object() {
+            return Err("known journal event payload must be an object".into());
+        }
+        let data = Self::decode_data(&kind, payload)?;
+        Ok(Self {
+            seq,
+            schema_version,
+            session_id,
+            kind,
+            data,
+            raw,
+        })
+    }
+    fn payload(&self) -> &Value {
+        &self.raw["payload"]
+    }
+    fn into_raw(self) -> Value {
+        self.raw
+    }
+    fn decode_data(kind: &JournalEventKind, p: &Value) -> Result<JournalEventData> {
+        use JournalEventKind as K;
+        Ok(match kind {
+            K::CellStart => {
+                let cell = journal_index(&p["cell"], "invalid cell number")?;
+                if cell == 0 {
+                    return Err("invalid cell number".into());
+                }
+                let parent_cell = match p.get("parent_cell") {
+                    Some(value) if value.is_null() => None,
+                    Some(value) => Some(journal_index(value, "invalid parent cell")?),
+                    None => return Err("parent cell provenance missing".into()),
+                };
+                if parent_cell == Some(0) {
+                    return Err("invalid parent cell".into());
+                }
+                JournalEventData::CellStart(JournalCellStart {
+                    cell,
+                    parent_cell,
+                    operation: p["operation"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("cell operation missing")?
+                        .into(),
+                    user_record_indices: journal_indices(
+                        p,
+                        "user_record_indices",
+                        "invalid cell input provenance",
+                    )?,
+                    input_raw_indices: journal_indices(
+                        p,
+                        "input_raw_indices",
+                        "invalid cell raw input provenance",
+                    )?,
+                    generation_request: journal_optional_string(
+                        p,
+                        "generation_request",
+                        "invalid generation provenance",
+                    )?,
+                    explicit_generation: p.get("generation_request").is_some(),
+                })
+            }
+            K::CellEnd => {
+                let cell = journal_index(&p["cell"], "invalid cell end")?;
+                if cell == 0 {
+                    return Err("invalid cell end".into());
+                }
+                JournalEventData::CellEnd(JournalCellEnd {
+                    cell,
+                    status: p["status"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("cell end status missing")?
+                        .into(),
+                    elapsed_ms: p["elapsed_ms"]
+                        .as_u64()
+                        .ok_or("cell end elapsed time missing")?,
+                })
+            }
+            K::CellRecord => {
+                let collection = RecordCollection::decode(
+                    p["collection"]
+                        .as_str()
+                        .ok_or("invalid cell record collection")?,
+                )?;
+                if matches!(
+                    collection,
+                    RecordCollection::Code
+                        | RecordCollection::Stdout
+                        | RecordCollection::Stderr
+                        | RecordCollection::Events
+                ) {
+                    return Err("invalid cell record collection".into());
+                }
+                let cell = journal_index(&p["cell"], "cell record owner missing")?;
+                if cell == 0 {
+                    return Err("cell record owner missing".into());
+                }
+                JournalEventData::CellRecord(JournalCellRecord {
+                    cell,
+                    collection,
+                    record_index: journal_index(&p["record_index"], "cell record index missing")?,
+                })
+            }
+            K::Code | K::User => {
+                let (key, error) = if *kind == K::Code {
+                    ("source", "code source missing")
+                } else {
+                    ("text", "user text missing")
+                };
+                JournalEventData::TextRecord(JournalTextRecord {
+                    text: p[key].as_str().ok_or(error)?.into(),
+                    record_index: journal_optional_index(
+                        p,
+                        "index",
+                        "invalid journal text record index",
+                    )?,
+                    operation: journal_optional_string(
+                        p,
+                        "operation",
+                        "invalid journal record operation",
+                    )?,
+                })
+            }
+            K::Stream | K::StreamComplete | K::StreamClosed => {
+                let collection = RecordCollection::decode(
+                    p["collection"]
+                        .as_str()
+                        .ok_or("invalid stream collection")?,
+                )?;
+                if !matches!(
+                    collection,
+                    RecordCollection::Stdout | RecordCollection::Stderr
+                ) {
+                    return Err("invalid stream collection".into());
+                }
+                let chunk = *kind == K::Stream;
+                let index = if chunk {
+                    &p["index"]
+                } else {
+                    p["metadata"]
+                        .get("record_index")
+                        .filter(|value| !value.is_null())
+                        .unwrap_or(&p["metadata"]["index"])
+                };
+                JournalEventData::Stream(JournalStream {
+                    collection,
+                    record_index: journal_index(index, "stream record index missing")?,
+                    operation: journal_optional_string(p, "operation", "invalid stream operation")?,
+                    base64: if chunk {
+                        Some(p["base64"].as_str().ok_or("stream base64 missing")?.into())
+                    } else {
+                        None
+                    },
+                    complete: if chunk {
+                        None
+                    } else {
+                        Some(
+                            p["metadata"]["complete"]
+                                .as_bool()
+                                .ok_or("stream completeness missing")?,
+                        )
+                    },
+                })
+            }
+            K::Intent | K::OperationComplete => {
+                let operation_type = journal_optional_string(p, "type", "invalid operation type")?;
+                let operation = journal_optional_string(p, "operation", "invalid operation ID")?;
+                if matches!(operation_type.as_deref(), Some("provider" | "image"))
+                    && operation.is_none()
+                {
+                    return Err("provider operation missing".into());
+                }
+                JournalEventData::Intent(JournalIntent {
+                    operation,
+                    operation_type,
+                })
+            }
+            K::Request
+            | K::Response
+            | K::Usage
+            | K::ProviderAttempt
+            | K::ProviderAttemptFailed
+            | K::ProviderCancelled
+            | K::ProviderResponseDiscarded
+            | K::ProviderRetry
+            | K::ProviderRetrySuperseded => {
+                let number = |name| -> Result<Option<u64>> {
+                    p.get(name)
+                        .map(|value| {
+                            value
+                                .as_u64()
+                                .ok_or_else(|| "invalid provider attempt counter".into())
+                        })
+                        .transpose()
+                };
+                let unknown = |name| -> Result<bool> {
+                    p.get(name)
+                        .map(|value| {
+                            value
+                                .as_bool()
+                                .ok_or_else(|| "invalid provider uncertainty flag".into())
+                        })
+                        .transpose()
+                        .map(|value| value.unwrap_or(false))
+                };
+                let billing_unknown = unknown("billing_unknown")?;
+                let outcome_unknown = unknown("outcome_unknown")?;
+                JournalEventData::ProviderRecord(JournalProviderRecord {
+                    // Request attribution was historically supplied by its intent.
+                    operation: journal_optional_string(
+                        p,
+                        "operation",
+                        "invalid provider operation",
+                    )?,
+                    attempt: number("attempt")?,
+                    retry: number("retry")?,
+                    billing_unknown: billing_unknown
+                        || outcome_unknown
+                        || p["billing"] == "unknown",
+                })
+            }
+            K::ContextAdd => JournalEventData::ContextAdd(parse_item(p)?),
+            K::ContextReplace => JournalEventData::ContextReplace(
+                p["items"]
+                    .as_array()
+                    .ok_or("invalid context journal")?
+                    .clone(),
+            ),
+            K::WorkerReset => {
+                let active_cell = journal_optional_index(
+                    p,
+                    "active_cell",
+                    "invalid worker reset cell provenance",
+                )?;
+                if active_cell == Some(0) {
+                    return Err("invalid worker reset cell provenance".into());
+                }
+                JournalEventData::WorkerReset {
+                    generation: journal_index(&p["generation"], "invalid worker generation")?,
+                    active_cell,
+                    explicit_active_cell: p.get("active_cell").is_some(),
+                }
+            }
+            _ => JournalEventData::Opaque,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryOperationState {
+    Unknown,
+    Completed,
+    Cancelled,
+}
+impl RecoveryOperationState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+struct RecoveryOperation {
+    operation: String,
+    kind: Option<String>,
+    state: RecoveryOperationState,
+    intent_event: usize,
+    completion_event: Option<usize>,
+}
+struct RecoveryStream {
+    operation: String,
+    collection: RecordCollection,
+    index: usize,
+    complete: Option<bool>,
+    chunks: usize,
+    counts: Option<Value>,
+}
+struct RecoveryQueue {
+    command_id: String,
+    command: Value,
+    user_index: Value,
+    state: &'static str,
+}
+struct RecoveryUnknownAttempt {
+    operation: Option<String>,
+    attempt: Option<u64>,
+    retry: Option<u64>,
+}
+#[derive(Default)]
+struct RecoveryIndex {
+    operations: std::collections::BTreeMap<String, RecoveryOperation>,
+    streams: std::collections::BTreeMap<(String, String, usize), RecoveryStream>,
+    queues: std::collections::BTreeMap<String, RecoveryQueue>,
+    unknown_attempts: Vec<RecoveryUnknownAttempt>,
+    legacy_events: usize,
+    error: Option<&'static str>,
+}
+impl RecoveryIndex {
+    fn apply(&mut self, event: &JournalEvent) {
+        if event.schema_version == JournalVersion::Legacy {
+            self.legacy_events += 1;
+        }
+        let payload = event.payload();
+        match &event.data {
+            JournalEventData::Intent(intent) if event.kind == JournalEventKind::Intent => {
+                if let Some(operation) = &intent.operation {
+                    self.operations.insert(
+                        operation.clone(),
+                        RecoveryOperation {
+                            operation: operation.clone(),
+                            kind: intent.operation_type.clone(),
+                            state: RecoveryOperationState::Unknown,
+                            intent_event: event.seq,
+                            completion_event: None,
+                        },
+                    );
+                }
+            }
+            JournalEventData::Stream(record) => {
+                let Some(operation) = &record.operation else {
+                    self.error.get_or_insert("stream operation missing");
+                    return;
+                };
+                let key = (
+                    operation.clone(),
+                    record.collection.label().to_owned(),
+                    record.record_index,
+                );
+                if event.kind == JournalEventKind::Stream {
+                    let stream = self.streams.entry(key).or_insert_with(|| RecoveryStream {
+                        operation: operation.clone(),
+                        collection: record.collection,
+                        index: record.record_index,
+                        complete: Some(false),
+                        chunks: 0,
+                        counts: None,
+                    });
+                    stream.chunks += 1;
+                } else if let Some(stream) = self.streams.get_mut(&key) {
+                    stream.complete = record.complete;
+                    stream.counts = Some(payload["metadata"].clone());
+                }
+            }
+            JournalEventData::ProviderRecord(record) => {
+                if event.kind == JournalEventKind::ProviderAttemptFailed && record.billing_unknown {
+                    self.unknown_attempts.push(RecoveryUnknownAttempt {
+                        operation: record.operation.clone(),
+                        attempt: record.attempt,
+                        retry: record.retry,
+                    });
+                }
+            }
+            _ => {}
+        }
+        match &event.kind {
+            JournalEventKind::Completion
+            | JournalEventKind::ShellCompletion
+            | JournalEventKind::OperationComplete
+            | JournalEventKind::TaskSettled
+            | JournalEventKind::ProviderCancelled => {
+                if let Some(operation) = payload["operation"]
+                    .as_str()
+                    .or(payload["command_id"].as_str())
+                {
+                    if let Some(record) = self.operations.get_mut(operation) {
+                        record.state = if payload["stdout"]["complete"] == false
+                            || payload["status"] == "worker_crashed"
+                        {
+                            RecoveryOperationState::Unknown
+                        } else if event.kind == JournalEventKind::ProviderCancelled {
+                            RecoveryOperationState::Cancelled
+                        } else {
+                            RecoveryOperationState::Completed
+                        };
+                        record.completion_event = Some(event.seq);
+                    }
+                }
+            }
+            JournalEventKind::QueueArrival => {
+                if let Some(command_id) = payload["command_id"].as_str() {
+                    self.queues.insert(
+                        command_id.to_owned(),
+                        RecoveryQueue {
+                            command_id: command_id.to_owned(),
+                            command: payload["command"].clone(),
+                            user_index: payload["user_index"].clone(),
+                            state: "pending",
+                        },
+                    );
+                }
+            }
+            JournalEventKind::QueueDelivered
+            | JournalEventKind::QueueDispatched
+            | JournalEventKind::QueueRestored
+            | JournalEventKind::QueueCancelled => {
+                if let Some(queue) = payload["command_id"]
+                    .as_str()
+                    .and_then(|id| self.queues.get_mut(id))
+                {
+                    queue.state = match event.kind {
+                        JournalEventKind::QueueDelivered => "delivered",
+                        JournalEventKind::QueueDispatched => "dispatched",
+                        JournalEventKind::QueueRestored => "restored",
+                        _ => "cancelled",
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    fn snapshot(&self) -> Result<Value> {
+        if let Some(error) = self.error {
+            return Err(error.into());
+        }
+        let operations = self.operations.values().map(|record| {
+            let mut value = json!({"operation":record.operation,"type":record.kind,
+                "state":record.state.label(),"replay_allowed":false,"intent_event":record.intent_event});
+            if let Some(sequence) = record.completion_event { value["completion_event"] = json!(sequence); }
+            value
+        }).collect::<Vec<_>>();
+        let streams = self.streams.values().map(|record| {
+            let mut value = json!({"operation":record.operation,"collection":record.collection.label(),
+                "index":record.index,"complete":record.complete,"chunks":record.chunks});
+            if let Some(counts) = &record.counts { value["counts"] = counts.clone(); }
+            value
+        }).collect::<Vec<_>>();
+        let queues = self.queues.values().map(|record| json!({"command_id":record.command_id,
+            "command":record.command,"user_index":record.user_index,"state":record.state,"auto_dispatch":false})).collect::<Vec<_>>();
+        let unknown_attempts = self.unknown_attempts.iter().map(|record| json!({"operation":record.operation,
+            "attempt":record.attempt,"retry":record.retry,"billing":"unknown","replay_allowed":false})).collect::<Vec<_>>();
+        Ok(
+            json!({"operations":operations,"streams":streams,"queues":queues,
+            "unknown_provider_attempts":unknown_attempts,"legacy_events":self.legacy_events,
+            "policy":"Unknown outcome is never permission to replay. Fresh Python; captured chunks only."}),
+        )
+    }
+}
 struct Journal {
     file: File,
     offsets: Vec<(u64, u64)>,
@@ -329,6 +2801,10 @@ struct Journal {
     session_id: String,
     seq: usize,
     failed: bool,
+    history_index: HistoryIndex,
+    recovery_index: RecoveryIndex,
+    #[cfg(test)]
+    event_reads: std::cell::RefCell<Vec<usize>>,
 }
 fn valid_journal_session_id(identity: &str) -> bool {
     !identity.is_empty()
@@ -352,6 +2828,8 @@ impl Journal {
         let mut reader = BufReader::new(File::open(&path)?);
         let mut offsets = vec![];
         let mut session_id: Option<String> = None;
+        let mut history_index = HistoryIndex::default();
+        let mut recovery_index = RecoveryIndex::default();
         let mut position = 0u64;
         let mut line = Vec::new();
         loop {
@@ -367,18 +2845,8 @@ impl Journal {
                 file.sync_all()?;
                 break;
             }
-            let value: Value = serde_json::from_slice(&line)?;
-            if value["seq"].as_u64() != Some(offsets.len() as u64) {
-                return Err("invalid journal sequence".into());
-            }
-            if let Some(identity) = value
-                .get("session_id")
-                .filter(|identity| !identity.is_null())
-            {
-                let identity = identity
-                    .as_str()
-                    .filter(|identity| valid_journal_session_id(identity))
-                    .ok_or("invalid journal session ID")?;
+            let event = JournalEvent::decode(serde_json::from_slice(&line)?, offsets.len())?;
+            if let Some(identity) = event.session_id.as_deref() {
                 if session_id
                     .as_deref()
                     .is_some_and(|previous| previous != identity)
@@ -387,6 +2855,8 @@ impl Journal {
                 }
                 session_id.get_or_insert_with(|| identity.to_owned());
             }
+            history_index.apply(&event);
+            recovery_index.apply(&event);
             offsets.push((position, size as u64));
             position += size as u64;
         }
@@ -410,10 +2880,19 @@ impl Journal {
             session_id,
             seq,
             failed: false,
+            history_index,
+            recovery_index,
+            #[cfg(test)]
+            event_reads: std::cell::RefCell::new(Vec::new()),
         })
     }
     fn event(&self, index: usize) -> Result<Value> {
+        Ok(self.decoded_event(index)?.into_raw())
+    }
+    fn decoded_event(&self, index: usize) -> Result<JournalEvent> {
         use std::io::{Read, Seek, SeekFrom};
+        #[cfg(test)]
+        self.event_reads.borrow_mut().push(index);
         let &(offset, size) = self
             .offsets
             .get(index)
@@ -422,7 +2901,7 @@ impl Journal {
         file.seek(SeekFrom::Start(offset))?;
         let mut bytes = vec![0; size as usize];
         file.read_exact(&mut bytes)?;
-        Ok(serde_json::from_slice(&bytes)?)
+        JournalEvent::decode(serde_json::from_slice(&bytes)?, index)
     }
     fn append(&mut self, kind: &str, payload: Value) -> Result<usize> {
         if self.failed {
@@ -435,7 +2914,10 @@ impl Journal {
         let v = json!({"schema_version":1,"seq":n,"kind":kind,"payload":payload,
             "session_id":self.session_id,
             "timestamp_ms":now_ms()});
-        let bytes = format!("{v}\n").into_bytes();
+        // Structural rejection must not write even a partial event or poison
+        // an otherwise usable journal. Disk failures still poison it below.
+        let event = JournalEvent::decode(v, n)?;
+        let bytes = format!("{}\n", event.raw).into_bytes();
         let write = (|| -> io::Result<u64> {
             let offset = self.file.metadata()?.len();
             self.file.write_all(&bytes)?;
@@ -452,9 +2934,316 @@ impl Journal {
         };
         self.offsets.push((offset, bytes.len() as u64));
         self.seq += 1;
+        // The derived projection only observes committed events. Semantic
+        // ownership errors belong to this projection, not append durability.
+        self.history_index.apply(&event);
+        self.recovery_index.apply(&event);
         Ok(n)
     }
 }
+#[cfg(test)]
+mod journal_decoder_tests {
+    use super::*;
+    fn event(kind: &str, payload: Value) -> Value {
+        crate::test_support::JournalFixture::envelope(kind, payload)
+    }
+    #[test]
+    fn versions_preserve_raw_envelopes_and_unknown_extensions() {
+        let raw = event(
+            "future_extension",
+            json!(["opaque",{"arbitrary":"payload"}]),
+        );
+        let decoded = JournalEvent::decode(raw.clone(), 0).unwrap();
+        assert_eq!(decoded.schema_version, JournalVersion::V1);
+        assert_eq!(decoded.seq, 0);
+        assert_eq!(
+            decoded.kind,
+            JournalEventKind::Unknown("future_extension".into())
+        );
+        assert_eq!(decoded.into_raw(), raw);
+        let mut legacy = event("user", json!({"text":"legacy without an index"}));
+        legacy.as_object_mut().unwrap().remove("schema_version");
+        legacy.as_object_mut().unwrap().remove("session_id");
+        let decoded = JournalEvent::decode(legacy.clone(), 0).unwrap();
+        assert_eq!(decoded.schema_version, JournalVersion::Legacy);
+        assert_eq!(decoded.session_id, None);
+        let JournalEventData::TextRecord(record) = &decoded.data else {
+            panic!("not a typed user record")
+        };
+        assert_eq!(record.text, "legacy without an index");
+        assert_eq!(record.record_index, None);
+        assert_eq!(decoded.into_raw(), legacy);
+        let mut explicit_zero = event("user", json!({"index":0,"text":"ok"}));
+        explicit_zero["schema_version"] = json!(0);
+        assert_eq!(
+            JournalEvent::decode(explicit_zero, 0)
+                .unwrap()
+                .schema_version,
+            JournalVersion::Legacy
+        );
+    }
+    #[test]
+    fn unsupported_or_malformed_envelopes_fail_without_payload_disclosure() {
+        for (key, value) in [
+            ("schema_version", json!(2)),
+            ("schema_version", json!("SECRET_VALUE")),
+            ("seq", json!(2)),
+            ("seq", json!(false)),
+            ("kind", json!(null)),
+            ("session_id", json!("SECRET_VALUE\n")),
+        ] {
+            let mut raw = event("user", json!({"text":"SECRET_VALUE"}));
+            raw[key] = value;
+            let error = JournalEvent::decode(raw, 0).err().unwrap().to_string();
+            assert!(!error.contains("SECRET_VALUE"), "{error}");
+        }
+        assert!(JournalEvent::decode(event("user", json!("SECRET_VALUE")), 0).is_err());
+        let mut raw = event("user", json!({"text":"ok"}));
+        raw.as_object_mut().unwrap().remove("payload");
+        assert!(JournalEvent::decode(raw, 0).is_err());
+    }
+    #[test]
+    fn shared_journal_fixture_builds_structurally_decoded_cell_records() {
+        let mut fixture = crate::test_support::JournalFixture::named("py-decoded-fixture");
+        fixture.start(1, "fixture-cell", None);
+        fixture.end(1);
+        assert_eq!(
+            fixture.journal.decoded_event(0).unwrap().kind,
+            JournalEventKind::CellStart
+        );
+        assert_eq!(
+            fixture.journal.decoded_event(1).unwrap().kind,
+            JournalEventKind::CellEnd
+        );
+        assert_eq!(fixture.journal.seq, 2);
+    }
+    #[test]
+    fn cell_and_record_fields_have_one_structural_interpretation() {
+        let mut raw = event(
+            "cell_start",
+            json!({"cell":1,"parent_cell":null,"operation":"cell-one"}),
+        );
+        let decoded = JournalEvent::decode(raw.clone(), 0).unwrap();
+        let JournalEventData::CellStart(start) = decoded.data else {
+            panic!("missing typed start")
+        };
+        assert_eq!(start.cell, 1);
+        assert_eq!(start.parent_cell, None);
+        assert_eq!(start.operation, "cell-one");
+        assert_eq!(start.user_record_indices, None);
+        assert_eq!(start.input_raw_indices, None);
+        assert!(!start.explicit_generation);
+        raw["payload"]["user_record_indices"] = json!([]);
+        raw["payload"]["input_raw_indices"] = json!([0]);
+        raw["payload"]["generation_request"] = Value::Null;
+        let JournalEventData::CellStart(start) = JournalEvent::decode(raw, 0).unwrap().data else {
+            panic!("missing typed start")
+        };
+        assert_eq!(start.user_record_indices, Some(vec![]));
+        assert_eq!(start.input_raw_indices, Some(vec![0]));
+        assert!(start.explicit_generation);
+        assert_eq!(start.generation_request, None);
+        let JournalEventData::CellEnd(end) = JournalEvent::decode(
+            event("cell_end", json!({"cell":1,"status":"ok","elapsed_ms":9})),
+            0,
+        )
+        .unwrap()
+        .data
+        else {
+            panic!("missing typed end")
+        };
+        assert_eq!(
+            (end.cell, end.status.as_str(), end.elapsed_ms),
+            (1, "ok", 9)
+        );
+        let JournalEventData::CellRecord(record) = JournalEvent::decode(
+            event(
+                "cell_record",
+                json!({"cell":1,"collection":"user","record_index":0}),
+            ),
+            0,
+        )
+        .unwrap()
+        .data
+        else {
+            panic!("missing typed record")
+        };
+        assert_eq!(record.cell, 1);
+        assert_eq!(record.collection, RecordCollection::User);
+        assert_eq!(record.record_index, 0);
+        for (kind, payload) in [
+            (
+                "cell_start",
+                json!({"cell":0,"parent_cell":null,"operation":"op"}),
+            ),
+            ("cell_start", json!({"cell":1,"operation":"op"})),
+            (
+                "cell_start",
+                json!({"cell":1,"parent_cell":false,"operation":"op"}),
+            ),
+            (
+                "cell_start",
+                json!({"cell":1,"parent_cell":null,"operation":"op","user_record_indices":[true]}),
+            ),
+            ("cell_end", json!({"cell":1,"status":"ok"})),
+            ("cell_end", json!({"cell":1,"status":false,"elapsed_ms":1})),
+            (
+                "cell_record",
+                json!({"cell":1,"collection":"stdout","record_index":0}),
+            ),
+            ("stream", json!({"collection":"user","index":0,"base64":""})),
+            (
+                "stream_complete",
+                json!({"collection":"stdout","metadata":{"index":0}}),
+            ),
+        ] {
+            assert!(
+                JournalEvent::decode(event(kind, payload), 0).is_err(),
+                "{kind}"
+            );
+        }
+    }
+    #[test]
+    fn stream_provider_and_context_records_keep_legacy_payload_semantics() {
+        let JournalEventData::Stream(stream) = JournalEvent::decode(
+            event(
+                "stream",
+                json!({"collection":"stdout","index":0,"operation":"op","base64":"aGk="}),
+            ),
+            0,
+        )
+        .unwrap()
+        .data
+        else {
+            panic!("missing typed stream")
+        };
+        assert_eq!(stream.collection, RecordCollection::Stdout);
+        assert_eq!(stream.record_index, 0);
+        assert_eq!(stream.operation.as_deref(), Some("op"));
+        assert_eq!(stream.base64.as_deref(), Some("aGk="));
+        let JournalEventData::Stream(stream) = JournalEvent::decode(
+            event(
+                "stream_closed",
+                json!({"collection":"stderr","metadata":{"index":3,"complete":false}}),
+            ),
+            0,
+        )
+        .unwrap()
+        .data
+        else {
+            panic!("missing typed close")
+        };
+        assert_eq!(stream.record_index, 3);
+        assert_eq!(stream.complete, Some(false));
+        let JournalEventData::Intent(intent) = JournalEvent::decode(
+            event("intent", json!({"type":"provider","operation":"op"})),
+            0,
+        )
+        .unwrap()
+        .data
+        else {
+            panic!("missing typed intent")
+        };
+        assert_eq!(intent.operation.as_deref(), Some("op"));
+        assert_eq!(intent.operation_type.as_deref(), Some("provider"));
+        assert!(JournalEvent::decode(event("intent", json!({"type":"provider"})), 0).is_err());
+        let JournalEventData::ProviderRecord(request) = JournalEvent::decode(
+            event(
+                "request",
+                json!({"messages":[],"opaque_option":{"anything":true}}),
+            ),
+            0,
+        )
+        .unwrap()
+        .data
+        else {
+            panic!("missing typed request")
+        };
+        assert_eq!(request.operation, None); // Legacy request ownership comes from its preceding intent.
+        let JournalEventData::ProviderRecord(attempt) = JournalEvent::decode(
+            event(
+                "provider_attempt_failed",
+                json!({"operation":"op","attempt":2,"retry":1,"billing_unknown":true}),
+            ),
+            0,
+        )
+        .unwrap()
+        .data
+        else {
+            panic!("missing typed attempt")
+        };
+        assert_eq!(attempt.attempt, Some(2));
+        assert_eq!(attempt.retry, Some(1));
+        assert!(attempt.billing_unknown);
+        assert!(JournalEvent::decode(
+            event(
+                "provider_attempt_failed",
+                json!({"billing_unknown":"SECRET_VALUE"})
+            ),
+            0
+        )
+        .is_err());
+        let raw = event(
+            "context_add",
+            json!({"id":"c0","text":"selected","ranges":[[1,2]]}),
+        );
+        let JournalEventData::ContextAdd(item) = JournalEvent::decode(raw, 0).unwrap().data else {
+            panic!("missing typed context")
+        };
+        assert_eq!(item.id, "c0");
+        assert_eq!(item.role, "user");
+        assert!(!item.output);
+        let JournalEventData::WorkerReset {
+            generation,
+            active_cell,
+            explicit_active_cell,
+        } = JournalEvent::decode(event("worker_reset", json!({"generation":2})), 0)
+            .unwrap()
+            .data
+        else {
+            panic!("missing typed reset")
+        };
+        assert_eq!(generation, 2);
+        assert_eq!(active_cell, None);
+        assert!(!explicit_active_cell);
+    }
+    #[test]
+    fn append_validation_precedes_durable_write_and_open_uses_the_same_decoder() {
+        let mut fixture = crate::test_support::JournalFixture::named("py-journal-decoder");
+        let path = fixture.directory.join("session.jsonl");
+        {
+            let journal = &mut fixture.journal;
+            assert!(journal
+                .append("cell_end", json!({"cell":1,"status":"ok"}))
+                .is_err());
+            assert_eq!(journal.seq, 0);
+            assert_eq!(journal.file.metadata().unwrap().len(), 0);
+            assert!(!journal.failed);
+            journal
+                .append("user", json!({"index":0,"text":"full original"}))
+                .unwrap();
+            assert_eq!(
+                journal.decoded_event(0).unwrap().kind,
+                JournalEventKind::User
+            );
+            assert_eq!(
+                journal.event(0).unwrap()["payload"]["text"],
+                "full original"
+            );
+        }
+        let crate::test_support::JournalFixture {
+            journal,
+            directory: _directory,
+        } = fixture;
+        drop(journal);
+        assert_eq!(Journal::open(path.clone()).unwrap().seq, 1);
+        let mut malformed = event("cell_end", json!({"cell":1,"status":"ok"}));
+        malformed["session_id"] = json!("session");
+        fs::write(&path, format!("{malformed}\n")).unwrap();
+        assert!(Journal::open(path).is_err());
+    }
+}
+
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -478,6 +3267,60 @@ struct Capture {
     carry: Vec<u8>,
     chunk: usize,
 }
+trait CaptureSink {
+    fn stream_length(&self, name: &str) -> usize;
+    fn commit_stream(&mut self, name: &str, index: usize, payload: Value) -> Result<()>;
+    fn append_capture_event(&mut self, kind: &str, payload: Value) -> Result<()>;
+    fn capture_owner(&self, operation: &str) -> Option<usize>;
+}
+struct CaptureSession<'a> {
+    journal: &'a mut Journal,
+    history: &'a mut HistoryArchive,
+    owner: Option<(usize, String)>,
+}
+impl CaptureSink for CaptureSession<'_> {
+    fn stream_length(&self, name: &str) -> usize {
+        self.history
+            .len(RecordCollection::decode(name).expect("capture collection"))
+    }
+    fn commit_stream(&mut self, name: &str, index: usize, payload: Value) -> Result<()> {
+        let collection = RecordCollection::decode(name)?;
+        let seq = self.journal.append("stream", payload)?;
+        self.history.set_stream_snapshot(collection, index, seq)
+    }
+    fn append_capture_event(&mut self, kind: &str, payload: Value) -> Result<()> {
+        self.journal.append(kind, payload)?;
+        Ok(())
+    }
+    fn capture_owner(&self, operation: &str) -> Option<usize> {
+        self.owner
+            .as_ref()
+            .and_then(|(cell, owner)| (owner == operation).then_some(*cell))
+    }
+}
+impl CaptureSink for Host {
+    fn stream_length(&self, name: &str) -> usize {
+        self.history
+            .len(RecordCollection::decode(name).expect("capture collection"))
+    }
+    fn commit_stream(&mut self, name: &str, index: usize, payload: Value) -> Result<()> {
+        CaptureSession {
+            journal: &mut self.journal,
+            history: &mut self.history,
+            owner: None,
+        }
+        .commit_stream(name, index, payload)
+    }
+    fn append_capture_event(&mut self, kind: &str, payload: Value) -> Result<()> {
+        self.journal.append(kind, payload)?;
+        Ok(())
+    }
+    fn capture_owner(&self, operation: &str) -> Option<usize> {
+        (self.execution.operation().as_deref() == Some(operation))
+            .then(|| self.execution.cell())
+            .flatten()
+    }
+}
 impl Capture {
     fn open(path: &Path, name: &str, operation: &str) -> Result<Self> {
         Ok(Self {
@@ -495,27 +3338,17 @@ impl Capture {
             chunk: 0,
         })
     }
-    fn commit(&mut self, host: &mut Host, bytes: &[u8]) -> Result<()> {
+    fn commit(&mut self, host: &mut impl CaptureSink, bytes: &[u8]) -> Result<()> {
         let index = *self
             .index
-            .get_or_insert_with(|| host.history[&self.name].len());
-        let seq = host.journal.append(
-            "stream",
+            .get_or_insert_with(|| host.stream_length(&self.name));
+        host.commit_stream(
+            &self.name,
+            index,
             json!({"collection":self.name,"index":index,
             "operation":self.operation,"base64":B64.encode(bytes),
             "text":String::from_utf8_lossy(bytes),"chunk":self.chunk}),
         )?;
-        let list = host
-            .history
-            .get_mut(&self.name)
-            .ok_or("missing stream collection")?;
-        if list.len() == index {
-            list.push(json!({"$chunks":[]}));
-        }
-        list[index]["$chunks"]
-            .as_array_mut()
-            .ok_or("invalid stream history")?
-            .push(json!(seq));
         self.chunk += 1;
         self.bytes += bytes.len();
         self.newlines += bytes.iter().filter(|&&b| b == b'\n').count();
@@ -551,7 +3384,7 @@ impl Capture {
         }
         Ok(())
     }
-    fn drain(&mut self, host: &mut Host) -> Result<bool> {
+    fn drain(&mut self, host: &mut impl CaptureSink) -> Result<bool> {
         use std::io::Read;
         let mut buffer = [0u8; 65536];
         // Bound each poll's work, even when a child continuously writes.
@@ -564,11 +3397,11 @@ impl Capture {
         }
         Ok(true)
     }
-    fn finish(mut self, host: &mut Host, complete: bool) -> Result<Value> {
+    fn finish(mut self, host: &mut impl CaptureSink, complete: bool) -> Result<Value> {
         while self.drain(host)? {}
         self.finish_metadata(host, complete)
     }
-    fn finish_metadata(mut self, host: &mut Host, complete: bool) -> Result<Value> {
+    fn finish_metadata(mut self, host: &mut impl CaptureSink, complete: bool) -> Result<Value> {
         if self.index.is_none() {
             self.commit(host, &[])?;
         }
@@ -585,7 +3418,7 @@ impl Capture {
             "omitted_lines":lines.saturating_sub(12),"complete":complete});
         let mut durable = metadata.clone();
         durable.as_object_mut().unwrap().remove("preview");
-        host.journal.append(
+        host.append_capture_event(
             if complete {
                 "stream_complete"
             } else {
@@ -594,8 +3427,7 @@ impl Capture {
             json!({"collection":self.name,"operation":self.operation,
             "metadata":durable}),
         )?;
-        if host.active_operation.as_deref() == Some(self.operation.as_str()) {
-            let cell = host.active_cell.ok_or("capture owner has no active cell")?;
+        if let Some(cell) = host.capture_owner(&self.operation) {
             Ok(cell_metadata(metadata, &self.name, cell))
         } else {
             Ok(metadata)
@@ -717,12 +3549,7 @@ mod foreground_shell_lifecycle_tests {
 
     #[test]
     fn foreground_shell_error_exit_kills_and_reaps_group() {
-        let directory = std::env::temp_dir().join(format!(
-            "py-foreground-{}-{}",
-            std::process::id(),
-            unique_id()
-        ));
-        fs::create_dir_all(&directory).unwrap();
+        let directory = crate::test_support::TestDirectory::new("py-foreground");
         let descendant_path = directory.join("descendant-pid");
         let pid = std::cell::Cell::new(0);
         let result = (|| -> io::Result<()> {
@@ -774,7 +3601,6 @@ mod foreground_shell_lifecycle_tests {
                 libc::waitpid(pid.get(), &mut status, 0);
             }
         }
-        fs::remove_dir_all(&directory).unwrap();
         assert_eq!(result.unwrap_err().to_string(), "fixture capture failure");
         assert_eq!(waited, -1, "the direct child must already be reaped");
         assert_eq!(wait_error, Some(libc::ECHILD));
@@ -833,12 +3659,7 @@ mod foreground_shell_lifecycle_tests {
 
     #[test]
     fn shell_capture_partial_setup_preserves_preexisting_paths() {
-        let directory = std::env::temp_dir().join(format!(
-            "py-shell-files-{}-{}",
-            std::process::id(),
-            unique_id()
-        ));
-        fs::create_dir_all(&directory).unwrap();
+        let directory = crate::test_support::TestDirectory::new("py-shell-files");
         let stdout = directory.join("stdout");
         let stderr = directory.join("stderr");
         fs::write(&stderr, b"preexisting").unwrap();
@@ -852,17 +3673,11 @@ mod foreground_shell_lifecycle_tests {
         }
         assert!(!stdout.exists());
         assert_eq!(fs::read(&stderr).unwrap(), b"preexisting");
-        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
     fn shell_capture_cleanup_finishes_after_remove_error() {
-        let directory = std::env::temp_dir().join(format!(
-            "py-shell-remove-{}-{}",
-            std::process::id(),
-            unique_id()
-        ));
-        fs::create_dir_all(&directory).unwrap();
+        let directory = crate::test_support::TestDirectory::new("py-shell-remove");
         let stdout = directory.join("stdout");
         let stderr = directory.join("stderr");
         let mut files = ShellCaptureFiles::default();
@@ -871,7 +3686,6 @@ mod foreground_shell_lifecycle_tests {
         fs::remove_file(&stdout).unwrap();
         assert_eq!(files.remove().unwrap_err().kind(), io::ErrorKind::NotFound);
         assert!(!stderr.exists());
-        fs::remove_dir_all(&directory).unwrap();
     }
 }
 
@@ -879,86 +3693,832 @@ mod foreground_shell_lifecycle_tests {
 // Python worker IPC
 // =============================================================================
 
-struct Worker {
-    child: Child,
+// Framing limits count UTF-8 JSON bytes, excluding the terminating newline.
+const WORKER_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const WORKER_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const WORKER_IO_TICK: std::time::Duration = std::time::Duration::from_millis(20);
+const WORKER_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug)]
+enum WorkerTransportError {
+    Disconnected { partial_frame: bool },
+    Protocol(&'static str),
+    TooLarge,
+    HandshakeTimedOut,
+    Cancelled,
+    Io(io::Error),
+}
+impl std::fmt::Display for WorkerTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected {
+                partial_frame: true,
+            } => f.write_str("Python worker disconnected mid-frame"),
+            Self::Disconnected {
+                partial_frame: false,
+            } => f.write_str("Python worker disconnected"),
+            Self::Protocol(reason) => write!(f, "Python worker protocol error: {reason}"),
+            Self::TooLarge => f.write_str("Python worker message exceeds 64 MiB limit"),
+            Self::HandshakeTimedOut => f.write_str("Python worker handshake timed out"),
+            Self::Cancelled => f.write_str("Python worker transport cancelled"),
+            Self::Io(error) => write!(f, "Python worker transport I/O error: {error}"),
+        }
+    }
+}
+impl std::error::Error for WorkerTransportError {}
+impl From<io::Error> for WorkerTransportError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+type WorkerTransportResult<T> = std::result::Result<T, WorkerTransportError>;
+
+// Arbitrary RPC results and execution source remain Python-facing data; only
+// envelope meanings are decoded here, once, before crossing the transport.
+enum WorkerRequest<'a> {
+    Execute(&'a Value),
+    RpcReply(&'a Value),
+    Inspect(&'a Value),
+    Validate(&'a Value),
+    Shutdown(&'a Value),
+}
+impl<'a> WorkerRequest<'a> {
+    fn decode(value: &'a Value) -> WorkerTransportResult<Self> {
+        if !value.is_object() {
+            return Err(WorkerTransportError::Protocol("request must be an object"));
+        }
+        match value["kind"].as_str() {
+            Some("execute")
+                if value["source"].is_string()
+                    && value["stdout"].is_string()
+                    && value["stderr"].is_string()
+                    && value["forced"].is_boolean() =>
+            {
+                Ok(Self::Execute(value))
+            }
+            Some("rpc_reply") if value["rpc_id"].as_u64().is_some() && value["ok"].is_boolean() => {
+                Ok(Self::RpcReply(value))
+            }
+            Some("ide_inspect") => Ok(Self::Inspect(value)),
+            Some("ide_validate") if value["source"].is_string() => Ok(Self::Validate(value)),
+            Some("shutdown") => Ok(Self::Shutdown(value)),
+            _ => Err(WorkerTransportError::Protocol("invalid request envelope")),
+        }
+    }
+    fn value(&self) -> &Value {
+        match self {
+            Self::Execute(v)
+            | Self::RpcReply(v)
+            | Self::Inspect(v)
+            | Self::Validate(v)
+            | Self::Shutdown(v) => v,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerOutcome {
+    Ok,
+    Error,
+}
+impl WorkerOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
+}
+#[derive(Debug)]
+enum WorkerReply {
+    Ready,
+    Started,
+    Done(WorkerOutcome),
+    Rpc {
+        id: u64,
+        operation: String,
+        payload: Value,
+    },
+    Names {
+        names: Vec<String>,
+        cwd: Option<PathBuf>,
+    },
+    Validation {
+        incomplete: bool,
+    },
+}
+impl WorkerReply {
+    fn decode(value: Value) -> WorkerTransportResult<Self> {
+        if !value.is_object() {
+            return Err(WorkerTransportError::Protocol("reply must be an object"));
+        }
+        match value["kind"].as_str() {
+            Some("ready") => Ok(Self::Ready),
+            Some("started") => Ok(Self::Started),
+            Some("done") => match value["status"].as_str() {
+                Some("ok") => Ok(Self::Done(WorkerOutcome::Ok)),
+                Some("error") => Ok(Self::Done(WorkerOutcome::Error)),
+                _ => Err(WorkerTransportError::Protocol("invalid completion outcome")),
+            },
+            Some("rpc") => {
+                let id = value["rpc_id"]
+                    .as_u64()
+                    .ok_or(WorkerTransportError::Protocol("invalid RPC ID"))?;
+                let operation = value["op"]
+                    .as_str()
+                    .ok_or(WorkerTransportError::Protocol("invalid RPC operation"))?
+                    .to_owned();
+                Ok(Self::Rpc {
+                    id,
+                    operation,
+                    payload: value,
+                })
+            }
+            Some("ide_names") => {
+                let names = value["names"]
+                    .as_array()
+                    .ok_or(WorkerTransportError::Protocol("invalid inspection names"))?
+                    .iter()
+                    .map(|name| {
+                        name.as_str()
+                            .map(str::to_owned)
+                            .ok_or(WorkerTransportError::Protocol("invalid inspection name"))
+                    })
+                    .collect::<WorkerTransportResult<Vec<_>>>()?;
+                let cwd = match value.get("cwd") {
+                    None => None,
+                    Some(cwd) => Some(PathBuf::from(cwd.as_str().ok_or(
+                        WorkerTransportError::Protocol("invalid inspection directory"),
+                    )?)),
+                };
+                Ok(Self::Names { names, cwd })
+            }
+            Some("ide_validation") => Ok(Self::Validation {
+                incomplete: value["incomplete"]
+                    .as_bool()
+                    .ok_or(WorkerTransportError::Protocol("invalid validation result"))?,
+            }),
+            _ => Err(WorkerTransportError::Protocol("unexpected reply kind")),
+        }
+    }
+}
+struct BoundedWorkerFrame {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+impl Write for BoundedWorkerFrame {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "worker frame too large",
+            ));
+        }
+        let needed = self.bytes.len() + bytes.len();
+        if needed > self.bytes.capacity() {
+            let capacity = needed
+                .max(self.bytes.capacity().saturating_mul(2))
+                .min(self.limit.saturating_add(1));
+            self.bytes.reserve_exact(capacity - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+struct WorkerTransport {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    pending: Vec<u8>,
+    limit: usize,
+}
+impl WorkerTransport {
+    fn new(socket: UnixStream) -> WorkerTransportResult<Self> {
+        Self::with_limit(socket, WORKER_MAX_MESSAGE_BYTES)
+    }
+    fn with_limit(socket: UnixStream, limit: usize) -> WorkerTransportResult<Self> {
+        // Timeouts backstop polling races; the framing loop owns its deadline.
+        socket.set_read_timeout(Some(WORKER_IO_TICK))?;
+        socket.set_write_timeout(Some(WORKER_IO_TICK))?;
+        let writer = socket.try_clone()?;
+        Ok(Self {
+            reader: BufReader::new(socket),
+            writer,
+            pending: Vec::new(),
+            limit,
+        })
+    }
+    fn clone_idle(&self) -> WorkerTransportResult<Self> {
+        if !self.pending.is_empty() || !self.reader.buffer().is_empty() {
+            return Err(WorkerTransportError::Protocol(
+                "cannot clone a buffered worker connection",
+            ));
+        }
+        Self::with_limit(self.reader.get_ref().try_clone()?, self.limit)
+    }
+    fn poll(
+        socket: &UnixStream,
+        events: i16,
+        wait: std::time::Duration,
+    ) -> WorkerTransportResult<bool> {
+        let mut fd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        let result =
+            unsafe { libc::poll(&mut fd, 1, wait.as_millis().min(i32::MAX as u128) as i32) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(error.into());
+        }
+        if result > 0 && fd.revents & libc::POLLNVAL != 0 {
+            return Err(WorkerTransportError::Protocol("invalid worker descriptor"));
+        }
+        Ok(result > 0)
+    }
+    // One finite wait. A partial line is retained without blocking the caller's
+    // control pump; each append is checked before growing the pending buffer.
+    fn read_value(&mut self, wait: std::time::Duration) -> WorkerTransportResult<Option<Value>> {
+        if self.reader.buffer().is_empty()
+            && !Self::poll(self.reader.get_ref(), libc::POLLIN, wait)?
+        {
+            return Ok(None);
+        }
+        let available = match self.reader.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if available.is_empty() {
+            return Err(WorkerTransportError::Disconnected {
+                partial_frame: !self.pending.is_empty(),
+            });
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let count = newline.unwrap_or(available.len());
+        if count > self.limit.saturating_sub(self.pending.len()) {
+            return Err(WorkerTransportError::TooLarge);
+        }
+        let needed = self.pending.len() + count;
+        if needed > self.pending.capacity() {
+            let capacity = needed
+                .max(self.pending.capacity().saturating_mul(2))
+                .min(self.limit);
+            self.pending.reserve_exact(capacity - self.pending.len());
+        }
+        self.pending.extend_from_slice(&available[..count]);
+        self.reader.consume(count + usize::from(newline.is_some()));
+        if newline.is_none() {
+            return Ok(None);
+        }
+        let result = serde_json::from_slice(&self.pending)
+            .map_err(|_| WorkerTransportError::Protocol("invalid JSON frame"));
+        self.pending.clear();
+        result.map(Some)
+    }
+    fn receive_value_with(
+        &mut self,
+        timeout: std::time::Duration,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> WorkerTransportResult<Value> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if cancelled() {
+                return Err(WorkerTransportError::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(WorkerTransportError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "worker read deadline exceeded",
+                )));
+            }
+            if let Some(value) = self.read_value(remaining.min(WORKER_IO_TICK))? {
+                return Ok(value);
+            }
+        }
+    }
+    fn receive_reply_with(
+        &mut self,
+        timeout: std::time::Duration,
+        cancelled: impl FnMut() -> bool,
+    ) -> WorkerTransportResult<WorkerReply> {
+        WorkerReply::decode(self.receive_value_with(timeout, cancelled)?)
+    }
+    fn writer_lease(&self) -> WorkerTransportResult<WorkerWriteLease> {
+        Ok(WorkerWriteLease {
+            writer: self.writer.try_clone()?,
+            limit: self.limit,
+        })
+    }
+    fn send_request_with(
+        &mut self,
+        request: &WorkerRequest<'_>,
+        timeout: std::time::Duration,
+        cancelled: impl FnMut() -> bool,
+    ) -> WorkerTransportResult<()> {
+        Self::send_to(&mut self.writer, self.limit, request, timeout, cancelled)
+    }
+    fn send_to(
+        writer: &mut UnixStream,
+        limit: usize,
+        request: &WorkerRequest<'_>,
+        timeout: std::time::Duration,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> WorkerTransportResult<()> {
+        let mut frame = BoundedWorkerFrame {
+            bytes: Vec::new(),
+            limit,
+            exceeded: false,
+        };
+        if serde_json::to_writer(&mut frame, request.value()).is_err() {
+            return Err(if frame.exceeded {
+                WorkerTransportError::TooLarge
+            } else {
+                WorkerTransportError::Protocol("request serialization failed")
+            });
+        }
+        frame.bytes.reserve_exact(1);
+        frame.bytes.push(b'\n');
+        let deadline = std::time::Instant::now() + timeout;
+        let mut written = 0;
+        while written < frame.bytes.len() {
+            if cancelled() {
+                return Err(WorkerTransportError::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(WorkerTransportError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "worker write timed out",
+                )));
+            }
+            if !Self::poll(writer, libc::POLLOUT, remaining.min(WORKER_IO_TICK))? {
+                continue;
+            }
+            match writer.write(&frame.bytes[written..]) {
+                Ok(0) => {
+                    return Err(WorkerTransportError::Disconnected {
+                        partial_frame: written != 0,
+                    })
+                }
+                Ok(count) => written += count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+}
+// Write-only lease: it cannot consume or abandon the owner's buffered replies.
+// Host is single-threaded and serializes worker requests, so control callbacks
+// may borrow Host without moving the worker or relinquishing process ownership.
+struct WorkerWriteLease {
+    writer: UnixStream,
+    limit: usize,
+}
+impl WorkerWriteLease {
+    fn send_with_timeout(
+        &mut self,
+        request: &WorkerRequest<'_>,
+        timeout: std::time::Duration,
+        cancelled: impl FnMut() -> bool,
+    ) -> WorkerTransportResult<()> {
+        WorkerTransport::send_to(&mut self.writer, self.limit, request, timeout, cancelled)
+    }
+}
+struct WorkerDirectory {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+impl WorkerDirectory {
+    fn create(path: PathBuf) -> Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        Ok(Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+impl Drop for WorkerDirectory {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+            metadata.is_dir() && metadata.dev() == self.device && metadata.ino() == self.inode
+        }) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+struct WorkerProcess {
+    child: Child,
+    group: Option<i32>,
+}
+impl WorkerProcess {
+    fn new(child: Child) -> Self {
+        let group = Some(child.id() as i32);
+        Self { child, group }
+    }
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+    fn terminate_group(&mut self) {
+        if let Some(group) = self.group.take() {
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+    }
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.terminate_group();
+        }
+        Ok(status)
+    }
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        let status = self.child.wait()?;
+        self.terminate_group();
+        Ok(status)
+    }
+}
+impl Drop for WorkerProcess {
+    fn drop(&mut self) {
+        self.terminate_group();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+struct Worker {
+    child: WorkerProcess,
+    transport: WorkerTransport,
     dir: PathBuf,
+    _directory: WorkerDirectory,
 }
 impl Worker {
     fn spawn(home: &Path, generation: usize) -> Result<Self> {
+        Self::spawn_using(
+            home,
+            generation,
+            std::env::var("PY_PYTHON")
+                .unwrap_or_else(|_| "python3".into())
+                .as_ref(),
+            WORKER_HANDSHAKE_TIMEOUT,
+        )
+    }
+    fn spawn_using(
+        home: &Path,
+        generation: usize,
+        python: &std::ffi::OsStr,
+        handshake_timeout: std::time::Duration,
+    ) -> Result<Self> {
         let dir = home.join(format!(
             "worker-{}-{}-{}",
             std::process::id(),
             generation,
             unique_id()
         ));
-        fs::create_dir_all(&dir)?;
+        let directory = WorkerDirectory::create(dir.clone())?;
         let script = dir.join("worker.py");
-        fs::write(&script, PYTHON)?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&script)?;
+        file.write_all(PYTHON.as_bytes())?;
+        drop(file);
         let (host, child_socket) = UnixStream::pair()?;
         let fd = child_socket.as_raw_fd();
-        let mut command =
-            Command::new(std::env::var("PY_PYTHON").unwrap_or_else(|_| "python3".into()));
+        let mut command = Command::new(python);
         command
-            .args(["-u", script.to_str().unwrap(), &fd.to_string()])
+            .args([
+                "-u",
+                script.to_str().ok_or("worker script path is not UTF-8")?,
+                &fd.to_string(),
+            ])
             .stdin(std::process::Stdio::null());
         unsafe {
             command.pre_exec(move || {
-                if libc::setsid() < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                if libc::setsid() < 0 || libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
             });
         }
-        let child = command.spawn()?;
+        // Child ownership is guarded before descriptor cloning can fail.
+        let child = WorkerProcess::new(command.spawn()?);
         drop(child_socket);
-        let writer = host.try_clone()?;
+        let transport = WorkerTransport::new(host)?;
         let mut worker = Self {
             child,
-            reader: BufReader::new(host),
-            writer,
+            transport,
             dir,
+            _directory: directory,
         };
-        if worker.recv()?["kind"] != "ready" {
-            return Err("worker did not initialize".into());
+        let ready = worker
+            .transport
+            .receive_reply_with(handshake_timeout, || {
+                INTERRUPT.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .map_err(|error| match error {
+                WorkerTransportError::Io(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    WorkerTransportError::HandshakeTimedOut
+                }
+                other => other,
+            })?;
+        if !matches!(ready, WorkerReply::Ready) {
+            return Err(WorkerTransportError::Protocol("worker did not initialize").into());
         }
         Ok(worker)
     }
-    fn send(&mut self, v: &Value) -> Result<()> {
-        writeln!(self.writer, "{}", v)?;
-        Ok(())
+    fn poll_value(&mut self) -> WorkerTransportResult<Option<Value>> {
+        self.transport.read_value(WORKER_IO_TICK)
     }
-    fn reply(&mut self, id: &Value, mut response: Value) -> Result<()> {
-        response["kind"] = json!("rpc_reply");
-        response["rpc_id"] = id.clone();
-        self.send(&response)
-    }
-    fn recv(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
-            return Err("Python worker disconnected".into());
-        }
-        Ok(serde_json::from_str(&line)?)
+    fn receive_reply(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> WorkerTransportResult<WorkerReply> {
+        self.transport.receive_reply_with(timeout, || {
+            INTERRUPT.load(std::sync::atomic::Ordering::SeqCst)
+        })
     }
 }
-impl Drop for Worker {
-    fn drop(&mut self) {
-        let _ = self.send(&json!({"kind":"shutdown"}));
-        unsafe {
-            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+// No shutdown write in Drop: an unresponsive/full peer cannot block cleanup.
+// WorkerProcess kills/reaps first; the owned directory is removed afterward.
+
+#[cfg(test)]
+mod worker_transport_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn pair(limit: usize) -> (WorkerTransport, UnixStream) {
+        let (host, peer) = UnixStream::pair().unwrap();
+        (WorkerTransport::with_limit(host, limit).unwrap(), peer)
+    }
+    fn receive(transport: &mut WorkerTransport) -> WorkerTransportResult<Value> {
+        transport.receive_value_with(std::time::Duration::from_secs(1), || false)
+    }
+    #[test]
+    fn partial_lines_preserve_framing_and_do_not_block_control_ticks() {
+        let (mut transport, mut peer) = pair(1024);
+        peer.write_all(b"{\"kind\":").unwrap();
+        assert!(transport
+            .read_value(std::time::Duration::ZERO)
+            .unwrap()
+            .is_none());
+        let began = std::time::Instant::now();
+        assert!(transport.read_value(WORKER_IO_TICK).unwrap().is_none());
+        assert!(began.elapsed() < std::time::Duration::from_secs(1));
+        peer.write_all(b"\"ready\"}\n{\"kind\":\"started\"}\n")
+            .unwrap();
+        assert_eq!(receive(&mut transport).unwrap(), json!({"kind":"ready"}));
+        assert_eq!(receive(&mut transport).unwrap(), json!({"kind":"started"}));
+    }
+    #[test]
+    fn inbound_limit_is_checked_before_growth_and_exact_limit_is_accepted() {
+        let value = json!({"kind":"ready"});
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let (mut transport, mut peer) = pair(bytes.len());
+        peer.write_all(&bytes).unwrap();
+        peer.write_all(b"\n").unwrap();
+        assert_eq!(receive(&mut transport).unwrap(), value);
+        let (mut transport, mut peer) = pair(16);
+        peer.write_all(&[b'x'; 17]).unwrap();
+        assert!(matches!(
+            transport.read_value(WORKER_IO_TICK),
+            Err(WorkerTransportError::TooLarge)
+        ));
+        assert!(transport.pending.len() <= 16 && transport.pending.capacity() <= 16);
+    }
+    #[test]
+    fn outbound_limit_rejects_before_sending_any_bytes() {
+        let (mut transport, mut peer) = pair(24);
+        peer.set_read_timeout(Some(WORKER_IO_TICK)).unwrap();
+        let value = json!({"kind":"ide_validate","source":"secret source payload"});
+        let request = WorkerRequest::decode(&value).unwrap();
+        assert!(matches!(
+            transport.send_request_with(&request, std::time::Duration::from_secs(1), || false),
+            Err(WorkerTransportError::TooLarge)
+        ));
+        let mut byte = [0u8];
+        let error = peer.read(&mut byte).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+    }
+    #[test]
+    fn invalid_json_and_eof_errors_never_echo_payloads() {
+        let (mut transport, mut peer) = pair(1024);
+        peer.write_all(b"secret-invalid-json\n").unwrap();
+        let error = receive(&mut transport).unwrap_err();
+        assert!(matches!(error, WorkerTransportError::Protocol(_)));
+        assert!(!error.to_string().contains("secret"));
+        let (mut transport, peer) = pair(1024);
+        drop(peer);
+        assert!(matches!(
+            receive(&mut transport),
+            Err(WorkerTransportError::Disconnected {
+                partial_frame: false
+            })
+        ));
+        let (mut transport, mut peer) = pair(1024);
+        peer.write_all(b"{\"kind\":").unwrap();
+        drop(peer);
+        assert!(matches!(
+            receive(&mut transport),
+            Err(WorkerTransportError::Disconnected {
+                partial_frame: true
+            })
+        ));
+    }
+    #[test]
+    fn timeout_and_cancellation_are_explicit_and_cancellation_keeps_partial_bytes() {
+        let (mut transport, mut peer) = pair(1024);
+        peer.write_all(b"{").unwrap();
+        assert!(transport.read_value(WORKER_IO_TICK).unwrap().is_none());
+        assert!(matches!(
+            transport.receive_value_with(std::time::Duration::from_secs(1), || true),
+            Err(WorkerTransportError::Cancelled)
+        ));
+        assert_eq!(transport.pending.as_slice(), b"{");
+        let error = transport
+            .receive_value_with(std::time::Duration::from_millis(30), || false)
+            .unwrap_err();
+        assert!(
+            matches!(error, WorkerTransportError::Io(ref error) if error.kind() == io::ErrorKind::TimedOut)
+        );
+        peer.write_all(b"\"kind\":\"ready\"}\n").unwrap();
+        assert_eq!(receive(&mut transport).unwrap(), json!({"kind":"ready"}));
+    }
+    #[test]
+    fn envelopes_validate_meaning_and_leave_rpc_arguments_opaque() {
+        assert!(matches!(
+            WorkerReply::decode(json!({"kind":"ready"})).unwrap(),
+            WorkerReply::Ready
+        ));
+        assert!(WorkerReply::decode(json!({"kind":"rpc","rpc_id":true,"op":"history"})).is_err());
+        assert!(WorkerReply::decode(json!({"kind":"done","status":"invented"})).is_err());
+        assert!(WorkerReply::decode(json!({"kind":"ide_validation","incomplete":null})).is_err());
+        assert!(WorkerReply::decode(json!({"kind":"unknown","secret":"never print"})).is_err());
+        let payload =
+            json!({"kind":"rpc","rpc_id":8,"op":"history","arbitrary":{"nested":[1,null,true]}});
+        match WorkerReply::decode(payload.clone()).unwrap() {
+            WorkerReply::Rpc {
+                id,
+                operation,
+                payload: decoded,
+            } => {
+                assert_eq!(id, 8);
+                assert_eq!(operation, "history");
+                assert_eq!(decoded, payload);
+            }
+            _ => panic!("RPC was not decoded"),
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = fs::remove_dir_all(&self.dir);
+        assert!(WorkerRequest::decode(&json!({"kind":"execute","source":"x"})).is_err());
+        assert!(WorkerRequest::decode(
+            &json!({"kind":"rpc_reply","rpc_id":1,"ok":false,"exception":"KeyboardInterrupt"})
+        )
+        .is_ok());
+    }
+    #[test]
+    fn idle_clone_refuses_partial_or_prefetched_frames() {
+        let (mut transport, mut peer) = pair(1024);
+        let _empty = transport.clone_idle().unwrap();
+        peer.write_all(b"{").unwrap();
+        assert!(transport.read_value(WORKER_IO_TICK).unwrap().is_none());
+        assert!(matches!(
+            transport.clone_idle(),
+            Err(WorkerTransportError::Protocol(_))
+        ));
+    }
+    struct Home(crate::test_support::TestDirectory);
+    impl Home {
+        fn new() -> Self {
+            Self(crate::test_support::TestDirectory::new(
+                "py-worker-transport",
+            ))
+        }
+        fn stub(&self, body: &str) -> PathBuf {
+            let path = self.0.join("python-stub");
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o700)
+                .open(&path)
+                .unwrap();
+            file.write_all(body.as_bytes()).unwrap();
+            path
+        }
+    }
+    #[test]
+    fn spawn_failure_removes_owned_setup_directory() {
+        let home = Home::new();
+        assert!(Worker::spawn_using(
+            &home.0,
+            1,
+            std::ffi::OsStr::new("/no/such/worker-python"),
+            std::time::Duration::from_secs(1)
+        )
+        .is_err());
+        assert_eq!(fs::read_dir(&home.0).unwrap().count(), 0);
+    }
+    #[test]
+    fn hung_handshake_times_out_kills_reaps_and_removes_worker_directory() {
+        let home = Home::new();
+        let pidfile = home.0.join("pid");
+        let stub = home.stub(&format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+            pidfile.display()
+        ));
+        let began = std::time::Instant::now();
+        let error = match Worker::spawn_using(
+            &home.0,
+            1,
+            stub.as_os_str(),
+            std::time::Duration::from_millis(500),
+        ) {
+            Ok(_) => panic!("hung worker unexpectedly initialized"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error.downcast_ref::<WorkerTransportError>(),
+            Some(WorkerTransportError::HandshakeTimedOut)
+        ));
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        let pid: i32 = fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(!fs::read_dir(&home.0).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("worker-")));
+    }
+    #[test]
+    fn unexpected_ready_reply_is_protocol_error_with_owned_cleanup() {
+        let home = Home::new();
+        let stub = home.stub("#!/usr/bin/env python3\nimport sys,socket,time\ns=socket.socket(fileno=int(sys.argv[-1]))\ns.sendall(b'{\"kind\":\"started\"}\\n')\ntime.sleep(30)\n");
+        let error = match Worker::spawn_using(
+            &home.0,
+            1,
+            stub.as_os_str(),
+            std::time::Duration::from_secs(3),
+        ) {
+            Ok(_) => panic!("unexpected ready accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error.downcast_ref::<WorkerTransportError>(),
+            Some(WorkerTransportError::Protocol(_))
+        ));
+        assert!(!fs::read_dir(&home.0).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("worker-")));
     }
 }
 
 // =============================================================================
-// Session host and model loop
+// Domain owners, typed commands and session orchestration
 // =============================================================================
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -986,6 +4546,119 @@ struct ProviderRetryState {
     retry: u64,
     max_retries: u64,
     waiting_delay_ms: Option<u64>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderAttemptPhase {
+    Preparing,
+    Sending,
+    Streaming,
+    Backoff,
+    Settled,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderRequestOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+#[derive(Clone, Debug)]
+struct ProviderAttemptState {
+    operation: String,
+    cancellation_epoch: u64,
+    phase: ProviderAttemptPhase,
+    outcome: Option<ProviderRequestOutcome>,
+    retry: Option<ProviderRetryState>,
+}
+#[derive(Clone, Default)]
+struct ProviderAttempts {
+    stack: std::rc::Rc<std::cell::RefCell<Vec<ProviderAttemptState>>>,
+}
+struct ProviderAttemptScope {
+    stack: std::rc::Rc<std::cell::RefCell<Vec<ProviderAttemptState>>>,
+    depth: usize,
+}
+impl Drop for ProviderAttemptScope {
+    fn drop(&mut self) {
+        self.stack.borrow_mut().truncate(self.depth);
+    }
+}
+impl ProviderAttempts {
+    fn begin(&self, operation: &str, cancellation_epoch: u64) -> ProviderAttemptScope {
+        let mut stack = self.stack.borrow_mut();
+        let depth = stack.len();
+        stack.push(ProviderAttemptState {
+            operation: operation.into(),
+            cancellation_epoch,
+            phase: ProviderAttemptPhase::Preparing,
+            outcome: None,
+            retry: None,
+        });
+        ProviderAttemptScope {
+            stack: self.stack.clone(),
+            depth,
+        }
+    }
+    fn current(&self) -> Option<ProviderAttemptState> {
+        self.stack.borrow().last().cloned()
+    }
+    fn transition(
+        &self,
+        operation: &str,
+        phase: ProviderAttemptPhase,
+        retry: Option<ProviderRetryState>,
+    ) {
+        if let Some(state) = self
+            .stack
+            .borrow_mut()
+            .last_mut()
+            .filter(|state| state.operation == operation)
+        {
+            state.phase = phase;
+            if let Some(retry) = retry {
+                state.retry = Some(retry);
+            }
+        }
+    }
+    fn settle(&self, operation: &str, outcome: ProviderRequestOutcome) {
+        if let Some(state) = self
+            .stack
+            .borrow_mut()
+            .last_mut()
+            .filter(|state| state.operation == operation)
+        {
+            if state.outcome != Some(ProviderRequestOutcome::Cancelled) {
+                state.phase = ProviderAttemptPhase::Settled;
+                state.outcome = Some(outcome);
+            }
+        }
+    }
+}
+trait ProviderControl {
+    fn provider_checkpoint(&mut self, operation: &str) -> Result<bool>;
+    fn provider_retry_checkpoint(&mut self, operation: &str) -> Result<()>;
+    fn provider_attempt_started(
+        &mut self,
+        operation: &str,
+        retry: u64,
+        max_retries: u64,
+    ) -> Result<()>;
+    fn provider_attempt_failed(
+        &mut self,
+        operation: &str,
+        retry: u64,
+        retryable: bool,
+        billing_unknown: bool,
+        error: &str,
+    ) -> Result<()>;
+    fn provider_retry_scheduled(
+        &mut self,
+        operation: &str,
+        retry: u64,
+        max_retries: u64,
+        delay_ms: u64,
+        billing_unknown: bool,
+        reason: &str,
+    ) -> Result<()>;
 }
 #[derive(Debug)]
 struct RetryableProviderError {
@@ -1017,96 +4690,2680 @@ impl std::fmt::Display for RetrySuperseded {
 }
 impl std::error::Error for RetrySuperseded {}
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LocalCommandPhase {
     Immediate,
     CellBoundary,
     AfterTurn,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalCommandKind {
+    Help,
+    Model,
+    Models,
+    Effort,
+    Status,
+    Context,
+    Save,
+    Config,
+    Login,
+    Logout,
+    Auth,
+    Session,
+    Sessions,
+    Resume,
+    Recovery,
+    Reset,
+    New,
+    Compact,
+    Interrupt,
+    Quit,
+    Tasks,
+    Task,
+    Background,
+    Wakeups,
+    Wakeup,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandOperation {
+    Query,
+    ModelList,
+    Mutation,
+    Refresh,
+    Execute,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandSchedule {
+    Immediate,
+    MutationAtCellBoundary,
+    MutationAfterTurn,
+    AfterTurn,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandInterruption {
+    None,
+    CancelActive,
+    QuitActive,
+    EndTurn,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandCompletion {
+    Files,
+    Models,
+    Effort,
+    Authentication,
+    Tasks,
+    Sessions,
+    Config,
+}
+struct CommandSpec {
+    kind: LocalCommandKind,
+    names: &'static [&'static str],
+    usage: &'static str,
+    help: &'static str,
+    schedule: CommandSchedule,
+    interruption: CommandInterruption,
+    completion: CommandCompletion,
+}
+// This order preserves the existing picker inventory, including aliases.
+const LOCAL_COMMANDS: &[CommandSpec] = &[
+    CommandSpec {kind:LocalCommandKind::Help,names:&["/help","/hotkeys"],usage:"/help /hotkeys",help:"Editor keys and implemented local commands.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
+    CommandSpec {kind:LocalCommandKind::Model,names:&["/model"],usage:"/model <provider/id or fuzzy query>",help:"Select and save defaults, rejecting ambiguity; no argument shows the current model. /model list [query]: cached inventory, refreshed when stale. /model list refresh [provider]: force refresh.",schedule:CommandSchedule::MutationAtCellBoundary,interruption:CommandInterruption::None,completion:CommandCompletion::Models},
+    CommandSpec {kind:LocalCommandKind::Models,names:&["/models"],usage:"/models [query]",help:"Cached usable-model inventory, refreshed when stale; /models refresh [provider]: force refresh.",schedule:CommandSchedule::MutationAtCellBoundary,interruption:CommandInterruption::None,completion:CommandCompletion::Models},
+    CommandSpec {kind:LocalCommandKind::Effort,names:&["/effort","/think","/thinking"],usage:"/effort <off|minimal|low|medium|high|xhigh> (/think, /thinking)",help:"Save accepted defaults; no argument shows the current effort.",schedule:CommandSchedule::MutationAtCellBoundary,interruption:CommandInterruption::None,completion:CommandCompletion::Effort},
+    CommandSpec {kind:LocalCommandKind::Status,names:&["/status"],usage:"/status",help:"Session and execution status.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
+    CommandSpec {kind:LocalCommandKind::Context,names:&["/context"],usage:"/context",help:"Selected context metadata and budget.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
+    CommandSpec {kind:LocalCommandKind::Save,names:&["/save"],usage:"/save [path.html]",help:"Private, offline HTML of selected context and collapse history.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
+    CommandSpec {kind:LocalCommandKind::Config,names:&["/config"],usage:"/config get <key> | set <key> <JSON-value> | unset <key> | reload",help:"Inspect or update configuration.",schedule:CommandSchedule::MutationAtCellBoundary,interruption:CommandInterruption::None,completion:CommandCompletion::Config},
+    CommandSpec {kind:LocalCommandKind::Login,names:&["/login"],usage:"/login <provider> [browser|manual|device|api-key]",help:"No argument: status + login options; /login status: credentials without secrets.",schedule:CommandSchedule::MutationAfterTurn,interruption:CommandInterruption::EndTurn,completion:CommandCompletion::Authentication},
+    CommandSpec {kind:LocalCommandKind::Logout,names:&["/logout"],usage:"/logout [provider]",help:"Remove stored credentials, not environment credentials; no argument lists options.",schedule:CommandSchedule::MutationAtCellBoundary,interruption:CommandInterruption::None,completion:CommandCompletion::Authentication},
+    CommandSpec {kind:LocalCommandKind::Auth,names:&["/auth"],usage:"/auth",help:"Authentication (no secrets).",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Authentication},
+    CommandSpec {kind:LocalCommandKind::Session,names:&["/session"],usage:"/session",help:"Current journal path.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
+    CommandSpec {kind:LocalCommandKind::Sessions,names:&["/sessions"],usage:"/sessions",help:"Saved sessions.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
+    CommandSpec {kind:LocalCommandKind::Resume,names:&["/resume"],usage:"/resume <path or fuzzy session>",help:"Restore H/context/settings, never Python variables or execution; no argument lists sessions.",schedule:CommandSchedule::MutationAfterTurn,interruption:CommandInterruption::EndTurn,completion:CommandCompletion::Sessions},
+    CommandSpec {kind:LocalCommandKind::Recovery,names:&["/recovery"],usage:"/recovery",help:"Recovery diagnostics; no automatic replay.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
+    CommandSpec {kind:LocalCommandKind::Reset,names:&["/reset"],usage:"/reset",help:"Authorized worker reset with the frozen startup snapshot.",schedule:CommandSchedule::AfterTurn,interruption:CommandInterruption::EndTurn,completion:CommandCompletion::Files},
+    CommandSpec {kind:LocalCommandKind::New,names:&["/new"],usage:"/new [--cancel-tasks]",help:"New session and newly loaded core entries/inventory.",schedule:CommandSchedule::AfterTurn,interruption:CommandInterruption::EndTurn,completion:CommandCompletion::Tasks},
+    CommandSpec {kind:LocalCommandKind::Compact,names:&["/compact"],usage:"/compact [instructions]",help:"Ask the model to collapse selected context.",schedule:CommandSchedule::AfterTurn,interruption:CommandInterruption::EndTurn,completion:CommandCompletion::Files},
+    CommandSpec {kind:LocalCommandKind::Interrupt,names:&["/interrupt"],usage:"/interrupt",help:"Cancel the active operation; idle: explain Ctrl-C.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::CancelActive,completion:CommandCompletion::Files},
+    CommandSpec {kind:LocalCommandKind::Quit,names:&["/quit","/exit"],usage:"/quit [--cancel-tasks] (/exit)",help:"Exit; running jobs require --cancel-tasks.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::QuitActive,completion:CommandCompletion::Tasks},
+    CommandSpec {kind:LocalCommandKind::Tasks,names:&["/tasks"],usage:"/tasks [state]",help:"Background jobs.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Tasks},
+    CommandSpec {kind:LocalCommandKind::Task,names:&["/task"],usage:"/task <id> | /task logs <id> [stdout|stderr|both] | /task kill <id> [--force]",help:"Inspect, read or cancel a background job.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Tasks},
+    CommandSpec {kind:LocalCommandKind::Background,names:&["/bg"],usage:"/bg shell|python <source>",help:"Start an isolated background job.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Tasks},
+    CommandSpec {kind:LocalCommandKind::Wakeups,names:&["/wakeups"],usage:"/wakeups",help:"Scheduled wakeups.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
+    CommandSpec {kind:LocalCommandKind::Wakeup,names:&["/wakeup"],usage:"/wakeup cancel|run <id>",help:"Cancel or deliver a wakeup.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Tasks},
+];
+impl LocalCommandKind {
+    fn spec(self) -> Option<&'static CommandSpec> {
+        LOCAL_COMMANDS.iter().find(|spec| spec.kind == self)
+    }
+    fn canonical_name(self) -> Option<&'static str> {
+        self.spec().map(|spec| spec.names[0])
+    }
+}
+#[derive(Clone)]
+struct ParsedLocalCommand {
+    kind: LocalCommandKind,
+    name: String,
+    args: String,
+    operation: CommandOperation,
+    model_list_query: Option<String>,
+    // Historically busy /model accepts any whitespace after "list", whereas
+    // ordinary dispatch recognizes the documented ASCII-space form. Keep this
+    // compatibility difference explicit rather than reparsing at execution.
+    busy_model_list_query: Option<String>,
+}
+impl ParsedLocalCommand {
+    fn parse(line: &str) -> Self {
+        let (name, args) = line
+            .split_once(char::is_whitespace)
+            .map(|(name, args)| (name, args.trim()))
+            .unwrap_or((line, ""));
+        let kind = LOCAL_COMMANDS
+            .iter()
+            .find(|spec| spec.names.contains(&name))
+            .map_or(LocalCommandKind::Unknown, |spec| spec.kind);
+        let model_list_query = (kind == LocalCommandKind::Model)
+            .then(|| {
+                args.strip_prefix("list")
+                    .filter(|q| q.is_empty() || q.starts_with(' '))
+                    .map(|q| q.trim().to_owned())
+            })
+            .flatten();
+        let busy_model_list_query = (kind == LocalCommandKind::Model)
+            .then(|| {
+                args.strip_prefix("list")
+                    .filter(|q| q.is_empty() || q.starts_with(char::is_whitespace))
+                    .map(|q| q.trim().to_owned())
+            })
+            .flatten();
+        let operation = match kind {
+            LocalCommandKind::Model
+                if args == "list refresh" || args.starts_with("list refresh ") =>
+            {
+                CommandOperation::Refresh
+            }
+            LocalCommandKind::Models if args == "refresh" || args.starts_with("refresh ") => {
+                CommandOperation::Refresh
+            }
+            LocalCommandKind::Model if model_list_query.is_some() => CommandOperation::ModelList,
+            LocalCommandKind::Models => CommandOperation::ModelList,
+            LocalCommandKind::Model
+            | LocalCommandKind::Effort
+            | LocalCommandKind::Logout
+            | LocalCommandKind::Resume => {
+                if args.is_empty() {
+                    CommandOperation::Query
+                } else {
+                    CommandOperation::Mutation
+                }
+            }
+            LocalCommandKind::Config => {
+                if args.is_empty() || args == "get" || args.starts_with("get ") {
+                    CommandOperation::Query
+                } else {
+                    CommandOperation::Mutation
+                }
+            }
+            LocalCommandKind::Login => {
+                if args.is_empty() || args == "status" {
+                    CommandOperation::Query
+                } else {
+                    CommandOperation::Mutation
+                }
+            }
+            _ => CommandOperation::Execute,
+        };
+        Self {
+            kind,
+            name: name.to_owned(),
+            args: args.to_owned(),
+            operation,
+            model_list_query,
+            busy_model_list_query,
+        }
+    }
+    fn phase(&self) -> LocalCommandPhase {
+        if self.operation == CommandOperation::Refresh {
+            return LocalCommandPhase::AfterTurn;
+        }
+        match self.kind.spec().map(|spec| spec.schedule) {
+            Some(CommandSchedule::AfterTurn) => LocalCommandPhase::AfterTurn,
+            Some(CommandSchedule::MutationAtCellBoundary)
+                if self.operation == CommandOperation::Mutation =>
+            {
+                LocalCommandPhase::CellBoundary
+            }
+            Some(CommandSchedule::MutationAfterTurn)
+                if self.operation == CommandOperation::Mutation =>
+            {
+                LocalCommandPhase::AfterTurn
+            }
+            _ => LocalCommandPhase::Immediate,
+        }
+    }
+    fn interruption(&self) -> CommandInterruption {
+        let policy = self
+            .kind
+            .spec()
+            .map_or(CommandInterruption::None, |spec| spec.interruption);
+        if policy == CommandInterruption::EndTurn && self.phase() != LocalCommandPhase::AfterTurn {
+            CommandInterruption::None
+        } else {
+            policy
+        }
+    }
+}
 struct LocalCommand {
     id: String,
-    line: String,
+    parsed: ParsedLocalCommand,
     phase: LocalCommandPhase,
+}
+fn command_help() -> String {
+    let mut help = "py — ordinary persistent Python, unrestricted execution.\nOrdinary Python. No sandbox.\n! shell / @ Python: hidden from the model; !! / @@: visible.\nTab: fuzzy picker for commands, arguments, Python names, executables and files.\nType to filter; arrows/Tab move, Enter selects (not submits); Esc cancels.\nWhile busy: / commands stay local; queries run now, mutations at a safe cell boundary.\n! and !! run immediately; !! is visible, ! stays hidden.\nShift+Enter inserts newline on supported terminals; Ctrl-J is a fallback.\nContinuation lines align after the two-column > prompt.\nPython brackets/suites and bracketed multiline paste form a single cell.\nCtrl-D: exit idle editor. Ctrl-C: clear editor / cancel active operation.\n".to_owned();
+    for spec in LOCAL_COMMANDS {
+        help.push_str(spec.usage);
+        help.push_str(": ");
+        help.push_str(spec.help);
+        let aliases = &spec.names[1..];
+        if !aliases.is_empty() {
+            help.push_str(" Aliases: ");
+            help.push_str(&aliases.join(", "));
+            help.push('.');
+        }
+        help.push('\n');
+    }
+    help.push_str("Model/effort queries do not change config; explicit changes save both accepted values.\nDurable entries: ~/.py/skills/*.md (or PY_HOME); ordinary file editing, no skills API.\nCore entries and inventory freeze on /new; reset/resume preserve that snapshot.\nCore Python repeats on authorized startup/reset, not automatically after a worker crash.\nStartup bridges are limited to H history/cell reads; prefer definitions/imports.\n/quit, /new and /resume require --cancel-tasks while jobs run.\nH stores full history; previews show at most 12 original lines.\nSession resume restores H/context/settings, never Python variables or execution.\nBrowser OAuth: Codex callback, Anthropic hidden code paste.\nUnsupported provider protocols and live subscription parity are not claimed.");
+    help
+}
+
+#[cfg(test)]
+mod local_command_contract_tests {
+    use super::*;
+
+    fn catalog() -> CompletionCatalog {
+        CompletionCatalog {
+            names: vec![],
+            models: json!([]),
+            home: PathBuf::from("."),
+            python_cwd: PathBuf::from("."),
+            current_model: String::new(),
+            configured_providers: vec![],
+            task_ids: vec![],
+            wakeup_ids: vec![],
+        }
+    }
+    #[test]
+    fn registry_is_the_complete_unique_ordered_help_and_completion_inventory() {
+        let expected = [
+            "/help",
+            "/hotkeys",
+            "/model",
+            "/models",
+            "/effort",
+            "/think",
+            "/thinking",
+            "/status",
+            "/context",
+            "/save",
+            "/config",
+            "/login",
+            "/logout",
+            "/auth",
+            "/session",
+            "/sessions",
+            "/resume",
+            "/recovery",
+            "/reset",
+            "/new",
+            "/compact",
+            "/interrupt",
+            "/quit",
+            "/exit",
+            "/tasks",
+            "/task",
+            "/bg",
+            "/wakeups",
+            "/wakeup",
+        ];
+        let names = LOCAL_COMMANDS
+            .iter()
+            .flat_map(|spec| spec.names.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(names, expected);
+        assert_eq!(names.iter().collect::<HashSet<_>>().len(), names.len());
+        let kinds = LOCAL_COMMANDS
+            .iter()
+            .map(|spec| spec.kind)
+            .collect::<Vec<_>>();
+        for (index, kind) in kinds.iter().enumerate() {
+            assert!(!kinds[..index].contains(kind));
+        }
+        let help = command_help();
+        let (_, pairs) = catalog().candidates("/", 1, true).unwrap();
+        let completions = pairs
+            .iter()
+            .map(|pair| pair.replacement.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(completions, names.iter().copied().collect::<HashSet<_>>());
+        for name in names {
+            assert!(help.contains(name), "missing {name}");
+        }
+        assert!(help.contains("/save [path.html]"));
+    }
+    #[test]
+    fn conditional_busy_policy_and_aliases_preserve_existing_boundaries() {
+        for line in [
+            "/model",
+            "/model list",
+            "/model list codex",
+            "/models codex",
+            "/effort",
+            "/think",
+            "/thinking",
+            "/logout",
+            "/config",
+            "/config get model",
+            "/login",
+            "/login status",
+            "/resume",
+            "/save file.html",
+            "/task kill t1",
+            "/wat secret",
+        ] {
+            assert_eq!(
+                ParsedLocalCommand::parse(line).phase(),
+                LocalCommandPhase::Immediate,
+                "{line}"
+            );
+        }
+        for line in [
+            "/model codex/sol61",
+            "/effort high",
+            "/think high",
+            "/thinking high",
+            "/logout codex",
+            "/config set model \"codex/sol61\"",
+            "/config reload",
+        ] {
+            assert_eq!(
+                ParsedLocalCommand::parse(line).phase(),
+                LocalCommandPhase::CellBoundary,
+                "{line}"
+            );
+        }
+        for line in [
+            "/model list refresh",
+            "/model list refresh codex",
+            "/models refresh",
+            "/models refresh codex",
+            "/login codex device",
+            "/new",
+            "/reset",
+            "/compact",
+            "/resume saved.jsonl",
+        ] {
+            assert_eq!(
+                ParsedLocalCommand::parse(line).phase(),
+                LocalCommandPhase::AfterTurn,
+                "{line}"
+            );
+        }
+        for line in ["/effort high", "/think high", "/thinking high"] {
+            assert_eq!(
+                ParsedLocalCommand::parse(line).kind,
+                LocalCommandKind::Effort
+            );
+        }
+        assert_eq!(
+            ParsedLocalCommand::parse("/exit").interruption(),
+            CommandInterruption::QuitActive
+        );
+        assert_eq!(
+            ParsedLocalCommand::parse("/interrupt").interruption(),
+            CommandInterruption::CancelActive
+        );
+        assert_eq!(
+            ParsedLocalCommand::parse("/login status").interruption(),
+            CommandInterruption::None
+        );
+        assert_eq!(
+            ParsedLocalCommand::parse("/login codex").interruption(),
+            CommandInterruption::EndTurn
+        );
+    }
+    #[test]
+    fn parser_keeps_opaque_arguments_and_legacy_busy_whitespace_semantics() {
+        let parsed = ParsedLocalCommand::parse(
+            "/config\tset provider {\"secret\": \"value with spaces\"}  ",
+        );
+        assert_eq!(parsed.kind, LocalCommandKind::Config);
+        assert_eq!(
+            parsed.args,
+            "set provider {\"secret\": \"value with spaces\"}"
+        );
+        let parsed = ParsedLocalCommand::parse("/save 'path with spaces.html'");
+        assert_eq!(parsed.args, "'path with spaces.html'");
+        let parsed = ParsedLocalCommand::parse("/model list\tquery");
+        assert_eq!(parsed.phase(), LocalCommandPhase::CellBoundary);
+        assert!(parsed.model_list_query.is_none());
+        assert_eq!(parsed.busy_model_list_query.as_deref(), Some("query"));
+        let parsed = ParsedLocalCommand::parse("/bad private-argument");
+        assert_eq!(parsed.kind, LocalCommandKind::Unknown);
+        assert_eq!(parsed.name, "/bad");
+        assert_eq!(parsed.args, "private-argument");
+    }
+    #[test]
+    fn aliases_use_identical_argument_completion_metadata() {
+        let catalog = catalog();
+        let (_, canonical) = catalog.candidates("/effort h", 9, false).unwrap();
+        let (_, alias) = catalog.candidates("/thinking h", 11, false).unwrap();
+        assert_eq!(
+            canonical
+                .iter()
+                .map(|pair| &pair.replacement)
+                .collect::<Vec<_>>(),
+            alias
+                .iter()
+                .map(|pair| &pair.replacement)
+                .collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn typed_dispatch_keeps_unknown_and_malformed_argument_errors_local() {
+        let mut host = crate::test_support::HostFixture::named("py-command-contract", None);
+        let before = host.context.snapshot();
+        let error = host.ui_command("/wat do-not-echo").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Unknown command /wat; /help lists implemented commands"
+        );
+        let error = host
+            .ui_command("/sessions unexpected")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Unknown command /sessions; /help lists implemented commands"
+        );
+        assert!(host.ui_command("/new unexpected").is_err());
+        assert!(host.ui_command("/exit unexpected").is_err());
+        assert!(host.ui_command("/config set").is_err());
+        assert_eq!(
+            before.iter().map(item_json).collect::<Vec<_>>(),
+            host.context
+                .items()
+                .iter()
+                .map(item_json)
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 const READ_TEXT_MAX_CHARS: usize = 8000;
 
-struct Host {
-    state: UiState,
-    thinking_model: Option<String>,
-    thinking_started: Option<std::time::Instant>,
-    cells: usize,
-    active_cell: Option<usize>,
-    active_language: Option<String>,
-    active_started: Option<std::time::Instant>,
-    active_operation: Option<String>,
-    cancel_revision: u64,
-    cell_input_records: Vec<usize>,
-    pending_generation_request: Option<String>,
-    provider_retry: Option<ProviderRetryState>,
-    last_generation_failed: bool,
-    cell_history_cache: std::cell::RefCell<CellHistoryCache>,
-    status_line: std::cell::Cell<bool>,
-    busy_draft: EditBuffer,
-    busy_input: Option<BusyInput>,
-    input_busy_paused: bool,
-    local_commands: std::collections::VecDeque<LocalCommand>,
-    exit_requested: bool,
-    busy_visible_revision: u64,
-    last_cell: Value,
-    journal: Journal,
+#[derive(Clone, Debug)]
+struct ActiveCell {
+    number: usize,
+    language: String,
+    operation: String,
+    started: std::time::Instant,
+}
+
+// A cell lease owns restoration, independently of Host's mutable borrow. The
+// committed counter is deliberately not restored: failed cells are not replayed.
+struct CellScope {
+    stack: std::rc::Rc<std::cell::RefCell<Vec<ActiveCell>>>,
+    depth: usize,
+}
+impl Drop for CellScope {
+    fn drop(&mut self) {
+        self.stack.borrow_mut().truncate(self.depth);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupState {
+    Blocked,
+    Initializing,
+    Ready,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ResetDecision {
+    #[default]
+    None,
+    Replace,
+    Explicit,
+}
+#[derive(Default)]
+enum CompletionDecision {
+    #[default]
+    Continue,
+    StagedStop {
+        wakeup: Option<(f64, String)>,
+    },
+    CommittedStop {
+        wakeup: Option<(f64, String)>,
+    },
+}
+#[derive(Default)]
+struct CellDecision {
+    completion: CompletionDecision,
+    reset: ResetDecision,
+}
+impl CellDecision {
+    fn begin(&mut self) {
+        *self = Self::default();
+    }
+    fn stage_stop(&mut self, wakeup: Option<(f64, String)>) {
+        self.completion = CompletionDecision::StagedStop { wakeup };
+    }
+    fn clear_stop(&mut self) {
+        self.completion = CompletionDecision::Continue;
+    }
+    fn should_stop(&self) -> bool {
+        matches!(self.completion, CompletionDecision::CommittedStop { .. })
+    }
+    fn commit_success(&mut self) {
+        self.completion = match std::mem::take(&mut self.completion) {
+            CompletionDecision::StagedStop { wakeup } => {
+                CompletionDecision::CommittedStop { wakeup }
+            }
+            decision => decision,
+        };
+    }
+    fn take_wakeup(&mut self) -> Option<(f64, String)> {
+        match &mut self.completion {
+            CompletionDecision::CommittedStop { wakeup } => wakeup.take(),
+            _ => None,
+        }
+    }
+    fn stage_reset(&mut self, explicit: bool) {
+        // Transport failure must not erase an already explicit reset decision.
+        if explicit || self.reset != ResetDecision::Explicit {
+            self.reset = if explicit {
+                ResetDecision::Explicit
+            } else {
+                ResetDecision::Replace
+            };
+        }
+    }
+    fn reset(&self) -> ResetDecision {
+        self.reset
+    }
+    fn finish_python(&mut self, success: bool) {
+        if !success {
+            self.clear_stop();
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExecutionOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+    WorkerCrashed,
+    WorkerProtocolError,
+    // On-disk legacy/future labels retain their presentation without being
+    // mistaken for a successful current execution.
+    Other(String),
+}
+impl ExecutionOutcome {
+    fn from_label(label: &str) -> Self {
+        match label {
+            "ok" => Self::Succeeded,
+            "error" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            "timeout" => Self::TimedOut,
+            "worker_crashed" => Self::WorkerCrashed,
+            "worker_protocol_error" => Self::WorkerProtocolError,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+    fn label(&self) -> &str {
+        match self {
+            Self::Succeeded => "ok",
+            Self::Failed => "error",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timeout",
+            Self::WorkerCrashed => "worker_crashed",
+            Self::WorkerProtocolError => "worker_protocol_error",
+            Self::Other(label) => label,
+        }
+    }
+    fn successful(&self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+}
+
+struct ExecutionController {
     worker: Worker,
-    home: PathBuf,
-    context: Vec<Item>,
-    history: HashMap<String, Vec<Value>>,
-    ids: HashSet<String>,
-    json: bool,
-    stop: bool,
-    stop_wakeup: Option<(f64, String)>,
-    reset: bool,
-    reset_explicit: bool,
+    cells: usize,
+    stack: std::rc::Rc<std::cell::RefCell<Vec<ActiveCell>>>,
+    startup: StartupState,
     generation: usize,
-    revision: usize,
-    bg_tasks: HashMap<String, BgTask>,
-    wakeups: HashMap<String, Wakeup>,
-    servicing: bool,
-    incoming: Option<std::sync::mpsc::Receiver<Value>>,
-    input_closed: bool,
-    pending: std::collections::VecDeque<Value>,
-    queued: HashMap<String, Option<(usize, usize)>>,
-    deferred_say: Vec<(usize, String)>,
-    agent_turn: bool,
+    decision: CellDecision,
+    cancel_revision: u64,
+    pending_generation_request: Option<String>,
+    last_cell: Value,
+}
+impl ExecutionController {
+    fn spawn(home: &std::path::Path, generation: usize) -> Result<Self> {
+        Ok(Self::new(Worker::spawn(home, generation)?, generation))
+    }
+    fn new(worker: Worker, generation: usize) -> Self {
+        Self {
+            worker,
+            cells: 0,
+            stack: Default::default(),
+            startup: StartupState::Blocked,
+            generation,
+            decision: CellDecision::default(),
+            cancel_revision: 0,
+            pending_generation_request: None,
+            last_cell: Value::Null,
+        }
+    }
+    fn next_cell(&self) -> Result<usize> {
+        self.cells
+            .checked_add(1)
+            .ok_or_else(|| "session cell counter exhausted".into())
+    }
+    fn begin_cell(&mut self, cell: usize, language: &str, operation: &str) -> CellScope {
+        let depth = self.stack.borrow().len();
+        self.cells = cell;
+        self.stack.borrow_mut().push(ActiveCell {
+            number: cell,
+            language: language.into(),
+            operation: operation.into(),
+            started: std::time::Instant::now(),
+        });
+        CellScope {
+            stack: self.stack.clone(),
+            depth,
+        }
+    }
+    fn active(&self) -> Option<ActiveCell> {
+        self.stack.borrow().last().cloned()
+    }
+    fn cell(&self) -> Option<usize> {
+        self.stack.borrow().last().map(|cell| cell.number)
+    }
+    fn language(&self) -> Option<String> {
+        self.active().map(|cell| cell.language)
+    }
+    fn operation(&self) -> Option<String> {
+        self.active().map(|cell| cell.operation)
+    }
+    fn started(&self) -> Option<std::time::Instant> {
+        self.stack.borrow().last().map(|cell| cell.started)
+    }
+    fn cells(&self) -> usize {
+        self.cells
+    }
+    fn restore_cell(&mut self, cell: usize) {
+        self.cells = self.cells.max(cell);
+    }
+    fn commit_completion(&mut self, metadata: Value) {
+        if metadata["language"] == "python" && metadata["status"] == "ok" {
+            self.decision.commit_success();
+        }
+        self.last_cell = metadata;
+    }
+    fn last_cell(&self) -> &Value {
+        &self.last_cell
+    }
+    fn worker(&self) -> &Worker {
+        &self.worker
+    }
+    // Idle inspection needs the transport borrow; execution's lifecycle changes
+    // use the owner operations below rather than exposing the process guard.
+    fn worker_mut(&mut self) -> &mut Worker {
+        &mut self.worker
+    }
+    fn poll_worker(&mut self) -> WorkerTransportResult<Option<Value>> {
+        self.worker.poll_value()
+    }
+    fn writer_lease(&self) -> WorkerTransportResult<WorkerWriteLease> {
+        self.worker.transport.writer_lease()
+    }
+    fn worker_pid(&self) -> i32 {
+        self.worker.child.id() as i32
+    }
+    fn signal_worker(&self, signal: i32) {
+        if let Some(group) = self.worker.child.group {
+            unsafe {
+                libc::kill(-group, signal);
+            }
+        }
+    }
+    fn worker_exit(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        Ok(self.worker.child.try_wait()?)
+    }
+    fn reap_worker(&mut self) -> Result<std::process::ExitStatus> {
+        Ok(self.worker.child.wait()?)
+    }
+    fn replace_worker(&mut self, home: &std::path::Path) -> Result<()> {
+        self.block_startup();
+        self.generation += 1;
+        self.worker = Worker::spawn(home, self.generation)?;
+        Ok(())
+    }
+    fn generation(&self) -> usize {
+        self.generation
+    }
+    fn block_startup(&mut self) {
+        self.startup = StartupState::Blocked;
+    }
+    fn begin_startup(&mut self) {
+        self.startup = StartupState::Initializing;
+    }
+    fn finish_startup(&mut self, success: bool) {
+        self.startup = if success {
+            StartupState::Ready
+        } else {
+            StartupState::Blocked
+        };
+    }
+    fn initializing(&self) -> bool {
+        self.startup == StartupState::Initializing
+    }
+    fn ready(&self) -> bool {
+        self.startup == StartupState::Ready
+    }
+    fn begin_python(&mut self) {
+        self.decision.begin();
+    }
+    fn stage_stop(&mut self, wakeup: Option<(f64, String)>) {
+        self.decision.stage_stop(wakeup);
+    }
+    fn clear_stop(&mut self) {
+        self.decision.clear_stop();
+    }
+    fn should_stop(&self) -> bool {
+        self.decision.should_stop()
+    }
+    fn take_wakeup(&mut self) -> Option<(f64, String)> {
+        self.decision.take_wakeup()
+    }
+    fn stage_reset(&mut self, explicit: bool) {
+        self.decision.stage_reset(explicit);
+    }
+    fn needs_reset(&self) -> bool {
+        self.decision.reset() != ResetDecision::None
+    }
+    fn explicit_reset(&self) -> bool {
+        self.decision.reset() == ResetDecision::Explicit
+    }
+    fn finish_python(&mut self, success: bool) {
+        self.decision.finish_python(success);
+    }
+    fn cancel_revision(&self) -> u64 {
+        self.cancel_revision
+    }
+    fn cancelled(&mut self) {
+        self.cancel_revision = self.cancel_revision.wrapping_add(1);
+    }
+    fn stage_generation(&mut self, operation: String) {
+        self.pending_generation_request = Some(operation);
+    }
+    fn take_generation(&mut self) -> Option<String> {
+        self.pending_generation_request.take()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WaitPolicy<'a> {
+    Service,
+    Process { pid: i32, signal: i32 },
+    Provider { operation: &'a str },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ControlProgress {
+    cancelled: bool,
+    revision: u64,
+}
+const CONTROL_COMMANDS_PER_TICK: usize = 256;
+
+#[cfg(test)]
+mod execution_controller_tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use crate::test_support::HostFixture as Fixture;
+
+    #[test]
+    fn active_cell_lease_restores_nested_metadata_on_error_and_unwind_without_reusing_numbers() {
+        let mut fixture = Fixture::new();
+        let host = fixture.host();
+        let before = host.execution.cells();
+        let root = host.execution.begin_cell(before + 1, "python", "parent");
+        let parent = host.execution.active().unwrap();
+        let failed: Result<()> = (|| {
+            let _child = host.execution.begin_cell(before + 2, "shell", "child");
+            assert_eq!(host.execution.cell(), Some(before + 2));
+            Err("expected child error".into())
+        })();
+        assert!(failed.is_err());
+        assert_eq!(host.execution.cell(), Some(parent.number));
+        assert_eq!(host.execution.operation().as_deref(), Some("parent"));
+        assert_eq!(host.execution.language().as_deref(), Some("python"));
+        assert_eq!(host.execution.started(), Some(parent.started));
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _child = host.execution.begin_cell(before + 3, "shell", "panic");
+            panic!("expected unwind");
+        }))
+        .is_err());
+        assert_eq!(host.execution.cell(), Some(parent.number));
+        assert_eq!(host.execution.cells(), before + 3);
+        drop(root);
+        assert_eq!(host.execution.cell(), None);
+        assert_eq!(host.execution.next_cell().unwrap(), before + 4);
+    }
+
+    #[test]
+    fn staged_decisions_clear_only_failed_stop_and_keep_explicit_reset_and_performed_effects() {
+        let mut decision = CellDecision::default();
+        let mut effects = vec!["shell already ran"];
+        decision.stage_stop(Some((1.0, "later".into())));
+        decision.stage_reset(true);
+        decision.stage_reset(false);
+        effects.push("say already journaled");
+        decision.finish_python(false);
+        assert!(!decision.should_stop());
+        assert_eq!(decision.take_wakeup(), None);
+        assert_eq!(decision.reset(), ResetDecision::Explicit);
+        assert_eq!(effects, ["shell already ran", "say already journaled"]);
+        decision.begin();
+        assert_eq!(decision.reset(), ResetDecision::None);
+        decision.stage_stop(Some((2.0, "once".into())));
+        decision.finish_python(true);
+        assert!(!decision.should_stop());
+        assert_eq!(decision.take_wakeup(), None);
+        decision.commit_success();
+        assert!(decision.should_stop());
+        assert_eq!(decision.take_wakeup(), Some((2.0, "once".into())));
+        assert_eq!(decision.take_wakeup(), None);
+        assert!(decision.should_stop());
+    }
+
+    #[test]
+    fn committed_cell_scope_restores_parent_when_action_fails() {
+        let mut fixture = Fixture::new();
+        let host = fixture.host();
+        let before = host.execution.cells();
+        let error = host
+            .with_cell("python", "outer-scope", "H.records.code[0]", |host| {
+                let outer = host.execution.cell();
+                let started = host.execution.started();
+                let child = host.with_cell("shell", "inner-scope", "H.records.code[0]", |_| {
+                    Err("inner error".into())
+                });
+                assert!(child.is_err());
+                assert_eq!(host.execution.cell(), outer);
+                assert_eq!(host.execution.started(), started);
+                assert_eq!(host.execution.operation().as_deref(), Some("outer-scope"));
+                Err("outer error".into())
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "outer error");
+        assert_eq!(host.execution.cell(), None);
+        assert_eq!(host.execution.cells(), before + 2);
+        assert_eq!(host.execution.last_cell()["status"], "error");
+    }
+
+    #[test]
+    fn end_write_failure_restores_scope_without_committing_a_staged_stop() {
+        let mut fixture = Fixture::new();
+        let host = fixture.host();
+        let before = host.execution.cells();
+        let completion = host.execution.last_cell().clone();
+        assert!(host
+            .with_cell("python", "failed-end", "H.records.code[0]", |host| {
+                host.execution
+                    .stage_stop(Some((1.0, "must-not-settle".into())));
+                host.journal.failed = true;
+                Ok(json!({"status":"ok"}))
+            })
+            .is_err());
+        assert_eq!(host.execution.cell(), None);
+        assert_eq!(host.execution.cells(), before + 1);
+        assert_eq!(host.execution.last_cell(), &completion);
+        assert!(!host.execution.should_stop());
+        assert_eq!(host.execution.take_wakeup(), None);
+    }
+
+    #[test]
+    fn startup_failure_and_implicit_replacement_never_replay_initialization() {
+        let mut fixture = Fixture::new();
+        let effect = fixture.home.join("startup-effects");
+        let source = format!("from pathlib import Path\nwith Path({}).open('a') as f: f.write('effect\\n')\nraise RuntimeError('expected startup failure')", serde_json::to_string(&effect).unwrap());
+        let host = fixture.host();
+        host.skills["entries"] = json!([{"core":true,"kind":"python","python":source,"filename":"failure.py","path":"failure.py","sha256":"test"}]);
+        assert!(host.initialize_skills().is_err());
+        assert!(!host.execution.ready());
+        assert!(!host.execution.initializing());
+        assert_eq!(fs::read_to_string(&effect).unwrap(), "effect\n");
+        let generation = host.execution.generation();
+        host.replace_worker(false).unwrap();
+        assert_eq!(host.execution.generation(), generation + 1);
+        assert!(!host.execution.ready());
+        assert_eq!(fs::read_to_string(&effect).unwrap(), "effect\n");
+        assert!(host.reset_worker().is_err());
+        assert_eq!(fs::read_to_string(&effect).unwrap(), "effect\neffect\n");
+    }
+
+    #[test]
+    fn control_pump_leases_restore_reentrancy_on_unwind() {
+        let pump = ControlPump::default();
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _lease = pump.enter().unwrap();
+            assert!(pump.enter().is_none());
+            panic!("expected pump unwind");
+        }))
+        .is_err());
+        assert!(pump.enter().is_some());
+    }
+
+    #[test]
+    fn partial_worker_frame_returns_to_shared_control_pump_and_cancellation_is_sticky() {
+        let mut fixture = Fixture::new();
+        let host = fixture.host();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        host.execution.worker_mut().transport = WorkerTransport::with_limit(socket, 1024).unwrap();
+        peer.write_all(b"{\"kind\":").unwrap();
+        assert!(host.execution.worker_mut().poll_value().unwrap().is_none());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        host.incoming = Some(receiver);
+        sender
+            .send(NativeCommand::decode(
+                json!({"id":"cancel-partial","kind":"interrupt"}),
+                NativeCommandOrigin::Native,
+            ))
+            .unwrap();
+        let revision = host.execution.cancel_revision();
+        let began = std::time::Instant::now();
+        let progress = host
+            .pump_control(WaitPolicy::Process {
+                pid: host.execution.worker_pid(),
+                signal: 0,
+            })
+            .unwrap();
+        assert!(began.elapsed() < std::time::Duration::from_secs(1));
+        assert!(progress.cancelled);
+        assert_eq!(progress.revision, revision + 1);
+        assert_eq!(host.execution.worker().transport.pending, b"{\"kind\":");
+        assert!(host.ids.contains("cancel-partial"));
+    }
+
+    #[test]
+    fn repeated_interrupts_settle_rpc_reply_but_still_abort_execute_requests() {
+        let mut fixture = Fixture::new();
+        let host = fixture.host();
+        // The peer below supplies only framing. Block the owned real worker's
+        // SIGINT so this test cannot signal the harness or race its idle loop.
+        assert_eq!(
+            host.execute(
+                "mask-for-peer",
+                "import signal; signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGINT})",
+                false
+            )
+            .unwrap()["status"],
+            "ok"
+        );
+        let generation = host.execution.generation();
+        let pid = host.execution.worker_pid();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        host.execution.worker_mut().transport = WorkerTransport::with_limit(socket, 4096).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        host.incoming = Some(receiver);
+        for index in 0..3 {
+            sender
+                .send(NativeCommand::decode(
+                    json!({"id":format!("reply-cancel-{index}"),"kind":"interrupt"}),
+                    NativeCommandOrigin::Native,
+                ))
+                .unwrap();
+        }
+        let revision = host.execution.cancel_revision();
+        let response = input_exception("cancel");
+        host.reply_worker(&json!(7), response.clone()).unwrap();
+        assert_eq!(host.execution.cancel_revision(), revision + 3);
+        assert_eq!(host.execution.generation(), generation);
+        assert_eq!(host.execution.worker_pid(), pid);
+        assert!(!host.execution.needs_reset());
+        let mut reader = std::io::BufReader::new(peer.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["kind"], "rpc_reply");
+        assert_eq!(reply["rpc_id"], 7);
+        assert_eq!(reply["exception"], response["exception"]);
+        for index in 0..3 {
+            assert!(host.ids.contains(&format!("reply-cancel-{index}")));
+        }
+        // This policy is only for an already-issued RPC transaction, not a
+        // license to begin a new execution after cancellation.
+        sender
+            .send(NativeCommand::decode(
+                json!({"id":"execute-cancel","kind":"interrupt"}),
+                NativeCommandOrigin::Native,
+            ))
+            .unwrap();
+        let result = host.send_worker_request(&json!({"kind":"execute","source":"sentinel=99","stdout":"unused","stderr":"unused","forced":false}));
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<WorkerTransportError>(),
+            Some(WorkerTransportError::Cancelled)
+        ));
+        use std::io::Read;
+        let mut byte = [0; 1];
+        let error = peer.read(&mut byte).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+    }
+    #[test]
+    fn oversized_execute_is_an_explicit_refusal_not_a_worker_crash() {
+        let mut fixture = Fixture::new();
+        let host = fixture.host();
+        assert_eq!(
+            host.execute("size-warm", "sentinel=47", false).unwrap()["status"],
+            "ok"
+        );
+        let pid = host.execution.worker_pid();
+        let generation = host.execution.generation();
+        // Exercise the real executor and real healthy worker without allocating
+        // a 64 MiB test request: only this connection's test limit is lowered.
+        host.execution.worker_mut().transport.limit = 4096;
+        let source = format!("sentinel=999\n#{}", "x".repeat(6000));
+        let result = host.execute("size-refused", &source, false).unwrap();
+        assert_eq!(result["status"], "error");
+        assert!(result["exit_code"].is_null());
+        assert_eq!(result["transport_error"]["kind"], "message_too_large");
+        assert_eq!(
+            result["transport_error"]["message"],
+            "Python worker message exceeds 64 MiB limit"
+        );
+        assert_eq!(
+            result["transport_error"]["limit_bytes"],
+            WORKER_MAX_MESSAGE_BYTES
+        );
+        assert_eq!(result["transport_error"]["execution_started"], false);
+        for stream in ["stdout", "stderr"] {
+            assert_eq!(result[stream]["bytes"], 0);
+            assert_eq!(result[stream]["complete"], true);
+        }
+        assert!(!host.execution.needs_reset());
+        assert_eq!(host.execution.worker_pid(), pid);
+        assert_eq!(host.execution.generation(), generation);
+        assert!(host.execution.ready());
+        let next = host.execute("size-next", "print(sentinel)", false).unwrap();
+        assert_eq!(next["status"], "ok");
+        assert!(next.get("transport_error").is_none());
+        assert_eq!(
+            host.history_value(
+                "stdout",
+                next["stdout"]["record_index"].as_u64().unwrap() as usize
+            )
+            .unwrap(),
+            "47\n"
+        );
+        assert_eq!(host.execution.worker_pid(), pid);
+        assert_eq!(host.execution.generation(), generation);
+        let completion = (0..host.journal.seq)
+            .map(|sequence| host.journal.event(sequence).unwrap())
+            .find(|event| {
+                event["kind"] == "completion" && event["payload"]["command_id"] == "size-refused"
+            })
+            .unwrap();
+        assert_eq!(
+            completion["payload"]["transport_error"],
+            result["transport_error"]
+        );
+    }
+
+    #[test]
+    fn interrupt_before_started_pumps_control_and_escalates_a_silent_worker() {
+        let mut fixture = Fixture::new();
+        let marker = fixture.home.join("execute-received");
+        let script = fixture.home.join("silent-worker");
+        let source = format!(
+            r#"#!/usr/bin/env python3
+import json,signal,socket,sys,time
+from pathlib import Path
+connection=socket.socket(fileno=int(sys.argv[3]))
+reader=connection.makefile('r')
+writer=connection.makefile('w')
+writer.write('{{"kind":"ready"}}\n');writer.flush()
+for line in reader:
+ command=json.loads(line)
+ if command.get('kind')=='execute':
+  signal.signal(signal.SIGINT,signal.SIG_IGN)
+  Path({}).touch()
+  while True:time.sleep(0.02)
+"#,
+            serde_json::to_string(&marker).unwrap()
+        );
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&script)
+            .unwrap();
+        file.write_all(source.as_bytes()).unwrap();
+        drop(file);
+        let worker = Worker::spawn_using(
+            &fixture.home,
+            99,
+            script.as_os_str(),
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let interrupted = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed = interrupted.clone();
+        let signaler = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !marker.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "worker did not receive execute"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            *observed.lock().unwrap() = Some(std::time::Instant::now());
+            sender
+                .send(NativeCommand::decode(
+                    json!({"id":"pre-start-interrupt","kind":"interrupt"}),
+                    NativeCommandOrigin::Native,
+                ))
+                .unwrap();
+        });
+        let host = fixture.host();
+        host.execution.worker = worker;
+        host.incoming = Some(receiver);
+        let generation = host.execution.generation();
+        let result = host
+            .execute("silent-execute", "not executed", false)
+            .unwrap();
+        signaler.join().unwrap();
+        assert!(
+            interrupted.lock().unwrap().unwrap().elapsed() < std::time::Duration::from_millis(2500)
+        );
+        assert_eq!(result["status"], "cancelled");
+        assert!(host.ids.contains("pre-start-interrupt"));
+        assert_eq!(host.execution.generation(), generation + 1);
+        for stream in ["stdout", "stderr"] {
+            assert_eq!(result[stream]["bytes"], 0);
+            assert_eq!(result[stream]["complete"], false);
+        }
+        assert!(result.get("transport_error").is_none());
+    }
+
+    #[test]
+    fn native_input_flood_is_bounded_per_tick_and_preserves_fifo() {
+        let mut fixture = Fixture::new();
+        let host = fixture.host();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        host.incoming = Some(receiver);
+        for n in 0..CONTROL_COMMANDS_PER_TICK + 1 {
+            sender
+                .send(NativeCommand::decode(
+                    json!({"id":format!("tick-{n}"),"kind":"task_list"}),
+                    NativeCommandOrigin::Native,
+                ))
+                .unwrap();
+        }
+        let progress = host
+            .pump_control(WaitPolicy::Provider {
+                operation: "tick-test",
+            })
+            .unwrap();
+        assert!(!progress.cancelled);
+        assert!(host.ids.contains("tick-0"));
+        assert!(host
+            .ids
+            .contains(&format!("tick-{}", CONTROL_COMMANDS_PER_TICK - 1)));
+        assert!(!host
+            .ids
+            .contains(&format!("tick-{}", CONTROL_COMMANDS_PER_TICK)));
+        host.pump_control(WaitPolicy::Provider {
+            operation: "tick-test",
+        })
+        .unwrap();
+        assert!(host
+            .ids
+            .contains(&format!("tick-{}", CONTROL_COMMANDS_PER_TICK)));
+    }
+}
+
+#[derive(Default)]
+struct ControlPump {
+    servicing: std::rc::Rc<std::cell::Cell<bool>>,
+}
+struct PumpLease(std::rc::Rc<std::cell::Cell<bool>>);
+impl Drop for PumpLease {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+impl ControlPump {
+    fn enter(&self) -> Option<PumpLease> {
+        if self.servicing.replace(true) {
+            None
+        } else {
+            Some(PumpLease(self.servicing.clone()))
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FrontendPhase {
+    state: UiState,
+    model: Option<String>,
+    started: Option<std::time::Instant>,
+}
+enum InputOwnership {
+    Idle,
+    Busy(BusyInput),
+    PromptExclusive { resume_busy: bool },
+}
+struct TerminalFrontend {
+    phase: FrontendPhase,
+    status_line: std::cell::Cell<bool>,
+    draft: EditBuffer,
+    input: InputOwnership,
+    commands: std::collections::VecDeque<LocalCommand>,
+    visible_revision: u64,
+}
+impl TerminalFrontend {
+    fn new() -> Self {
+        Self {
+            phase: FrontendPhase {
+                state: UiState::Idle,
+                model: None,
+                started: None,
+            },
+            status_line: std::cell::Cell::new(false),
+            draft: EditBuffer::default(),
+            input: InputOwnership::Idle,
+            commands: std::collections::VecDeque::new(),
+            visible_revision: 0,
+        }
+    }
+    fn state(&self) -> UiState {
+        self.phase.state
+    }
+    fn model(&self) -> Option<&str> {
+        self.phase.model.as_deref()
+    }
+    fn thinking_elapsed(&self) -> Option<u64> {
+        self.phase
+            .started
+            .map(|start| start.elapsed().as_millis().min(u64::MAX as u128) as u64)
+    }
+    fn phase(&self) -> FrontendPhase {
+        self.phase.clone()
+    }
+    fn transition(&mut self, state: UiState, model: Option<String>) -> bool {
+        if self.phase.state == state && self.phase.model == model {
+            return false;
+        }
+        self.phase = FrontendPhase {
+            state,
+            model,
+            started: (state == UiState::Thinking).then(std::time::Instant::now),
+        };
+        true
+    }
+    fn restore_phase(&mut self, phase: FrontendPhase) -> bool {
+        let changed = self.phase.state != phase.state || self.phase.model != phase.model;
+        self.phase = phase;
+        changed
+    }
+    fn busy(&self) -> Option<&BusyInput> {
+        match &self.input {
+            InputOwnership::Busy(busy) => Some(busy),
+            _ => None,
+        }
+    }
+    fn start_busy(&mut self, status: Value) -> bool {
+        if !matches!(self.input, InputOwnership::Idle) {
+            return false;
+        }
+        match BusyInput::start(status, self.draft.clone()) {
+            Ok(busy) => {
+                self.draft = EditBuffer::default();
+                self.input = InputOwnership::Busy(busy);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+    fn next_busy_line(&self) -> Option<(String, String)> {
+        self.busy().and_then(|busy| busy.lines.try_recv().ok())
+    }
+    fn stop_busy(&mut self, status: Value) -> Vec<(String, String)> {
+        match std::mem::replace(&mut self.input, InputOwnership::Idle) {
+            InputOwnership::Busy(busy) => {
+                let (lines, draft) = busy.finish(status);
+                self.draft = draft;
+                lines
+            }
+            ownership => {
+                self.input = ownership;
+                Vec::new()
+            }
+        }
+    }
+    fn acquire_prompt(&mut self, status: Value) -> Result<Vec<(String, String)>> {
+        if matches!(self.input, InputOwnership::PromptExclusive { .. }) {
+            return Err("stdin is already owned by an input prompt".into());
+        }
+        let resume_busy = self.busy().is_some();
+        // finish() joins the raw reader and drains an in-flight paste before
+        // exclusive stdin ownership is granted to the prompt.
+        let lines = self.stop_busy(status);
+        self.input = InputOwnership::PromptExclusive { resume_busy };
+        Ok(lines)
+    }
+    fn release_prompt(&mut self) -> bool {
+        if let InputOwnership::PromptExclusive { resume_busy } = self.input {
+            self.input = InputOwnership::Idle;
+            resume_busy
+        } else {
+            false
+        }
+    }
+    fn take_draft(&mut self) -> EditBuffer {
+        std::mem::take(&mut self.draft)
+    }
+    fn save_draft(&mut self, draft: EditBuffer) {
+        self.draft = draft;
+    }
+    fn queue_command(&mut self, command: LocalCommand) {
+        self.commands.push_back(command);
+    }
+    fn pop_command(&mut self) -> Option<LocalCommand> {
+        self.commands.pop_front()
+    }
+    fn next_command_phase(&self) -> Option<LocalCommandPhase> {
+        self.commands.front().map(|command| command.phase)
+    }
+    fn has_commands(&self) -> bool {
+        !self.commands.is_empty()
+    }
+    fn has_after_turn_command(&self) -> bool {
+        self.commands
+            .iter()
+            .any(|command| command.phase == LocalCommandPhase::AfterTurn)
+    }
+    fn visible_revision(&self) -> u64 {
+        self.visible_revision
+    }
+    fn admit_visible_change(&mut self) -> Result<()> {
+        self.visible_revision = self
+            .visible_revision
+            .checked_add(1)
+            .ok_or("visible command revision exhausted")?;
+        Ok(())
+    }
+}
+// Provider identities and protocols are decoded once at request planning.
+// Unknown API labels keep the historical OpenAI-compatible fallback rather
+// than claiming an unsupported capability from a provider's display name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProviderKind {
+    OpenAi,
+    Codex,
+    Anthropic,
+    Google,
+    Copilot,
+    Zai,
+    Compatible(String),
+}
+impl ProviderKind {
+    fn decode(label: &str) -> Self {
+        match provider_alias(label) {
+            "openai" => Self::OpenAi,
+            "openai-codex" => Self::Codex,
+            "anthropic" => Self::Anthropic,
+            "google" => Self::Google,
+            "github-copilot" => Self::Copilot,
+            "zai" => Self::Zai,
+            other => Self::Compatible(other.to_owned()),
+        }
+    }
+    fn label(&self) -> &str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Codex => "openai-codex",
+            Self::Anthropic => "anthropic",
+            Self::Google => "google",
+            Self::Copilot => "github-copilot",
+            Self::Zai => "zai",
+            Self::Compatible(label) => label,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ApiKind {
+    Responses,
+    CodexResponses,
+    Completions,
+    Anthropic,
+    Google,
+    Image,
+    Compatible(String),
+}
+impl ApiKind {
+    fn decode(label: &str) -> Self {
+        match label {
+            "openai-responses" => Self::Responses,
+            "openai-codex-responses" => Self::CodexResponses,
+            "openai-completions" => Self::Completions,
+            "anthropic-messages" => Self::Anthropic,
+            "google-generative-ai" => Self::Google,
+            "image-generation" => Self::Image,
+            other => Self::Compatible(other.to_owned()),
+        }
+    }
+    #[cfg(test)]
+    fn label(&self) -> &str {
+        match self {
+            Self::Responses => "openai-responses",
+            Self::CodexResponses => "openai-codex-responses",
+            Self::Completions => "openai-completions",
+            Self::Anthropic => "anthropic-messages",
+            Self::Google => "google-generative-ai",
+            Self::Image => "image-generation",
+            Self::Compatible(label) => label,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThinkingFormat {
+    OpenAi,
+    Zai,
+    Qwen,
+}
+impl ThinkingFormat {
+    fn decode(label: &str) -> Self {
+        match label {
+            "zai" => Self::Zai,
+            "qwen" => Self::Qwen,
+            _ => Self::OpenAi,
+        }
+    }
+}
+#[derive(Clone, Debug)]
+struct ModelCapabilities {
+    reasoning: bool,
+    // Decode this capability, but do not introduce a new image-admission policy.
+    #[allow(dead_code)]
+    image_input: bool,
+    image_output: bool,
+    complete: bool,
+    max_input_tokens: Option<u64>,
+    max_output_tokens: Option<u64>,
+    reasoning_efforts: Option<Vec<String>>,
+    thinking_format: Option<ThinkingFormat>,
+    supports_reasoning_effort: Option<bool>,
+    opaque: Value,
+}
+impl ModelCapabilities {
+    fn decode(metadata: &Value) -> Self {
+        Self {
+            reasoning: metadata["reasoning"] == true,
+            image_input: metadata["image_input"] == true,
+            image_output: metadata["image_output"] == true,
+            complete: metadata["metadata_complete"] != false,
+            max_input_tokens: metadata["max_input_tokens"].as_u64(),
+            max_output_tokens: metadata["max_tokens"].as_u64(),
+            reasoning_efforts: metadata["reasoning_efforts"].as_array().map(|levels| {
+                levels
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            }),
+            thinking_format: metadata["compat"]["thinkingFormat"]
+                .as_str()
+                .or(metadata["compat"]["thinking_format"].as_str())
+                .map(ThinkingFormat::decode),
+            supports_reasoning_effort: metadata["compat"]["supportsReasoningEffort"]
+                .as_bool()
+                .or(metadata["compat"]["supports_reasoning_effort"].as_bool()),
+            opaque: metadata.clone(),
+        }
+    }
+}
+struct TextRequestPlan {
+    provider: ProviderKind,
+    api: ApiKind,
+    reasoning_fields: Value,
+    max_retries: u64,
+}
+
+// Provider configuration, credentials, selection and measured usage have one
+// owner. Host retains the journal/control boundary, not copies of this state.
+struct ProviderClient {
     config: Value,
     config_defaults: Value,
     auth: Value,
+    catalog: Value,
     model: String,
     effort: String,
-    no_model: bool,
     context_limit: usize,
-    trigger: usize,
-    retain: usize,
-    current_code: Option<String>,
     usage: Value,
     cache_accounting: CacheAccounting,
-    skills: Value,
-    catalog: Value,
-    initializing: bool,
-    startup_ready: bool,
+    attempts: ProviderAttempts,
 }
-impl Host {
-    fn event(&self, kind: &str, payload: Value) {
+impl ProviderClient {
+    fn model(&self) -> &str {
+        &self.model
+    }
+    fn effort(&self) -> &str {
+        &self.effort
+    }
+    fn new() -> Self {
+        Self {
+            config: json!({}),
+            config_defaults: json!({}),
+            auth: json!({}),
+            catalog: empty_model_catalog(),
+            model: std::env::var("PY_MODEL").unwrap_or_else(|_| "openai/gpt-4.1".into()),
+            effort: "medium".into(),
+            context_limit: std::env::var("PY_CONTEXT_LIMIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(128000),
+            usage: json!({}),
+            cache_accounting: CacheAccounting::default(),
+            attempts: ProviderAttempts::default(),
+        }
+    }
+    fn begin_request(&self, operation: &str, cancellation_epoch: u64) -> ProviderAttemptScope {
+        self.attempts.begin(operation, cancellation_epoch)
+    }
+    fn retry_snapshot(&self) -> Option<ProviderRetryState> {
+        self.attempts.current().and_then(|state| state.retry)
+    }
+    #[cfg(test)]
+    fn sending(&self, operation: &str, retry: u64, max_retries: u64) {
+        self.attempts.transition(
+            operation,
+            ProviderAttemptPhase::Sending,
+            Some(ProviderRetryState {
+                operation: operation.into(),
+                retry,
+                max_retries,
+                waiting_delay_ms: None,
+            }),
+        );
+    }
+    #[cfg(test)]
+    fn streaming(&self, operation: &str) {
+        self.attempts
+            .transition(operation, ProviderAttemptPhase::Streaming, None);
+    }
+    #[cfg(test)]
+    fn backoff(&self, operation: &str, retry: u64, max_retries: u64, delay_ms: u64) {
+        self.attempts.transition(
+            operation,
+            ProviderAttemptPhase::Backoff,
+            Some(ProviderRetryState {
+                operation: operation.into(),
+                retry,
+                max_retries,
+                waiting_delay_ms: Some(delay_ms),
+            }),
+        );
+    }
+    fn settle_request(&self, operation: &str, outcome: ProviderRequestOutcome) {
+        self.attempts.settle(operation, outcome);
+    }
+    fn cancellation_epoch(&self, operation: &str) -> Option<u64> {
+        self.attempts
+            .current()
+            .filter(|state| state.operation == operation)
+            .map(|state| state.cancellation_epoch)
+    }
+    fn cancel_request(&self, operation: &str, epoch: Option<u64>) {
+        if self.cancellation_epoch(operation) == epoch {
+            self.settle_request(operation, ProviderRequestOutcome::Cancelled);
+        }
+    }
+    fn plan_text_request(
+        &self,
+        model: &str,
+        messages: &[Value],
+        max: usize,
+    ) -> Result<TextRequestPlan> {
+        let (provider, id) = model.split_once('/').unwrap_or(("openai", model));
+        let provider = ProviderKind::decode(provider);
+        let api = ApiKind::decode(&self.model_api(model));
+        let capabilities = ModelCapabilities::decode(&self.reasoning_metadata(model));
+        if !capabilities.complete {
+            return Err("model capabilities are incomplete; declare this model's API/context/capabilities in config.json before selecting or invoking it".into());
+        }
+        let fields = reasoning_fields_typed(&api, &provider, id, &capabilities, &self.effort, max)?;
+        let max_retries = if provider == ProviderKind::Codex {
+            self.codex_retry_limit()?
+        } else {
+            0
+        };
+        if provider == ProviderKind::Codex {
+            for message in messages
+                .iter()
+                .filter(|message| message["role"] == "assistant")
+            {
+                codex_assistant_phase(message)?;
+            }
+        }
+        if capabilities.max_input_tokens.is_some() {
+            let input = serde_json::to_string(messages)?.chars().count().div_ceil(3);
+            let available = model_input_budget(self.model_limit(model)?, &capabilities.opaque, max);
+            if input > available {
+                return Err(format!("estimated request input {input} exceeds model input budget {available}; reduce the prompt/context before retrying").into());
+            }
+        }
+        Ok(TextRequestPlan {
+            provider,
+            api,
+            reasoning_fields: fields,
+            max_retries,
+        })
+    }
+    fn transport_client(no_redirects: bool) -> Result<reqwest::Client> {
+        Ok(reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(180))
+            .redirect(if no_redirects {
+                reqwest::redirect::Policy::none()
+            } else {
+                reqwest::redirect::Policy::limited(10)
+            })
+            .build()?)
+    }
+    fn codex_retry_limit(&self) -> Result<u64> {
+        let Some(value) = self.config["providers"]["openai-codex"].get("request_retries") else {
+            return Ok(2);
+        };
+        value.as_u64().filter(|limit| *limit <= 5).ok_or_else(|| {
+            "providers.openai-codex.request_retries must be an integer from 0 to 5".into()
+        })
+    }
+    fn accept_auth(&mut self, auth: Value) {
+        self.auth = auth;
+    }
+    fn accept_catalog(&mut self, catalog: Value) {
+        self.catalog = catalog;
+    }
+    fn accept_credential(&mut self, provider: &str, credential: Value) {
+        self.auth[provider] = credential;
+    }
+    fn restore_usage(
+        &mut self,
+        report: &Value,
+        response_recorded: bool,
+        any_responses: bool,
+    ) -> Result<()> {
+        self.usage = report.clone();
+        if !response_recorded {
+            if let Some(snapshot) = report.get("cache_accounting") {
+                let mut recovered = CacheAccounting::from_snapshot(snapshot)?;
+                recovered.merge_coverage(&self.cache_accounting);
+                self.cache_accounting = recovered;
+            } else if !any_responses {
+                let input = report["input_tokens"].as_u64();
+                let cached = report["cache_hit_tokens"]
+                    .as_u64()
+                    .or(report["reported_cache_hit_tokens"].as_u64());
+                let mut legacy = CacheAccounting::default();
+                legacy.observe(input, cached, input)?;
+                legacy.mark_incomplete();
+                self.cache_accounting = legacy;
+            } else {
+                self.cache_accounting.mark_incomplete();
+            }
+        } else if let Some(snapshot) = report.get("cache_accounting") {
+            self.cache_accounting
+                .merge_coverage(&CacheAccounting::from_snapshot(snapshot)?);
+        } else if report["cache_usage_complete"] == false {
+            self.cache_accounting.cache_complete = false;
+            self.cache_accounting.rate_complete = false;
+        }
+        Ok(())
+    }
+    fn restore_cache_body(&mut self, body: &Value) -> Result<()> {
+        self.cache_accounting.observe_body(body)
+    }
+    fn restore_unknown_attempt(&mut self) {
+        self.cache_accounting.mark_incomplete();
+    }
+    fn refresh_usage_report(&mut self) {
+        self.cache_accounting.write_report(&mut self.usage);
+    }
+    fn accept_defaults(&mut self, defaults: Value) {
+        self.config_defaults = defaults;
+    }
+    fn load_session_config(&mut self, config: Value) {
+        self.config_defaults = config.clone();
+        self.config = config;
+    }
+    fn configure_selection(&mut self) -> String {
+        if let Some(model) = self.config["model"].as_str() {
+            self.model = model.into();
+        }
+        if let Ok(model) = std::env::var("PY_MODEL") {
+            self.model = model;
+        }
+        if let Some(effort) = self.config["effort"].as_str() {
+            self.effort = effort.into();
+        }
+        self.model.clone()
+    }
+    fn persist_selection_defaults(
+        &mut self,
+        home: &Path,
+        model: &str,
+        effort: &str,
+        persist: bool,
+    ) -> Result<Option<File>> {
+        if !persist {
+            return Ok(None);
+        }
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(home.join("config.lock"))?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let path = home.join("config.json");
+        if load_json(&path)? != self.config_defaults {
+            return Err(
+                "config.json changed externally; /config reload before changing model or effort"
+                    .into(),
+            );
+        }
+        let mut next = self.config_defaults.clone();
+        next["model"] = json!(model);
+        next["effort"] = json!(effort);
+        validate_config(&next)?;
+        if let Err(error) = write_private_json(&path, &next) {
+            if load_json(&path).ok().as_ref() == Some(&next) {
+                self.accept_defaults(next);
+                return Err(format!("Global model/effort defaults may have been updated, but their durable save failed: {error}. Current session selection was not changed; verify /config before continuing.").into());
+            }
+            return Err(error);
+        }
+        self.accept_defaults(next);
+        Ok(Some(lock))
+    }
+    fn mark_cache_incomplete(&mut self) {
+        self.cache_accounting.mark_incomplete();
+        self.cache_accounting.write_report(&mut self.usage);
+    }
+    fn commit_selection(&mut self, model: String, effort: String, limit: usize, persisted: bool) {
+        self.model = model;
+        self.effort = effort;
+        self.context_limit = limit;
+        if persisted {
+            self.config["model"] = json!(self.model);
+            self.config["effort"] = json!(self.effort);
+        }
+    }
+    fn set_session_model(&mut self, model: String, limit: usize) {
+        self.model = model;
+        self.context_limit = limit;
+    }
+    fn set_call_effort(&mut self, effort: String) -> String {
+        std::mem::replace(&mut self.effort, effort)
+    }
+    fn restore_effort(&mut self, effort: String) -> Result<()> {
+        self.validate_effort_for(&self.model, &effort)?;
+        self.effort = effort;
+        Ok(())
+    }
+    fn response_text(body: &Value) -> Result<String> {
+        validate_provider_completion(body)?;
+        let text = if let Some(text) = body["choices"][0]["message"]["content"].as_str() {
+            text.to_owned()
+        } else if let Some(output) = body["output"].as_array() {
+            responses_final_text(output)?
+        } else if let Some(parts) = body["content"].as_array() {
+            parts
+                .iter()
+                .filter(|part| part["type"] == "text")
+                .filter_map(|part| part["text"].as_str())
+                .collect::<String>()
+        } else if let Some(parts) = body["candidates"][0]["content"]["parts"].as_array() {
+            parts
+                .iter()
+                .filter(|part| part["thought"] != true)
+                .filter_map(|part| part["text"].as_str())
+                .collect::<String>()
+        } else {
+            return Err("provider response contains no text".into());
+        };
+        if text.is_empty() {
+            return Err("provider response contains no text".into());
+        }
+        Ok(text)
+    }
+    fn validate_image_model(model: &str) -> Result<()> {
+        let kind = model
+            .split_once('/')
+            .map(|(provider, _)| ProviderKind::decode(provider));
+        if kind != Some(ProviderKind::OpenAi) {
+            return Err("image generation currently requires openai-compatible provider".into());
+        }
+        Ok(())
+    }
+    fn image_request(url: &str, key: &str, id: &str, prompt: &str) -> reqwest::RequestBuilder {
+        reqwest::Client::new()
+            .post(format!("{url}/images/generations"))
+            .bearer_auth(key)
+            .json(&json!({"model":id,"prompt":prompt,"size":"1024x1024","n":1}))
+    }
+    fn observe_response(&mut self, body: &Value, operation: &str) -> Result<Value> {
+        let raw = &body["usage"];
+        let input = raw["prompt_tokens"]
+            .as_u64()
+            .or(raw["input_tokens"].as_u64())
+            .or(body["usageMetadata"]["promptTokenCount"].as_u64());
+        let output = raw["completion_tokens"]
+            .as_u64()
+            .or(raw["output_tokens"].as_u64())
+            .or(body["usageMetadata"]["candidatesTokenCount"].as_u64());
+        let output_total = output.map_or(Value::Null, |n| {
+            json!(self.usage["output_tokens"].as_u64().unwrap_or(0) + n)
+        });
+        if self.usage["cache_usage_complete"] == false && self.cache_accounting.complete() {
+            self.cache_accounting.mark_incomplete();
+        }
+        self.cache_accounting.observe_body(body)?;
+        let mut report =
+            json!({"output_tokens":output_total,"last_input_tokens":input,"operation":operation});
+        self.cache_accounting.write_report(&mut report);
+        self.usage = report.clone();
+        Ok(report)
+    }
+}
+#[cfg(test)]
+mod provider_domain_tests {
+    use super::*;
+    #[test]
+    fn provider_aliases_and_unknown_api_keep_compatible_meaning_without_claiming_capabilities() {
+        assert_eq!(ProviderKind::decode("codex"), ProviderKind::Codex);
+        assert_eq!(ProviderKind::decode("openai-codex"), ProviderKind::Codex);
+        assert_eq!(
+            ProviderKind::decode("my-local-server"),
+            ProviderKind::Compatible("my-local-server".into())
+        );
+        let api = ApiKind::decode("custom-wire-version");
+        assert_eq!(api.label(), "custom-wire-version");
+        assert!(matches!(api, ApiKind::Compatible(_)));
+        let capabilities = ModelCapabilities::decode(&json!({"reasoning":true,"image_input":true,
+            "image_output":false,"max_tokens":8192,"reasoning_efforts":["low","high"],"compat":{"thinkingFormat":"qwen"}}));
+        assert!(
+            capabilities.complete
+                && capabilities.reasoning
+                && capabilities.image_input
+                && !capabilities.image_output
+        );
+        assert_eq!(capabilities.max_output_tokens, Some(8192));
+        let fields = reasoning_fields_typed(
+            &ApiKind::Completions,
+            &ProviderKind::Compatible("custom".into()),
+            "model",
+            &capabilities,
+            "high",
+            100,
+        )
+        .unwrap();
+        assert_eq!(fields, json!({"enable_thinking":true}));
+        assert!(reasoning_fields_typed(
+            &api,
+            &ProviderKind::Compatible("custom".into()),
+            "model",
+            &capabilities,
+            "high",
+            100
+        )
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .is_empty());
+    }
+    #[test]
+    fn attempt_scopes_restore_parent_retry_state_on_error_unwind_and_cancellation() {
+        let client = ProviderClient::new();
+        let outer = client.begin_request("outer", 10);
+        client.sending("outer", 0, 2);
+        client.backoff("outer", 1, 2, 500);
+        let failed: Result<()> = (|| {
+            let _inner = client.begin_request("inner", 11);
+            client.sending("inner", 0, 1);
+            client.streaming("inner");
+            Err("failed nested request".into())
+        })();
+        assert!(failed.is_err());
+        let restored = client.attempts.current().unwrap();
+        assert_eq!(restored.operation, "outer");
+        assert_eq!(restored.cancellation_epoch, 10);
+        assert_eq!(restored.phase, ProviderAttemptPhase::Backoff);
+        assert_eq!(client.retry_snapshot().unwrap().waiting_delay_ms, Some(500));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _inner = client.begin_request("panic", 12);
+            panic!("expected unwind");
+        }))
+        .is_err());
+        assert_eq!(client.attempts.current().unwrap().operation, "outer");
+        client.settle_request("outer", ProviderRequestOutcome::Cancelled);
+        client.settle_request("outer", ProviderRequestOutcome::Failed);
+        assert_eq!(
+            client.attempts.current().unwrap().outcome,
+            Some(ProviderRequestOutcome::Cancelled)
+        );
+        drop(outer);
+        assert!(client.attempts.current().is_none() && client.retry_snapshot().is_none());
+    }
+    struct ControlProbe {
+        cancelled: bool,
+        reject_attempt: bool,
+        attempts: usize,
+    }
+    impl ProviderControl for ControlProbe {
+        fn provider_checkpoint(&mut self, _: &str) -> Result<bool> {
+            Ok(self.cancelled)
+        }
+        fn provider_retry_checkpoint(&mut self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn provider_attempt_started(&mut self, _: &str, _: u64, _: u64) -> Result<()> {
+            self.attempts += 1;
+            if self.reject_attempt {
+                Err("attempt journal rejected".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn provider_attempt_failed(
+            &mut self,
+            _: &str,
+            _: u64,
+            _: bool,
+            _: bool,
+            _: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn provider_retry_scheduled(
+            &mut self,
+            _: &str,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: bool,
+            _: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn transport_obeys_control_cancellation_and_durable_attempt_before_sending() {
+        let mut control = ControlProbe {
+            cancelled: true,
+            reject_attempt: false,
+            attempts: 0,
+        };
+        let error =
+            ProviderClient::wait_codex(std::future::pending::<Result<()>>(), "op", &mut control)
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Codex operation cancelled; request outcome may be unknown"
+        );
+        assert_eq!(control.attempts, 0);
+        control.cancelled = false;
+        control.reject_attempt = true;
+        let request = reqwest::Client::new()
+            .post("http://127.0.0.1:1")
+            .json(&json!({"input":"not sent"}));
+        let attempts = ProviderAttempts::default();
+        let _scope = attempts.begin("op", 0);
+        let error =
+            ProviderClient::retry_codex(&request, "op", 2, &[], attempts.clone(), &mut control)
+                .unwrap_err();
+        assert_eq!(error.to_string(), "attempt journal rejected");
+        assert_eq!(control.attempts, 1);
+        assert_eq!(
+            attempts.current().unwrap().phase,
+            ProviderAttemptPhase::Sending
+        );
+    }
+    #[test]
+    fn shared_mock_provider_captures_json_without_recording_auth_headers() {
+        let server = crate::test_support::MockProvider::json(1, |request| {
+            assert_eq!(request, json!({"input":"provider fixture"}));
+            json!({"output":"fixture response"}).to_string()
+        });
+        let request = reqwest::Client::new()
+            .post(format!("http://{}/responses", server.address))
+            .bearer_auth("fixture-secret-not-captured")
+            .json(&json!({"input":"provider fixture"}));
+        let attempts = ProviderAttempts::default();
+        let _scope = attempts.begin("fixture-op", 0);
+        let mut control = ControlProbe {
+            cancelled: false,
+            reject_attempt: false,
+            attempts: 0,
+        };
+        let response =
+            ProviderClient::json_response(request, "fixture-op", attempts, &mut control).unwrap();
+        assert_eq!(response, json!({"output":"fixture response"}));
+        let requests = server.finish();
+        assert_eq!(requests, vec![json!({"input":"provider fixture"})]);
+        assert!(!serde_json::to_string(&requests)
+            .unwrap()
+            .contains("fixture-secret-not-captured"));
+    }
+    #[test]
+    fn planned_unknown_api_preserves_chat_completions_wire_and_secret_free_capabilities() {
+        let mut client = ProviderClient::new();
+        client.load_session_config(json!({"providers":{"custom":{"base_url":"http://127.0.0.1:1",
+            "models":[{"id":"test-model","api":"future-compatible-api","context_limit":32000,"reasoning":false,"image_input":false,"image_output":false}]}}}));
+        let messages = vec![json!({"role":"user","content":"hello"})];
+        let plan = client
+            .plan_text_request("custom/test-model", &messages, 100)
+            .unwrap();
+        assert!(matches!(plan.api, ApiKind::Compatible(_)));
+        assert_eq!(plan.provider, ProviderKind::Compatible("custom".into()));
+        let request = client
+            .text_request(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:1",
+                "secret",
+                "test-model",
+                messages.clone(),
+                &plan.api,
+                &plan.reasoning_fields,
+                100,
+                "session",
+                false,
+                false,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(request.url().path(), "/chat/completions");
+        let body: Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({"model":"test-model","messages":messages,"max_tokens":100})
+        );
+        assert!(!body.to_string().contains("secret"));
+    }
+}
+#[cfg(test)]
+mod provider_client_owner_tests {
+    use super::*;
+
+    #[test]
+    fn owner_records_weighted_cache_usage_and_unknown_attempts_without_mean_averaging() {
+        let mut client = ProviderClient::new();
+        client.observe_response(&json!({"usage":{"input_tokens":100,"output_tokens":2,"input_tokens_details":{"cached_tokens":50}}}), "first").unwrap();
+        let report = client.observe_response(&json!({"usage":{"input_tokens":900,"output_tokens":3,"input_tokens_details":{"cached_tokens":0}}}), "second").unwrap();
+        assert_eq!(report["input_tokens"], 1000);
+        assert_eq!(report["output_tokens"], 5);
+        assert_eq!(report["cache_hit_percentage"], 5.0);
+        client.mark_cache_incomplete();
+        assert_eq!(client.usage["cache_percentage_complete"], false);
+        assert_eq!(client.usage["cache_hit_percentage"], 5.0);
+    }
+
+    #[test]
+    fn owner_call_effort_is_temporary_and_session_selection_does_not_change_defaults() {
+        let mut client = ProviderClient::new();
+        client.load_session_config(json!({"model":"openai/gpt-4o","effort":"medium"}));
+        client.commit_selection("openai/gpt-4o".into(), "medium".into(), 128000, false);
+        let defaults = client.config_defaults.clone();
+        let previous = client.set_call_effort("high".into());
+        assert_eq!(previous, "medium");
+        assert_eq!(client.effort, "high");
+        client.set_call_effort(previous);
+        client.set_session_model("openai/gpt-4.1".into(), 1047576);
+        assert_eq!(client.effort, "medium");
+        assert_eq!(client.model, "openai/gpt-4.1");
+        assert_eq!(client.context_limit, 1047576);
+        assert_eq!(client.config_defaults, defaults);
+        assert_eq!(client.config["model"], "openai/gpt-4o");
+    }
+
+    #[test]
+    fn owner_restore_preserves_partial_legacy_cache_coverage() {
+        let mut client = ProviderClient::new();
+        client
+            .restore_usage(
+                &json!({"input_tokens":100,"cache_hit_tokens":50,"output_tokens":2}),
+                false,
+                false,
+            )
+            .unwrap();
+        client.refresh_usage_report();
+        assert_eq!(client.usage["cache_hit_percentage"], 50.0);
+        assert_eq!(client.usage["cache_percentage_complete"], false);
+        client.restore_unknown_attempt();
+        client.observe_response(&json!({"usage":{"input_tokens":900,"output_tokens":3,"input_tokens_details":{"cached_tokens":0}}}), "next").unwrap();
+        assert_eq!(client.usage["cache_hit_percentage"], 5.0);
+        assert_eq!(client.usage["cache_percentage_complete"], false);
+    }
+}
+// Decode client envelopes once. Deferred field errors preserve accepted/error ordering.
+#[derive(Clone)]
+struct NativeField<T>(std::result::Result<T, &'static str>);
+impl<T> NativeField<T> {
+    fn require(&self) -> Result<&T> {
+        self.0.as_ref().map_err(|e| (*e).into())
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeCommandOrigin {
+    Native,
+    Terminal,
+    Internal,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeCommandKind {
+    Python,
+    Shell,
+    Submit,
+    Local,
+    Interrupt,
+    StdinReply,
+    Reset,
+    Login,
+    Logout,
+    Auth,
+    Model,
+    Effort,
+    Models,
+    Recovery,
+    Status,
+    Context,
+    New,
+    Resume,
+    Quit,
+    BgRun,
+    TaskList,
+    TaskGet,
+    TaskLogs,
+    TaskKill,
+    WakeupList,
+    WakeupCancel,
+    WakeupRun,
+    Unknown,
+}
+const NATIVE_COMMAND_NAMES: &[(NativeCommandKind, &[&str])] = &[
+    (NativeCommandKind::Python, &["python"]),
+    (NativeCommandKind::Shell, &["shell"]),
+    (NativeCommandKind::Submit, &["submit"]),
+    (NativeCommandKind::Interrupt, &["interrupt"]),
+    (NativeCommandKind::StdinReply, &["stdin_reply"]),
+    (NativeCommandKind::Reset, &["reset"]),
+    (NativeCommandKind::Login, &["login"]),
+    (NativeCommandKind::Logout, &["logout"]),
+    (NativeCommandKind::Auth, &["auth"]),
+    (NativeCommandKind::Model, &["model"]),
+    (NativeCommandKind::Effort, &["effort", "thinking"]),
+    (NativeCommandKind::Models, &["models"]),
+    (NativeCommandKind::Recovery, &["recovery"]),
+    (NativeCommandKind::Status, &["status"]),
+    (NativeCommandKind::Context, &["context"]),
+    (NativeCommandKind::New, &["new"]),
+    (NativeCommandKind::Resume, &["resume"]),
+    (NativeCommandKind::Quit, &["quit"]),
+    (NativeCommandKind::BgRun, &["bg_run"]),
+    (NativeCommandKind::TaskList, &["task_list"]),
+    (NativeCommandKind::TaskGet, &["task_get"]),
+    (NativeCommandKind::TaskLogs, &["task_logs"]),
+    (NativeCommandKind::TaskKill, &["task_kill"]),
+    (NativeCommandKind::WakeupList, &["wakeup_list"]),
+    (NativeCommandKind::WakeupCancel, &["wakeup_cancel"]),
+    (NativeCommandKind::WakeupRun, &["wakeup_run"]),
+];
+impl NativeCommandKind {
+    fn decode(label: Option<&str>) -> Self {
+        label
+            .and_then(|label| {
+                NATIVE_COMMAND_NAMES
+                    .iter()
+                    .find(|(_, names)| names.contains(&label))
+                    .map(|(kind, _)| *kind)
+            })
+            .unwrap_or(Self::Unknown)
+    }
+    fn label(self) -> &'static str {
+        if self == Self::Local {
+            return "submit";
+        }
+        NATIVE_COMMAND_NAMES
+            .iter()
+            .find(|(kind, _)| *kind == self)
+            .map_or("unknown", |(_, names)| names[0])
+    }
+    fn background(self) -> bool {
+        matches!(
+            self,
+            Self::TaskList
+                | Self::TaskGet
+                | Self::TaskLogs
+                | Self::TaskKill
+                | Self::WakeupList
+                | Self::WakeupCancel
+                | Self::WakeupRun
+        )
+    }
+}
+#[derive(Clone, PartialEq, Eq)]
+enum SubmissionMode {
+    Steering,
+    Followup,
+    Other(String),
+}
+impl SubmissionMode {
+    fn decode(v: &Value) -> Self {
+        match v.as_str().unwrap_or("steering") {
+            "steering" => Self::Steering,
+            "followup" => Self::Followup,
+            other => Self::Other(other.into()),
+        }
+    }
+    fn label(&self) -> &str {
+        match self {
+            Self::Steering => "steering",
+            Self::Followup => "followup",
+            Self::Other(s) => s,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum NativeLoginMethod {
+    Browser,
+    Manual,
+    Device,
+    ApiKey,
+    Unsupported,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeInputAction {
+    Text,
+    Eof,
+    Cancel,
+    Invalid,
+}
+impl NativeInputAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Eof => "eof",
+            Self::Cancel => "cancel",
+            Self::Invalid => "",
+        }
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeLogStream {
+    Both,
+    Stdout,
+    Stderr,
+}
+impl NativeLogStream {
+    fn includes(self, name: &str) -> bool {
+        self == Self::Both
+            || matches!(
+                (self, name),
+                (Self::Stdout, "stdout") | (Self::Stderr, "stderr")
+            )
+    }
+}
+#[derive(Clone)]
+struct NativeArguments {
+    source: NativeField<String>,
+    text: NativeField<String>,
+    command: NativeField<String>,
+    provider: NativeField<String>,
+    key: NativeField<String>,
+    model: NativeField<String>,
+    effort: NativeField<String>,
+    task_id: NativeField<String>,
+    wakeup_id: NativeField<String>,
+    session: NativeField<String>,
+    task_state: NativeField<Option<String>>,
+    stream: NativeField<NativeLogStream>,
+    refresh: NativeField<bool>,
+    cancel_tasks: NativeField<bool>,
+    force: NativeField<bool>,
+    visible: bool,
+    terminal_controls: bool,
+    options: Value,
+    task_launch: Value,
+    login_method: NativeLoginMethod,
+    action: NativeInputAction,
+    prompt_id: Option<String>,
+    operation: Option<String>,
+    worker_generation: Option<u64>,
+    input_value: Option<String>,
+    catalog_provider: Option<String>,
+    local: Option<ParsedLocalCommand>,
+}
+#[derive(Clone)]
+struct NativeCommand {
+    id: String,
+    kind: NativeCommandKind,
+    mode: SubmissionMode,
+    args: NativeArguments,
+    wire: Value,
+}
+impl NativeCommand {
+    fn decode(mut wire: Value, origin: NativeCommandOrigin) -> Self {
+        if origin != NativeCommandOrigin::Internal {
+            if let Some(o) = wire.as_object_mut() {
+                o.remove("terminal_controls");
+            }
+        }
+        let mut local = None;
+        if wire["kind"] == "submit" {
+            if let Some(text) = wire["text"].as_str().map(str::trim_start) {
+                if text.starts_with('/') {
+                    local = Some(ParsedLocalCommand::parse(text));
+                } else if let Some((command, visible)) = shell_prefix(text) {
+                    wire =
+                        json!({"id":wire["id"],"kind":"shell","command":command,"visible":visible});
+                }
+            }
+        }
+        let kind = if local.is_some() {
+            NativeCommandKind::Local
+        } else {
+            NativeCommandKind::decode(wire["kind"].as_str())
+        };
+        let terminal_controls = kind == NativeCommandKind::Shell
+            && (origin == NativeCommandOrigin::Terminal
+                || (origin == NativeCommandOrigin::Internal && wire["terminal_controls"] == true));
+        if terminal_controls {
+            wire["terminal_controls"] = json!(true);
+        }
+        let required =
+            |name: &str, error| NativeField(wire[name].as_str().map(str::to_owned).ok_or(error));
+        let query = |name: &str, error| {
+            NativeField(match wire.get(name).filter(|v| !v.is_null()) {
+                None => Ok(String::new()),
+                Some(v) => v.as_str().map(|s| s.trim().to_owned()).ok_or(error),
+            })
+        };
+        let boolean = |name: &str, error| {
+            NativeField(match wire.get(name) {
+                None => Ok(false),
+                Some(v) => v.as_bool().ok_or(error),
+            })
+        };
+        let args = NativeArguments {
+            source: required("source", "source required"),
+            text: required("text", "text required"),
+            command: required("command", "command required"),
+            provider: required("provider", "provider required"),
+            key: required("key", "key required"),
+            model: query("model", "model must be a string"),
+            effort: query("effort", "effort must be a string"),
+            task_id: required("task_id", "task_id required"),
+            wakeup_id: required("wakeup_id", "wakeup_id required"),
+            session: NativeField(
+                wire["session"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .ok_or("session path/query required"),
+            ),
+            task_state: NativeField(match wire.get("state").filter(|v| !v.is_null()) {
+                None => Ok(None),
+                Some(v) => v
+                    .as_str()
+                    .map(|s| Some(s.to_owned()))
+                    .ok_or("state must be a string"),
+            }),
+            stream: NativeField(match wire.get("stream") {
+                None => Ok(NativeLogStream::Both),
+                Some(v) => match v.as_str() {
+                    Some("both") => Ok(NativeLogStream::Both),
+                    Some("stdout") => Ok(NativeLogStream::Stdout),
+                    Some("stderr") => Ok(NativeLogStream::Stderr),
+                    Some(_) => Err("stream must be stdout, stderr or both"),
+                    None => Err("stream must be a string"),
+                },
+            }),
+            refresh: boolean("refresh", "refresh must be boolean"),
+            cancel_tasks: boolean("cancel_tasks", "cancel_tasks must be boolean"),
+            force: boolean("force", "force must be boolean"),
+            visible: wire["visible"].as_bool().unwrap_or(false),
+            terminal_controls,
+            options: if matches!(kind, NativeCommandKind::Shell | NativeCommandKind::BgRun) {
+                wire["options"].clone()
+            } else {
+                Value::Null
+            },
+            task_launch: if kind == NativeCommandKind::BgRun {
+                json!({"kind":wire.get("task_kind").unwrap_or(&json!("shell")),"source":wire["source"],"options":wire["options"]})
+            } else {
+                Value::Null
+            },
+            login_method: match wire["method"].as_str() {
+                Some("browser") => NativeLoginMethod::Browser,
+                Some("manual") => NativeLoginMethod::Manual,
+                Some("device" | "oauth") => NativeLoginMethod::Device,
+                Some("api-key") | None => NativeLoginMethod::ApiKey,
+                _ => NativeLoginMethod::Unsupported,
+            },
+            action: match wire.get("action") {
+                None => NativeInputAction::Text,
+                Some(v) => match v.as_str() {
+                    Some("text") => NativeInputAction::Text,
+                    Some("eof") => NativeInputAction::Eof,
+                    Some("cancel") => NativeInputAction::Cancel,
+                    _ => NativeInputAction::Invalid,
+                },
+            },
+            prompt_id: wire["prompt_id"].as_str().map(str::to_owned),
+            operation: wire["operation"].as_str().map(str::to_owned),
+            worker_generation: wire["worker_generation"].as_u64(),
+            input_value: wire["value"].as_str().map(str::to_owned),
+            catalog_provider: wire["provider"].as_str().map(str::to_owned),
+            local,
+        };
+        Self {
+            id: wire["id"].as_str().unwrap_or("").to_owned(),
+            kind,
+            mode: SubmissionMode::decode(&wire["mode"]),
+            args,
+            wire,
+        }
+    }
+    fn user_text(&self) -> Option<&str> {
+        match self.kind {
+            NativeCommandKind::Submit => self.args.text.0.as_ref().ok().map(String::as_str),
+            NativeCommandKind::Python => self.args.source.0.as_ref().ok().map(String::as_str),
+            NativeCommandKind::Shell => self.args.command.0.as_ref().ok().map(String::as_str),
+            _ => None,
+        }
+    }
+    fn steering(&self) -> bool {
+        self.kind == NativeCommandKind::Submit && self.mode == SubmissionMode::Steering
+    }
+    fn recorded(&self) -> Result<Value> {
+        redacted_command(self.wire.clone(), self.kind)
+    }
+}
+#[cfg(test)]
+mod native_command_tests {
+    use super::*;
+    fn native(value: Value) -> NativeCommand {
+        NativeCommand::decode(value, NativeCommandOrigin::Native)
+    }
+    #[test]
+    fn command_names_aliases_and_normalization_have_one_registry() {
+        let mut names = HashSet::new();
+        for (kind, aliases) in NATIVE_COMMAND_NAMES {
+            assert_eq!(kind.label(), aliases[0]);
+            for name in *aliases {
+                assert!(names.insert(*name));
+                assert!(NativeCommandKind::decode(Some(name)) == *kind);
+            }
+        }
+        let thinking =
+            native(json!({"id":"one","kind":"thinking","effort":" high ","extra":"kept"}));
+        assert!(thinking.kind == NativeCommandKind::Effort);
+        assert_eq!(thinking.args.effort.require().unwrap(), "high");
+        assert_eq!(thinking.recorded().unwrap()["kind"], "thinking");
+        assert_eq!(thinking.recorded().unwrap()["extra"], "kept");
+        let local = native(json!({"id":"local","kind":"submit","text":"  /thinking high "}));
+        assert!(local.kind == NativeCommandKind::Local);
+        assert!(local.args.local.as_ref().unwrap().kind == LocalCommandKind::Effort);
+        let shell = native(
+            json!({"id":"shell","kind":"submit","text":"  !!printf ok","mode":"followup","options":{"timeout":1}}),
+        );
+        assert!(shell.kind == NativeCommandKind::Shell);
+        assert_eq!(shell.args.command.require().unwrap(), "printf ok");
+        assert!(shell.args.visible && !shell.args.terminal_controls);
+        assert!(shell.args.options.is_null()); // Legacy submit-prefix normalization discards options/mode.
+        assert!(shell.mode == SubmissionMode::Steering);
+    }
+    #[test]
+    fn native_fields_preserve_deferred_errors_and_null_default_rules() {
+        let bad =
+            native(json!({"id":"accepted-first","kind":"python","source":42,"visible":"true"}));
+        assert_eq!(bad.id, "accepted-first");
+        assert!(bad.kind == NativeCommandKind::Python);
+        assert_eq!(
+            bad.args.source.require().unwrap_err().to_string(),
+            "source required"
+        );
+        assert!(!bad.args.visible);
+        assert_eq!(bad.recorded().unwrap()["source"], 42);
+        for mode in [Value::Null, json!(false), json!(3), json!("steering")] {
+            assert!(native(json!({"id":"x","kind":"submit","text":"full","mode":mode})).steering());
+        }
+        assert!(
+            !native(json!({"id":"x","kind":"submit","text":"full","mode":"unknown"})).steering()
+        );
+        assert!(
+            !native(json!({"id":"x","kind":"submit","text":"full","mode":"followup"})).steering()
+        );
+        assert_eq!(
+            native(json!({"id":"x","kind":"model","model":null}))
+                .args
+                .model
+                .require()
+                .unwrap(),
+            ""
+        );
+        assert!(native(json!({"id":"x","kind":"models","refresh":null}))
+            .args
+            .refresh
+            .require()
+            .is_err());
+        assert!(native(json!({"id":"x","kind":"quit","cancel_tasks":null}))
+            .args
+            .cancel_tasks
+            .require()
+            .is_err());
+        assert!(native(json!({"id":"x","kind":123})).kind == NativeCommandKind::Unknown);
+    }
+    #[test]
+    fn control_replay_is_an_origin_capability_and_login_records_are_redacted() {
+        let wire =
+            json!({"id":"shell","kind":"shell","command":"printf ok","terminal_controls":true});
+        let client = native(wire.clone());
+        assert!(!client.args.terminal_controls);
+        assert!(client
+            .recorded()
+            .unwrap()
+            .get("terminal_controls")
+            .is_none());
+        let terminal = NativeCommand::decode(wire, NativeCommandOrigin::Terminal);
+        assert!(terminal.args.terminal_controls);
+        assert!(terminal
+            .recorded()
+            .unwrap()
+            .get("terminal_controls")
+            .is_none());
+        let login = native(
+            json!({"id":"auth","kind":"login","provider":"openai","key":"secret-example","other":"secret-example","method":"api-key"}),
+        );
+        assert_eq!(login.args.key.require().unwrap(), "secret-example");
+        assert_eq!(
+            login.recorded().unwrap(),
+            json!({"id":"auth","kind":"login","provider":"openai","method":"api-key"})
+        );
+    }
+    #[test]
+    fn malformed_arguments_are_accepted_before_error_without_user_or_effect_records() {
+        let mut fixture = crate::test_support::HostFixture::named(
+            "py-native-deferred",
+            Some(json!({"skills":{"enabled":false}})),
+        );
+        let host = fixture.host();
+        let sequence = host.journal.seq;
+        let error = host
+            .dispatch_command(native(
+                json!({"id":"bad-source","kind":"python","source":false}),
+            ))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "source required");
+        assert!(host.ids.contains("bad-source"));
+        assert_eq!(host.journal.event(sequence).unwrap()["kind"], "accepted");
+        assert_eq!(host.journal.seq, sequence + 1);
+        assert_eq!(host.execution.cells(), 0);
+        assert!(!host
+            .dispatch_command(native(json!({"id":"end","kind":"quit"})))
+            .unwrap());
+    }
+    #[test]
+    fn queued_steering_keeps_full_body_and_typed_submission_policy() {
+        let mut fixture = crate::test_support::HostFixture::named(
+            "py-native-steering",
+            Some(json!({"skills":{"enabled":false}})),
+        );
+        let host = fixture.host();
+        let text = format!("{}\nfull-user-tail-🙂", "λ".repeat(9000));
+        host.queue_arrival(native(
+            json!({"id":"steer-full","kind":"submit","text":text,"mode":"steering"}),
+        ))
+        .unwrap();
+        assert!(host.pending.front().unwrap().steering());
+        assert!(host.deliver_steering().unwrap());
+        assert_eq!(host.context.items().last().unwrap().text, text);
+        assert!(host.pending.is_empty());
+        assert!(!host.queued.contains_key("steer-full"));
+    }
+}
+struct Host {
+    frontend: TerminalFrontend,
+    execution: ExecutionController,
+    cell_input_records: Vec<usize>,
+    provider: ProviderClient,
+    last_generation_failed: bool,
+    exit_requested: bool,
+    journal: Journal,
+    home: PathBuf,
+    context: ContextStore,
+    history: HistoryArchive,
+    ids: HashSet<String>,
+    json: bool,
+    scheduler: TaskScheduler,
+    control_pump: ControlPump,
+    incoming: Option<std::sync::mpsc::Receiver<NativeCommand>>,
+    input_closed: bool,
+    pending: std::collections::VecDeque<NativeCommand>,
+    queued: HashMap<String, Option<(usize, usize)>>,
+    deferred_say: Vec<(usize, String)>,
+    agent_turn: bool,
+    no_model: bool,
+    current_code: Option<String>,
+    skills: Value,
+}
+impl TerminalFrontend {
+    fn render(
+        &self,
+        kind: &str,
+        payload: Value,
+        json_output: bool,
+        native_input: bool,
+        status: impl FnOnce() -> Value,
+    ) {
         let mut v = payload;
         v["kind"] = json!(kind);
         v["schema_version"] = json!(1);
-        if self.json {
+        if json_output {
             println!("{}", v);
         } else {
-            if let Some(busy) = &self.busy_input {
-                busy.event(&v, self.state_payload());
+            if let Some(busy) = self.busy() {
+                busy.event(&v, status());
                 return;
             }
             if kind == "state"
-                && self.incoming.is_none()
+                && !native_input
                 && terminal_editor_available(false)
                 && matches!(v["state"].as_str(), Some("idle" | "running" | "thinking"))
             {
@@ -1139,7 +7396,7 @@ impl Host {
                 // Interactive completion is shown by the single footer below
                 // the answer. Only noninteractive output needs a printed end.
                 "cell_end" => {
-                    if self.incoming.is_some() || !terminal_editor_available(false) {
+                    if native_input || !terminal_editor_available(false) {
                         for line in terminal_cell_end(&v, terminal_width()) {
                             println!("{line}");
                         }
@@ -1201,18 +7458,18 @@ impl Host {
             }
         }
     }
+}
+impl Host {
+    fn event(&self, kind: &str, payload: Value) {
+        self.frontend
+            .render(kind, payload, self.json, self.incoming.is_some(), || {
+                self.state_payload()
+            });
+    }
     fn hist_push(&mut self, name: &str, value: Value) -> usize {
-        let value = if ["raw", "requests", "responses", "say", "usage", "stdin"].contains(&name)
-            && self.journal.seq > 0
-        {
-            json!({"$event":self.journal.seq-1})
-        } else {
-            value
-        };
-        let list = self.history.entry(name.into()).or_default();
-        let n = list.len();
-        list.push(value);
-        n
+        let collection = RecordCollection::decode(name).expect("internal history collection");
+        self.history
+            .append_record(collection, value, self.journal.seq)
     }
     fn add_context(
         &mut self,
@@ -1231,47 +7488,25 @@ impl Host {
         ranges: Vec<(usize, usize)>,
         raw_index: Option<usize>,
     ) -> Result<String> {
-        let id = format!("c{}", self.journal.seq);
-        let ranges = if ranges.is_empty() {
-            vec![(self.journal.seq, self.journal.seq + 1)]
-        } else {
-            ranges
-        };
-        let n=self.journal.append("context_add",json!({"id":id,"role":role,"text":text,"output":output,"ranges":ranges,"raw_index":raw_index}))?;
-        self.context.push(Item {
-            id: id.clone(),
-            role: role.into(),
-            text,
-            output,
-            ranges: if ranges.is_empty() {
-                vec![(n, n + 1)]
-            } else {
-                ranges
-            },
-            raw_index,
-        });
-        self.revision += 1;
+        let (id, transition) =
+            self.context
+                .prepare_add(role, text, output, ranges, raw_index, self.journal.seq)?;
+        self.context.persist(&mut self.journal, transition)?;
         Ok(id)
     }
     // Provider retry/cancellation code should use this narrow transition. The
     // compatibility JSON flag is still merged on the next successful response.
     fn mark_cache_usage_incomplete(&mut self) {
-        self.cache_accounting.mark_incomplete();
-        self.cache_accounting.write_report(&mut self.usage);
+        self.provider.mark_cache_incomplete();
     }
     fn chars(&self) -> usize {
-        self.system_prompt().chars().count()
-            + 512
-            + self
-                .context
-                .iter()
-                .map(|i| i.text.chars().count() + 64)
-                .sum::<usize>()
+        self.context
+            .rendered_chars(self.system_prompt().chars().count())
     }
     fn input_budget(&self) -> usize {
         model_input_budget(
-            self.context_limit,
-            &self.reasoning_metadata(&self.model),
+            self.provider.context_limit,
+            &self.reasoning_metadata(&self.provider.model),
             4096,
         )
     }
@@ -1279,21 +7514,14 @@ impl Host {
         self.chars().div_ceil(3) > self.input_budget() * 9 / 10
     }
     fn context_usage(&self) -> Value {
-        json!({"context_revision":self.revision,"item_count":self.context.len(),
-            "rendered_chars":self.chars(),"estimated_input_tokens":self.chars().div_ceil(3),
-            "measured_last_input_tokens":self.usage["last_input_tokens"],
-            "model_context_limit":self.context_limit,"reserved_output_tokens":4096,
-            "input_token_budget":self.input_budget(),
-            "remaining_input_tokens":self.input_budget().saturating_sub(self.chars().div_ceil(3)),
-            "system_chars":self.system_prompt().chars().count(),"skills_estimated_tokens":self.skills["estimated_added_tokens"],
-            "forced":self.forced(),"force_threshold":0.9,"estimator":"unicode-chars/3-v1 estimate; system/control allowance included; image budget separate"})
+        self.status_snapshot_inputs().context_usage()
     }
 }
 
 impl Host {
     fn rpc(&mut self, v: &Value) -> Result<Value> {
         let op = v["op"].as_str().unwrap_or("");
-        if self.initializing
+        if self.execution.initializing()
             && !["history", "history_len", "cell", "cell_len", "cell_history"].contains(&op)
         {
             return Err("startup entries may define/import helpers and read H, but cannot use agent bridge controls, context, input or side-effect helpers during initialization".into());
@@ -1304,7 +7532,7 @@ impl Host {
                     v["cell"].as_i64().ok_or("cell number must be an integer")?,
                 )?)
             }
-            "cell_len" => Ok(json!(self.cells)),
+            "cell_len" => Ok(json!(self.execution.cells())),
             "cell_history" => {
                 let collection = v["collection"]
                     .as_str()
@@ -1321,7 +7549,7 @@ impl Host {
                 let len = if name == "events" {
                     self.journal.seq
                 } else {
-                    self.history.get(name).ok_or("unknown H collection")?.len()
+                    self.history.len(RecordCollection::decode(name)?)
                 };
                 if let Some(n) = v["index"].as_i64() {
                     let index = if n < 0 { len as i64 + n } else { n };
@@ -1342,60 +7570,29 @@ impl Host {
             "history_len" => Ok(json!(if v["collection"] == "events" {
                 self.journal.seq
             } else {
-                self.history
-                    .get(v["collection"].as_str().unwrap_or(""))
-                    .map_or(0, Vec::len)
+                RecordCollection::decode(v["collection"].as_str().unwrap_or(""))
+                    .map_or(0, |collection| self.history.len(collection))
             })),
             "read_text" => {
-                if v.get("max_chars").is_some() {
-                    return Err(
-                        "max_chars is no longer supported; use required start and stop".into(),
-                    );
-                }
-                let start = v["start"]
-                    .as_u64()
-                    .ok_or("start must be a nonnegative integer")?;
-                let stop = v["stop"]
-                    .as_u64()
-                    .ok_or("stop must be a nonnegative integer")?;
-                let width = stop
-                    .checked_sub(start)
-                    .ok_or("stop must be greater than or equal to start")?;
-                if width > READ_TEXT_MAX_CHARS as u64 {
-                    return Err("read_text range exceeds fixed 8000-character limit".into());
-                }
-                // The worker sends only the selected Unicode slice, not the
-                // entire history stream. Bounds describe its original range;
-                // this is a bounded payload, not a trusted provenance claim.
-                let text = v["selected_text"]
-                    .as_str()
-                    .ok_or("selected_text required")?;
-                let chars = text.chars().count();
-                if chars as u64 > width {
-                    return Err("selected text exceeds requested range".into());
-                }
-                if (self.chars() + chars + 64).div_ceil(3) >= self.input_budget() {
-                    return Err("selection exceeds next-request context budget".into());
-                }
+                let text = self.context.validate_text_selection(
+                    v,
+                    self.system_prompt().chars().count(),
+                    self.input_budget(),
+                )?;
                 let id = self.add_context("user", text.into(), true, vec![])?;
                 Ok(json!(id))
             }
             "context_usage" => Ok(self.context_usage()),
-            "context_items" => Ok(json!(self
-                .context
-                .iter()
-                .map(|i| json!({"id":i.id,"role":i.role,
-                "chars":i.text.chars().count(),"ranges":i.ranges,"raw_index":i.raw_index}))
-                .collect::<Vec<_>>())),
+            "context_items" => Ok(self.context.metadata()),
             "say" | "final" => {
                 let text = v["text"].as_str().unwrap_or("");
                 let final_answer = op == "final";
                 self.journal
                     .append("say", json!({"text":text,"final":final_answer}))?;
                 self.hist_push("say", json!(text));
-                if final_answer && self.active_cell.is_some() && !self.json {
+                if final_answer && self.execution.cell().is_some() && !self.json {
                     self.deferred_say
-                        .push((self.active_cell.unwrap(), text.into()));
+                        .push((self.execution.cell().unwrap(), text.into()));
                 } else {
                     self.event(
                         if final_answer { "final" } else { "say" },
@@ -1404,8 +7601,7 @@ impl Host {
                 }
                 if final_answer {
                     // Steering still wins before this staged stop commits.
-                    self.stop = true;
-                    self.stop_wakeup = None;
+                    self.execution.stage_stop(None);
                 }
                 Ok(Value::Null)
             }
@@ -1425,8 +7621,7 @@ impl Host {
                         Some((seconds, reason))
                     }
                 };
-                self.stop = true;
-                self.stop_wakeup = wakeup;
+                self.execution.stage_stop(wakeup);
                 Ok(Value::Null)
             }
             "bg_run" => self.bg_run(v),
@@ -1445,8 +7640,7 @@ impl Host {
                     .unwrap_or(false),
             ),
             "reset" => {
-                self.reset = true;
-                self.reset_explicit = true;
+                self.execution.stage_reset(true);
                 Ok(Value::Null)
             }
             "collapse" => self.collapse(v),
@@ -1463,79 +7657,10 @@ impl Host {
         }
     }
     fn collapse(&mut self, v: &Value) -> Result<Value> {
-        let a = self
+        let transition = self
             .context
-            .iter()
-            .position(|i| i.id == v["start"])
-            .ok_or("missing start boundary")?;
-        let b = self
-            .context
-            .iter()
-            .position(|i| i.id == v["end"])
-            .ok_or("missing end boundary")?;
-        if a >= b {
-            return Err("collapse requires ordered distinct boundaries".into());
-        }
-        let source = v["source"].as_str().ok_or("missing retained call")?;
-        let mut ranges: Vec<(usize, usize)> = self.context[a..b]
-            .iter()
-            .flat_map(|i| i.ranges.clone())
-            .collect();
-        ranges.sort_unstable();
-        let mut merged: Vec<(usize, usize)> = vec![];
-        for (s, e) in ranges {
-            if let Some(last) = merged.last_mut() {
-                if s <= last.1 {
-                    last.1 = last.1.max(e);
-                    continue;
-                }
-            }
-            merged.push((s, e));
-        }
-        let end = self.context[b].clone();
-        let preserve = end.role == "user" || end.role == "summary";
-        let mut text = format!("[Collapsed originals: {:?}]\n{}", merged, source);
-        if preserve {
-            text.push_str("\n[Preserved boundary]\n");
-            text.push_str(&end.text);
-        }
-        let mut all_ranges = merged.clone();
-        if preserve {
-            all_ranges.extend(end.ranges.clone());
-        }
-        let id = self.context[a].id.clone();
-        let own = self.current_code.clone();
-        let mut next = self.context.clone();
-        next.splice(
-            a..=b,
-            [Item {
-                id: id.clone(),
-                role: "summary".into(),
-                text: text.clone(),
-                output: false,
-                ranges: all_ranges.clone(),
-                raw_index: None,
-            }],
-        );
-        if let Some(own) = own {
-            next.retain(|i| i.id != own || i.id == id);
-        }
-        let after = self.system_prompt().chars().count()
-            + 512
-            + next
-                .iter()
-                .map(|i| i.text.chars().count() + 64)
-                .sum::<usize>();
-        if after >= self.chars() {
-            return Err("collapse must reduce rendered context size".into());
-        }
-        self.journal.append(
-            "context_replace",
-            json!({"items":next.iter().map(item_json).collect::<Vec<_>>(),
-            "summary":v["summary"],"ranges":merged}),
-        )?;
-        self.context = next;
-        self.revision += 1;
+            .prepare_collapse(v, self.current_code.as_deref())?;
+        self.context.persist(&mut self.journal, transition)?;
         Ok(Value::Null)
     }
 }
@@ -1637,7 +7762,10 @@ fn cell_metadata(mut metadata: Value, collection: &str, cell: usize) -> Value {
 }
 impl Host {
     fn execute(&mut self, id: &str, source: &str, retain_source: bool) -> Result<Value> {
-        let source_ref = format!("H.records.code[{}]", self.history["code"].len());
+        let source_ref = format!(
+            "H.records.code[{}]",
+            self.history.len(RecordCollection::Code)
+        );
         let result = self.with_cell("python", id, &source_ref, |host| {
             host.execute_inner(id, source, retain_source)
         });
@@ -1647,24 +7775,21 @@ impl Host {
         result
     }
     fn execute_inner(&mut self, id: &str, source: &str, retain_source: bool) -> Result<Value> {
-        self.stop = false;
-        self.stop_wakeup = None;
-        self.reset = false;
-        self.reset_explicit = false;
+        self.execution.begin_python();
         let code_index = self.hist_push("code", json!(source));
         let n = self.journal.append(
             "code",
             json!({"index":code_index,"source":source,
-            "operation":id,"worker_generation":self.generation,"initialization":self.initializing}),
+            "operation":id,"worker_generation":self.execution.generation(),"initialization":self.execution.initializing()}),
         )?;
         self.current_code = None;
-        let forced = !self.initializing && self.forced();
+        let forced = !self.execution.initializing() && self.forced();
         if retain_source {
             self.current_code =
                 Some(self.add_context("assistant", source.into(), false, vec![(n, n + 1)])?);
         }
-        let out = self.worker.dir.join("stdout");
-        let err = self.worker.dir.join("stderr");
+        let out = self.execution.worker().dir.join("stdout");
+        let err = self.execution.worker().dir.join("stderr");
         self.journal.append(
             "intent",
             json!({"operation":id,"type":"python","code_index":code_index}),
@@ -1681,10 +7806,25 @@ impl Host {
                 .open(path)?;
         }
         if !self.json {
-            self.event("source",json!({"cell":self.active_cell,"command_id":id,
-                "code":cell_metadata(stream_info(source.as_bytes(),"code",code_index),"code",self.active_cell.ok_or("source cell missing")?)}));
+            self.event("source",json!({"cell":self.execution.cell(),"command_id":id,
+                "code":cell_metadata(stream_info(source.as_bytes(),"code",code_index),"code",self.execution.cell().ok_or("source cell missing")?)}));
         }
-        let sent=self.worker.send(&json!({"kind":"execute","source":source,"stdout":out,"stderr":err,"forced":forced})).is_ok();
+        let cancel_revision = self.execution.cancel_revision();
+        let send_result = self.send_worker_request(
+            &json!({"kind":"execute","source":source,"stdout":out,"stderr":err,"forced":forced}),
+        );
+        // TooLarge is produced by bounded serialization before the first write.
+        // Other send failures may have left a partial frame and still require
+        // replacing the connection; they must not be confused with this refusal.
+        let transport_error = send_result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<WorkerTransportError>())
+            .filter(|error| matches!(error, WorkerTransportError::TooLarge))
+            .map(|error| {
+                json!({"kind":"message_too_large","message":error.to_string(),
+                "limit_bytes":WORKER_MAX_MESSAGE_BYTES,"execution_started":false})
+            });
         let mut cancelled = false;
         let mut started = false;
         let mut complete = true;
@@ -1693,9 +7833,12 @@ impl Host {
         let mut cancel_time = None;
         let mut prompt: Option<InputPrompt> = None;
         let mut input_rpc = Value::Null;
-        let status = if !sent {
+        let status = if let Some(error) = &transport_error {
+            self.event("error", json!({"operation":id,"error":error["message"]}));
+            "error".to_string()
+        } else if send_result.is_err() {
             complete = false;
-            self.reset = true;
+            self.execution.stage_reset(false);
             "worker_crashed".to_string()
         } else {
             'execution: loop {
@@ -1704,12 +7847,16 @@ impl Host {
                     stdout.drain(self)?;
                     stderr.drain(self)?;
                 }
-                if started
-                    && self.poll_target(
-                        self.worker.child.id() as i32,
-                        if prompt.is_some() { 0 } else { libc::SIGINT },
-                    )?
-                {
+                // An acknowledged connection is not an acknowledged execution.
+                // Pump interruption while waiting for started as well, so a
+                // silent worker cannot bypass cancellation and escalation.
+                let interrupted = self.poll_target(
+                    self.execution.worker_pid(),
+                    if prompt.is_some() { 0 } else { libc::SIGINT },
+                )?;
+                // A reply write can consume an interrupt while settling its
+                // frame. Keep that cancellation sticky for the whole cell.
+                if interrupted || self.execution.cancel_revision() != cancel_revision {
                     if !cancelled {
                         cancel_time = Some(std::time::Instant::now());
                     }
@@ -1718,21 +7865,25 @@ impl Host {
                 if cancelled {
                     if let Some(p) = prompt.take() {
                         let response = self.close_input(&p, "cancel", None)?;
-                        if self.worker.reply(&input_rpc, response).is_err() {
+                        if self.reply_worker(&input_rpc, response).is_err() {
                             complete = false;
-                            self.reset = true;
+                            self.execution.stage_reset(false);
                             break 'execution "worker_crashed".to_string();
                         }
                     }
                 }
-                while let Some(pos) = self.pending.iter().position(|v| v["kind"] == "stdin_reply") {
+                while let Some(pos) = self
+                    .pending
+                    .iter()
+                    .position(|v| v.kind == NativeCommandKind::StdinReply)
+                {
                     let command = self.pending.remove(pos).unwrap();
                     if let Some(p) = &prompt {
                         if let Some((response, cancel)) = self.reply_input(p, &command)? {
                             prompt = None;
-                            if self.worker.reply(&input_rpc, response).is_err() {
+                            if self.reply_worker(&input_rpc, response).is_err() {
                                 complete = false;
-                                self.reset = true;
+                                self.execution.stage_reset(false);
                                 break 'execution "worker_crashed".to_string();
                             }
                             if cancel {
@@ -1741,7 +7892,7 @@ impl Host {
                             }
                         }
                     } else {
-                        self.event("rejected",json!({"command_id":command["id"],"error":"no matching active input prompt"}));
+                        self.event("rejected",json!({"command_id":command.id,"error":"no matching active input prompt"}));
                     }
                 }
                 if let Some(p) = prompt.as_mut() {
@@ -1754,9 +7905,9 @@ impl Host {
                     };
                     if let Some(response) = response {
                         prompt = None;
-                        if self.worker.reply(&input_rpc, response).is_err() {
+                        if self.reply_worker(&input_rpc, response).is_err() {
                             complete = false;
-                            self.reset = true;
+                            self.execution.stage_reset(false);
                             break 'execution "worker_crashed".to_string();
                         }
                     }
@@ -1764,42 +7915,29 @@ impl Host {
                 if cancel_time.is_some_and(|t: std::time::Instant| {
                     t.elapsed() > std::time::Duration::from_secs(2)
                 }) {
-                    unsafe {
-                        libc::kill(-(self.worker.child.id() as i32), libc::SIGKILL);
-                    }
+                    self.execution.signal_worker(libc::SIGKILL);
                     complete = false;
-                    self.reset = true;
+                    self.execution.stage_reset(false);
                     break "cancelled".to_string();
                 }
-                let mut pollfd = libc::pollfd {
-                    fd: self.worker.reader.get_ref().as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                if self.worker.reader.buffer().is_empty()
-                    && unsafe { libc::poll(&mut pollfd, 1, 20) } <= 0
-                {
-                    continue;
-                }
-                let v = match self.worker.recv() {
-                    Ok(v) => v,
+                let value = match self.execution.poll_worker() {
+                    Ok(Some(value)) => value,
+                    Ok(None) => continue,
                     Err(_) => {
                         complete = false;
-                        self.reset = true;
+                        self.execution.stage_reset(false);
                         // A disconnected worker cannot be reused. Give an exiting process
                         // time to expose its actual exit status, then terminate its group.
                         for _ in 0..10 {
-                            if let Some(exit) = self.worker.child.try_wait()? {
+                            if let Some(exit) = self.execution.worker_exit()? {
                                 worker_exit = Some(exit);
                                 break;
                             }
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
-                        unsafe {
-                            libc::kill(-(self.worker.child.id() as i32), libc::SIGKILL);
-                        }
+                        self.execution.signal_worker(libc::SIGKILL);
                         if worker_exit.is_none() {
-                            worker_exit = Some(self.worker.child.wait()?);
+                            worker_exit = Some(self.execution.reap_worker()?);
                         }
                         break if cancelled {
                             "cancelled".to_string()
@@ -1809,10 +7947,21 @@ impl Host {
                     }
                 };
 
-                if v["kind"] == "started" {
+                // Valid framing and valid execution envelopes are separate:
+                // transport disconnects retain worker_crashed semantics, while
+                // a decoded but unexpected envelope is a protocol completion.
+                let reply = match WorkerReply::decode(value) {
+                    Ok(reply) => reply,
+                    Err(_) => {
+                        complete = false;
+                        self.execution.stage_reset(false);
+                        break "worker_protocol_error".to_string();
+                    }
+                };
+                if matches!(reply, WorkerReply::Started) {
                     if started {
                         complete = false;
-                        self.reset = true;
+                        self.execution.stage_reset(false);
                         break "worker_protocol_error".to_string();
                     }
                     captures = Some((
@@ -1822,39 +7971,44 @@ impl Host {
                     started = true;
                     continue;
                 }
-                if v["kind"] == "done" {
+                if let WorkerReply::Done(outcome) = reply {
                     if !started {
                         complete = false;
-                        self.reset = true;
+                        self.execution.stage_reset(false);
                         break "worker_protocol_error".to_string();
                     }
                     break if cancelled {
                         "cancelled".to_string()
                     } else {
-                        v["status"].as_str().unwrap_or("error").to_string()
+                        outcome.label().to_string()
                     };
                 }
-                if v["kind"] == "rpc" {
-                    if !started || v["rpc_id"].as_u64().is_none() {
+                if let WorkerReply::Rpc {
+                    id: rpc_id,
+                    operation,
+                    payload: v,
+                } = reply
+                {
+                    if !started {
                         complete = false;
-                        self.reset = true;
+                        self.execution.stage_reset(false);
                         break "worker_protocol_error".to_string();
                     }
                     let response = if cancelled {
                         input_exception("cancel")
                     } else {
-                        if v["op"] == "input" && !self.initializing {
-                            input_rpc = v["rpc_id"].clone();
+                        if operation == "input" && !self.execution.initializing() {
+                            input_rpc = json!(rpc_id);
                             prompt =
                                 Some(self.begin_input(id, v["prompt"].as_str().unwrap_or(""))?);
                             continue;
                         }
-                        let checkpoint = self.cancel_revision;
+                        let checkpoint = self.execution.cancel_revision();
                         let response = match self.rpc(&v) {
                             Ok(value) => json!({"ok":true,"value":value}),
                             Err(e) => json!({"ok":false,"error":e.to_string()}),
                         };
-                        if self.cancel_revision != checkpoint {
+                        if self.execution.cancel_revision() != checkpoint {
                             // A helper can consume the interrupt while Python waits
                             // on its RPC. Preserve sticky cancellation/semantic status
                             // instead of treating that request as an ordinary error.
@@ -1865,28 +8019,34 @@ impl Host {
                             response
                         }
                     };
-                    if self.worker.reply(&v["rpc_id"], response).is_err() {
+                    if self.reply_worker(&json!(rpc_id), response).is_err() {
                         complete = false;
-                        self.reset = true;
+                        self.execution.stage_reset(false);
                         break "worker_crashed".to_string();
                     }
                     continue;
                 }
                 complete = false;
-                self.reset = true;
+                self.execution.stage_reset(false);
                 break "worker_protocol_error".to_string();
             }
         };
+        // An interruption can occur while a bounded frame is being written,
+        // before the read loop observes it. Keep cancellation's semantic status.
+        let status =
+            if status == "worker_crashed" && self.execution.cancel_revision() != cancel_revision {
+                "cancelled".to_owned()
+            } else {
+                status
+            };
         if prompt.is_some() {
             self.set_state(UiState::Running, None);
         }
-        if self.reset && worker_exit.is_none() {
-            worker_exit = self.worker.child.try_wait()?;
+        if self.execution.needs_reset() && worker_exit.is_none() {
+            worker_exit = self.execution.worker_exit()?;
             if worker_exit.is_none() {
-                unsafe {
-                    libc::kill(-(self.worker.child.id() as i32), libc::SIGKILL);
-                }
-                worker_exit = Some(self.worker.child.wait()?);
+                self.execution.signal_worker(libc::SIGKILL);
+                worker_exit = Some(self.execution.reap_worker()?);
             }
         }
         let (stdout, stderr) = match captures {
@@ -1901,12 +8061,15 @@ impl Host {
         let code = cell_metadata(
             stream_info(source.as_bytes(), "code", code_index),
             "code",
-            self.active_cell.ok_or("source cell missing")?,
+            self.execution.cell().ok_or("source cell missing")?,
         );
-        let metadata = json!({"cell":self.active_cell,"command_id":id,"status":status,"exit_code":if let Some(exit)=worker_exit{exit.code()}else if status=="ok"{Some(0)}else{Some(1)},
+        let mut metadata = json!({"cell":self.execution.cell(),"command_id":id,"status":status,"exit_code":if transport_error.is_some(){None}else if let Some(exit)=worker_exit{exit.code()}else if status=="ok"{Some(0)}else{Some(1)},
             "stdout":stdout,"stderr":stderr,"code":code,"context_usage":self.context_usage()});
+        if let Some(error) = transport_error {
+            metadata["transport_error"] = error;
+        }
         let mut preview = metadata.clone();
-        preview["cell"] = json!(self.active_cell);
+        preview["cell"] = json!(self.execution.cell());
         if !self.json {
             preview.as_object_mut().unwrap().remove("code");
         }
@@ -1918,10 +8081,12 @@ impl Host {
         self.journal.append("completion", metadata.clone())?;
         if retain_source {
             let cell = self
-                .active_cell
+                .execution
+                .cell()
                 .ok_or("execution observation requires an active cell")?;
             let elapsed_ms = self
-                .active_started
+                .execution
+                .started()
                 .ok_or("execution observation requires a cell timer")?
                 .elapsed()
                 .as_millis()
@@ -1930,12 +8095,10 @@ impl Host {
             self.add_context("user", observation, false, vec![])?;
         }
         self.current_code = None;
-        if status != "ok" {
-            self.stop = false;
-            self.stop_wakeup = None;
-        }
-        if self.reset && !self.initializing {
-            if self.reset_explicit {
+        self.execution
+            .finish_python(ExecutionOutcome::from_label(&status).successful());
+        if self.execution.needs_reset() && !self.execution.initializing() {
+            if self.execution.explicit_reset() {
                 self.reset_worker()?;
             } else {
                 self.with_state(UiState::Running, None, |host| host.replace_worker(false))?;
@@ -1950,13 +8113,11 @@ impl Host {
         self.replace_worker(true)
     }
     fn replace_worker(&mut self, initialize: bool) -> Result<()> {
-        self.startup_ready = false;
-        self.generation += 1;
-        self.worker = Worker::spawn(&self.home, self.generation)?;
+        self.execution.replace_worker(&self.home)?;
         let notice="Session loaded into fresh Python. Previous variables are undefined; H and context are restored.";
         self.journal.append(
             "worker_reset",
-            json!({"generation":self.generation,"active_cell":self.active_cell}),
+            json!({"generation":self.execution.generation(),"active_cell":self.execution.cell()}),
         )?;
         self.add_context("user", notice.into(), false, vec![])?;
         self.event("notice", json!({"text":notice}));
@@ -1967,7 +8128,7 @@ impl Host {
                     .any(|e| e["core"] == true && e["kind"] == "python")
             })
         {
-            self.journal.append("startup_blocked",json!({"generation":self.generation,"reason":"worker failure; core initialization requires explicit reset"}))?;
+            self.journal.append("startup_blocked",json!({"generation":self.execution.generation(),"reason":"worker failure; core initialization requires explicit reset"}))?;
             self.event("notice",json!({"text":"Core Python was not automatically re-executed after worker failure. /reset explicitly authorizes initialization; the outer agent is blocked until then."}));
             Ok(())
         } else {
@@ -2012,10 +8173,10 @@ impl Host {
         };
         let out_path = self
             .home
-            .join(format!(".{id}-stdout-{}", self.worker.child.id()));
+            .join(format!(".{id}-stdout-{}", self.execution.worker_pid()));
         let err_path = self
             .home
-            .join(format!(".{id}-stderr-{}", self.worker.child.id()));
+            .join(format!(".{id}-stderr-{}", self.execution.worker_pid()));
         let mut capture_files = ShellCaptureFiles::default();
         c.stdout(capture_files.create(&out_path)?)
             .stderr(capture_files.create(&err_path)?)
@@ -2036,11 +8197,11 @@ impl Host {
             let code = cell_metadata(
                 code,
                 "code",
-                self.active_cell.ok_or("shell source cell missing")?,
+                self.execution.cell().ok_or("shell source cell missing")?,
             );
             self.event(
                 "source",
-                json!({"cell":self.active_cell,"command_id":id,"code":code}),
+                json!({"cell":self.execution.cell(),"command_id":id,"code":code}),
             );
         }
         let mut child = ForegroundShell::spawn(&mut c)?;
@@ -2087,16 +8248,16 @@ impl Host {
         let code = cell_metadata(
             code,
             "code",
-            self.active_cell.ok_or("shell source cell missing")?,
+            self.execution.cell().ok_or("shell source cell missing")?,
         );
-        let mut preview = json!({"cell":self.active_cell,"command_id":id,"stdout":stdout,"stderr":stderr,
+        let mut preview = json!({"cell":self.execution.cell(),"command_id":id,"stdout":stdout,"stderr":stderr,
             "status":state.unwrap_or(if exit.success(){"ok"}else{"error"}),"code":code,
             "terminal_controls":v["terminal_controls"]==true});
         if !self.json {
             preview.as_object_mut().unwrap().remove("code");
         }
         self.event("preview", preview);
-        let mut result = json!({"cell":self.active_cell,"exit_code":exit.code(),"status":state.unwrap_or(if exit.success(){"ok"}else{"error"}),
+        let mut result = json!({"cell":self.execution.cell(),"exit_code":exit.code(),"status":state.unwrap_or(if exit.success(){"ok"}else{"error"}),
             "stdout":stdout,"stderr":stderr});
         for stream in ["stdout", "stderr"] {
             result[stream].as_object_mut().unwrap().remove("preview");
@@ -2107,35 +8268,9 @@ impl Host {
         Ok(result)
     }
     fn evict(&mut self) -> Result<()> {
-        let eligible: Vec<usize> = self
-            .context
-            .iter()
-            .enumerate()
-            .filter_map(|(n, i)| i.output.then_some(n))
-            .collect();
-        if eligible.len() < self.trigger {
-            return Ok(());
+        if let Some(transition) = self.context.prepare_evict()? {
+            self.context.persist(&mut self.journal, transition)?;
         }
-        let mut next = self.context.clone();
-        for &n in eligible
-            .iter()
-            .take(eligible.len().saturating_sub(self.retain))
-        {
-            let i = &mut next[n];
-            i.text = format!(
-                "[Output omitted: originals {:?}; {} chars]",
-                i.ranges,
-                i.text.chars().count()
-            );
-            i.output = false;
-            i.raw_index = None;
-        }
-        self.journal.append(
-            "context_replace",
-            json!({"items":next.iter().map(item_json).collect::<Vec<_>>(),"reason":"output_batch"}),
-        )?;
-        self.context = next;
-        self.revision += 1;
         Ok(())
     }
 }
@@ -2189,22 +8324,24 @@ impl Host {
         let mut unfinished_startup = false;
         let mut generation = 0;
         for sequence in 0..journal.seq {
-            let ev = journal.event(sequence)?;
-            match ev["kind"].as_str().unwrap_or("") {
+            let ev = journal.decoded_event(sequence)?;
+            match ev.kind.label() {
                 "skills_snapshot" => {
                     if snapshot.is_some() {
                         return Err("duplicate skills snapshot".into());
                     }
-                    snapshot = Some(ev["payload"].clone());
+                    snapshot = Some(ev.payload().clone());
                 }
                 "worker_reset" => {
-                    generation = ev["payload"]["generation"]
-                        .as_u64()
-                        .ok_or("invalid worker generation")?
-                        as usize
+                    if let JournalEventData::WorkerReset {
+                        generation: value, ..
+                    } = ev.data
+                    {
+                        generation = value;
+                    }
                 }
                 "startup_begin" | "startup_blocked" => unfinished_startup = true,
-                "startup_end" => unfinished_startup = ev["payload"]["status"] != "ok",
+                "startup_end" => unfinished_startup = ev.payload()["status"] != "ok",
                 _ => {}
             }
         }
@@ -2225,139 +8362,74 @@ impl Host {
             journal.append("skills_snapshot", snapshot.clone())?;
             snapshot
         };
-        let worker = Worker::spawn(&home, if resumed { generation + 1 } else { 0 })?;
+        let execution =
+            ExecutionController::spawn(&home, if resumed { generation + 1 } else { 0 })?;
         let mut host = Self {
-            state: UiState::Idle,
-            thinking_model: None,
-            thinking_started: None,
-            cells: 0,
-            active_cell: None,
-            active_language: None,
-            active_started: None,
-            active_operation: None,
-            cancel_revision: 0,
-            provider_retry: None,
+            frontend: TerminalFrontend::new(),
+
+            execution,
+            provider: ProviderClient::new(),
             last_generation_failed: false,
             cell_input_records: vec![],
-            pending_generation_request: None,
-            cell_history_cache: std::cell::RefCell::new(CellHistoryCache::default()),
-            status_line: std::cell::Cell::new(false),
-            busy_draft: EditBuffer::default(),
-            busy_input: None,
-            input_busy_paused: false,
-            local_commands: std::collections::VecDeque::new(),
             exit_requested: false,
-            busy_visible_revision: 0,
-            last_cell: Value::Null,
             journal,
-            worker,
             home,
-            context: vec![],
-            history: HashMap::new(),
+            context: ContextStore::default(),
+            history: HistoryArchive::default(),
             ids: HashSet::new(),
             json: json_mode,
-            stop: false,
-            stop_wakeup: None,
-            reset: false,
-            reset_explicit: false,
-            generation: 0,
-            revision: 0,
-            bg_tasks: HashMap::new(),
-            wakeups: HashMap::new(),
-            servicing: false,
+            scheduler: TaskScheduler::default(),
+            control_pump: ControlPump::default(),
             incoming: None,
             input_closed: false,
             pending: std::collections::VecDeque::new(),
             queued: HashMap::new(),
             deferred_say: vec![],
             agent_turn: false,
-            config: json!({}),
-            config_defaults: json!({}),
-            auth: json!({}),
-            model: std::env::var("PY_MODEL").unwrap_or_else(|_| "openai/gpt-4.1".into()),
-            effort: "medium".into(),
             no_model,
-            context_limit: std::env::var("PY_CONTEXT_LIMIT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(128000),
-            trigger: 20,
-            retain: 10,
             current_code: None,
-            usage: json!({}),
-            cache_accounting: CacheAccounting::default(),
             skills,
-            catalog: empty_model_catalog(),
-            initializing: false,
-            startup_ready: false,
         };
-        for name in [
-            "code",
-            "user",
-            "stdout",
-            "stderr",
-            "stdin",
-            "raw",
-            "say",
-            "requests",
-            "responses",
-            "usage",
-        ] {
-            host.history.insert(name.into(), vec![]);
-        }
         let mut settings = None;
         let mut user_provenance = Vec::<(usize, usize)>::new();
         let mut cache_response_operations = HashSet::<String>::new();
         let mut cache_pending_operations = HashSet::<String>::new();
         let mut cache_intended_operation: Option<String> = None;
         for sequence in 0..host.journal.seq {
-            let ev = host.journal.event(sequence)?;
-            let p = &ev["payload"];
-            match ev["kind"].as_str().unwrap_or("") {
-                "code" => {
-                    host.hist_push("code", p["source"].clone());
-                }
-                "user" => {
-                    let index = host.hist_push("user", p["text"].clone());
-                    user_provenance.push((sequence, index));
+            let ev = host.journal.decoded_event(sequence)?;
+            let p = ev.payload();
+            match ev.kind.label() {
+                "code" | "user" => {
+                    let JournalEventData::TextRecord(record) = &ev.data else {
+                        return Err("text record decoder invariant failed".into());
+                    };
+                    let index = host.hist_push(ev.kind.label(), json!(record.text));
+                    if ev.kind == JournalEventKind::User {
+                        user_provenance.push((sequence, index));
+                    }
                 }
                 "stdin" => {
                     host.history
-                        .get_mut("stdin")
-                        .unwrap()
-                        .push(json!({"$event":sequence}));
+                        .restore_reference(RecordCollection::Stdin, sequence);
                 }
-                "worker_reset" => {
-                    host.generation = p["generation"]
-                        .as_u64()
-                        .ok_or("invalid worker generation")?
-                        as usize;
-                }
+                // Historical generations are projected from the journal. They
+                // must not overwrite the generation of the live owned worker.
+                "worker_reset" => {}
                 "settings_initial" | "settings_change" => {
                     settings = Some(p.clone());
                 }
-                "task_state" | "task_settled" | "wakeup_state" => {
-                    host.bg_restore(ev["kind"].as_str().unwrap(), p)?
-                }
+                "task_state" | "task_settled" | "wakeup_state" => host.bg_restore(&ev.kind, p)?,
                 "cell_start" => {
-                    host.cells = host
-                        .cells
-                        .max(p["cell"].as_u64().ok_or("invalid session cell number")? as usize);
-                    if let Some(values) = p.get("user_record_indices") {
-                        host.cell_input_records = values
-                            .as_array()
-                            .ok_or("invalid cell input provenance")?
-                            .iter()
-                            .map(|v| {
-                                v.as_u64()
-                                    .and_then(|n| usize::try_from(n).ok())
-                                    .ok_or("invalid user record index".into())
-                            })
-                            .collect::<Result<Vec<_>>>()?;
+                    let JournalEventData::CellStart(start) = &ev.data else {
+                        return Err("cell start decoder invariant failed".into());
+                    };
+                    host.execution.restore_cell(start.cell);
+                    if let Some(values) = &start.user_record_indices {
+                        host.cell_input_records = values.clone();
                         if host
                             .cell_input_records
                             .iter()
-                            .any(|index| *index >= host.history["user"].len())
+                            .any(|index| *index >= host.history.len(RecordCollection::User))
                         {
                             return Err(
                                 "cell input provenance points to unavailable user history".into()
@@ -2365,26 +8437,20 @@ impl Host {
                         }
                     }
                 }
-                "cell_end" => host.last_cell = p.clone(),
+                "cell_end" => host.execution.commit_completion(p.clone()),
                 "stream" => {
-                    let list = host
-                        .history
-                        .get_mut(p["collection"].as_str().unwrap())
-                        .ok_or("invalid stream collection")?;
-                    let index = p["index"].as_u64().ok_or("missing stream index")? as usize;
-                    while list.len() <= index {
-                        list.push(json!({"$chunks":[]}));
-                    }
-                    list[index]["$chunks"]
-                        .as_array_mut()
-                        .unwrap()
-                        .push(json!(sequence));
+                    let JournalEventData::Stream(stream) = &ev.data else {
+                        return Err("stream decoder invariant failed".into());
+                    };
+                    host.history.set_stream_snapshot(
+                        stream.collection,
+                        stream.record_index,
+                        sequence,
+                    )?;
                 }
                 "say" => {
                     host.history
-                        .get_mut("say")
-                        .unwrap()
-                        .push(json!({"$event":sequence}));
+                        .restore_reference(RecordCollection::Say, sequence);
                 }
                 "accepted" | "local_command_accepted" => {
                     if let Some(s) = p["command_id"].as_str() {
@@ -2392,7 +8458,10 @@ impl Host {
                     }
                 }
                 "context_add" => {
-                    let item = parse_item(p)?;
+                    let JournalEventData::ContextAdd(item) = &ev.data else {
+                        return Err("context add decoder invariant failed".into());
+                    };
+                    let item = item.clone();
                     let mut inputs = Vec::new();
                     for (start, _) in &item.ranges {
                         let source = host.journal.event(*start)?;
@@ -2401,7 +8470,7 @@ impl Host {
                                 .as_u64()
                                 .ok_or("selected user record index missing")?
                                 as usize;
-                            if index >= host.history["user"].len() {
+                            if index >= host.history.len(RecordCollection::User) {
                                 return Err("selected user record unavailable".into());
                             }
                             inputs.push(index);
@@ -2410,111 +8479,88 @@ impl Host {
                     if !inputs.is_empty() {
                         host.cell_input_records = inputs;
                     }
-                    host.context.push(item);
-                    host.revision += 1;
+                    host.context.restore_add(item)?;
                 }
                 "context_replace" => {
-                    let next = p["items"]
-                        .as_array()
-                        .ok_or("invalid context journal")?
-                        .iter()
-                        .map(|item| parse_replaced_item(item, &host.context))
-                        .collect::<Result<Vec<_>>>()?;
-                    host.context = next;
-                    host.revision += 1;
+                    let JournalEventData::ContextReplace(items) = &ev.data else {
+                        return Err("context replacement decoder invariant failed".into());
+                    };
+                    host.context.restore_replace(items)?;
                 }
                 "intent" => {
-                    cache_intended_operation = if p["type"] == "provider" {
-                        Some(
-                            p["operation"]
-                                .as_str()
-                                .ok_or("provider intent operation missing")?
-                                .to_string(),
-                        )
-                    } else {
-                        None
+                    let JournalEventData::Intent(intent) = &ev.data else {
+                        return Err("intent decoder invariant failed".into());
                     };
+                    cache_intended_operation =
+                        if intent.operation_type.as_deref() == Some("provider") {
+                            Some(
+                                intent
+                                    .operation
+                                    .clone()
+                                    .ok_or("provider intent operation missing")?,
+                            )
+                        } else {
+                            None
+                        };
                 }
                 "usage" => {
-                    host.usage = p.clone();
                     host.history
-                        .get_mut("usage")
-                        .unwrap()
-                        .push(json!({"$event":sequence}));
-                    let response_recorded = p["operation"]
-                        .as_str()
+                        .restore_reference(RecordCollection::Usage, sequence);
+                    let JournalEventData::ProviderRecord(record) = &ev.data else {
+                        return Err("usage decoder invariant failed".into());
+                    };
+                    let response_recorded = record
+                        .operation
+                        .as_deref()
                         .is_some_and(|operation| cache_response_operations.contains(operation));
-                    if !response_recorded {
-                        if let Some(snapshot) = p.get("cache_accounting") {
-                            let mut recovered = CacheAccounting::from_snapshot(snapshot)?;
-                            recovered.merge_coverage(&host.cache_accounting);
-                            host.cache_accounting = recovered;
-                        } else if cache_response_operations.is_empty() {
-                            // Usage-only legacy snapshots cannot prove complete
-                            // coverage (older counters reset after missing data).
-                            // Retain the latest usable interval, visibly partial.
-                            let input = p["input_tokens"].as_u64();
-                            let cached = p["cache_hit_tokens"]
-                                .as_u64()
-                                .or(p["reported_cache_hit_tokens"].as_u64());
-                            let mut legacy = CacheAccounting::default();
-                            legacy.observe(input, cached, input)?;
-                            legacy.mark_incomplete();
-                            host.cache_accounting = legacy;
-                        } else {
-                            host.cache_accounting.mark_incomplete();
-                        }
-                    } else if let Some(snapshot) = p.get("cache_accounting") {
-                        // Reconstruct counts from responses, but preserve explicit
-                        // uncertainty recorded for earlier unmeasured attempts.
-                        host.cache_accounting
-                            .merge_coverage(&CacheAccounting::from_snapshot(snapshot)?);
-                    } else if p["cache_usage_complete"] == false {
-                        host.cache_accounting.cache_complete = false;
-                        host.cache_accounting.rate_complete = false;
-                    }
+                    host.provider.restore_usage(
+                        p,
+                        response_recorded,
+                        !cache_response_operations.is_empty(),
+                    )?;
                 }
                 "request" => {
                     host.history
-                        .get_mut("requests")
-                        .unwrap()
-                        .push(json!({"$event":sequence}));
+                        .restore_reference(RecordCollection::Requests, sequence);
                     if let Some(operation) = &cache_intended_operation {
                         cache_pending_operations.insert(operation.clone());
                     }
                 }
                 "response" => {
                     host.history
-                        .get_mut("responses")
-                        .unwrap()
-                        .push(json!({"$event":sequence}));
-                    host.cache_accounting.observe_body(&p["body"])?;
-                    if let Some(operation) = p["operation"].as_str() {
+                        .restore_reference(RecordCollection::Responses, sequence);
+                    host.provider.restore_cache_body(&p["body"])?;
+                    let JournalEventData::ProviderRecord(record) = &ev.data else {
+                        return Err("response decoder invariant failed".into());
+                    };
+                    if let Some(operation) = record.operation.as_deref() {
                         cache_response_operations.insert(operation.to_string());
                         cache_pending_operations.remove(operation);
                     }
                 }
                 "provider_attempt_failed" => {
-                    if p["billing_unknown"] == true
-                        || p["outcome_unknown"] == true
-                        || p["billing"] == "unknown"
-                    {
-                        host.cache_accounting.mark_incomplete();
+                    let JournalEventData::ProviderRecord(attempt) = &ev.data else {
+                        return Err("provider attempt decoder invariant failed".into());
+                    };
+                    if attempt.billing_unknown {
+                        host.provider.restore_unknown_attempt();
                     }
                 }
                 "provider_cancelled" => {
-                    if p["operation"]
-                        .as_str()
+                    let JournalEventData::ProviderRecord(record) = &ev.data else {
+                        return Err("cancellation decoder invariant failed".into());
+                    };
+                    if record
+                        .operation
+                        .as_deref()
                         .is_some_and(|operation| cache_pending_operations.contains(operation))
                     {
-                        host.cache_accounting.mark_incomplete();
+                        host.provider.restore_unknown_attempt();
                     }
                 }
                 "raw" => {
                     host.history
-                        .get_mut("raw")
-                        .unwrap()
-                        .push(json!({"$event":sequence}));
+                        .restore_reference(RecordCollection::Raw, sequence);
                 }
                 "attachment" => {
                     let id = p["context_id"]
@@ -2524,25 +8570,13 @@ impl Host {
                         .as_u64()
                         .and_then(|n| usize::try_from(n).ok())
                         .ok_or("invalid attachment raw index")?;
-                    if index >= host.history["raw"].len() {
+                    if index >= host.history.len(RecordCollection::Raw) {
                         return Err("attachment raw history index missing".into());
                     }
                     // Legacy attachment events bind only to the item currently
                     // present at this point in replay; discarded IDs never
                     // survive as entries in a separate attachment map.
-                    if let Some(item) = host.context.iter_mut().find(|item| item.id == id) {
-                        if item.role != "user" {
-                            return Err(
-                                "attachment receipt cannot bind a non-user context item".into()
-                            );
-                        }
-                        if item.raw_index.is_some_and(|owned| owned != index) {
-                            return Err(
-                                "attachment receipt contradicts committed context ownership".into(),
-                            );
-                        }
-                        item.raw_index = Some(index);
-                    }
+                    host.context.restore_attachment(id, index)?;
                 }
                 _ => {}
             }
@@ -2551,22 +8585,22 @@ impl Host {
             host.restore_full_user_context(&user_provenance)?;
         }
         if !cache_pending_operations.is_empty() {
-            host.cache_accounting.mark_incomplete();
+            host.provider.restore_unknown_attempt();
         }
-        host.cache_accounting.write_report(&mut host.usage);
+        host.provider.refresh_usage_report();
         if host
             .context
-            .iter()
-            .filter_map(|item| item.raw_index)
-            .any(|index| index >= host.history["raw"].len())
+            .raw_indices()
+            .into_iter()
+            .any(|index| index >= host.history.len(RecordCollection::Raw))
         {
             return Err("context attachment raw history index missing".into());
         }
-        host.config_defaults = config.clone();
-        host.config = config;
-        host.auth = load_json(&host.home.join("auth.json"))?;
+        host.provider.load_session_config(config);
+        host.provider
+            .accept_auth(load_json(&host.home.join("auth.json"))?);
         match load_model_catalog(&host.home.join("models.json")){
-            Ok(cache)=>host.catalog=cache,Err(_)=>host.event("notice",json!({"text":"Invalid model catalog cache ignored; using offline inventory until refresh."}))
+            Ok(cache)=>host.provider.accept_catalog(cache),Err(_)=>host.event("notice",json!({"text":"Invalid model catalog cache ignored; using offline inventory until refresh."}))
         }
         host.configure()?;
         if let Some(settings) = settings {
@@ -2576,41 +8610,41 @@ impl Host {
                     .ok_or("invalid session model")?
                     .into(),
             )?;
-            host.effort = settings["effort"]
-                .as_str()
-                .ok_or("invalid session effort")?
-                .into();
-            host.validate_effort(&host.effort)?;
+            host.provider.restore_effort(
+                settings["effort"]
+                    .as_str()
+                    .ok_or("invalid session effort")?
+                    .into(),
+            )?;
         }
         if let Some(model) = model_override {
             host.choose_model_session(model)?;
         }
         if !resumed
             && model_override.is_none()
-            && host.config["model"].is_null()
+            && host.provider.config["model"].is_null()
             && std::env::var("PY_MODEL").is_err()
-            && host.auth["openai-codex"].is_object()
+            && host.provider.auth["openai-codex"].is_object()
         {
             host.select_model_after_login("openai-codex");
         }
         if let Some(effort) = effort_override {
             host.change_effort_session(effort)?;
         }
-        host.validate_effort(&host.effort)?;
-        host.check_system_budget(host.context_limit)?;
+        host.validate_effort(&host.provider.effort)?;
+        host.check_system_budget(host.provider.context_limit)?;
         if !resumed {
             host.journal.append(
                 "settings_initial",
-                json!({"model":host.model,"effort":host.effort}),
+                json!({"model":host.provider.model,"effort":host.provider.effort}),
             )?;
         }
         if resumed {
             host.bg_recover()?;
-            host.generation += 1;
             let notice="Session loaded into fresh Python. Previous variables are undefined; H and context are restored. H[n], H.cells[n], and H.code/stdout/stderr[n] use presented one-based cell numbers; other H histories group records by cell. Use H.records.<collection>[record_index] for legacy zero-based/global records, including old recorded references.";
             host.journal.append(
                 "worker_reset",
-                json!({"generation":host.generation,"active_cell":null}),
+                json!({"generation":host.execution.generation(),"active_cell":null}),
             )?;
             host.add_context("user", notice.into(), false, vec![])?;
             host.event("notice", json!({"text":notice}));
@@ -2640,20 +8674,16 @@ impl Host {
         }
         Ok(index)
     }
-    fn dispatch(&mut self, mut v: Value) -> Result<bool> {
+    fn dispatch(&mut self, wire: Value) -> Result<bool> {
+        self.dispatch_command(NativeCommand::decode(wire, NativeCommandOrigin::Internal))
+    }
+    fn dispatch_command(&mut self, v: NativeCommand) -> Result<bool> {
         self.reload_auth()?;
-        if v["kind"] == "submit" {
-            if let Some(text) = v["text"].as_str().map(str::trim_start).map(str::to_owned) {
-                if text.starts_with('/') {
-                    self.receive_local_command(v["id"].as_str().unwrap_or(""), &text, false)?;
-                    return Ok(!self.exit_requested);
-                }
-                if let Some((command, visible)) = shell_prefix(&text) {
-                    v = json!({"id":v["id"],"kind":"shell","command":command,"visible":visible});
-                }
-            }
+        if let Some(parsed) = v.args.local.clone() {
+            self.receive_parsed_local_command(&v.id, parsed, false)?;
+            return Ok(!self.exit_requested);
         }
-        let id = v["id"].as_str().unwrap_or("").to_string();
+        let id = v.id.clone();
         if id.is_empty() {
             self.event(
                 "rejected",
@@ -2661,7 +8691,7 @@ impl Host {
             );
             return Ok(true);
         }
-        if v["kind"] == "stdin_reply" {
+        if v.kind == NativeCommandKind::StdinReply {
             self.event(
                 "rejected",
                 json!({"command_id":id,"error":"no matching active input prompt"}),
@@ -2676,7 +8706,7 @@ impl Host {
             );
             return Ok(true);
         }
-        let recorded = redacted_command(v.clone())?;
+        let recorded = v.recorded()?;
         if queued.is_some() {
             self.journal.append(
                 "queue_dispatched",
@@ -2688,15 +8718,15 @@ impl Host {
             self.ids.insert(id.clone());
             self.event("accepted", json!({"command_id":id}));
         }
-        if matches!(v["kind"].as_str(), Some("python" | "shell")) {
+        if matches!(v.kind, NativeCommandKind::Python | NativeCommandKind::Shell) {
             if let Some(Some((index, _))) = queued {
                 self.cell_input_records = vec![index];
             }
         }
-        match v["kind"].as_str().unwrap_or("") {
-            "python" => {
-                let source = v["source"].as_str().ok_or("source required")?;
-                let visible = v["visible"].as_bool().unwrap_or(false);
+        match v.kind {
+            NativeCommandKind::Python => {
+                let source = v.args.source.require()?;
+                let visible = v.args.visible;
                 if queued.is_none() {
                     self.user(source, false)?;
                 }
@@ -2730,30 +8760,35 @@ impl Host {
                         json!({"cell":result["cell"],"collection":"user","record_index":index}),
                     )?;
                 }
-                if self.stop {
+                if self.execution.should_stop() {
                     self.commit_stop()?;
                 }
                 self.event("completed", result);
             }
-            "bg_run" => {
-                let result=self.bg_run(&json!({"kind":v.get("task_kind").unwrap_or(&json!("shell")),"source":v["source"],"options":v["options"]}))?;
+            NativeCommandKind::BgRun => {
+                let result = self.bg_run(&v.args.task_launch)?;
                 self.event(
                     "completed",
                     json!({"command_id":id,"status":"ok","result":result}),
                 );
             }
-            "task_list" | "task_get" | "task_logs" | "task_kill" | "wakeup_list"
-            | "wakeup_cancel" | "wakeup_run" => {
+            NativeCommandKind::TaskList
+            | NativeCommandKind::TaskGet
+            | NativeCommandKind::TaskLogs
+            | NativeCommandKind::TaskKill
+            | NativeCommandKind::WakeupList
+            | NativeCommandKind::WakeupCancel
+            | NativeCommandKind::WakeupRun => {
                 self.finish_background_control(&v)?;
             }
-            "shell" => {
-                let command = v["command"].as_str().ok_or("command required")?;
+            NativeCommandKind::Shell => {
+                let command = v.args.command.require()?;
                 if queued.is_none() {
                     self.user(command, false)?;
                 }
-                let r = self.shell(&json!({"command":command,"options":v["options"],
-                    "terminal_controls":v["terminal_controls"]==true}))?;
-                if v["visible"].as_bool().unwrap_or(false) {
+                let r = self.shell(&json!({"command":command,"options":v.args.options,
+                    "terminal_controls":v.args.terminal_controls}))?;
+                if v.args.visible {
                     let message = format!(
                         "!!{}\n[stdout]\n{}\n[stderr]\n{}",
                         command,
@@ -2784,8 +8819,8 @@ impl Host {
                 }
                 self.event("completed",json!({"cell":r["cell"],"command_id":id,"status":r["status"],"stdout":r["stdout"],"stderr":r["stderr"]}));
             }
-            "submit" => {
-                let text = v["text"].as_str().ok_or("text required")?;
+            NativeCommandKind::Submit => {
+                let text = v.args.text.require()?;
                 if let Some(Some((index, sequence))) = queued {
                     self.select_user(text, index, sequence)?;
                 } else {
@@ -2796,27 +8831,25 @@ impl Host {
                 }
                 self.event("completed", json!({"command_id":id,"status":"ok"}));
             }
-            "interrupt" => {
+            NativeCommandKind::Interrupt => {
                 INTERRUPT.store(false, std::sync::atomic::Ordering::SeqCst);
                 self.event(
                     "completed",
                     json!({"command_id":id,"status":"ok","active":false}),
                 );
             }
-            "reset" => {
+            NativeCommandKind::Reset => {
                 self.reset_worker()?;
                 self.event("completed", json!({"command_id":id,"status":"ok"}));
             }
-            "login" => {
-                let provider = v["provider"].as_str().ok_or("provider required")?;
-                match v["method"].as_str() {
-                    Some("browser") => self.browser_login(provider, false)?,
-                    Some("manual") => self.browser_login(provider, true)?,
-                    Some("oauth" | "device") => self.oauth_login(provider)?,
-                    Some("api-key") | None => {
-                        self.key_login(provider, v["key"].as_str().ok_or("key required")?)?
-                    }
-                    _ => {
+            NativeCommandKind::Login => {
+                let provider = v.args.provider.require()?;
+                match v.args.login_method {
+                    NativeLoginMethod::Browser => self.browser_login(provider, false)?,
+                    NativeLoginMethod::Manual => self.browser_login(provider, true)?,
+                    NativeLoginMethod::Device => self.oauth_login(provider)?,
+                    NativeLoginMethod::ApiKey => self.key_login(provider, v.args.key.require()?)?,
+                    NativeLoginMethod::Unsupported => {
                         return Err(
                             "Unsupported login method: browser, manual, device, oauth or api-key"
                                 .into(),
@@ -2827,62 +8860,53 @@ impl Host {
                 self.select_model_after_login(&provider);
                 self.event("completed", json!({"command_id":id,"status":"ok"}));
             }
-            "logout" => {
-                self.logout(v["provider"].as_str().ok_or("provider required")?)?;
+            NativeCommandKind::Logout => {
+                self.logout(v.args.provider.require()?)?;
                 self.event("completed", json!({"command_id":id,"status":"ok"}));
             }
-            "auth" => {
+            NativeCommandKind::Auth => {
                 self.reload_auth()?;
                 self.event(
                     "auth",
                     json!({"command_id":id,"providers":self.auth_status()}),
                 );
             }
-            "model" => {
-                let query = v
-                    .get("model")
-                    .filter(|value| !value.is_null())
-                    .map(|value| value.as_str().ok_or("model must be a string"))
-                    .transpose()?
-                    .unwrap_or("")
-                    .trim();
+            NativeCommandKind::Model => {
+                let query = v.args.model.require()?;
                 if !query.is_empty() {
                     self.choose_model(query)?;
                 }
                 self.event(
                     "completed",
-                    json!({"command_id":id,"status":"ok","model":self.model,"effort":self.effort,
+                    json!({"command_id":id,"status":"ok","model":self.provider.model,"effort":self.provider.effort,
                     "persisted_defaults":!query.is_empty()}),
                 );
             }
-            "effort" | "thinking" => {
-                let effort = v
-                    .get("effort")
-                    .filter(|value| !value.is_null())
-                    .map(|value| value.as_str().ok_or("effort must be a string"))
-                    .transpose()?
-                    .unwrap_or("")
-                    .trim();
+            NativeCommandKind::Effort => {
+                let effort = v.args.effort.require()?;
                 if !effort.is_empty() {
                     self.change_effort(effort)?;
                 }
                 self.event(
                     "completed",
-                    json!({"command_id":id,"status":"ok","model":self.model,"effort":self.effort,
+                    json!({"command_id":id,"status":"ok","model":self.provider.model,"effort":self.provider.effort,
                     "persisted_defaults":!effort.is_empty()}),
                 );
             }
-            "models" => {
+            NativeCommandKind::Models => {
                 self.reload_auth()?;
-                let refresh = v
-                    .get("refresh")
-                    .map(|r| r.as_bool().ok_or("refresh must be boolean"))
-                    .transpose()?
-                    .unwrap_or(false);
+                let refresh = *v.args.refresh.require()?;
                 if refresh {
-                    let provider = v["provider"]
-                        .as_str()
-                        .unwrap_or_else(|| self.model.split_once('/').map_or("openai", |p| p.0))
+                    let provider = v
+                        .args
+                        .catalog_provider
+                        .as_deref()
+                        .unwrap_or_else(|| {
+                            self.provider
+                                .model
+                                .split_once('/')
+                                .map_or("openai", |p| p.0)
+                        })
                         .to_string();
                     if !self.provider_usable(&provider) {
                         return Err(format!("Provider {provider} is not usable; /login {provider} before catalog refresh").into());
@@ -2894,49 +8918,35 @@ impl Host {
                     json!({"command_id":id,"models":self.usable_models()}),
                 );
             }
-            "recovery" => self.event("recovery", {
+            NativeCommandKind::Recovery => self.event("recovery", {
                 let mut status = self.recovery_status()?;
                 status["command_id"] = json!(id);
                 status
             }),
-            "status" => self.event("status", self.status()),
-            "context" => self.event(
+            NativeCommandKind::Status => self.event("status", self.status()),
+            NativeCommandKind::Context => self.event(
                 "context",
                 json!({"command_id":id,"usage":self.context_usage(),
-                "items":self.context.iter().map(item_json).collect::<Vec<_>>()}),
+                "items":self.context.items().iter().map(item_json).collect::<Vec<_>>()}),
             ),
-            "new" | "resume" => {
-                let cancel = v
-                    .get("cancel_tasks")
-                    .map(|x| x.as_bool().ok_or("cancel_tasks must be boolean"))
-                    .transpose()?
-                    .unwrap_or(false);
-                let query = if v["kind"] == "resume" {
-                    Some(
-                        v["session"]
-                            .as_str()
-                            .filter(|s| !s.is_empty())
-                            .ok_or("session path/query required")?,
-                    )
+            NativeCommandKind::New | NativeCommandKind::Resume => {
+                let cancel = *v.args.cancel_tasks.require()?;
+                let query = if v.kind == NativeCommandKind::Resume {
+                    Some(v.args.session.require()?.as_str())
                 } else {
                     None
                 };
                 self.switch_session(query, cancel)?;
                 self.journal
-                    .append("accepted", json!({"command_id":id,"command":v}))?;
+                    .append("accepted", json!({"command_id":id,"command":v.wire}))?;
                 self.ids.insert(id.clone());
                 self.event(
                     "completed",
                     json!({"command_id":id,"status":"ok","session":self.journal.path}),
                 );
             }
-            "quit" => {
-                self.bg_guard(
-                    v.get("cancel_tasks")
-                        .map(|x| x.as_bool().ok_or("cancel_tasks must be boolean"))
-                        .transpose()?
-                        .unwrap_or(false),
-                )?;
+            NativeCommandKind::Quit => {
+                self.bg_guard(*v.args.cancel_tasks.require()?)?;
                 return Ok(false);
             }
             _ => self.event(
@@ -3003,19 +9013,11 @@ fn parse_replaced_item(p: &Value, previous: &[Item]) -> Result<Item> {
 mod context_attachment_tests {
     use super::*;
 
-    fn host() -> Host {
-        let home = std::env::temp_dir().join(format!(
-            "py-context-attachment-{}-{}",
-            std::process::id(),
-            unique_id()
-        ));
-        fs::create_dir_all(&home).unwrap();
-        fs::write(
-            home.join("config.json"),
-            json!({"skills":{"enabled":false}}).to_string(),
+    fn host() -> crate::test_support::HostFixture {
+        crate::test_support::HostFixture::named(
+            "py-context-attachment",
+            Some(json!({"skills":{"enabled":false}})),
         )
-        .unwrap();
-        Host::new(home, None, true, true, None, None).unwrap()
     }
 
     fn image_data() -> String {
@@ -3042,6 +9044,7 @@ mod context_attachment_tests {
 
     fn raw_index(host: &Host, id: &str) -> Option<usize> {
         host.context
+            .items()
             .iter()
             .find(|item| item.id == id)
             .unwrap()
@@ -3077,6 +9080,7 @@ mod context_attachment_tests {
         );
         assert!(host
             .context
+            .items()
             .iter()
             .find(|item| item.id == start)
             .unwrap()
@@ -3094,7 +9098,12 @@ mod context_attachment_tests {
         let end = attach(&mut host, &data);
         let outside = attach(&mut host, &data);
         collapse(&mut host, &start, &end);
-        let summary = host.context.iter().find(|item| item.id == start).unwrap();
+        let summary = host
+            .context
+            .items()
+            .iter()
+            .find(|item| item.id == start)
+            .unwrap();
         assert!(
             summary.text.contains("[image H.records.raw[0]]"),
             "preserved boundary text is retained"
@@ -3103,7 +9112,7 @@ mod context_attachment_tests {
             summary.raw_index, None,
             "preserving image reference text does not select the image"
         );
-        assert!(!host.context.iter().any(|item| item.id == end));
+        assert!(!host.context.items().iter().any(|item| item.id == end));
         assert_eq!(raw_index(&host, &outside), Some(1));
         let fresh = attach(&mut host, &data);
         assert_ne!(fresh, start);
@@ -3111,6 +9120,7 @@ mod context_attachment_tests {
         assert_eq!(raw_index(&host, &fresh), Some(2));
         assert_eq!(
             host.context
+                .items()
                 .iter()
                 .filter(|item| item.raw_index.is_some())
                 .count(),
@@ -3125,12 +9135,12 @@ mod context_attachment_tests {
         let image = attach(&mut host, &data);
         host.add_context("user", "keep latest selected output".into(), true, vec![])
             .unwrap();
-        host.trigger = 2;
-        host.retain = 1;
+        host.context.configure_eviction(2, 1);
         host.evict().unwrap();
         assert_eq!(raw_index(&host, &image), None);
         assert!(host
             .context
+            .items()
             .iter()
             .find(|item| item.id == image)
             .unwrap()
@@ -3146,23 +9156,32 @@ mod context_attachment_tests {
         let mut host = host();
         let data = image_data();
         let image = attach(&mut host, &data);
-        host.trigger = 1;
-        host.retain = 0;
-        let before = host.context.iter().map(item_json).collect::<Vec<_>>();
-        let revision = host.revision;
+        host.context.configure_eviction(1, 0);
+        let before = host
+            .context
+            .items()
+            .iter()
+            .map(item_json)
+            .collect::<Vec<_>>();
+        let revision = host.context.revision();
         host.journal.failed = true;
         assert!(host.evict().is_err());
         assert_eq!(
-            host.context.iter().map(item_json).collect::<Vec<_>>(),
+            host.context
+                .items()
+                .iter()
+                .map(item_json)
+                .collect::<Vec<_>>(),
             before
         );
         assert_eq!(raw_index(&host, &image), Some(0));
-        assert_eq!(host.revision, revision);
+        assert_eq!(host.context.revision(), revision);
     }
 
     #[test]
     fn resume_does_not_resurrect_collapsed_image_from_legacy_attachment_events() {
-        let mut host = host();
+        let mut fixture = host();
+        let mut host = fixture.take_host();
         let data = image_data();
         let start = attach(&mut host, &data);
         host.add_context("user", "large selected payload ".repeat(300), true, vec![])
@@ -3215,6 +9234,7 @@ mod context_attachment_tests {
         assert_eq!(
             restored
                 .context
+                .items()
                 .iter()
                 .filter(|item| item.raw_index.is_some())
                 .count(),
@@ -3225,7 +9245,8 @@ mod context_attachment_tests {
 
     #[test]
     fn committed_context_add_owns_image_without_later_attachment_receipt() {
-        let mut host = host();
+        let mut fixture = host();
+        let mut host = fixture.take_host();
         let data = image_data();
         let image = attach(&mut host, &data);
         let home = host.home.clone();
@@ -3282,6 +9303,23 @@ fn reasoning_fields(
     effort: &str,
     max: usize,
 ) -> Result<Value> {
+    reasoning_fields_typed(
+        &ApiKind::decode(api),
+        &ProviderKind::decode(provider),
+        id,
+        &ModelCapabilities::decode(meta),
+        effort,
+        max,
+    )
+}
+fn reasoning_fields_typed(
+    api: &ApiKind,
+    provider: &ProviderKind,
+    id: &str,
+    capabilities: &ModelCapabilities,
+    effort: &str,
+    max: usize,
+) -> Result<Value> {
     if !["off", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort) {
         return Err("effort must be off/minimal/low/medium/high/xhigh/max".into());
     }
@@ -3289,20 +9327,20 @@ fn reasoning_fields(
         return Err("max_tokens must be positive".into());
     }
     let mut fields = json!({});
-    if meta["reasoning"] != true {
+    if !capabilities.reasoning {
         return Ok(fields);
     }
     let adaptive = id.contains("opus-4-6") || id.contains("opus-4.6");
-    let supported = meta["reasoning_efforts"].as_array();
+    let supported = capabilities.reasoning_efforts.as_ref();
     if supported.is_some_and(|levels| !levels.iter().any(|level| level == effort)) {
         return Err(format!(
             "Effort {effort} unsupported by {id}; supported: {}",
-            meta["reasoning_efforts"]
+            capabilities.opaque["reasoning_efforts"]
         )
         .into());
     }
     if effort == "max"
-        && !(api == "anthropic-messages" && adaptive)
+        && !(*api == ApiKind::Anthropic && adaptive)
         && !supported.is_some_and(|levels| levels.iter().any(|level| level == "max"))
     {
         return Err("max effort requires explicit model capability metadata (or Anthropic Messages Opus 4.6); use high or xhigh".into());
@@ -3316,35 +9354,35 @@ fn reasoning_fields(
         effort
     };
     match api {
-        "openai-responses" if effort != "off" || supported.is_some() => {
+        ApiKind::Responses if effort != "off" || supported.is_some() => {
             fields["reasoning"] =
                 json!({"effort":if effort=="off"{"none"}else{clamped},"summary":"auto"});
             fields["include"] = json!(["reasoning.encrypted_content"]);
         }
-        "openai-completions" => {
-            let compat = &meta["compat"];
-            let format = compat["thinkingFormat"]
-                .as_str()
-                .or(compat["thinking_format"].as_str())
-                .unwrap_or(if provider == "zai" { "zai" } else { "openai" });
-            if format == "zai" {
+        ApiKind::Completions => {
+            let format =
+                capabilities
+                    .thinking_format
+                    .unwrap_or(if *provider == ProviderKind::Zai {
+                        ThinkingFormat::Zai
+                    } else {
+                        ThinkingFormat::OpenAi
+                    });
+            if format == ThinkingFormat::Zai {
                 fields["thinking"] = json!({"type":if effort=="off"{"disabled"}else{"enabled"}});
-            } else if format == "qwen" {
+            } else if format == ThinkingFormat::Qwen {
                 fields["enable_thinking"] = json!(effort != "off");
             } else {
-                let verified = compat["supportsReasoningEffort"]
-                    .as_bool()
-                    .or(compat["supports_reasoning_effort"].as_bool())
-                    .unwrap_or(matches!(
-                        provider,
-                        "openai" | "github-copilot" | "groq" | "cerebras" | "openrouter"
-                    ));
+                let verified = capabilities.supports_reasoning_effort.unwrap_or(matches!(
+                    provider.label(),
+                    "openai" | "github-copilot" | "groq" | "cerebras" | "openrouter"
+                ));
                 if verified && effort != "off" {
                     fields["reasoning_effort"] = json!(clamped);
                 }
             }
         }
-        "anthropic-messages" if effort != "off" => {
+        ApiKind::Anthropic if effort != "off" => {
             if adaptive {
                 fields["thinking"] = json!({"type":"adaptive"});
                 fields["output_config"] = json!({"effort":match effort{
@@ -3359,8 +9397,8 @@ fn reasoning_fields(
                     "medium" => 8192,
                     _ => 16384,
                 };
-                let cap = meta["max_tokens"]
-                    .as_u64()
+                let cap = capabilities
+                    .max_output_tokens
                     .unwrap_or(64000)
                     .min(usize::MAX as u64) as usize;
                 if cap < 2048 {
@@ -3375,7 +9413,7 @@ fn reasoning_fields(
                 fields["thinking"] = json!({"type":"enabled","budget_tokens":budget});
             }
         }
-        "google-generative-ai" => {
+        ApiKind::Google => {
             if effort == "off" {
                 // 2.5 Flash explicitly permits zero. Pro/3 families cannot
                 // uniformly disable thinking, so leave their default untouched.
@@ -3427,7 +9465,7 @@ fn merge_reasoning_fields(body: &mut Value, fields: &Value) {
         body[k] = v.clone();
     }
 }
-impl Host {
+impl ProviderClient {
     fn provider_config(&self, model: &str) -> Result<(String, String, String)> {
         let (provider, id) = model.split_once('/').unwrap_or(("openai", model));
         let provider = provider_alias(provider);
@@ -3678,8 +9716,25 @@ impl Host {
         }
         meta
     }
+}
+impl Host {
+    fn provider_config(&self, model: &str) -> Result<(String, String, String)> {
+        self.provider.provider_config(model)
+    }
+    fn provider_usable(&self, provider: &str) -> bool {
+        self.provider.provider_usable(provider)
+    }
+    fn models(&self) -> Value {
+        self.provider.models()
+    }
+    fn usable_models(&self) -> Value {
+        self.provider.usable_models()
+    }
+    fn reasoning_metadata(&self, model: &str) -> Value {
+        self.provider.reasoning_metadata(model)
+    }
     fn invoke(&mut self, model: &str, messages: Vec<Value>, max: usize) -> Result<String> {
-        let outer = self.agent_turn && self.active_cell.is_none();
+        let outer = self.agent_turn && self.execution.cell().is_none();
         if outer {
             self.last_generation_failed = false;
         }
@@ -3694,190 +9749,44 @@ impl Host {
         result
     }
     fn invoke_inner(&mut self, model: &str, messages: Vec<Value>, max: usize) -> Result<String> {
-        let (provider, id) = model.split_once('/').unwrap_or(("openai", model));
-        let api = self.model_api(model);
-        let meta = self.reasoning_metadata(model);
-        if meta["metadata_complete"] == false {
-            return Err("model capabilities are incomplete; declare this model's API/context/capabilities in config.json before selecting or invoking it".into());
-        }
-        // Validate before an operation intent or network request. Unsupported
-        // capability metadata is deliberately not inferred from API compatibility.
-        let fields =
-            reasoning_fields(&api, provider_alias(provider), id, &meta, &self.effort, max)?;
-        let codex = model.starts_with("openai-codex/") || model.starts_with("codex/");
-        let max_retries = if codex { self.codex_retry_limit()? } else { 0 };
-        if codex {
-            for message in &messages {
-                if message["role"] == "assistant" {
-                    codex_assistant_phase(message)?;
-                }
-            }
-        }
-        if meta["max_input_tokens"].is_u64() {
-            let input = serde_json::to_string(&messages)?
-                .chars()
-                .count()
-                .div_ceil(3);
-            let available = model_input_budget(self.model_limit(model)?, &meta, max);
-            if input > available {
-                return Err(format!("estimated request input {input} exceeds model input budget {available}; reduce the prompt/context before retrying").into());
-            }
-        }
+        // Decode capability/transport meaning and validate before an intent or send.
+        let plan = self.provider.plan_text_request(model, &messages, max)?;
+        let codex = plan.provider == ProviderKind::Codex;
+        let max_retries = plan.max_retries;
         self.reload_auth()?;
-        if model.starts_with("github-copilot/") {
+        if plan.provider == ProviderKind::Copilot {
             self.refresh_copilot()?;
         }
         if codex {
             self.refresh_codex()?;
         }
-        let anthropic_oauth =
-            provider_alias(provider) == "anthropic" && self.auth["anthropic"]["type"] == "oauth";
+        let anthropic_oauth = plan.provider == ProviderKind::Anthropic
+            && self.provider.auth["anthropic"]["type"] == "oauth";
         if anthropic_oauth {
             self.refresh_anthropic()?;
         }
         let (url, key, id) = self.provider_config(model)?;
-        let mut request = json!({"model":model,"messages":messages,"max_tokens":max,"effort":self.effort,
+        let mut request = json!({"model":model,"messages":messages,"max_tokens":max,"effort":self.provider.effort,
             "requested_output_tokens":max,"reserved_output_tokens":4096});
         request["retry_policy"] = json!({"max_retries":max_retries,"scope":"provider request only",
             "billing_may_repeat":codex&&max_retries>0});
         let operation = format!("req{}", self.journal.seq);
         self.journal
             .append("intent", json!({"operation":operation,"type":"provider"}))?;
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(180))
-            .redirect(if codex || anthropic_oauth {
-                reqwest::redirect::Policy::none()
-            } else {
-                reqwest::redirect::Policy::limited(10)
-            })
-            .build()?;
-        let request_builder = if codex {
-            self.codex_request(&client, &url, &key, &id, &messages)?
-        } else if api == "openai-responses" {
-            let mut input = messages.clone();
-            for message in &mut input {
-                if let Some(parts) = message["content"].as_array_mut() {
-                    for part in parts {
-                        match part["type"].as_str() {
-                            Some("text") => part["type"] = json!("input_text"),
-                            Some("image_url") => {
-                                let url = part["image_url"]["url"].clone();
-                                *part = json!({"type":"input_image","image_url":url});
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            let mut body = json!({"model":id,"input":input,"max_output_tokens":max,"store":false});
-            merge_reasoning_fields(&mut body, &fields);
-            client
-                .post(format!("{url}/responses"))
-                .bearer_auth(key)
-                .json(&body)
-        } else if api == "anthropic-messages" {
-            let system = messages
-                .iter()
-                .filter(|m| m["role"] == "system")
-                .filter_map(|m| m["content"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let mut msgs: Vec<_> = messages
-                .into_iter()
-                .filter(|m| m["role"] != "system")
-                .collect();
-            for message in &mut msgs {
-                if let Some(parts) = message["content"].as_array_mut() {
-                    for part in parts {
-                        if part["type"] == "image_url" {
-                            let url = part["image_url"]["url"]
-                                .as_str()
-                                .ok_or("image URL missing")?;
-                            let (mime, data) = image_data_url(url)?;
-                            *part = json!({"type":"image","source":{"type":"base64","media_type":mime,"data":data}});
-                        }
-                    }
-                }
-            }
-            let mut body = json!({"model":id,"system":system,"messages":msgs,"max_tokens":max});
-            merge_reasoning_fields(&mut body, &fields);
-            let mut request = client
-                .post(format!("{url}/messages"))
-                .header("anthropic-version", "2023-06-01");
-            if anthropic_oauth {
-                // Explicit subscription-protocol compatibility, not a change to
-                // stored context or harness instructions. Announced during login.
-                body["system"] = json!([
-                    {"type":"text","text":ANTHROPIC_OAUTH_SYSTEM},
-                    {"type":"text","text":system}
-                ]);
-                let mut beta =
-                    "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14"
-                        .to_string();
-                if body.get("thinking").is_some() {
-                    beta.push_str(",interleaved-thinking-2025-05-14");
-                }
-                request = request
-                    .bearer_auth(key)
-                    .header("anthropic-beta", beta)
-                    .header("x-app", "cli")
-                    .header(
-                        "User-Agent",
-                        "claude-cli/2.1.2 (external, cli) py-rust/0.1.0",
-                    )
-                    .header("Accept", "application/json");
-            } else {
-                request = request.header("x-api-key", key);
-                if body.get("thinking").is_some() {
-                    request = request.header("anthropic-beta", "interleaved-thinking-2025-05-14");
-                }
-            }
-            request.json(&body)
-        } else if api == "google-generative-ai" {
-            let system = messages
-                .iter()
-                .filter(|m| m["role"] == "system")
-                .filter_map(|m| m["content"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let mut contents = Vec::new();
-            for message in messages.iter().filter(|m| m["role"] != "system") {
-                let mut parts = Vec::new();
-                if let Some(text) = message["content"].as_str() {
-                    parts.push(json!({"text":text}));
-                } else if let Some(items) = message["content"].as_array() {
-                    for item in items {
-                        if item["type"] == "text" {
-                            parts.push(json!({"text":item["text"]}));
-                        } else if item["type"] == "image_url" {
-                            let (mime, data) = image_data_url(
-                                item["image_url"]["url"]
-                                    .as_str()
-                                    .ok_or("image URL missing")?,
-                            )?;
-                            parts.push(json!({"inlineData":{"mimeType":mime,"data":data}}));
-                        }
-                    }
-                }
-                contents.push(json!({"role":if message["role"]=="assistant"{"model"}else{"user"},"parts":parts}));
-            }
-            let mut body = json!({"contents":contents,"systemInstruction":{"parts":[{"text":system}]},
-                "generationConfig":{"maxOutputTokens":max}});
-            if let Some(config) = fields.get("thinkingConfig") {
-                body["generationConfig"]["thinkingConfig"] = config.clone();
-            }
-            client
-                .post(format!("{url}/models/{id}:generateContent"))
-                .header("x-goog-api-key", key)
-                .json(&body)
-        } else {
-            let mut body = json!({"model":id,"messages":messages,"max_tokens":max});
-            merge_reasoning_fields(&mut body, &fields);
-            client
-                .post(format!("{url}/chat/completions"))
-                .bearer_auth(key)
-                .json(&body)
-        };
+        let client = ProviderClient::transport_client(codex || anthropic_oauth)?;
+        let request_builder = self.provider.text_request(
+            &client,
+            &url,
+            &key,
+            &id,
+            messages,
+            &plan.api,
+            &plan.reasoning_fields,
+            max,
+            &self.journal.session_id,
+            codex,
+            anthropic_oauth,
+        )?;
         // Limits come from serialized JSON (including reasoning adjustments).
         // Cache diagnostics whitelist only session headers/known cache fields;
         // authentication headers are never inspected or journaled.
@@ -3913,63 +9822,15 @@ impl Host {
             "operation_complete",
             json!({"operation":operation,"type":"provider"}),
         )?;
-        let raw = &body["usage"];
-        let input = raw["prompt_tokens"]
-            .as_u64()
-            .or(raw["input_tokens"].as_u64())
-            .or(body["usageMetadata"]["promptTokenCount"].as_u64());
-        let output = raw["completion_tokens"]
-            .as_u64()
-            .or(raw["output_tokens"].as_u64())
-            .or(body["usageMetadata"]["candidatesTokenCount"].as_u64());
-        let cumulative = |name: &str, amount: Option<u64>| -> Value {
-            match amount {
-                Some(n) => json!(self.usage[name].as_u64().unwrap_or(0) + n),
-                None => Value::Null,
-            }
-        };
-        let output_total = cumulative("output_tokens", output);
-        // Retry transport can mark the old compatibility report incomplete;
-        // merge that signal before accepting another measured response.
-        if self.usage["cache_usage_complete"] == false && self.cache_accounting.complete() {
-            self.cache_accounting.mark_incomplete();
-        }
-        self.cache_accounting.observe_body(&body)?;
-        let mut usage =
-            json!({"output_tokens":output_total,"last_input_tokens":input,"operation":operation});
-        self.cache_accounting.write_report(&mut usage);
-        self.usage = usage;
-        self.journal.append("usage", self.usage.clone())?;
-        self.hist_push("usage", self.usage.clone());
-        validate_provider_completion(&body)?;
-        let text = if let Some(text) = body["choices"][0]["message"]["content"].as_str() {
-            text.to_string()
-        } else if let Some(output) = body["output"].as_array() {
-            responses_final_text(output)?
-        } else if let Some(parts) = body["content"].as_array() {
-            parts
-                .iter()
-                .filter(|p| p["type"] == "text")
-                .filter_map(|p| p["text"].as_str())
-                .collect::<String>()
-        } else if let Some(parts) = body["candidates"][0]["content"]["parts"].as_array() {
-            parts
-                .iter()
-                .filter(|p| p["thought"] != true)
-                .filter_map(|p| p["text"].as_str())
-                .collect::<String>()
-        } else {
-            return Err("provider response contains no text".into());
-        };
-        if text.is_empty() {
-            return Err("provider response contains no text".into());
-        }
-        Ok(text)
+        let usage = self.provider.observe_response(&body, &operation)?;
+        self.journal.append("usage", usage.clone())?;
+        self.hist_push("usage", usage);
+        ProviderClient::response_text(&body)
     }
     fn inner_llm(&mut self, v: &Value) -> Result<Value> {
         let model = v["options"]["model"]
             .as_str()
-            .unwrap_or(&self.model)
+            .unwrap_or(&self.provider.model)
             .to_string();
         let prompt = v["prompt"].as_str().ok_or("prompt required")?;
         let max = v["options"]["max_tokens"].as_u64().unwrap_or(2048) as usize;
@@ -4004,7 +9865,7 @@ impl Host {
             .filter(|e| !e.is_null())
             .map(|e| e.as_str().ok_or("effort must be a level string"))
             .transpose()?;
-        let previous = override_effort.map(|e| std::mem::replace(&mut self.effort, e.to_string()));
+        let previous = override_effort.map(|e| self.provider.set_call_effort(e.to_string()));
         let result = self.invoke(
             &model,
             vec![
@@ -4014,7 +9875,7 @@ impl Host {
             max,
         );
         if let Some(previous) = previous {
-            self.effort = previous;
+            self.provider.set_call_effort(previous);
         }
         Ok(json!(result?))
     }
@@ -4067,10 +9928,10 @@ impl Host {
     }
     fn run_agent_inner(&mut self) -> Result<()> {
         for _ in 0..100 {
-            if !self.startup_ready {
+            if !self.execution.ready() {
                 return Err("Python initialization is incomplete; inspect /recovery and explicitly /reset to retry startup".into());
             }
-            self.check_system_budget(self.context_limit)?;
+            self.check_system_budget(self.provider.context_limit)?;
             self.evict()?;
             let mut system = self.system_prompt().to_owned();
             if self.forced() {
@@ -4078,7 +9939,7 @@ impl Host {
                 system.push_str("\nFORCED COLLAPSE MODE: collapse or literal stderr read only.");
             }
             let mut messages = vec![json!({"role":"system","content":system})];
-            messages.extend(self.context.iter().map(|i|->Result<Value>{
+            messages.extend(self.context.items().iter().map(|i|->Result<Value>{
                 let text=format!("[boundary {}]\n{}",i.id,i.text);
                 let content=if let Some(index)=i.raw_index{
                     let raw=self.history_value("raw",index)?;
@@ -4089,10 +9950,10 @@ impl Host {
                 }else{json!(text)};
                 Ok(json!({"role":if i.role=="assistant"{"assistant"}else{"user"},"content":content}))
             }).collect::<Result<Vec<_>>>()?);
-            let model = self.model.clone();
+            let model = self.provider.model.clone();
             let generation_start = self.journal.seq;
-            let visible_revision = self.busy_visible_revision;
-            let generation_effort = self.effort.clone();
+            let visible_revision = self.frontend.visible_revision();
+            let generation_effort = self.provider.effort.clone();
             let code = match self.invoke(&model, messages, 4096) {
                 Ok(code) => code,
                 Err(error) if error.downcast_ref::<RetrySuperseded>().is_some() => {
@@ -4111,9 +9972,9 @@ impl Host {
             }
             self.drain_local_commands(false)?;
             let transition = self.has_after_turn_command();
-            let changed = visible_revision != self.busy_visible_revision
-                || model != self.model
-                || generation_effort != self.effort;
+            let changed = visible_revision != self.frontend.visible_revision()
+                || model != self.provider.model
+                || generation_effort != self.provider.effort;
             if transition || changed {
                 self.journal.append("provider_response_discarded", json!({
                     "reason":"local control changed generation checkpoint",
@@ -4125,7 +9986,8 @@ impl Host {
             }
             // Bind pre-cell request/response/usage records only after a complete
             // generation succeeds. Failed/global requests stay in H.records.
-            self.pending_generation_request = Some(self.generation_operation(generation_start)?);
+            self.execution
+                .stage_generation(self.generation_operation(generation_start)?);
             let id = format!("agent{}", self.journal.seq);
             let result = self.execute(&id, &code, true)?;
             let cancelled = result["status"] == "cancelled";
@@ -4142,12 +10004,11 @@ impl Host {
             }
             // A visible shell submitted during Python execution must be seen at
             // the next generation boundary, even if that cell staged final().
-            if visible_revision != self.busy_visible_revision {
-                self.stop = false;
-                self.stop_wakeup = None;
+            if visible_revision != self.frontend.visible_revision() {
+                self.execution.clear_stop();
                 continue;
             }
-            if self.stop {
+            if self.execution.should_stop() {
                 self.commit_stop()?;
                 return Ok(());
             }
@@ -4169,9 +10030,7 @@ impl Host {
             .as_str()
             .unwrap_or("openai/gpt-image-1");
         let (url, key, id) = self.provider_config(model)?;
-        if !model.starts_with("openai/") {
-            return Err("image generation currently requires openai-compatible provider".into());
-        }
+        ProviderClient::validate_image_model(model)?;
         let prompt = v["prompt"].as_str().ok_or("prompt required")?;
         let operation = format!("img{}", self.journal.seq);
         self.journal
@@ -4179,10 +10038,7 @@ impl Host {
         let request_record = json!({"model":model,"prompt":prompt});
         self.journal.append("request", request_record.clone())?;
         self.hist_push("requests", request_record);
-        let request = reqwest::Client::new()
-            .post(format!("{url}/images/generations"))
-            .bearer_auth(key)
-            .json(&json!({"model":id,"prompt":prompt,"size":"1024x1024","n":1}));
+        let request = ProviderClient::image_request(&url, &key, &id, prompt);
         let body = self.http_json(request, &operation)?;
         self.journal
             .append("response", json!({"operation":operation,"body":body}))?;
@@ -4191,7 +10047,7 @@ impl Host {
             .as_str()
             .ok_or("image response missing base64")?;
         let bytes = B64.decode(data)?;
-        let index = self.history["raw"].len();
+        let index = self.history.len(RecordCollection::Raw);
         self.journal.append(
             "raw",
             json!({"index":index,"base64":data,"mime":"image/png","operation":operation}),
@@ -4202,7 +10058,8 @@ impl Host {
             json!({"operation":operation,"type":"image"}),
         )?;
         let cell = self
-            .active_cell
+            .execution
+            .cell()
             .ok_or("image generation has no cell owner")?;
         let view = self.cell_view(cell)?;
         let offset = view["record_indices"]["raw"]
@@ -4240,15 +10097,11 @@ impl Host {
         if decoded.width() > 1536 || decoded.height() > 1536 {
             return Err("image dimensions exceed 1536 pixels".into());
         }
-        let active = self
-            .context
-            .iter()
-            .filter(|i| i.raw_index.is_some())
-            .count();
+        let active = self.context.attachment_count();
         if active >= 4 {
             return Err("at most four active images per context".into());
         }
-        let index = self.history["raw"].len();
+        let index = self.history.len(RecordCollection::Raw);
         self.journal
             .append("raw", json!({"index":index,"base64":data,"mime":mime}))?;
         self.hist_push("raw", json!({"base64":data,"mime":mime}));
@@ -4266,11 +10119,11 @@ impl Host {
         Ok(json!(id))
     }
 }
-fn redacted_command(mut command: Value) -> Result<Value> {
+fn redacted_command(mut command: Value, kind: NativeCommandKind) -> Result<Value> {
     if let Some(object) = command.as_object_mut() {
         object.remove("terminal_controls");
     }
-    if command["kind"] == "login" {
+    if kind == NativeCommandKind::Login {
         command
             .as_object_mut()
             .ok_or("command must be an object")?
@@ -4587,60 +10440,41 @@ impl Host {
         self.event("notice", json!({"text":text}));
     }
     fn ui_json(&self, title: &str, value: &Value) {
-        if self.json || self.busy_input.is_some() {
+        if self.json || self.frontend.busy().is_some() {
             self.event("info", json!({"title":title,"value":value}));
         } else {
             ui_json(title, value);
         }
     }
     fn announce_ready(&self) {
-        self.event(if self.startup_ready{"ready"}else{"initialization_blocked"},json!({"session":self.journal.path,"model":self.model,"effort":self.effort,"startup_ready":self.startup_ready,"context_usage":self.context_usage()}));
+        self.event(if self.execution.ready(){"ready"}else{"initialization_blocked"},json!({"session":self.journal.path,"model":self.provider.model,"effort":self.provider.effort,"startup_ready":self.execution.ready(),"context_usage":self.context_usage()}));
         self.event("state", self.state_payload());
     }
+    fn status_snapshot_inputs(&self) -> StatusSnapshotInputs<'_> {
+        StatusSnapshotInputs {
+            frontend: &self.frontend,
+            execution: &self.execution,
+            provider: &self.provider,
+            context: &self.context,
+            skills: &self.skills,
+            last_generation_failed: self.last_generation_failed,
+        }
+    }
     fn state_payload(&self) -> Value {
-        let mut payload = json!({"state":self.state.label(),"cell":self.active_cell,"cells":self.cells,
-            "language":self.active_language,"cell_elapsed_ms":self.active_started.map(|start|start.elapsed().as_millis().min(u64::MAX as u128) as u64),
-            "thinking_elapsed_ms":self.thinking_started.map(|start|start.elapsed().as_millis().min(u64::MAX as u128) as u64),
-            "selected_model":self.model,"effort":self.effort,
-            "context_usage":self.context_usage(),"cache_hit_tokens":self.usage["cache_hit_tokens"],
-            "reported_cache_hit_tokens":self.usage["reported_cache_hit_tokens"],
-            "cache_hit_percentage":self.cache_accounting.percentage(),
-            "cache_percentage_complete":self.cache_accounting.complete()&&self.usage["cache_usage_complete"]!=false,
-            "last_cell":self.last_cell,"generation_failed":self.last_generation_failed});
-        if self.state == UiState::Thinking {
-            payload["model"] = json!(self.thinking_model.as_deref().unwrap_or(&self.model));
-        }
-        if let Some(retry) = &self.provider_retry {
-            payload["retry"] = json!(retry.retry);
-            payload["max_retries"] = json!(retry.max_retries);
-            payload["retry_delay_ms"] = json!(retry.waiting_delay_ms);
-            payload["retry_operation"] = json!(retry.operation);
-        }
-        payload
+        self.status_snapshot_inputs().payload()
     }
     fn start_busy_input(&mut self) -> bool {
-        if self.busy_input.is_some()
+        if self.frontend.busy().is_some()
             || self.json
             || self.incoming.is_some()
             || !terminal_editor_available(false)
         {
             return false;
         }
-        match BusyInput::start(self.state_payload(), self.busy_draft.clone()) {
-            Ok(busy) => {
-                self.busy_draft = EditBuffer::default();
-                self.busy_input = Some(busy);
-                true
-            }
-            Err(_) => false,
-        }
+        self.frontend.start_busy(self.state_payload())
     }
     fn poll_busy_input(&mut self) -> Result<()> {
-        while let Some((text, mode)) = self
-            .busy_input
-            .as_ref()
-            .and_then(|busy| busy.lines.try_recv().ok())
-        {
+        while let Some((text, mode)) = self.frontend.next_busy_line() {
             self.queue_busy_line(text, mode)?;
         }
         Ok(())
@@ -4654,35 +10488,28 @@ impl Host {
                 break id;
             }
         };
-        let command = json!({"id":id,"kind":"submit","text":text,"mode":mode});
-        if self.route_busy_command(command.clone(), true)? {
-            return Ok(());
-        }
+        let command = NativeCommand::decode(
+            json!({"id":id,"kind":"submit","text":text,"mode":mode}),
+            NativeCommandOrigin::Terminal,
+        );
         self.queue_arrival(command)
     }
     fn stop_busy_input(&mut self) -> Result<()> {
-        if let Some(busy) = self.busy_input.take() {
-            let (lines, draft) = busy.finish(self.state_payload());
-            self.busy_draft = draft;
-            for (text, mode) in lines {
-                self.queue_busy_line(text, mode)?;
-            }
+        let lines = self.frontend.stop_busy(self.state_payload());
+        for (text, mode) in lines {
+            self.queue_busy_line(text, mode)?;
         }
         Ok(())
     }
     fn set_state(&mut self, state: UiState, model: Option<&str>) {
         let model = if state == UiState::Thinking {
-            Some(model.unwrap_or(&self.model).to_string())
+            Some(model.unwrap_or(&self.provider.model).to_string())
         } else {
             None
         };
-        if self.state == state && self.thinking_model == model {
-            return;
+        if self.frontend.transition(state, model) {
+            self.event("state", self.state_payload());
         }
-        self.state = state;
-        self.thinking_model = model;
-        self.thinking_started = (state == UiState::Thinking).then(std::time::Instant::now);
-        self.event("state", self.state_payload());
     }
     fn with_state<T>(
         &mut self,
@@ -4690,9 +10517,7 @@ impl Host {
         model: Option<&str>,
         action: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
-        let previous = self.state;
-        let previous_model = self.thinking_model.clone();
-        let previous_started = self.thinking_started;
+        let previous = self.frontend.phase();
         self.set_state(state, model);
         let started = state == UiState::Thinking && self.start_busy_input();
         let result = action(self);
@@ -4701,11 +10526,8 @@ impl Host {
         } else {
             Ok(())
         };
-        let changed = self.state != previous || self.thinking_model != previous_model;
-        self.state = previous;
-        self.thinking_model = previous_model;
-        self.thinking_started = previous_started;
-        if changed || self.busy_input.is_some() {
+        let changed = self.frontend.restore_phase(previous);
+        if changed || self.frontend.busy().is_some() {
             self.event("state", self.state_payload());
         }
         stopped?;
@@ -4718,20 +10540,10 @@ impl Host {
         source_ref: &str,
         action: impl FnOnce(&mut Self) -> Result<Value>,
     ) -> Result<Value> {
-        let cell = self
-            .cells
-            .checked_add(1)
-            .ok_or("session cell counter exhausted")?;
-        let parent = self.active_cell;
-        let parent_language = self.active_language.clone();
-        let parent_started = self.active_started;
-        let parent_operation = self.active_operation.clone();
-        let generation_request = self.pending_generation_request.take();
-        let input_raw_indices = self
-            .context
-            .iter()
-            .filter_map(|item| item.raw_index)
-            .collect::<Vec<_>>();
+        let cell = self.execution.next_cell()?;
+        let parent = self.execution.cell();
+        let generation_request = self.execution.take_generation();
+        let input_raw_indices = self.context.raw_indices();
         let public_source_ref = format!("H.code[{cell}]");
         let start = json!({"cell":cell,"parent_cell":parent,"language":language,"operation":operation,
             "source_ref":public_source_ref,"source_record_ref":source_ref,"history_view_version":1,
@@ -4740,17 +10552,16 @@ impl Host {
         if parent.is_none() {
             self.last_generation_failed = false;
         }
-        self.cells = cell;
-        self.active_cell = Some(cell);
-        self.active_language = Some(language.into());
-        self.active_operation = Some(operation.into());
-        let began = std::time::Instant::now();
-        self.active_started = Some(began);
+        let scope = self.execution.begin_cell(cell, language, operation);
+        let began = self.execution.started().ok_or("cell timer missing")?;
         self.event("cell_start", start);
         let result = self.with_state(UiState::Running, None, |host| {
             let result = action(host);
             let value = result.as_ref().ok();
-            let status = value.and_then(|v| v["status"].as_str()).unwrap_or("error");
+            let outcome = ExecutionOutcome::from_label(
+                value.and_then(|v| v["status"].as_str()).unwrap_or("error"),
+            );
+            let status = outcome.label();
             let end = json!({
                 "cell": cell,
                 "parent_cell": parent,
@@ -4761,35 +10572,40 @@ impl Host {
                 "status": status,
                 "elapsed_ms": began.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 "context_usage": host.context_usage(),
-                "cache_hit_tokens": host.usage["cache_hit_tokens"],
-                "reported_cache_hit_tokens": host.usage["reported_cache_hit_tokens"],
-                "cache_hit_percentage": host.cache_accounting.percentage(),
-                "cache_percentage_complete": host.cache_accounting.complete()
-                    && host.usage["cache_usage_complete"] != false,
-                "model": host.model,
-                "effort": host.effort,
+                "cache_hit_tokens": host.provider.usage["cache_hit_tokens"],
+                "reported_cache_hit_tokens": host.provider.usage["reported_cache_hit_tokens"],
+                "cache_hit_percentage": host.provider.cache_accounting.percentage(),
+                "cache_percentage_complete": host.provider.cache_accounting.complete()
+                    && host.provider.usage["cache_usage_complete"] != false,
+                "model": host.provider.model,
+                "effort": host.provider.effort,
                 "stdout_ref": value.and_then(|v| v["stdout"]["ref"].as_str()),
                 "stderr_ref": value.and_then(|v| v["stderr"]["ref"].as_str())
             });
             let committed = host.journal.append("cell_end", end.clone());
             if committed.is_ok() {
-                host.last_cell = end.clone();
+                host.execution.commit_completion(end.clone());
                 host.event("cell_end", end);
             }
-            host.active_cell = parent;
-            host.active_language = parent_language.clone();
-            host.active_started = parent_started;
-            host.active_operation = parent_operation.clone();
+            // Restore before with_state redraws the enclosing footer, also on
+            // end-write failure. Unwinding drops the same independent lease.
+            drop(scope);
             committed?;
             result
         });
-        // Also restore attribution if a durable-end write failed.
-        self.active_cell = parent;
-        self.active_language = parent_language;
-        self.active_started = parent_started;
-        self.active_operation = parent_operation;
         result
     }
+    fn login_providers(&self) -> Vec<String> {
+        self.provider.login_providers()
+    }
+    fn resolve_provider(&self, query: &str) -> Result<String> {
+        self.provider.resolve_provider(query)
+    }
+    fn matching_models(&self, query: &str) -> Vec<Value> {
+        self.matching_models_in(query, &self.usable_models())
+    }
+}
+impl ProviderClient {
     fn login_providers(&self) -> Vec<String> {
         let mut names: Vec<String> = PROVIDERS.iter().map(|p| p.0.to_string()).collect();
         names.extend(["openai-codex".into(), "github-copilot".into()]);
@@ -4803,12 +10619,12 @@ impl Host {
     fn resolve_provider(&self, query: &str) -> Result<String> {
         let query = provider_alias(query);
         let names = self.login_providers();
-        if let Some(name) = names.iter().find(|n| n.eq_ignore_ascii_case(query)) {
+        if let Some(name) = names.iter().find(|name| name.eq_ignore_ascii_case(query)) {
             return Ok(name.clone());
         }
         let found: Vec<_> = names
             .into_iter()
-            .filter(|n| fuzzy_score(query, n).is_some())
+            .filter(|name| fuzzy_score(query, name).is_some())
             .collect();
         if found.len() == 1 {
             return Ok(found[0].clone());
@@ -4819,9 +10635,6 @@ impl Host {
             );
         }
         Err(format!("Provider query is ambiguous: {}", found.join(", ")).into())
-    }
-    fn matching_models(&self, query: &str) -> Vec<Value> {
-        self.matching_models_in(query, &self.usable_models())
     }
     fn matching_models_in(&self, query: &str, models: &Value) -> Vec<Value> {
         let mut found: Vec<(i64, Value)> = vec![];
@@ -4867,6 +10680,11 @@ impl Host {
         });
         found.into_iter().map(|p| p.1).collect()
     }
+}
+impl Host {
+    fn matching_models_in(&self, query: &str, models: &Value) -> Vec<Value> {
+        self.provider.matching_models_in(query, models)
+    }
     fn choose_model(&mut self, query: &str) -> Result<()> {
         self.choose_model_with_defaults(query, true)
     }
@@ -4907,7 +10725,7 @@ impl Host {
             .unwrap()
             .iter()
             .filter(|m| {
-                m["image_output"] != true
+                !ModelCapabilities::decode(m).image_output
                     && (m["id"].as_str().is_some_and(|id| {
                         id.eq_ignore_ascii_case(&canonical)
                             || (!query.contains('/')
@@ -4957,22 +10775,24 @@ impl Host {
             return Err("model discovered without capability metadata; declare its API/context/capabilities in config.json first".into());
         }
         let model = found[0]["id"].as_str().unwrap();
-        let adjusted = self.validate_effort_for(model, &self.effort).is_err();
+        let adjusted = self
+            .validate_effort_for(model, &self.provider.effort)
+            .is_err();
         let effort = if adjusted {
             found[0]["default_effort"]
                 .as_str()
                 .unwrap_or("medium")
                 .to_string()
         } else {
-            self.effort.clone()
+            self.provider.effort.clone()
         };
         self.commit_settings(model.into(), effort, persist_defaults)?;
         if adjusted {
-            self.event("notice",json!({"text":format!("Previous effort unsupported by this model; reset to {}.",self.effort)}));
+            self.event("notice",json!({"text":format!("Previous effort unsupported by this model; reset to {}.",self.provider.effort)}));
         }
         self.event(
             "notice",
-            json!({"text":format!("Model: {} [{}]",self.model,self.effort)}),
+            json!({"text":format!("Model: {} [{}]",self.provider.model,self.provider.effort)}),
         );
         if found[0]["deprecated"] == true {
             self.event("notice",json!({"text":"This legacy Codex model is deprecated for ChatGPT sign-in. Try /model codex/sol61 or /model codex/luna6; availability depends on your account/workspace."}));
@@ -4980,29 +10800,37 @@ impl Host {
         Ok(())
     }
     fn validate_effort(&self, effort: &str) -> Result<()> {
-        self.validate_effort_for(&self.model, effort)
+        self.validate_effort_for(&self.provider.model, effort)
     }
+}
+impl ProviderClient {
     fn validate_effort_for(&self, model: &str, effort: &str) -> Result<()> {
         if !["off", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort) {
             return Err("Unsupported effort: choose off, minimal, low, medium, high, xhigh or max (model-dependent)".into());
         }
-        let meta = self.reasoning_metadata(model);
-        if let Some(levels) = meta["reasoning_efforts"].as_array() {
+        let capabilities = ModelCapabilities::decode(&self.reasoning_metadata(model));
+        if let Some(levels) = &capabilities.reasoning_efforts {
             if !levels.iter().any(|level| level == effort) {
                 return Err(format!(
                     "Effort {effort} unsupported by this model; supported: {}",
-                    meta["reasoning_efforts"]
+                    capabilities.opaque["reasoning_efforts"]
                 )
                 .into());
             }
         } else if effort == "max"
-            && !(meta["reasoning"] == true
-                && meta["api"] == "anthropic-messages"
+            && !(capabilities.reasoning
+                && ApiKind::decode(capabilities.opaque["api"].as_str().unwrap_or(""))
+                    == ApiKind::Anthropic
                 && model.contains("claude-opus-4-6"))
         {
             return Err("Effort max unsupported by this model; requires explicit capability metadata or Opus 4.6".into());
         }
         Ok(())
+    }
+}
+impl Host {
+    fn validate_effort_for(&self, model: &str, effort: &str) -> Result<()> {
+        self.provider.validate_effort_for(model, effort)
     }
     fn change_effort(&mut self, effort: &str) -> Result<()> {
         self.change_effort_with_defaults(effort, true)
@@ -5011,8 +10839,15 @@ impl Host {
         self.change_effort_with_defaults(effort, false)
     }
     fn change_effort_with_defaults(&mut self, effort: &str, persist_defaults: bool) -> Result<()> {
-        self.commit_settings(self.model.clone(), effort.to_lowercase(), persist_defaults)?;
-        self.event("notice", json!({"text":format!("Effort: {}",self.effort)}));
+        self.commit_settings(
+            self.provider.model.clone(),
+            effort.to_lowercase(),
+            persist_defaults,
+        )?;
+        self.event(
+            "notice",
+            json!({"text":format!("Effort: {}",self.provider.effort)}),
+        );
         Ok(())
     }
     fn commit_settings(
@@ -5030,59 +10865,25 @@ impl Host {
         let limit = self.model_limit(&model)?;
         self.check_model_system_budget(&model, limit)?;
         self.validate_effort_for(&model, &effort)?;
-        let mut saved_defaults = None;
-        let _config_lock = if persist_defaults {
-            let lock = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(self.home.join("config.lock"))?;
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                return Err(io::Error::last_os_error().into());
-            }
-            let path = self.home.join("config.json");
-            if load_json(&path)? != self.config_defaults {
-                return Err("config.json changed externally; /config reload before changing model or effort".into());
-            }
-            let mut next = self.config_defaults.clone();
-            next["model"] = json!(model);
-            next["effort"] = json!(effort);
-            validate_config(&next)?;
-            if let Err(error) = write_private_json(&path, &next) {
-                // An error after rename can mean the new file is visible but
-                // its directory sync failed. Do not claim no external change.
-                if load_json(&path).ok().as_ref() == Some(&next) {
-                    self.config_defaults = next;
-                    return Err(format!("Global model/effort defaults may have been updated, but their durable save failed: {error}. Current session selection was not changed; verify /config before continuing.").into());
-                }
-                return Err(error);
-            }
-            self.config_defaults = next.clone();
-            saved_defaults = Some(next);
-            Some(lock)
-        } else {
-            None
-        };
+        // The returned file keeps the global settings lock held through the
+        // session acknowledgement, without exposing defaults mutation to Host.
+        let config_lock = self.provider.persist_selection_defaults(
+            &self.home,
+            &model,
+            &effort,
+            persist_defaults,
+        )?;
         if let Err(error) = self
             .journal
             .append("settings_change", json!({"model":model,"effort":effort}))
         {
-            if saved_defaults.is_some() {
+            if config_lock.is_some() {
                 return Err(format!("Global model/effort defaults were saved, but the session journal failed: {error}. Current session selection was not changed; restart and recover before continuing.").into());
             }
             return Err(error);
         }
-        self.context_limit = limit;
-        self.model = model;
-        self.effort = effort;
-        if saved_defaults.is_some() {
-            // Only these loading preferences change in the live config. Frozen
-            // skills/startup and provider descriptors remain session-owned.
-            self.config["model"] = json!(self.model);
-            self.config["effort"] = json!(self.effort);
-        }
+        self.provider
+            .commit_selection(model, effort, limit, persist_defaults);
         Ok(())
     }
     fn list_models(&self, query: &str) {
@@ -5133,7 +10934,7 @@ impl Host {
         Ok(paths)
     }
     fn switch_session(&mut self, query: Option<&str>, cancel_tasks: bool) -> Result<()> {
-        if !self.pending.is_empty() || !self.local_commands.is_empty() {
+        if !self.pending.is_empty() || self.frontend.has_commands() {
             return Err(
                 "Pending accepted commands must be handled before switching sessions".into(),
             );
@@ -5180,16 +10981,18 @@ impl Host {
         } else {
             Value::Null
         };
-        let model_override = if path.is_none() && defaults["model"] == self.config["model"] {
-            Some(self.model.as_str())
+        let model_override = if path.is_none() && defaults["model"] == self.provider.config["model"]
+        {
+            Some(self.provider.model.as_str())
         } else {
             None
         };
-        let effort_override = if path.is_none() && defaults["effort"] == self.config["effort"] {
-            Some(self.effort.as_str())
-        } else {
-            None
-        };
+        let effort_override =
+            if path.is_none() && defaults["effort"] == self.provider.config["effort"] {
+                Some(self.provider.effort.as_str())
+            } else {
+                None
+            };
         let mut next = Host::new(
             self.home.clone(),
             path.clone(),
@@ -5206,49 +11009,131 @@ impl Host {
         Ok(())
     }
     fn ui_command(&mut self, line: &str) -> Result<bool> {
+        self.execute_local_command(&ParsedLocalCommand::parse(line))
+    }
+    fn execute_local_command(&mut self, command: &ParsedLocalCommand) -> Result<bool> {
         self.reload_auth()?;
-        let (command, args) = line
-            .split_once(char::is_whitespace)
-            .map(|(c, a)| (c, a.trim()))
-            .unwrap_or((line, ""));
-        match command{
-            "/quit"|"/exit"=>{self.bg_guard(transition_cancel(args)?)?;return Ok(false);},
-            "/tasks"|"/task"|"/bg"|"/wakeups"|"/wakeup"=>self.ui_background_command(command,args)?,
-            "/help"|"/hotkeys"=>self.ui_text("py — ordinary persistent Python, unrestricted execution.\nOrdinary Python. No sandbox.\n! shell / @ Python: hidden from the model; !! / @@: visible.\nTab: fuzzy picker for commands, arguments, Python names, executables and files.\nType to filter; arrows/Tab move, Enter selects (not submits); Esc cancels.\nWhile busy: / commands stay local; queries run now, mutations at a safe cell boundary.\n! and !! run immediately; !! is visible, ! stays hidden.\nShift+Enter inserts newline on supported terminals; Ctrl-J is a fallback.\nContinuation lines align after the two-column > prompt.\nPython brackets/suites and bracketed multiline paste form a single cell.\nCtrl-D: exit idle editor. Ctrl-C: clear editor / cancel active operation.\n/model list [query] /models [query]: cached inventory, refreshed when stale\n/model list refresh [provider] /models refresh [provider]: force refresh\n/model <provider/id or fuzzy query>: select and save defaults, rejecting ambiguity\n/effort <off|minimal|low|medium|high|xhigh> (/think, /thinking): save defaults\nModel/effort queries do not change config; explicit changes save both accepted values.\n/login: status + login options; /login status (or /auth): credentials without secrets\n/login <provider> [browser|manual|device|api-key] /logout [provider]\n/status /context /config /recovery /session /sessions\n/save [path.html]: private, offline HTML of selected context and collapse history\n/config get <key> | set <key> <JSON-value> | unset <key> | reload\nDurable entries: ~/.py/skills/*.md (or PY_HOME); ordinary file editing, no skills API.\nCore entries and inventory freeze on /new; reset/resume preserve that snapshot.\nCore Python repeats on authorized startup/reset, not automatically after a worker crash.\nStartup bridges are limited to H history/cell reads; prefer definitions/imports.\n/new /resume <path or fuzzy session> /reset /compact [instructions]\n/tasks [state] /task <id> /task logs <id> [stdout|stderr|both]\n/task kill <id> [--force] /bg shell|python <source>\n/wakeups /wakeup cancel|run <id>\n/quit, /new and /resume require --cancel-tasks while jobs run.\nH stores full history; previews show at most 12 original lines.\nSession resume restores H/context/settings, never Python variables or execution.\n/quit: exit. Browser OAuth: Codex callback, Anthropic hidden code paste.\nUnsupported provider protocols and live subscription parity are not claimed."),
-            "/model" if args.is_empty()=>self.ui_text(&self.model),
-            "/model" if args=="list"||args.starts_with("list ")=>self.model_list_command(args.strip_prefix("list").unwrap().trim())?,
-            "/model"=>{
-                let provider=args.split_once('/').map(|p|provider_alias(p.0).to_string()).unwrap_or_else(||self.model.split_once('/').map_or("openai",|p|provider_alias(p.0)).to_string());
-                let cancel_revision=self.cancel_revision;self.maybe_refresh_model_catalog(&provider);
-                if self.cancel_revision!=cancel_revision{return Err("model selection cancelled; previous selection retained".into());}
+        let args = command.args.as_str();
+        match command.kind {
+            LocalCommandKind::Quit => {
+                self.bg_guard(transition_cancel(args)?)?;
+                return Ok(false);
+            }
+            LocalCommandKind::Tasks
+            | LocalCommandKind::Task
+            | LocalCommandKind::Background
+            | LocalCommandKind::Wakeups
+            | LocalCommandKind::Wakeup => {
+                self.ui_background_command(command.kind.canonical_name().unwrap(), args)?
+            }
+            LocalCommandKind::Help => self.ui_text(&command_help()),
+            LocalCommandKind::Model if command.operation == CommandOperation::Query => {
+                self.ui_text(&self.provider.model)
+            }
+            LocalCommandKind::Model if command.model_list_query.is_some() => {
+                self.model_list_command(command.model_list_query.as_deref().unwrap())?
+            }
+            LocalCommandKind::Model => {
+                let provider = args
+                    .split_once('/')
+                    .map(|p| provider_alias(p.0).to_string())
+                    .unwrap_or_else(|| {
+                        self.provider
+                            .model
+                            .split_once('/')
+                            .map_or("openai", |p| provider_alias(p.0))
+                            .to_string()
+                    });
+                let cancel_revision = self.execution.cancel_revision();
+                self.maybe_refresh_model_catalog(&provider);
+                if self.execution.cancel_revision() != cancel_revision {
+                    return Err("model selection cancelled; previous selection retained".into());
+                }
                 self.choose_model(args)?;
-            },
-            "/models"=>self.model_list_command(args)?,
-            "/effort"|"/think"|"/thinking"=>if args.is_empty(){self.ui_text(&self.effort);}else{self.change_effort(args)?;},
-            "/login"=>self.interactive_login(args)?,
-            "/logout"=>if args.is_empty(){
-                let stored=self.auth.as_object().map(|m|m.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
-                if stored.is_empty(){self.ui_text("No stored credentials. Environment variables are unchanged.");}
-                else{self.ui_text(&format!("Use /logout <provider>: {}. Environment credentials are not removed.",stored.join(", ")));}
-            }else{let provider=self.resolve_provider(args)?;self.logout(&provider)?;self.ui_text(&format!("Removed stored credentials for {provider}; environment credentials unchanged."));},
-            "/auth"=>{self.reload_auth()?;self.ui_json("Authentication (no secrets)",&self.auth_status());},
-            "/status"=>self.ui_json("Status",&self.status()),
-            "/context"=>self.ui_json("Context metadata",&self.context_usage()),
-            "/save"=>{self.save_context_html(args)?;},
-            "/config"=>self.config_command(args)?,
-            "/recovery"=>self.ui_json("Recovery: no automatic replay",&self.recovery_status()?),
-            "/session"=>self.ui_text(&format!("Session: {}",self.journal.path.display())),
-            "/sessions"|"/resume" if args.is_empty()=>{self.ui_text("Sessions — /resume <path or fuzzy filename>");for path in self.session_paths()?{self.ui_text(&path.to_string_lossy());}},
-            "/resume"=>{let (query,cancel)=transition_query(args)?;self.switch_session(Some(query),cancel)?;},
-            "/new"=>self.switch_session(None,transition_cancel(args)?)?,
-            "/reset"=>self.reset_worker()?,
-            "/interrupt"=>self.ui_text("No operation is running. Ctrl-C cancels an active operation."),
-            "/compact"=>{
-                if self.no_model{return Err("Compaction requires an authenticated model; local mode never silently discards context".into());}
-                let id=format!("compact{}",self.journal.seq);
-                self.dispatch(json!({"id":id,"kind":"submit","text":format!("Compact the context using a standalone agent.context.collapse call, preserve task constraints, unfinished work and original-range references, then agent.loop.stop(). Additional instructions: {args}")}))?;
-            },
-            _=>return Err(format!("Unknown command {command}; /help lists implemented commands").into())
+            }
+            LocalCommandKind::Models => self.model_list_command(args)?,
+            LocalCommandKind::Effort => {
+                if command.operation == CommandOperation::Query {
+                    self.ui_text(&self.provider.effort);
+                } else {
+                    self.change_effort(args)?;
+                }
+            }
+            LocalCommandKind::Login => self.interactive_login(args)?,
+            LocalCommandKind::Logout => {
+                if command.operation == CommandOperation::Query {
+                    let stored = self
+                        .provider
+                        .auth
+                        .as_object()
+                        .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    if stored.is_empty() {
+                        self.ui_text("No stored credentials. Environment variables are unchanged.");
+                    } else {
+                        self.ui_text(&format!(
+                            "Use /logout <provider>: {}. Environment credentials are not removed.",
+                            stored.join(", ")
+                        ));
+                    }
+                } else {
+                    let provider = self.resolve_provider(args)?;
+                    self.logout(&provider)?;
+                    self.ui_text(&format!("Removed stored credentials for {provider}; environment credentials unchanged."));
+                }
+            }
+            LocalCommandKind::Auth => {
+                self.reload_auth()?;
+                self.ui_json("Authentication (no secrets)", &self.auth_status());
+            }
+            LocalCommandKind::Status => self.ui_json("Status", &self.status()),
+            LocalCommandKind::Context => self.ui_json("Context metadata", &self.context_usage()),
+            LocalCommandKind::Save => {
+                self.save_context_html(args)?;
+            }
+            LocalCommandKind::Config => self.config_command(args)?,
+            LocalCommandKind::Recovery => {
+                self.ui_json("Recovery: no automatic replay", &self.recovery_status()?)
+            }
+            LocalCommandKind::Session => {
+                self.ui_text(&format!("Session: {}", self.journal.path.display()))
+            }
+            LocalCommandKind::Sessions | LocalCommandKind::Resume if args.is_empty() => {
+                self.ui_text("Sessions — /resume <path or fuzzy filename>");
+                for path in self.session_paths()? {
+                    self.ui_text(&path.to_string_lossy());
+                }
+            }
+            LocalCommandKind::Sessions => {
+                return Err(format!(
+                    "Unknown command {}; /help lists implemented commands",
+                    command.name
+                )
+                .into())
+            }
+            LocalCommandKind::Resume => {
+                let (query, cancel) = transition_query(args)?;
+                self.switch_session(Some(query), cancel)?;
+            }
+            LocalCommandKind::New => self.switch_session(None, transition_cancel(args)?)?,
+            LocalCommandKind::Reset => self.reset_worker()?,
+            LocalCommandKind::Interrupt => {
+                self.ui_text("No operation is running. Ctrl-C cancels an active operation.")
+            }
+            LocalCommandKind::Compact => {
+                if self.no_model {
+                    return Err("Compaction requires an authenticated model; local mode never silently discards context".into());
+                }
+                let id = format!("compact{}", self.journal.seq);
+                self.dispatch(json!({"id":id,"kind":NativeCommandKind::Submit.label(),"text":format!("Compact the context using a standalone agent.context.collapse call, preserve task constraints, unfinished work and original-range references, then agent.loop.stop(). Additional instructions: {args}")}))?;
+            }
+            LocalCommandKind::Unknown => {
+                return Err(format!(
+                    "Unknown command {}; /help lists implemented commands",
+                    command.name
+                )
+                .into())
+            }
         }
         Ok(true)
     }
@@ -5397,14 +11282,12 @@ impl Host {
         let mut selected: Vec<Item> = Vec::new();
         let mut replacements = Vec::new();
         for sequence in 0..through {
-            let event = self.journal.event(sequence)?;
-            let payload = &event["payload"];
-            match event["kind"].as_str() {
-                Some("context_add") => selected.push(parse_item(payload)?),
-                Some("context_replace") => {
-                    let next = payload["items"]
-                        .as_array()
-                        .ok_or("invalid context replacement during export")?
+            let event = self.journal.decoded_event(sequence)?;
+            let payload = event.payload();
+            match &event.data {
+                JournalEventData::ContextAdd(item) => selected.push(item.clone()),
+                JournalEventData::ContextReplace(items) => {
+                    let next = items
                         .iter()
                         .map(|item| parse_replaced_item(item, &selected))
                         .collect::<Result<Vec<_>>>()?;
@@ -5461,15 +11344,15 @@ impl Host {
 </style></head><body><main><h1>Context snapshot</h1>"#,
         );
         html.push_str(&format!("<p class=\"sub\">Session {} · {} [{}]<br>Journal snapshot before sequence {sequence} · context revision {} · saved {} ms since Unix epoch</p><p>{} active items · {retired} retired item versions · {} replacements</p>",
-            context_html_escape(&session), context_html_escape(&self.model), context_html_escape(&self.effort), self.revision, now_ms(), self.context.len(), replacements.len()));
+            context_html_escape(&session), context_html_escape(&self.provider.model), context_html_escape(&self.provider.effort), self.context.revision(), now_ms(), self.context.items().len(), replacements.len()));
         if self.forced() {
             html.push_str("<p class=\"section-note\">Forced-collapse safety gate is active; the next generation includes its brief control instruction.</p>");
         }
         html.push_str("<p class=\"section-note\">This is selected model context, not the full H archive or terminal transcript. Past selected text is retained below for collapse inspection. Attachment bytes and authentication/provider transport records are never embedded.</p><nav><a href=\"#active\">Active context</a><a href=\"#history\">Collapse &amp; eviction</a><a href=\"#instructions\">Frozen instructions</a></nav><section id=\"active\"><h2>Active context</h2>");
-        if self.context.is_empty() {
+        if self.context.items().is_empty() {
             html.push_str("<p class=\"meta\">No selected conversation items.</p>");
         }
-        for item in &self.context {
+        for item in self.context.items() {
             context_html_item(&mut html, item, "active");
         }
         html.push_str("</section><section id=\"history\"><h2>Collapse &amp; eviction history</h2><p class=\"meta\">Original selected items and replacements; unchanged items are not repeated.</p>");
@@ -5570,7 +11453,7 @@ impl Host {
         let mut owned = ContextHtmlFile::create(&path)?;
         owned.file.write_all(html.as_bytes())?;
         owned.sync()?;
-        self.journal.append("context_exported", json!({"path":path,"snapshot_seq":sequence,"context_revision":self.revision,"active_items":self.context.len(),"replacement_count":replacements.len()}))?;
+        self.journal.append("context_exported", json!({"path":path,"snapshot_seq":sequence,"context_revision":self.context.revision(),"active_items":self.context.items().len(),"replacement_count":replacements.len()}))?;
         owned.keep = true;
         directory_owned.keep = true;
         self.ui_text(&format!("Context HTML saved: {}", path.display()));
@@ -5580,18 +11463,8 @@ impl Host {
 #[cfg(test)]
 mod context_html_export_tests {
     use super::*;
-    fn directory() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "py-html-export-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            unique_id()
-        ));
-        fs::create_dir(&path).unwrap();
-        path
+    fn directory() -> crate::test_support::TestDirectory {
+        crate::test_support::TestDirectory::new("py-html-export")
     }
     #[test]
     fn html_escapes_text_and_all_attribute_delimiters() {
@@ -5629,7 +11502,6 @@ mod context_html_export_tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn html_directory_cleanup_removes_only_new_empty_owned_directories() {
@@ -5673,7 +11545,6 @@ mod context_html_export_tests {
             path.is_dir(),
             "must not remove an external replacement directory"
         );
-        fs::remove_dir_all(parent).unwrap();
     }
     #[test]
     fn html_create_new_preserves_existing_files_and_symlinks() {
@@ -5686,7 +11557,6 @@ mod context_html_export_tests {
         assert!(ContextHtmlFile::create(&link).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "original");
         assert!(link.is_symlink());
-        fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn html_cleanup_preserves_an_external_replacement_of_its_target() {
@@ -5699,12 +11569,11 @@ mod context_html_export_tests {
         assert!(owned.sync().is_err());
         drop(owned);
         assert_eq!(fs::read_to_string(&path).unwrap(), "external original");
-        fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn html_retains_selected_originals_after_output_eviction() {
         let directory = directory();
-        let mut host = Host::new(directory.clone(), None, true, true, None, None).unwrap();
+        let mut host = Host::new(directory.to_path_buf(), None, true, true, None, None).unwrap();
         for number in 0..21 {
             host.add_context("user", format!("EVICT_SELECTED_{number}"), true, vec![])
                 .unwrap();
@@ -5723,7 +11592,6 @@ mod context_html_export_tests {
         let html = fs::read_to_string(path).unwrap();
         assert!(html.contains("Output eviction") && html.contains("EVICT_SELECTED_0"));
         drop(host);
-        fs::remove_dir_all(directory).unwrap();
     }
     fn cli(body: &str) {
         let script = [r###"
@@ -5731,7 +11599,7 @@ import os,sys,json,time,tempfile,pathlib,subprocess,threading,queue,stat,glob
 home=tempfile.mkdtemp(prefix='py-html-cli-');env=dict(os.environ,PY_HOME=home)
 for key in ('PY_MODEL','PY_CONTEXT_LIMIT','PY_EFFORT'):env.pop(key,None)
 pathlib.Path(home,'auth.json').write_text(json.dumps({'openai':{'type':'api_key','key':'EXPORT_CREDENTIAL_NOT_INCLUDED'}}))
-def records():return [json.loads(line) for file in glob.glob(home+'/sessions/*.jsonl') for line in open(file)]
+def records():return fixture_journal(home,selection='all',torn_tail='strict')
 class Client:
  def __init__(self,no_model=True):
   self.p=subprocess.Popen([sys.argv[1],'--json','--json-input']+(['--no-model'] if no_model else []),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env);self.q=queue.Queue();self.seen=[]
@@ -5752,15 +11620,10 @@ class Client:
  def close(self):
   self.send('quit',kind='quit');self.p.stdin.close();assert self.p.wait(timeout=8)==0,self.p.stderr.read()
 "###, body].concat();
-        let output = test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-html-cli-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -5825,37 +11688,18 @@ fn shell_prefix(text: &str) -> Option<(&str, bool)> {
         .map(|command| (command, true))
         .or_else(|| text.strip_prefix('!').map(|command| (command, false)))
 }
-fn local_command_phase(line: &str) -> LocalCommandPhase {
-    let (command, args) = line
-        .split_once(char::is_whitespace)
-        .map(|(command, args)| (command, args.trim()))
-        .unwrap_or((line, ""));
-    match command {
-        "/model" if args == "list refresh" || args.starts_with("list refresh ") => {
-            LocalCommandPhase::AfterTurn
-        }
-        "/models" if args == "refresh" || args.starts_with("refresh ") => {
-            LocalCommandPhase::AfterTurn
-        }
-        "/model" if !args.is_empty() && args != "list" && !args.starts_with("list ") => {
-            LocalCommandPhase::CellBoundary
-        }
-        "/effort" | "/think" | "/thinking" | "/logout" if !args.is_empty() => {
-            LocalCommandPhase::CellBoundary
-        }
-        "/config" if !args.is_empty() && args != "get" && !args.starts_with("get ") => {
-            LocalCommandPhase::CellBoundary
-        }
-        "/login" if !args.is_empty() && args != "status" => LocalCommandPhase::AfterTurn,
-        "/new" | "/reset" | "/compact" => LocalCommandPhase::AfterTurn,
-        "/resume" if !args.is_empty() => LocalCommandPhase::AfterTurn,
-        _ => LocalCommandPhase::Immediate,
-    }
+fn local_command_phase(command: &ParsedLocalCommand) -> LocalCommandPhase {
+    command.phase()
 }
 impl Host {
     // This queue is strictly local: no user/context record, no steering receipt,
     // and no automatic replay of a partly executed control after resume.
-    fn receive_local_command(&mut self, id: &str, line: &str, busy: bool) -> Result<()> {
+    fn receive_parsed_local_command(
+        &mut self,
+        id: &str,
+        parsed: ParsedLocalCommand,
+        busy: bool,
+    ) -> Result<()> {
         if id.is_empty() || self.ids.contains(id) {
             self.event(
                 "rejected",
@@ -5863,7 +11707,7 @@ impl Host {
             );
             return Ok(());
         }
-        let name = line.split_whitespace().next().unwrap_or("/");
+        let name = parsed.name.clone();
         // Never journal arbitrary arguments (notably login/config credentials).
         self.journal.append(
             "local_command_accepted",
@@ -5873,13 +11717,13 @@ impl Host {
         self.ids.insert(id.to_owned());
         self.event("accepted", json!({"command_id":id}));
         let phase = if busy {
-            local_command_phase(line)
+            local_command_phase(&parsed)
         } else {
             LocalCommandPhase::Immediate
         };
         let command = LocalCommand {
             id: id.to_owned(),
-            line: line.to_owned(),
+            parsed,
             phase,
         };
         if phase == LocalCommandPhase::Immediate {
@@ -5889,50 +11733,44 @@ impl Host {
                 "notice",
                 json!({"text":format!("{name}: local command queued for the next cell boundary.")}),
             );
-            self.local_commands.push_back(command);
+            self.frontend.queue_command(command);
         }
         Ok(())
     }
     fn finish_local_command(&mut self, command: LocalCommand, busy: bool) -> Result<()> {
-        let (name, args) = command
-            .line
-            .split_once(char::is_whitespace)
-            .map(|(name, args)| (name, args.trim()))
-            .unwrap_or((&command.line, ""));
+        let parsed = &command.parsed;
+        let args = parsed.args.as_str();
         let result = (|| -> Result<bool> {
             self.reload_auth()?;
-            if busy && name == "/interrupt" {
+            if busy && parsed.interruption() == CommandInterruption::CancelActive {
                 INTERRUPT.store(true, std::sync::atomic::Ordering::SeqCst);
                 return Ok(true);
             }
-            if busy && matches!(name, "/quit" | "/exit") {
+            if busy && parsed.interruption() == CommandInterruption::QuitActive {
                 self.bg_guard(transition_cancel(args)?)?;
                 self.exit_requested = true;
                 INTERRUPT.store(true, std::sync::atomic::Ordering::SeqCst);
                 return Ok(false);
             }
             // No discovery HTTP/runtime reentry during an in-flight request.
-            if busy && name == "/models" {
+            if busy && parsed.kind == LocalCommandKind::Models {
                 self.ui_json("Usable models (cached)", &json!(self.matching_models(args)));
                 return Ok(true);
             }
-            if busy && name == "/model" {
-                if let Some(query) = args
-                    .strip_prefix("list")
-                    .filter(|query| query.is_empty() || query.starts_with(char::is_whitespace))
-                {
+            if busy && parsed.kind == LocalCommandKind::Model {
+                if let Some(query) = &parsed.busy_model_list_query {
                     self.ui_json(
                         "Usable models (cached)",
                         &json!(self.matching_models(query.trim())),
                     );
                 } else if args.is_empty() {
-                    self.ui_text(&self.model);
+                    self.ui_text(&self.provider.model);
                 } else {
                     self.choose_model(args)?;
                 }
                 return Ok(true);
             }
-            self.ui_command(&command.line)
+            self.execute_local_command(parsed)
         })();
         match result {
             Ok(keep_running) => {
@@ -5957,7 +11795,7 @@ impl Host {
         Ok(())
     }
     fn cancel_local_commands(&mut self) -> Result<()> {
-        while let Some(command) = self.local_commands.pop_front() {
+        while let Some(command) = self.frontend.pop_command() {
             self.journal.append(
                 "local_command_cancelled",
                 json!({
@@ -5971,17 +11809,15 @@ impl Host {
         Ok(())
     }
     fn has_after_turn_command(&self) -> bool {
-        self.local_commands
-            .iter()
-            .any(|command| command.phase == LocalCommandPhase::AfterTurn)
+        self.frontend.has_after_turn_command()
     }
     fn drain_local_commands(&mut self, after_turn: bool) -> Result<()> {
         while self
-            .local_commands
-            .front()
-            .is_some_and(|command| after_turn || command.phase == LocalCommandPhase::CellBoundary)
+            .frontend
+            .next_command_phase()
+            .is_some_and(|phase| after_turn || phase == LocalCommandPhase::CellBoundary)
         {
-            let command = self.local_commands.pop_front().unwrap();
+            let command = self.frontend.pop_command().unwrap();
             self.finish_local_command(command, !after_turn)?;
             if self.exit_requested {
                 break;
@@ -5989,50 +11825,27 @@ impl Host {
         }
         Ok(())
     }
-    fn route_busy_command(&mut self, mut command: Value, terminal: bool) -> Result<bool> {
-        if command["kind"] == "submit" {
-            let Some(text) = command["text"]
-                .as_str()
-                .map(str::trim_start)
-                .map(str::to_owned)
-            else {
-                return Ok(false);
-            };
-            if text.starts_with('/') {
-                self.receive_local_command(command["id"].as_str().unwrap_or(""), &text, true)?;
-                return Ok(true);
-            }
-            if let Some((source, visible)) = shell_prefix(&text) {
-                command =
-                    json!({"id":command["id"],"kind":"shell","command":source,"visible":visible});
-            }
+    fn route_busy_command(&mut self, command: NativeCommand) -> Result<bool> {
+        if let Some(parsed) = command.args.local.clone() {
+            self.receive_parsed_local_command(&command.id, parsed, true)?;
+            return Ok(true);
         }
-        if command["kind"] != "shell" {
+        if command.kind != NativeCommandKind::Shell {
             return Ok(false);
         }
-        // Only the actual terminal editor grants control replay, never JSON.
-        if let Some(object) = command.as_object_mut() {
-            object.remove("terminal_controls");
-            if terminal {
-                object.insert("terminal_controls".into(), json!(true));
-            }
-        }
         let inputs = self.cell_input_records.clone();
-        let revision = self.revision;
-        let result = self.dispatch(command.clone());
-        let selected = command["visible"] == true && self.revision != revision;
+        let revision = self.context.revision();
+        let result = self.dispatch_command(command.clone());
+        let selected = command.args.visible && self.context.revision() != revision;
         if selected {
-            self.busy_visible_revision = self
-                .busy_visible_revision
-                .checked_add(1)
-                .ok_or("visible command revision exhausted")?;
+            self.frontend.admit_visible_change()?;
         } else {
             self.cell_input_records = inputs;
         }
         if let Err(error) = result {
             self.event(
                 "error",
-                json!({"command_id":command["id"],"error":error.to_string()}),
+                json!({"command_id":command.id,"error":error.to_string()}),
             );
             if self.journal.failed {
                 return Err(error);
@@ -6089,22 +11902,25 @@ impl Host {
             },
             _=>return Err("Unexpected arguments; /help lists background commands".into())
         };
-        let previous: HashSet<_> = self.bg_tasks.keys().cloned().collect();
+        let previous: HashSet<_> = self.scheduler.task_ids().cloned().collect();
         v["id"] = json!(id);
-        self.dispatch(v.clone())?;
-        let result = match v["kind"].as_str().unwrap() {
-            "task_list" => self.bg_list(v["state"].as_str())?,
-            "bg_run" => self
-                .bg_tasks
-                .iter()
-                .find(|(id, _)| !previous.contains(*id))
-                .map(|(_, task)| task.snapshot())
+        let command = NativeCommand::decode(v, NativeCommandOrigin::Internal);
+        self.dispatch_command(command.clone())?;
+        let result = match command.kind {
+            NativeCommandKind::TaskList => {
+                self.bg_list(command.args.task_state.require()?.as_deref())?
+            }
+            NativeCommandKind::BgRun => self
+                .scheduler
+                .new_task(&previous)
                 .ok_or("background launch did not create a task")?,
-            "task_get" | "task_kill" => self.bg_get(v["task_id"].as_str().unwrap())?,
-            "task_logs" => {
-                let metadata = self.bg_get(v["task_id"].as_str().unwrap())?;
+            NativeCommandKind::TaskGet | NativeCommandKind::TaskKill => {
+                self.bg_get(command.args.task_id.require()?)?
+            }
+            NativeCommandKind::TaskLogs => {
+                let metadata = self.bg_get(command.args.task_id.require()?)?;
                 for stream in ["stdout", "stderr"] {
-                    if v["stream"] != "both" && v["stream"] != stream {
+                    if !command.args.stream.require()?.includes(stream) {
                         continue;
                     }
                     let index = metadata[stream]["index"]
@@ -6127,32 +11943,9 @@ impl Host {
         Ok(())
     }
     fn ui_stream_preview(&self, stream: &str, index: usize) -> Result<String> {
-        let value = self
-            .history
-            .get(stream)
-            .and_then(|values| values.get(index))
-            .ok_or("missing task stream")?;
-        let mut bytes = Vec::new();
-        if let Some(chunks) = value["$chunks"].as_array() {
-            for seq in chunks {
-                let event = self
-                    .journal
-                    .event(seq.as_u64().ok_or("invalid stream chunk")? as usize)?;
-                let chunk = B64.decode(
-                    event["payload"]["base64"]
-                        .as_str()
-                        .ok_or("missing stream bytes")?,
-                )?;
-                bytes.extend_from_slice(&chunk[..chunk.len().min(16384 - bytes.len())]);
-                if bytes.len() >= 16384 || bytes.iter().filter(|b| **b == b'\n').count() >= 12 {
-                    break;
-                }
-            }
-        } else if let Some(text) = value.as_str() {
-            bytes.extend_from_slice(&text.as_bytes()[..text.len().min(16384)]);
-        } else {
-            return Err("invalid task stream".into());
-        }
+        let bytes =
+            self.history
+                .preview_bytes(RecordCollection::decode(stream)?, index, &self.journal)?;
         Ok(String::from_utf8_lossy(&bytes)
             .lines()
             .take(12)
@@ -6246,12 +12039,15 @@ fn cli() -> Result<()> {
                 match line {
                     Ok(s) => match serde_json::from_str::<Value>(&s) {
                         Ok(v) => {
-                            if tx.send(v).is_err() {
+                            if tx
+                                .send(NativeCommand::decode(v, NativeCommandOrigin::Native))
+                                .is_err()
+                            {
                                 break;
                             }
                         }
                         Err(e) => {
-                            let _=tx.send(json!({"id":format!("bad{}",now_ms()),"kind":"invalid","error":e.to_string()}));
+                            let _=tx.send(NativeCommand::decode(json!({"id":format!("bad{}",now_ms()),"kind":"invalid","error":e.to_string()}), NativeCommandOrigin::Native));
                         }
                     },
                     Err(_) => break,
@@ -6265,7 +12061,7 @@ fn cli() -> Result<()> {
             }
             INTERRUPT.store(false, std::sync::atomic::Ordering::SeqCst);
             host.service_background()?;
-            let mut command = if let Some(v) = host.pending.pop_front() {
+            let command = if let Some(v) = host.pending.pop_front() {
                 v
             } else {
                 match host
@@ -6285,13 +12081,8 @@ fn cli() -> Result<()> {
                 }
             };
             INTERRUPT.store(false, std::sync::atomic::Ordering::SeqCst);
-            // Terminal control replay is a capability of explicit editor !/!!
-            // commands, not a client-controlled JSON field.
-            if let Some(object) = command.as_object_mut() {
-                object.remove("terminal_controls");
-            }
-            let command_id = command["id"].as_str().unwrap_or("").to_string();
-            match host.dispatch(command) {
+            let command_id = command.id.clone();
+            match host.dispatch_command(command) {
                 Ok(false) => break,
                 Ok(true) => {}
                 Err(e) => host.event(
@@ -6313,8 +12104,8 @@ fn cli() -> Result<()> {
             // Steering captured by the busy prompt is dispatched here if the
             // active turn ended before consuming it at a cell boundary.
             if let Some(command) = host.pending.pop_front() {
-                let id = command["id"].as_str().unwrap_or("").to_string();
-                if let Err(error) = host.dispatch(command) {
+                let id = command.id.clone();
+                if let Err(error) = host.dispatch_command(command) {
                     host.event("error", json!({"command_id":id,"error":error.to_string()}));
                 }
                 continue;
@@ -6325,16 +12116,16 @@ fn cli() -> Result<()> {
             let prompt = if host.json { "" } else { "> " };
             let models = host.usable_models();
             let providers = host.login_providers();
-            let current_model = host.model.clone();
+            let current_model = host.provider.model.clone();
             let mut helper = Completion::from_worker(
-                &mut host.worker,
+                host.execution.worker_mut(),
                 models,
                 host.home.clone(),
                 current_model,
                 providers,
             )?;
-            helper.catalog.task_ids = host.bg_tasks.keys().cloned().collect();
-            helper.catalog.wakeup_ids = host.wakeups.keys().cloned().collect();
+            helper.catalog.task_ids = host.scheduler.task_ids().cloned().collect();
+            helper.catalog.wakeup_ids = host.scheduler.wakeup_ids().cloned().collect();
             editor.set_helper(Some(helper));
             editor.bind_sequence(
                 rustyline::KeyEvent::from('\t'),
@@ -6388,7 +12179,7 @@ fn cli() -> Result<()> {
             } else {
                 json!({"id":id,"kind":"submit","text":line})
             };
-            match host.dispatch(v) {
+            match host.dispatch_command(NativeCommand::decode(v, NativeCommandOrigin::Terminal)) {
                 Ok(false) => break,
                 Ok(true) => {}
                 Err(e) => host.event("error", json!({"error":e.to_string()})),
@@ -6489,9 +12280,8 @@ impl BusyInput {
         // The reader never renders and never holds the display lock while
         // waiting for a key or a paste; agent output can continue independently.
         let mut reader = EditTerminal {
-            input: terminal.input.try_clone()?,
+            io: terminal.io.reader_clone()?,
             output: terminal.output.try_clone()?,
-            previous: terminal.previous,
             cursor_row: 0,
             rows: 1,
             keyboard: false,
@@ -6524,26 +12314,25 @@ impl BusyInput {
                     Err(_) => break,
                 };
                 let edited = key.is_some();
-                let followup = sequence_is_followup(&key);
-                let submitted = matches!(&key, Some(EditKey::Byte(13))) || followup;
                 let mut display = thread_display.lock().unwrap();
                 let buffer = &mut display.buffer;
-                match key {
-                    Some(_) if submitted => {
+                let intent = key
+                    .map(|key| editor_intent(EditMode::Busy, key, buffer.line.is_empty()))
+                    .unwrap_or(EditorIntent::Ignore);
+                match intent {
+                    EditorIntent::Submit { followup } => {
                         if !buffer.line.trim().is_empty() {
                             let mode = if followup { "followup" } else { "steering" };
                             let _ = line_tx.send((std::mem::take(&mut buffer.line), mode.into()));
                             *buffer = EditBuffer::default();
                         }
                     }
-                    Some(EditKey::Byte(3)) => {
+                    EditorIntent::Interrupt => {
                         *buffer = EditBuffer::default();
                         INTERRUPT.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
-                    Some(key) => {
-                        buffer.edit(key);
-                    }
-                    None => {}
+                    EditorIntent::Edit(action) => buffer.apply(action),
+                    _ => {}
                 }
                 if !reader.input_ready()
                     && (edited || painted.elapsed() >= std::time::Duration::from_millis(100))
@@ -6642,9 +12431,6 @@ impl BusyInput {
         )
     }
 }
-fn sequence_is_followup(key: &Option<EditKey>) -> bool {
-    matches!(key,Some(EditKey::Sequence(sequence)) if sequence=="alt:enter")
-}
 
 // The tty editor is deliberately a direct reader + buffer + renderer. Rustyline
 // still owns non-tty input/history and the shared idle validation/completion API.
@@ -6652,10 +12438,136 @@ fn terminal_editor_available(json: bool) -> bool {
     (unsafe { libc::isatty(0) == 1 && (json || libc::isatty(1) == 1) })
         && (json || !std::env::var("TERM").is_ok_and(|t| t == "dumb"))
 }
-struct EditTerminal {
+// Descriptor/raw-mode mechanisms are shared; editor and picker presentation
+// remain separate. Only the owning frontend holds a raw-mode lease. A busy
+// input reader clones the descriptor without acquiring/restoring terminal state.
+#[derive(Clone, Copy)]
+enum RawTerminalMode {
+    Editor,
+    Picker,
+}
+struct RawTerminal {
     input: File,
-    output: File,
     previous: libc::termios,
+}
+impl RawTerminal {
+    fn acquire(input: &File, mode: RawTerminalMode) -> io::Result<Self> {
+        let input = input.try_clone()?;
+        let mut previous = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(input.as_raw_fd(), &mut previous) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut raw = previous;
+        match mode {
+            RawTerminalMode::Editor => unsafe { libc::cfmakeraw(&mut raw) },
+            // Preserve the picker's existing input/output translation flags.
+            RawTerminalMode::Picker => raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG),
+        }
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        if unsafe { libc::tcsetattr(input.as_raw_fd(), libc::TCSANOW, &raw) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { input, previous })
+    }
+}
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.input.as_raw_fd(), libc::TCSANOW, &self.previous);
+        }
+    }
+}
+struct TerminalIo {
+    input: File,
+    _raw: Option<RawTerminal>,
+    eof_message: &'static str,
+    read_interrupt_is_timeout: bool,
+}
+impl TerminalIo {
+    fn duplicate(fd: i32) -> io::Result<File> {
+        use std::os::fd::FromRawFd;
+        let owned = unsafe { libc::dup(fd) };
+        if owned < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(owned) })
+    }
+    fn raw(input: File, mode: RawTerminalMode, eof_message: &'static str) -> io::Result<Self> {
+        let raw = RawTerminal::acquire(&input, mode)?;
+        Ok(Self {
+            input,
+            _raw: Some(raw),
+            eof_message,
+            read_interrupt_is_timeout: matches!(mode, RawTerminalMode::Editor),
+        })
+    }
+    fn reader_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            input: self.input.try_clone()?,
+            _raw: None,
+            eof_message: self.eof_message,
+            read_interrupt_is_timeout: self.read_interrupt_is_timeout,
+        })
+    }
+    fn byte(&mut self, timeout: i32) -> io::Result<Option<u8>> {
+        let mut poll = libc::pollfd {
+            fd: self.input.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll, 1, timeout) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::Interrupted {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        if ready == 0 {
+            return Ok(None);
+        }
+        let mut byte = [0];
+        match std::io::Read::read(&mut self.input, &mut byte) {
+            Ok(0) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                self.eof_message,
+            )),
+            Ok(_) => Ok(Some(byte[0])),
+            // The editor historically treated an interrupted byte read as an
+            // idle tick; the picker surfaced it. Keep that interface policy.
+            Err(error)
+                if error.kind() == io::ErrorKind::Interrupted && self.read_interrupt_is_timeout =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn input_ready(&self) -> bool {
+        let mut poll = libc::pollfd {
+            fd: self.input.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut poll, 1, 0) > 0 && poll.revents & libc::POLLIN != 0 }
+    }
+    fn size(output_fd: i32) -> (usize, usize) {
+        let mut size = unsafe { std::mem::zeroed::<libc::winsize>() };
+        let rows = if unsafe { libc::ioctl(output_fd, libc::TIOCGWINSZ, &mut size) } == 0
+            && size.ws_row > 0
+        {
+            size.ws_row as usize
+        } else {
+            24
+        };
+        (terminal_width_for(output_fd).max(1), rows.max(1))
+    }
+}
+struct EditTerminal {
+    io: TerminalIo,
+    output: File,
     cursor_row: usize,
     rows: usize,
     keyboard: bool,
@@ -6664,36 +12576,14 @@ struct EditTerminal {
 }
 impl EditTerminal {
     fn open(output_fd: i32) -> io::Result<Self> {
-        use std::os::fd::FromRawFd;
-        let mut previous = unsafe { std::mem::zeroed::<libc::termios>() };
-        if unsafe { libc::tcgetattr(0, &mut previous) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let input = unsafe { libc::dup(0) };
-        if input < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let input = unsafe { File::from_raw_fd(input) };
-        let output = unsafe { libc::dup(output_fd) };
-        if output < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let output = unsafe { File::from_raw_fd(output) };
-        let mut raw = previous;
-        unsafe {
-            libc::cfmakeraw(&mut raw);
-        }
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 0;
-        if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let input = TerminalIo::duplicate(0)?;
+        let output = TerminalIo::duplicate(output_fd)?;
+        let io = TerminalIo::raw(input, RawTerminalMode::Editor, "editor input closed")?;
         let display = unsafe { libc::isatty(output_fd) == 1 }
             && !std::env::var("TERM").is_ok_and(|t| t == "dumb");
         Ok(Self {
-            input,
+            io,
             output,
-            previous,
             cursor_row: 0,
             rows: 1,
             keyboard: false,
@@ -6712,54 +12602,16 @@ impl EditTerminal {
         Ok(())
     }
     fn byte(&mut self, timeout: i32) -> io::Result<Option<u8>> {
-        let mut poll = libc::pollfd {
-            fd: self.input.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut poll, 1, timeout) };
-        if ready < 0 {
-            let e = io::Error::last_os_error();
-            return if e.kind() == io::ErrorKind::Interrupted {
-                Ok(None)
-            } else {
-                Err(e)
-            };
-        }
-        if ready == 0 {
-            return Ok(None);
-        }
-        let mut byte = [0];
-        match std::io::Read::read(&mut self.input, &mut byte) {
-            Ok(0) => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "editor input closed",
-            )),
-            Ok(_) => Ok(Some(byte[0])),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(None),
-            Err(e) => Err(e),
-        }
+        self.io.byte(timeout)
     }
     fn input_ready(&self) -> bool {
-        let mut poll = libc::pollfd {
-            fd: self.input.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        unsafe { libc::poll(&mut poll, 1, 0) > 0 && poll.revents & libc::POLLIN != 0 }
+        self.io.input_ready()
     }
     fn width(&self) -> usize {
-        terminal_width_for(self.output.as_raw_fd())
+        TerminalIo::size(self.output.as_raw_fd()).0
     }
     fn height(&self) -> usize {
-        let mut size = unsafe { std::mem::zeroed::<libc::winsize>() };
-        if unsafe { libc::ioctl(self.output.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == 0
-            && size.ws_row > 0
-        {
-            size.ws_row as usize
-        } else {
-            24
-        }
+        TerminalIo::size(self.output.as_raw_fd()).1
     }
     fn draw(&mut self, line: &str, cursor: usize) -> io::Result<()> {
         self.draw_footer(&self.headers.clone(), line, cursor)
@@ -6852,9 +12704,7 @@ impl Drop for EditTerminal {
             let _ = self.keyboard(false);
             let _ = self.output.flush();
         }
-        unsafe {
-            libc::tcsetattr(0, libc::TCSANOW, &self.previous);
-        }
+        // TerminalIo's raw lease restores termios after presentation cleanup.
     }
 }
 struct EditRow {
@@ -6979,55 +12829,162 @@ struct EditBuffer {
     history: Option<usize>,
     draft: (String, usize),
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditMode {
+    Idle,
+    Busy,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditMotion {
+    Left,
+    Right,
+    WordLeft,
+    WordRight,
+    LineStart,
+    LineEnd,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditKill {
+    LineStart,
+    WordLeft,
+    LineEnd { include_newline: bool },
+}
+#[derive(Debug, PartialEq, Eq)]
+enum EditAction {
+    Insert(String),
+    Move(EditMotion),
+    DeleteBackward,
+    DeleteForward,
+    Kill(EditKill),
+    Yank,
+    Undo,
+}
+impl EditAction {
+    fn decode(key: EditKey, mode: EditMode) -> Option<Self> {
+        use EditAction::*;
+        Some(match key {
+            EditKey::Text(text) | EditKey::Paste(text) => Insert(text),
+            EditKey::Byte(10) => Insert("\n".into()),
+            EditKey::Byte(4) => DeleteForward,
+            EditKey::Byte(8 | 127) => DeleteBackward,
+            EditKey::Byte(1) => Move(EditMotion::LineStart),
+            EditKey::Byte(5) => Move(EditMotion::LineEnd),
+            EditKey::Byte(2) => Move(EditMotion::Left),
+            EditKey::Byte(6) => Move(EditMotion::Right),
+            EditKey::Byte(21) => Kill(EditKill::LineStart),
+            EditKey::Byte(23) => Kill(EditKill::WordLeft),
+            // Intentional legacy difference: idle Ctrl-K can join lines,
+            // whereas the busy draft kills only through the current line end.
+            EditKey::Byte(11) => Kill(EditKill::LineEnd {
+                include_newline: mode == EditMode::Idle,
+            }),
+            EditKey::Byte(25) => Yank,
+            EditKey::Byte(31) => Undo,
+            EditKey::Sequence(sequence) => match sequence.as_str() {
+                "[D" | "OD" => Move(EditMotion::Left),
+                "[C" | "OC" => Move(EditMotion::Right),
+                "[1;5D" | "alt:b" => Move(EditMotion::WordLeft),
+                "[1;5C" | "alt:f" => Move(EditMotion::WordRight),
+                "[H" | "OH" | "[1~" | "[7~" => Move(EditMotion::LineStart),
+                "[F" | "OF" | "[4~" | "[8~" => Move(EditMotion::LineEnd),
+                "[3~" => DeleteForward,
+                _ => return None,
+            },
+            _ => return None,
+        })
+    }
+}
+// Non-editing interaction policy is decoded separately from buffer mutation.
+// Busy mode submits steering/follow-ups and deliberately has no history/picker;
+// idle mode validates Enter, navigates history, and owns completion interaction.
+#[derive(Debug, PartialEq, Eq)]
+enum EditorIntent {
+    Edit(EditAction),
+    Submit { followup: bool },
+    Interrupt,
+    Eof,
+    Complete,
+    History { up: bool },
+    Vertical { up: bool },
+    Ignore,
+}
+fn editor_intent(mode: EditMode, key: EditKey, empty: bool) -> EditorIntent {
+    match key {
+        EditKey::Byte(13) => EditorIntent::Submit { followup: false },
+        EditKey::Byte(3) => EditorIntent::Interrupt,
+        EditKey::Byte(4) if mode == EditMode::Idle && empty => EditorIntent::Eof,
+        EditKey::Byte(9) if mode == EditMode::Idle => EditorIntent::Complete,
+        EditKey::Byte(16) if mode == EditMode::Idle => EditorIntent::History { up: true },
+        EditKey::Byte(14) if mode == EditMode::Idle => EditorIntent::History { up: false },
+        EditKey::Sequence(ref sequence) if mode == EditMode::Busy && sequence == "alt:enter" => {
+            EditorIntent::Submit { followup: true }
+        }
+        EditKey::Sequence(ref sequence)
+            if mode == EditMode::Idle && matches!(sequence.as_str(), "[A" | "OA") =>
+        {
+            EditorIntent::Vertical { up: true }
+        }
+        EditKey::Sequence(ref sequence)
+            if mode == EditMode::Idle && matches!(sequence.as_str(), "[B" | "OB") =>
+        {
+            EditorIntent::Vertical { up: false }
+        }
+        key => EditAction::decode(key, mode)
+            .map(EditorIntent::Edit)
+            .unwrap_or(EditorIntent::Ignore),
+    }
+}
 impl EditBuffer {
-    fn edit(&mut self, key: EditKey) {
-        match key {
-            EditKey::Text(text) | EditKey::Paste(text) => {
-                self.replace(self.cursor, self.cursor, &text)
+    fn apply(&mut self, action: EditAction) {
+        match action {
+            EditAction::Insert(text) => self.replace(self.cursor, self.cursor, &text),
+            EditAction::Move(motion) => {
+                self.cursor = match motion {
+                    EditMotion::Left => editor_previous(&self.line, self.cursor),
+                    EditMotion::Right => editor_next(&self.line, self.cursor),
+                    EditMotion::WordLeft => editor_word_left(&self.line, self.cursor),
+                    EditMotion::WordRight => editor_word_right(&self.line, self.cursor),
+                    EditMotion::LineStart => editor_line_start(&self.line, self.cursor),
+                    EditMotion::LineEnd => editor_line_end(&self.line, self.cursor),
+                }
             }
-            EditKey::Byte(10) => self.replace(self.cursor, self.cursor, "\n"),
-            EditKey::Byte(4) => self.replace(self.cursor, editor_next(&self.line, self.cursor), ""),
-            EditKey::Byte(8 | 127) => {
+            EditAction::DeleteBackward => {
                 self.replace(editor_previous(&self.line, self.cursor), self.cursor, "")
             }
-            EditKey::Byte(1) => self.cursor = editor_line_start(&self.line, self.cursor),
-            EditKey::Byte(5) => self.cursor = editor_line_end(&self.line, self.cursor),
-            EditKey::Byte(2) => self.cursor = editor_previous(&self.line, self.cursor),
-            EditKey::Byte(6) => self.cursor = editor_next(&self.line, self.cursor),
-            EditKey::Byte(code @ (21 | 23 | 11)) => {
-                let (start, end) = match code {
-                    21 => (editor_line_start(&self.line, self.cursor), self.cursor),
-                    23 => (editor_word_left(&self.line, self.cursor), self.cursor),
-                    _ => (self.cursor, editor_line_end(&self.line, self.cursor)),
+            EditAction::DeleteForward => {
+                self.replace(self.cursor, editor_next(&self.line, self.cursor), "")
+            }
+            EditAction::Kill(kill) => {
+                let (start, end) = match kill {
+                    EditKill::LineStart => {
+                        (editor_line_start(&self.line, self.cursor), self.cursor)
+                    }
+                    EditKill::WordLeft => (editor_word_left(&self.line, self.cursor), self.cursor),
+                    EditKill::LineEnd { include_newline } => {
+                        let end = editor_line_end(&self.line, self.cursor);
+                        (
+                            self.cursor,
+                            if include_newline && self.cursor == end {
+                                editor_next(&self.line, self.cursor)
+                            } else {
+                                end
+                            },
+                        )
+                    }
                 };
                 self.killed = self.line[start..end].into();
                 self.replace(start, end, "");
             }
-            EditKey::Byte(25) => {
+            EditAction::Yank => {
                 let text = self.killed.clone();
                 self.replace(self.cursor, self.cursor, &text);
             }
-            EditKey::Byte(31) => {
+            EditAction::Undo => {
                 if let Some((line, cursor)) = self.undo.pop_back() {
                     self.line = line;
                     self.cursor = cursor;
                 }
             }
-            EditKey::Sequence(sequence) => match sequence.as_str() {
-                "[D" | "OD" => self.cursor = editor_previous(&self.line, self.cursor),
-                "[C" | "OC" => self.cursor = editor_next(&self.line, self.cursor),
-                "[1;5D" | "alt:b" => self.cursor = editor_word_left(&self.line, self.cursor),
-                "[1;5C" | "alt:f" => self.cursor = editor_word_right(&self.line, self.cursor),
-                "[H" | "OH" | "[1~" | "[7~" => {
-                    self.cursor = editor_line_start(&self.line, self.cursor)
-                }
-                "[F" | "OF" | "[4~" | "[8~" => {
-                    self.cursor = editor_line_end(&self.line, self.cursor)
-                }
-                "[3~" => self.replace(self.cursor, editor_next(&self.line, self.cursor), ""),
-                _ => {}
-            },
-            _ => {}
         }
     }
     fn checkpoint(&mut self) {
@@ -7148,6 +13105,249 @@ fn editor_report(code: u32, modifier: u32) -> EditKey {
         }
     }
     EditKey::Ignore
+}
+#[cfg(test)]
+mod shared_editor_engine_tests {
+    use super::*;
+
+    fn apply_key(buffer: &mut EditBuffer, mode: EditMode, key: EditKey) {
+        if let EditorIntent::Edit(action) = editor_intent(mode, key, buffer.line.is_empty()) {
+            buffer.apply(action);
+        }
+    }
+    fn keys() -> Vec<EditKey> {
+        vec![
+            EditKey::Text("alpha λ🙂 beta".into()),
+            EditKey::Byte(23),
+            EditKey::Byte(25),
+            EditKey::Byte(31),
+            EditKey::Sequence("alt:b".into()),
+            EditKey::Byte(127),
+            EditKey::Paste("a\u{301}".into()),
+            EditKey::Sequence("[H".into()),
+            EditKey::Sequence("[3~".into()),
+            EditKey::Sequence("[F".into()),
+            EditKey::Byte(10),
+            EditKey::Text("tail".into()),
+        ]
+    }
+    #[test]
+    fn idle_and_busy_share_edit_actions_and_buffer_updates() {
+        let mut idle = EditBuffer::default();
+        let mut busy = EditBuffer::default();
+        for key in keys() {
+            apply_key(&mut idle, EditMode::Idle, key);
+        }
+        for key in keys() {
+            apply_key(&mut busy, EditMode::Busy, key);
+        }
+        assert_eq!(
+            (&idle.line, idle.cursor, &idle.killed, &idle.undo),
+            (&busy.line, busy.cursor, &busy.killed, &busy.undo)
+        );
+        assert!(idle.line.is_char_boundary(idle.cursor));
+    }
+    #[test]
+    fn normalized_alt_backspace_reports_have_one_word_kill_action() {
+        for mode in [EditMode::Idle, EditMode::Busy] {
+            for key in [
+                EditKey::Byte(23),
+                editor_report(8, 3),
+                editor_report(127, 4),
+            ] {
+                assert_eq!(
+                    editor_intent(mode, key, false),
+                    EditorIntent::Edit(EditAction::Kill(EditKill::WordLeft))
+                );
+            }
+            assert_eq!(
+                editor_intent(mode, EditKey::Sequence("[1;5D".into()), false),
+                EditorIntent::Edit(EditAction::Move(EditMotion::WordLeft))
+            );
+        }
+    }
+    #[test]
+    fn unicode_grapheme_deletion_kill_yank_and_undo_remain_shared() {
+        for mode in [EditMode::Idle, EditMode::Busy] {
+            let mut buffer = EditBuffer::default();
+            apply_key(&mut buffer, mode, EditKey::Text("λa\u{301}🙂".into()));
+            apply_key(&mut buffer, mode, EditKey::Byte(127));
+            assert_eq!(buffer.line, "λa\u{301}");
+            apply_key(&mut buffer, mode, EditKey::Byte(127));
+            assert_eq!(buffer.line, "λ");
+            apply_key(&mut buffer, mode, EditKey::Byte(31));
+            assert_eq!(buffer.line, "λa\u{301}");
+            buffer = EditBuffer::default();
+            apply_key(&mut buffer, mode, EditKey::Text("ab cd".into()));
+            apply_key(&mut buffer, mode, EditKey::Byte(23));
+            assert_eq!(
+                (&buffer.line, &buffer.killed),
+                (&"ab ".to_string(), &"cd".to_string())
+            );
+            apply_key(&mut buffer, mode, EditKey::Byte(25));
+            assert_eq!(buffer.line, "ab cd");
+            apply_key(&mut buffer, mode, EditKey::Byte(31));
+            assert_eq!(buffer.line, "ab ");
+        }
+    }
+    #[test]
+    fn submission_history_completion_eof_and_line_kill_policies_stay_explicit() {
+        assert_eq!(
+            editor_intent(EditMode::Idle, EditKey::Byte(13), false),
+            EditorIntent::Submit { followup: false }
+        );
+        assert_eq!(
+            editor_intent(EditMode::Busy, EditKey::Sequence("alt:enter".into()), false),
+            EditorIntent::Submit { followup: true }
+        );
+        assert_eq!(
+            editor_intent(EditMode::Idle, EditKey::Sequence("alt:enter".into()), false),
+            EditorIntent::Ignore
+        );
+        assert_eq!(
+            editor_intent(EditMode::Idle, EditKey::Byte(9), false),
+            EditorIntent::Complete
+        );
+        assert_eq!(
+            editor_intent(EditMode::Busy, EditKey::Byte(9), false),
+            EditorIntent::Ignore
+        );
+        assert_eq!(
+            editor_intent(EditMode::Idle, EditKey::Byte(16), false),
+            EditorIntent::History { up: true }
+        );
+        assert_eq!(
+            editor_intent(EditMode::Busy, EditKey::Byte(16), false),
+            EditorIntent::Ignore
+        );
+        assert_eq!(
+            editor_intent(EditMode::Idle, EditKey::Byte(4), true),
+            EditorIntent::Eof
+        );
+        assert_eq!(
+            editor_intent(EditMode::Busy, EditKey::Byte(4), true),
+            EditorIntent::Edit(EditAction::DeleteForward)
+        );
+        for mode in [EditMode::Idle, EditMode::Busy] {
+            assert_eq!(
+                editor_intent(mode, EditKey::Byte(3), false),
+                EditorIntent::Interrupt
+            );
+            let mut buffer = EditBuffer {
+                line: "abc\nxyz".into(),
+                cursor: 3,
+                ..EditBuffer::default()
+            };
+            apply_key(&mut buffer, mode, EditKey::Byte(11));
+            assert_eq!(
+                buffer.line,
+                if mode == EditMode::Idle {
+                    "abcxyz"
+                } else {
+                    "abc\nxyz"
+                }
+            );
+        }
+    }
+    fn pty() -> (File, File) {
+        use std::os::fd::FromRawFd;
+        let mut master = -1;
+        let mut slave = -1;
+        let result = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+        unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
+    }
+    fn flags(
+        file: &File,
+    ) -> (
+        libc::tcflag_t,
+        libc::tcflag_t,
+        libc::tcflag_t,
+        libc::tcflag_t,
+        Vec<libc::cc_t>,
+    ) {
+        let mut state = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(file.as_raw_fd(), &mut state) }, 0);
+        (
+            state.c_iflag,
+            state.c_oflag,
+            state.c_cflag,
+            state.c_lflag,
+            state.c_cc.to_vec(),
+        )
+    }
+    #[test]
+    fn raw_lease_reader_clone_poll_and_dimensions_use_owned_pty_descriptors() {
+        let (mut master, slave) = pty();
+        let before = flags(&slave);
+        let size = libc::winsize {
+            ws_row: 17,
+            ws_col: 61,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+            0
+        );
+        let owner = TerminalIo::raw(
+            slave.try_clone().unwrap(),
+            RawTerminalMode::Editor,
+            "test input closed",
+        )
+        .unwrap();
+        let raw = flags(&slave);
+        assert_eq!(raw.3 & (libc::ICANON | libc::ECHO | libc::ISIG), 0);
+        assert_eq!(TerminalIo::size(slave.as_raw_fd()), (61, 17));
+        let mut reader = owner.reader_clone().unwrap();
+        assert_eq!(reader.byte(0).unwrap(), None);
+        master.write_all(b"x").unwrap();
+        assert_eq!(reader.byte(100).unwrap(), Some(b'x'));
+        drop(reader);
+        assert_eq!(
+            flags(&slave),
+            raw,
+            "a non-owning reader must not restore raw state"
+        );
+        drop(owner);
+        assert_eq!(flags(&slave), before);
+    }
+    #[test]
+    fn raw_lease_restores_on_unwind_and_failed_acquisition_does_not_touch_tty() {
+        let (_master, slave) = pty();
+        let before = flags(&slave);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _io = TerminalIo::raw(
+                slave.try_clone().unwrap(),
+                RawTerminalMode::Picker,
+                "test input closed",
+            )
+            .unwrap();
+            assert_eq!(
+                flags(&slave).3 & (libc::ICANON | libc::ECHO | libc::ISIG),
+                0
+            );
+            panic!("presentation initialization failed");
+        }));
+        assert!(result.is_err());
+        assert_eq!(flags(&slave), before);
+        assert!(TerminalIo::duplicate(-1).is_err());
+        assert!(TerminalIo::raw(
+            File::open("/dev/null").unwrap(),
+            RawTerminalMode::Editor,
+            "closed"
+        )
+        .is_err());
+        assert_eq!(flags(&slave), before);
+    }
 }
 fn editor_key(terminal: &mut EditTerminal, host: &mut Host) -> rustyline::Result<Option<EditKey>> {
     editor_key_with(
@@ -7390,10 +13590,7 @@ fn serviceable_readline(
             return Err(error.into());
         }
         if ready == 0 {
-            let pending = host
-                .wakeups
-                .values()
-                .any(|w| w.metadata["state"] == "ready");
+            let pending = host.scheduler.has_ready();
             if let Err(e) = host.dispatch_wakeups() {
                 host.event("error", json!({"error":e.to_string()}));
             }
@@ -7452,7 +13649,7 @@ fn terminal_readline(
     use rustyline::error::ReadlineError;
     let mut terminal = EditTerminal::open(output_fd)?;
     terminal.headers = terminal_status(&host.state_payload(), terminal.width());
-    let mut buffer = std::mem::take(&mut host.busy_draft);
+    let mut buffer = host.frontend.take_draft();
     terminal.draw(&buffer.line, buffer.cursor)?;
     terminal.keyboard(true)?;
     // This readiness marker is last: callers cannot race a half-configured tty.
@@ -7466,19 +13663,14 @@ fn terminal_readline(
     loop {
         host.service_background()
             .map_err(|e| io::Error::other(e.to_string()))?;
-        if host
-            .wakeups
-            .values()
-            .any(|w| w.metadata["state"] == "ready")
-            && !terminal.input_ready()
-        {
+        if host.scheduler.has_ready() && !terminal.input_ready() {
             // The entire edit state remains in buffer while the model owns the tty.
             drop(terminal);
-            host.busy_draft = buffer;
+            host.frontend.save_draft(buffer);
             if let Err(e) = host.dispatch_wakeups() {
                 host.event("error", json!({"error":e.to_string()}));
             }
-            buffer = std::mem::take(&mut host.busy_draft);
+            buffer = host.frontend.take_draft();
             refreshed = Some(editor_completion(host).map_err(|e| io::Error::other(e.to_string()))?);
             terminal = EditTerminal::open(output_fd)?;
             terminal.headers = terminal_status(&host.state_payload(), terminal.width());
@@ -7510,11 +13702,8 @@ fn terminal_readline(
         let Some(key) = key else {
             continue;
         };
-        match key {
-            EditKey::Text(text) | EditKey::Paste(text) => {
-                buffer.replace(buffer.cursor, buffer.cursor, &text)
-            }
-            EditKey::Byte(13) => {
+        match editor_intent(EditMode::Idle, key, buffer.line.is_empty()) {
+            EditorIntent::Submit { .. } => {
                 if buffer.line.trim().is_empty() {
                     continue;
                 }
@@ -7523,81 +13712,19 @@ fn terminal_readline(
                     return Err(ReadlineError::Interrupted);
                 }
                 if incomplete {
-                    buffer.replace(buffer.cursor, buffer.cursor, "\n");
+                    buffer.apply(EditAction::Insert("\n".into()));
                 } else {
                     terminal.draw(&buffer.line, buffer.cursor)?;
                     return Ok(buffer.line);
                 }
             }
-            EditKey::Byte(10) => buffer.replace(buffer.cursor, buffer.cursor, "\n"),
-            EditKey::Byte(3) => return Err(ReadlineError::Interrupted),
-            EditKey::Byte(4) if buffer.line.is_empty() => return Err(ReadlineError::Eof),
-            EditKey::Byte(4) => {
-                let next = editor_next(&buffer.line, buffer.cursor);
-                buffer.replace(buffer.cursor, next, "");
-            }
-            EditKey::Byte(8 | 127) => {
-                let previous = editor_previous(&buffer.line, buffer.cursor);
-                buffer.replace(previous, buffer.cursor, "");
-            }
-            EditKey::Byte(1) => buffer.cursor = editor_line_start(&buffer.line, buffer.cursor),
-            EditKey::Byte(5) => buffer.cursor = editor_line_end(&buffer.line, buffer.cursor),
-            EditKey::Byte(2) => buffer.cursor = editor_previous(&buffer.line, buffer.cursor),
-            EditKey::Byte(6) => buffer.cursor = editor_next(&buffer.line, buffer.cursor),
-            EditKey::Byte(9) => editor_complete(helper, &mut terminal, &mut buffer, host)?,
-            EditKey::Byte(16) => buffer.history(history, true),
-            EditKey::Byte(14) => buffer.history(history, false),
-            EditKey::Byte(21 | 23 | 11) => {
-                let (start, end) = match key {
-                    EditKey::Byte(21) => (
-                        editor_line_start(&buffer.line, buffer.cursor),
-                        buffer.cursor,
-                    ),
-                    EditKey::Byte(23) => {
-                        (editor_word_left(&buffer.line, buffer.cursor), buffer.cursor)
-                    }
-                    _ => (
-                        buffer.cursor,
-                        if buffer.cursor == editor_line_end(&buffer.line, buffer.cursor) {
-                            editor_next(&buffer.line, buffer.cursor)
-                        } else {
-                            editor_line_end(&buffer.line, buffer.cursor)
-                        },
-                    ),
-                };
-                buffer.killed = buffer.line[start..end].into();
-                buffer.replace(start, end, "");
-            }
-            EditKey::Byte(25) => {
-                let text = buffer.killed.clone();
-                buffer.replace(buffer.cursor, buffer.cursor, &text);
-            }
-            EditKey::Byte(31) => {
-                if let Some((line, cursor)) = buffer.undo.pop_back() {
-                    buffer.line = line;
-                    buffer.cursor = cursor;
-                }
-            }
-            EditKey::Sequence(ref sequence) => match sequence.as_str() {
-                "[A" | "OA" => buffer.vertical(history, true),
-                "[B" | "OB" => buffer.vertical(history, false),
-                "[C" | "OC" => buffer.cursor = editor_next(&buffer.line, buffer.cursor),
-                "[D" | "OD" => buffer.cursor = editor_previous(&buffer.line, buffer.cursor),
-                "[1;5D" | "alt:b" => buffer.cursor = editor_word_left(&buffer.line, buffer.cursor),
-                "[1;5C" | "alt:f" => buffer.cursor = editor_word_right(&buffer.line, buffer.cursor),
-                "[H" | "OH" | "[1~" | "[7~" => {
-                    buffer.cursor = editor_line_start(&buffer.line, buffer.cursor)
-                }
-                "[F" | "OF" | "[4~" | "[8~" => {
-                    buffer.cursor = editor_line_end(&buffer.line, buffer.cursor)
-                }
-                "[3~" => {
-                    let next = editor_next(&buffer.line, buffer.cursor);
-                    buffer.replace(buffer.cursor, next, "");
-                }
-                _ => {}
-            },
-            _ => {}
+            EditorIntent::Interrupt => return Err(ReadlineError::Interrupted),
+            EditorIntent::Eof => return Err(ReadlineError::Eof),
+            EditorIntent::Complete => editor_complete(helper, &mut terminal, &mut buffer, host)?,
+            EditorIntent::History { up } => buffer.history(history, up),
+            EditorIntent::Vertical { up } => buffer.vertical(history, up),
+            EditorIntent::Edit(action) => buffer.apply(action),
+            EditorIntent::Ignore => {}
         }
         // A queued burst is one visual edit, not an O(n²) repaint per byte.
         // Submit explicitly draws the final buffer before leaving; completion
@@ -7608,56 +13735,66 @@ fn terminal_readline(
     }
 }
 
+#[derive(Clone, Copy)]
+enum WorkerWritePolicy {
+    CancellableRequest,
+    // Python blocks SIGINT throughout _rpc; settle its reply before it unmasks.
+    // Cancellation still advances the cell epoch and is delivered to the worker.
+    SettleRpcReply,
+}
+const WORKER_RPC_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 impl Host {
+    fn send_worker_request(&mut self, value: &Value) -> Result<()> {
+        let request = WorkerRequest::decode(value)?;
+        self.send_worker_frame(&request, WorkerWritePolicy::CancellableRequest)
+    }
+    fn send_worker_frame(
+        &mut self,
+        request: &WorkerRequest<'_>,
+        policy: WorkerWritePolicy,
+    ) -> Result<()> {
+        let mut writer = self.execution.writer_lease()?;
+        let revision = self.execution.cancel_revision();
+        let pid = self.execution.worker_pid();
+        let (signal, timeout) = match policy {
+            WorkerWritePolicy::CancellableRequest => (0, WORKER_WRITE_TIMEOUT),
+            WorkerWritePolicy::SettleRpcReply => (libc::SIGINT, WORKER_RPC_REPLY_TIMEOUT),
+        };
+        let mut control_error = None;
+        let result = writer.send_with_timeout(request, timeout, || {
+            match self.pump_control(WaitPolicy::Process { pid, signal }) {
+                Ok(progress) => {
+                    matches!(policy, WorkerWritePolicy::CancellableRequest)
+                        && (progress.cancelled || progress.revision != revision)
+                }
+                Err(error) => {
+                    control_error = Some(error);
+                    true
+                }
+            }
+        });
+        if let Some(error) = control_error {
+            return Err(error);
+        }
+        result?;
+        Ok(())
+    }
+    fn reply_worker(&mut self, id: &Value, mut response: Value) -> Result<()> {
+        response["kind"] = json!("rpc_reply");
+        response["rpc_id"] = id.clone();
+        let request = WorkerRequest::decode(&response)?;
+        self.send_worker_frame(&request, WorkerWritePolicy::SettleRpcReply)
+    }
     fn poll_commands(&mut self) -> Result<bool> {
-        self.poll_target(self.worker.child.id() as i32, libc::SIGINT)
+        self.poll_target(self.execution.worker_pid(), libc::SIGINT)
     }
     fn poll_target(&mut self, pid: i32, signal: i32) -> Result<bool> {
-        self.service_background()?;
-        let mut cancelled = false;
-        if INTERRUPT.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            self.journal.append(
-                "cancel",
-                json!({"generation":self.generation,"source":"SIGINT"}),
-            )?;
-            self.cancel_revision = self.cancel_revision.wrapping_add(1);
-            unsafe {
-                libc::kill(-pid, signal);
-            }
-            cancelled = true;
-        }
-        loop {
-            let command = match self.incoming.as_ref().map(|r| r.try_recv()) {
-                Some(Ok(v)) => v,
-                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                    self.input_closed = true;
-                    break;
-                }
-                _ => break,
-            };
-            if command["kind"] == "interrupt" {
-                if !self.accept_input_control(&command)? {
-                    continue;
-                }
-                let id = command["id"].as_str().unwrap();
-                self.journal.append(
-                    "cancel",
-                    json!({"command_id":id,"generation":self.generation}),
-                )?;
-                self.cancel_revision = self.cancel_revision.wrapping_add(1);
-                unsafe {
-                    libc::kill(-pid, signal);
-                }
-                self.event("completed", json!({"command_id":id,"status":"ok"}));
-                cancelled = true;
-            } else if !self.background_control(&command)? {
-                self.queue_arrival(command)?;
-            }
-        }
-        Ok(cancelled)
+        Ok(self
+            .pump_control(WaitPolicy::Process { pid, signal })?
+            .cancelled)
     }
-    fn accept_input_control(&mut self, command: &Value) -> Result<bool> {
-        let id = command["id"].as_str().unwrap_or("");
+    fn accept_input_control(&mut self, command: &NativeCommand) -> Result<bool> {
+        let id = command.id.as_str();
         if id.is_empty() || self.ids.contains(id) {
             self.event(
                 "rejected",
@@ -7665,25 +13802,35 @@ impl Host {
             );
             return Ok(false);
         }
-        self.journal
-            .append("accepted", json!({"command_id":id,"command":command}))?;
+        self.journal.append(
+            "accepted",
+            json!({"command_id":id,"command":command.recorded()?}),
+        )?;
         self.ids.insert(id.into());
         self.event("accepted", json!({"command_id":id}));
         Ok(true)
     }
     fn begin_input(&mut self, operation: &str, text: &str) -> Result<InputPrompt> {
         // Python input() exclusively owns stdin until its prompt closes.
-        self.input_busy_paused = self.busy_input.is_some();
-        self.stop_busy_input()?;
+        let lines = self.frontend.acquire_prompt(self.state_payload())?;
+        for (text, mode) in lines {
+            if let Err(error) = self.queue_busy_line(text, mode) {
+                self.frontend.release_prompt();
+                return Err(error);
+            }
+        }
         let p = InputPrompt {
             id: format!("input{}", self.journal.seq),
             operation: operation.into(),
-            generation: self.generation,
+            generation: self.execution.generation(),
             text: text.into(),
             buffer: vec![],
         };
         let payload = p.payload();
-        self.journal.append("input_prompt", payload.clone())?;
+        if let Err(error) = self.journal.append("input_prompt", payload.clone()) {
+            self.frontend.release_prompt();
+            return Err(error);
+        }
         self.set_state(UiState::Input, None);
         self.event("input_prompt", payload);
         Ok(p)
@@ -7692,7 +13839,7 @@ impl Host {
         let mut payload = p.payload();
         payload["action"] = json!(action);
         let response = if let Some(text) = text {
-            let index = self.history["stdin"].len();
+            let index = self.history.len(RecordCollection::Stdin);
             payload["index"] = json!(index);
             payload["text"] = json!(text);
             self.journal.append("stdin", payload.clone())?;
@@ -7704,27 +13851,28 @@ impl Host {
         payload.as_object_mut().unwrap().remove("text");
         self.journal.append("input_closed", payload)?;
         self.set_state(UiState::Running, None);
-        if std::mem::take(&mut self.input_busy_paused) {
+        if self.frontend.release_prompt() {
             self.start_busy_input();
         }
         Ok(response)
     }
-    fn reply_input(&mut self, p: &InputPrompt, command: &Value) -> Result<Option<(Value, bool)>> {
-        let action = match command.get("action") {
-            None => "text",
-            Some(v) => v.as_str().unwrap_or(""),
-        };
-        let text = command["value"].as_str();
-        let id = command["id"].as_str().unwrap_or("");
+    fn reply_input(
+        &mut self,
+        p: &InputPrompt,
+        command: &NativeCommand,
+    ) -> Result<Option<(Value, bool)>> {
+        let action = command.args.action;
+        let text = command.args.input_value.as_deref();
+        let id = command.id.as_str();
         let error = if id.is_empty() || self.ids.contains(id) {
             Some("missing or duplicate command ID")
-        } else if command["prompt_id"] != p.id
-            || command["operation"] != p.operation
-            || command["worker_generation"] != p.generation
+        } else if command.args.prompt_id.as_deref() != Some(p.id.as_str())
+            || command.args.operation.as_deref() != Some(p.operation.as_str())
+            || command.args.worker_generation != Some(p.generation as u64)
         {
             Some("reply does not match the active prompt, operation and generation")
-        } else if !["text", "eof", "cancel"].contains(&action)
-            || (action == "text" && text.is_none())
+        } else if action == NativeInputAction::Invalid
+            || (action == NativeInputAction::Text && text.is_none())
         {
             Some("stdin_reply requires text value or eof/cancel action")
         } else {
@@ -7737,16 +13885,24 @@ impl Host {
         if !self.accept_input_control(command)? {
             return Ok(None);
         }
-        if action == "cancel" {
+        if action == NativeInputAction::Cancel {
             self.journal.append(
                 "cancel",
                 json!({"command_id":id,
             "operation":p.operation,"prompt_id":p.id,"generation":p.generation}),
             )?;
         }
-        let response = self.close_input(p, action, if action == "text" { text } else { None })?;
+        let response = self.close_input(
+            p,
+            action.label(),
+            if action == NativeInputAction::Text {
+                text
+            } else {
+                None
+            },
+        )?;
         self.event("completed", json!({"command_id":id,"status":"ok"}));
-        Ok(Some((response, action == "cancel")))
+        Ok(Some((response, action == NativeInputAction::Cancel)))
     }
     fn terminal_input(&mut self, p: &mut InputPrompt) -> Result<Option<Value>> {
         let mut fd = libc::pollfd {
@@ -7811,13 +13967,11 @@ fn input_exception(action: &str) -> Value {
     json!({"ok":false,"exception":if action=="cancel"{"KeyboardInterrupt"}else{"EOFError"}})
 }
 
-// Idle editor IPC is separate from cell execution. The cached names are never
-// queried while a cell is running; only validation uses this cloned socket.
-#[derive(Clone)]
 // =============================================================================
 // Completion and picker
 // =============================================================================
 
+#[derive(Clone)]
 struct CompletionCatalog {
     names: Vec<String>,
     models: Value,
@@ -7831,7 +13985,9 @@ struct CompletionCatalog {
 struct Completion {
     catalog: CompletionCatalog,
     selection: std::sync::Arc<std::sync::Mutex<Option<(usize, String)>>>,
-    ipc: std::cell::RefCell<(BufReader<UnixStream>, UnixStream)>,
+    // Idle validation alone uses this cloned socket; names are cached and never
+    // queried while a cell is running. Settle each validation reply before reuse.
+    ipc: std::cell::RefCell<WorkerTransport>,
 }
 impl Completion {
     fn from_worker(
@@ -7841,29 +13997,21 @@ impl Completion {
         current_model: String,
         configured_providers: Vec<String>,
     ) -> Result<Self> {
-        worker.send(&json!({"kind":"ide_inspect"}))?;
-        worker
-            .reader
-            .get_ref()
-            .set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
-        let response = worker.recv();
-        worker.reader.get_ref().set_read_timeout(None)?;
-        let response = response?;
-        if response["kind"] != "ide_names" {
-            return Err("invalid idle worker inspection response".into());
-        }
-        let names = response["names"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let python_cwd = response["cwd"]
-            .as_str()
-            .map(PathBuf::from)
-            .unwrap_or(std::env::current_dir()?);
+        let inspection = json!({"kind":"ide_inspect"});
+        worker.transport.send_request_with(
+            &WorkerRequest::Inspect(&inspection),
+            std::time::Duration::from_secs(2),
+            || false,
+        )?;
+        let (names, cwd) = match worker.receive_reply(std::time::Duration::from_secs(2))? {
+            WorkerReply::Names { names, cwd } => (names, cwd),
+            _ => {
+                return Err(
+                    WorkerTransportError::Protocol("invalid idle inspection response").into(),
+                )
+            }
+        };
+        let python_cwd = cwd.unwrap_or(std::env::current_dir()?);
         Ok(Self {
             catalog: CompletionCatalog {
                 names,
@@ -7876,10 +14024,7 @@ impl Completion {
                 wakeup_ids: vec![],
             },
             selection: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            ipc: std::cell::RefCell::new((
-                BufReader::new(worker.reader.get_ref().try_clone()?),
-                worker.writer.try_clone()?,
-            )),
+            ipc: std::cell::RefCell::new(worker.transport.clone_idle()?),
         })
     }
     fn picker_handler(&self) -> rustyline::EventHandler {
@@ -7894,14 +14039,14 @@ fn editor_completion(host: &mut Host) -> Result<Completion> {
     let models = host.usable_models();
     let providers = host.login_providers();
     let mut helper = Completion::from_worker(
-        &mut host.worker,
+        host.execution.worker_mut(),
         models,
         host.home.clone(),
-        host.model.clone(),
+        host.provider.model.clone(),
         providers,
     )?;
-    helper.catalog.task_ids = host.bg_tasks.keys().cloned().collect();
-    helper.catalog.wakeup_ids = host.wakeups.keys().cloned().collect();
+    helper.catalog.task_ids = host.scheduler.task_ids().cloned().collect();
+    helper.catalog.wakeup_ids = host.scheduler.wakeup_ids().cloned().collect();
     Ok(helper)
 }
 impl CompletionCatalog {
@@ -7945,6 +14090,15 @@ impl rustyline::validate::Validator for Completion {
 }
 impl Completion {
     fn incomplete(&self, input: &str) -> rustyline::Result<bool> {
+        self.incomplete_with_interrupt(input, || {
+            INTERRUPT.load(std::sync::atomic::Ordering::SeqCst)
+        })
+    }
+    fn incomplete_with_interrupt(
+        &self,
+        input: &str,
+        interrupted: impl Fn() -> bool,
+    ) -> rustyline::Result<bool> {
         use rustyline::error::ReadlineError;
         let Some(source) = input.strip_prefix("@@").or_else(|| input.strip_prefix('@')) else {
             return Ok(input.ends_with('\\'));
@@ -7954,31 +14108,31 @@ impl Completion {
             return Ok(false);
         }
         let mut ipc = self.ipc.borrow_mut();
-        ipc.0
-            .get_ref()
-            .set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
-        let result = (|| -> rustyline::Result<bool> {
-            writeln!(ipc.1, "{}", json!({"kind":"ide_validate","source":source}))?;
-            let mut line = String::new();
-            if ipc.0.read_line(&mut line)? == 0 {
-                return Err(ReadlineError::Eof);
-            }
-            let v: Value = serde_json::from_str(&line).map_err(|_| {
-                ReadlineError::Io(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid idle validation response",
-                ))
-            })?;
-            if v["kind"] != "ide_validation" {
-                return Err(ReadlineError::Io(io::Error::new(
-                    io::ErrorKind::InvalidData,
+        let result = (|| -> WorkerTransportResult<bool> {
+            let value = json!({"kind":"ide_validate","source":source});
+            let request = WorkerRequest::decode(&value)?;
+            ipc.send_request_with(&request, std::time::Duration::from_secs(2), || false)?;
+            // Settle this bounded idle transaction before honoring Ctrl-C.
+            // Abandoning a cloned reader leaves a late reply for ide_inspect.
+            match ipc.receive_reply_with(std::time::Duration::from_secs(2), || false)? {
+                WorkerReply::Validation { incomplete } => Ok(incomplete),
+                _ => Err(WorkerTransportError::Protocol(
                     "unexpected idle validation response",
-                )));
+                )),
             }
-            Ok(v["incomplete"] == true)
         })();
-        ipc.0.get_ref().set_read_timeout(None)?;
         result
+            .map_err(|error| match error {
+                WorkerTransportError::Disconnected { .. } => ReadlineError::Eof,
+                other => ReadlineError::Io(io::Error::new(io::ErrorKind::InvalidData, other)),
+            })
+            .and_then(|incomplete| {
+                if interrupted() {
+                    Err(ReadlineError::Interrupted)
+                } else {
+                    Ok(incomplete)
+                }
+            })
     }
 }
 // Larger scores win. Categories deliberately dominate all within-category
@@ -8244,6 +14398,66 @@ fn completion_executables(query: &str, quote: Option<char>) -> Vec<(i64, String,
     }
     items
 }
+#[cfg(test)]
+mod completion_transaction_tests {
+    use super::*;
+    #[test]
+    fn interrupted_validation_consumes_its_reply_before_the_next_transaction() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let home = crate::test_support::TestDirectory::new("py-validation-transaction");
+        let (host, peer) = UnixStream::pair().unwrap();
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let signal = interrupted.clone();
+        let server = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(peer.try_clone().unwrap());
+            let mut writer = peer;
+            for attempt in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&line).unwrap()["kind"],
+                    "ide_validate"
+                );
+                if attempt == 0 {
+                    signal.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                writeln!(
+                    writer,
+                    "{}",
+                    json!({"kind":"ide_validation","incomplete":attempt == 0})
+                )
+                .unwrap();
+            }
+        });
+        let helper = Completion {
+            catalog: CompletionCatalog {
+                names: vec![],
+                models: json!([]),
+                home: home.to_path_buf(),
+                python_cwd: home.to_path_buf(),
+                current_model: "test/model".into(),
+                configured_providers: vec![],
+                task_ids: vec![],
+                wakeup_ids: vec![],
+            },
+            selection: Arc::new(std::sync::Mutex::new(None)),
+            ipc: std::cell::RefCell::new(WorkerTransport::new(host).unwrap()),
+        };
+        assert!(matches!(
+            helper.incomplete_with_interrupt("@value=1", || interrupted.load(Ordering::SeqCst)),
+            Err(rustyline::error::ReadlineError::Interrupted)
+        ));
+        interrupted.store(false, Ordering::SeqCst);
+        assert!(!helper
+            .incomplete_with_interrupt("@value=2", || interrupted.load(Ordering::SeqCst))
+            .unwrap());
+        server.join().unwrap();
+    }
+}
 impl rustyline::completion::Completer for Completion {
     type Candidate = rustyline::completion::Pair;
     fn complete(
@@ -8271,57 +14485,28 @@ impl CompletionCatalog {
         pos: usize,
         all: bool,
     ) -> rustyline::Result<(usize, Vec<rustyline::completion::Pair>)> {
-        const COMMANDS: &[&str] = &[
-            "/help",
-            "/hotkeys",
-            "/model",
-            "/models",
-            "/effort",
-            "/think",
-            "/thinking",
-            "/status",
-            "/context",
-            "/save",
-            "/config",
-            "/login",
-            "/logout",
-            "/auth",
-            "/session",
-            "/sessions",
-            "/resume",
-            "/recovery",
-            "/reset",
-            "/new",
-            "/compact",
-            "/interrupt",
-            "/quit",
-            "/exit",
-            "/tasks",
-            "/task",
-            "/bg",
-            "/wakeups",
-            "/wakeup",
-        ];
         let Some(prefix) = line.get(..pos) else {
             return Ok((pos, vec![]));
         };
         let mut items = Vec::new();
         if prefix.starts_with('/') {
             let Some(space) = prefix.find(char::is_whitespace) else {
-                for command in COMMANDS {
+                for command in LOCAL_COMMANDS.iter().flat_map(|spec| spec.names.iter()) {
                     if let Some(score) = fuzzy_score(if all { "" } else { prefix }, command) {
                         items.push((score, command.to_string(), command.to_string()));
                     }
                 }
                 return Ok((0, completion_rank(items)));
             };
-            let command = &prefix[..space];
+            let parsed = ParsedLocalCommand::parse(prefix);
+            let command = parsed.kind.canonical_name().unwrap_or(&prefix[..space]);
+            let completion = parsed.kind.spec().map(|spec| spec.completion);
             let args = prefix[space..].trim_start();
             let arg_start = prefix.len() - args.len();
             let (start, _) = completion_token(prefix, arg_start);
             let raw_word = &prefix[start..];
             let word = if all { "" } else { raw_word };
-            if command == "/model" || command == "/models" {
+            if completion == Some(CommandCompletion::Models) {
                 if command == "/model" && start == arg_start {
                     if let Some(score) = fuzzy_score(word, "list") {
                         items.push((score, "list".into(), "list".into()));
@@ -8403,7 +14588,7 @@ impl CompletionCatalog {
                         }
                     }
                 }
-            } else if matches!(command, "/effort" | "/think" | "/thinking") {
+            } else if completion == Some(CommandCompletion::Effort) {
                 let model = self
                     .models
                     .as_array()
@@ -8424,7 +14609,7 @@ impl CompletionCatalog {
                         items.push((score, effort.into(), effort.into()));
                     }
                 }
-            } else if matches!(command, "/login" | "/logout" | "/auth") {
+            } else if completion == Some(CommandCompletion::Authentication) {
                 if command == "/login" && start == arg_start {
                     if let Some(score) = fuzzy_score(word, "status") {
                         items.push((
@@ -8475,10 +14660,7 @@ impl CompletionCatalog {
                         items.push((score, provider.clone(), provider));
                     }
                 }
-            } else if matches!(
-                command,
-                "/tasks" | "/task" | "/bg" | "/wakeup" | "/quit" | "/exit" | "/new"
-            ) {
+            } else if completion == Some(CommandCompletion::Tasks) {
                 let tokens: Vec<_> = args.split_whitespace().collect();
                 let at_new = args.ends_with(char::is_whitespace);
                 let slot = tokens.len().saturating_sub(usize::from(!at_new));
@@ -8527,7 +14709,7 @@ impl CompletionCatalog {
                         items.push((score, suggestion.to_string(), suggestion.to_string()));
                     }
                 }
-            } else if command == "/resume" {
+            } else if completion == Some(CommandCompletion::Sessions) {
                 let directory = self.home.join("sessions");
                 if let Ok(entries) = fs::read_dir(directory) {
                     for entry in entries.take(4096).flatten() {
@@ -8672,9 +14854,8 @@ impl rustyline::ConditionalEventHandler for PickerTab {
     }
 }
 struct PickerTerminal {
-    input: File,
+    io: TerminalIo,
     tty: File,
-    previous: libc::termios,
     active: bool,
     slots: usize,
     cursor_row: usize,
@@ -8683,25 +14864,9 @@ struct PickerTerminal {
 }
 impl PickerTerminal {
     fn open(output_fd: i32, prompt_rows: usize, origin_up: usize) -> Result<Option<Self>> {
-        use std::os::fd::FromRawFd;
-        let input = unsafe { libc::dup(0) };
-        if input < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let input = unsafe { File::from_raw_fd(input) };
-        let tty = unsafe { libc::dup(output_fd) };
-        if tty < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let tty = unsafe { File::from_raw_fd(tty) };
-        let mut size = unsafe { std::mem::zeroed::<libc::winsize>() };
-        let height = if unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == 0
-            && size.ws_row > 0
-        {
-            size.ws_row as usize
-        } else {
-            24
-        };
+        let input = TerminalIo::duplicate(0)?;
+        let tty = TerminalIo::duplicate(output_fd)?;
+        let height = TerminalIo::size(tty.as_raw_fd()).1;
         // At most half the screen: reserve room for the source and recent output.
         // Multiline input can consume that room; a tiny screen declines the menu.
         let slots = height
@@ -8711,21 +14876,10 @@ impl PickerTerminal {
         if slots < 2 {
             return Ok(None);
         }
-        let mut previous = unsafe { std::mem::zeroed::<libc::termios>() };
-        if unsafe { libc::tcgetattr(input.as_raw_fd(), &mut previous) } < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let mut raw = previous;
-        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 0;
-        if unsafe { libc::tcsetattr(input.as_raw_fd(), libc::TCSANOW, &raw) } < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
+        let io = TerminalIo::raw(input, RawTerminalMode::Picker, "selection input closed")?;
         let mut guard = Self {
-            input,
+            io,
             tty,
-            previous,
             active: false,
             slots: 0,
             cursor_row: 0,
@@ -8759,45 +14913,14 @@ impl PickerTerminal {
         Ok(())
     }
     fn byte(&mut self, timeout: i32) -> Result<Option<u8>> {
-        use std::os::fd::AsRawFd;
-        let mut poll = libc::pollfd {
-            fd: self.input.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut poll, 1, timeout) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                return Ok(None);
-            }
-            return Err(error.into());
-        }
-        if ready == 0 {
-            return Ok(None);
-        }
-        let mut byte = [0];
-        if std::io::Read::read(&mut self.input, &mut byte)? == 0 {
-            return Err("selection input closed".into());
-        }
-        Ok(Some(byte[0]))
+        Ok(self.io.byte(timeout)?)
     }
     fn size(&self) -> (usize, usize) {
-        use std::os::fd::AsRawFd;
-        let mut size = unsafe { std::mem::zeroed::<libc::winsize>() };
-        let rows = if unsafe { libc::ioctl(self.tty.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == 0
-            && size.ws_row > 0
-        {
-            size.ws_row as usize
-        } else {
-            24
-        };
-        (terminal_width_for(self.tty.as_raw_fd()).max(1), rows.max(1))
+        TerminalIo::size(self.tty.as_raw_fd())
     }
 }
 impl Drop for PickerTerminal {
     fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
         if self.active {
             let _ = self.top();
             // Clear only below the prompt, return to its original caret row.
@@ -8805,9 +14928,7 @@ impl Drop for PickerTerminal {
             let _ = write!(self.tty, "\x1b[{}A\r\x1b[?25h", self.origin_up);
             let _ = self.tty.flush();
         }
-        unsafe {
-            libc::tcsetattr(self.input.as_raw_fd(), libc::TCSANOW, &self.previous);
-        }
+        // TerminalIo's raw lease restores termios after picker cleanup.
     }
 }
 fn picker_clip(text: &str, width: usize) -> String {
@@ -8949,7 +15070,7 @@ fn picker_paste_service(
         service()?;
         if INTERRUPT.load(std::sync::atomic::Ordering::SeqCst) {
             unsafe {
-                libc::tcflush(terminal.input.as_raw_fd(), libc::TCIFLUSH);
+                libc::tcflush(terminal.io.input.as_raw_fd(), libc::TCIFLUSH);
             }
             return Ok(None);
         }
@@ -9167,24 +15288,30 @@ fn picker_select_service(
 impl Host {
     fn deliver_steering(&mut self) -> Result<bool> {
         self.poll_commands()?;
-        let Some(pos) = self.pending.iter().position(|v| {
-            v["kind"] == "submit" && v["mode"].as_str().unwrap_or("steering") == "steering"
-        }) else {
+        let Some(pos) = self.pending.iter().position(NativeCommand::steering) else {
             return Ok(false);
         };
         let command = self.pending.remove(pos).unwrap();
-        let id = command["id"].as_str().ok_or("queued command ID required")?;
+        let id = command.id.as_str();
         let record = self
             .queued
             .remove(id)
             .ok_or("missing accepted queue arrival")?;
         let (index, sequence) = record.ok_or("queued steering has no user record")?;
         self.select_user(
-            command["text"].as_str().ok_or("queued text required")?,
+            command
+                .args
+                .text
+                .require()
+                .map_err(|_| "queued text required")?,
             index,
             sequence,
         )?;
-        let text = command["text"].as_str().ok_or("queued text required")?;
+        let text = command
+            .args
+            .text
+            .require()
+            .map_err(|_| "queued text required")?;
         self.journal.append(
             "queue_delivered",
             json!({"command_id":id,"mode":"steering"}),
@@ -9194,8 +15321,7 @@ impl Host {
             json!({"command_id":id,"mode":"steering","text":text}),
         );
         self.event("completed", json!({"command_id":id,"status":"delivered"}));
-        self.stop = false;
-        self.stop_wakeup = None;
+        self.execution.clear_stop();
         Ok(true)
     }
 }
@@ -9213,44 +15339,143 @@ fn install_signals() {
     }
 }
 
-impl Host {
-    fn http_json(&mut self, request: reqwest::RequestBuilder, operation: &str) -> Result<Value> {
-        let rt = tokio::runtime::Builder::new_current_thread()
+impl ProviderClient {
+    fn wait_codex<T>(
+        future: impl std::future::Future<Output = Result<T>>,
+        operation: &str,
+        control: &mut impl ProviderControl,
+    ) -> Result<T> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        rt.block_on(async{
-            let future=async{
-                let response=request.send().await?;
-                let status=response.status();
-                let body:Value=response.json().await?;
-                if !status.is_success(){
-                    let detail=if operation=="auth"{String::new()}else{format!(": {body}")};
-                    return Err::<Value,Box<dyn std::error::Error>>(format!("provider HTTP {status}{detail}").into());
+        runtime.block_on(async {
+            tokio::pin!(future);
+            loop {
+                if control.provider_checkpoint(operation)? {
+                    return Err("Codex operation cancelled; request outcome may be unknown".into());
+                }
+                control.provider_retry_checkpoint(operation)?;
+                tokio::select! {
+                    response = &mut future => return response,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(15)) => {}
+                }
+            }
+        })
+    }
+    fn json_response(
+        request: reqwest::RequestBuilder,
+        operation: &str,
+        attempts: ProviderAttempts,
+        control: &mut impl ProviderControl,
+    ) -> Result<Value> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let future = async {
+                attempts.transition(operation, ProviderAttemptPhase::Sending, None);
+                let response = request.send().await?;
+                attempts.transition(operation, ProviderAttemptPhase::Streaming, None);
+                let status = response.status();
+                let body: Value = response.json().await?;
+                if !status.is_success() {
+                    let detail = if operation == "auth" { String::new() } else { format!(": {body}") };
+                    return Err::<Value, Box<dyn std::error::Error>>(format!("provider HTTP {status}{detail}").into());
                 }
                 Ok(body)
             };
             tokio::pin!(future);
-            loop{
-                tokio::select!{
-                    response=&mut future=>return response,
-                    _=tokio::time::sleep(std::time::Duration::from_millis(15))=>{
-                        self.service_background()?;
-                        let mut cancel=INTERRUPT.swap(false,std::sync::atomic::Ordering::SeqCst);
-                        while let Some(command)=self.incoming.as_ref().and_then(|r|r.try_recv().ok()){
-                            if command["kind"]=="interrupt"{
-                                if !self.accept_input_control(&command)?{continue;}
-                                self.event("completed",json!({"command_id":command["id"],"status":"ok"}));cancel=true;
-                            }else if !self.background_control(&command)?{self.queue_arrival(command)?;}
-                        }
-                        if cancel{
-                            self.journal.append("provider_cancelled",json!({"operation":operation,"billing":"unknown"}))?;
-                            self.cancel_revision=self.cancel_revision.wrapping_add(1);
-                            return Err("provider request cancelled; outcome/billing may be unknown".into());
-                        }
+            loop {
+                tokio::select! {
+                    response = &mut future => return response,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(15)) => {
+                        if control.provider_checkpoint(operation)? { return Err("provider request cancelled; outcome/billing may be unknown".into()); }
                     }
                 }
             }
         })
+    }
+}
+impl ProviderControl for Host {
+    fn provider_checkpoint(&mut self, operation: &str) -> Result<bool> {
+        let epoch = self.provider.cancellation_epoch(operation);
+        let cancelled = self
+            .pump_control(WaitPolicy::Provider { operation })?
+            .cancelled;
+        if cancelled {
+            self.provider.cancel_request(operation, epoch);
+        }
+        Ok(cancelled)
+    }
+    fn provider_retry_checkpoint(&mut self, operation: &str) -> Result<()> {
+        self.supersede_pending_codex_retry(operation)
+    }
+    fn provider_attempt_started(
+        &mut self,
+        operation: &str,
+        retry: u64,
+        max_retries: u64,
+    ) -> Result<()> {
+        if retry > 0 {
+            self.event("state", self.state_payload());
+        }
+        self.journal.append(
+            "provider_attempt",
+            json!({"operation":operation,"attempt":retry+1,
+            "retry":retry,"max_retries":max_retries,"scope":"provider request only"}),
+        )?;
+        Ok(())
+    }
+    fn provider_attempt_failed(
+        &mut self,
+        operation: &str,
+        retry: u64,
+        retryable: bool,
+        billing_unknown: bool,
+        error: &str,
+    ) -> Result<()> {
+        self.journal.append(
+            "provider_attempt_failed",
+            json!({"operation":operation,"attempt":retry+1,
+            "retryable":retryable,"billing_unknown":billing_unknown,"error":error}),
+        )?;
+        if billing_unknown {
+            self.mark_codex_billing_unknown();
+        }
+        Ok(())
+    }
+    fn provider_retry_scheduled(
+        &mut self,
+        operation: &str,
+        retry: u64,
+        max_retries: u64,
+        delay_ms: u64,
+        billing_unknown: bool,
+        reason: &str,
+    ) -> Result<()> {
+        self.journal.append("provider_retry", json!({"operation":operation,"retry":retry,"max_retries":max_retries,
+            "delay_ms":delay_ms,"billing_unknown":billing_unknown,"reason":reason,"scope":"provider request only"}))?;
+        self.event("state", self.state_payload());
+        Ok(())
+    }
+}
+impl Host {
+    fn http_json(&mut self, request: reqwest::RequestBuilder, operation: &str) -> Result<Value> {
+        let scope = self
+            .provider
+            .begin_request(operation, self.execution.cancel_revision());
+        let attempts = self.provider.attempts.clone();
+        let result = ProviderClient::json_response(request, operation, attempts, self);
+        self.provider.settle_request(
+            operation,
+            if result.is_ok() {
+                ProviderRequestOutcome::Succeeded
+            } else {
+                ProviderRequestOutcome::Failed
+            },
+        );
+        drop(scope);
+        result
     }
 }
 
@@ -9264,10 +15489,632 @@ const CELL_GROUPS: &[&str] = &[
     "raw",
     "events",
 ];
-#[derive(Default)]
-struct CellHistoryCache {
+// Attribution coordinates only: source, stream and provider payloads stay in the journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HistoryIndexError(&'static str);
+impl std::fmt::Display for HistoryIndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for HistoryIndexError {}
+#[derive(Clone, Default)]
+struct CellMembership {
+    start: Value,
+    end: Option<Value>,
+    source_event: Option<usize>,
+    source_record_ref: Option<String>,
+    code_record_index: Option<usize>,
+    records: HashMap<RecordCollection, Vec<usize>>,
+    record_members: HashSet<(RecordCollection, usize)>,
+    event_sequences: std::collections::BTreeSet<usize>,
+    context_ids: Vec<String>,
+    stream_records: HashMap<RecordCollection, usize>,
+    stream_complete: HashMap<RecordCollection, bool>,
+}
+impl CellMembership {
+    fn record(&mut self, collection: RecordCollection, index: usize) {
+        if self.record_members.insert((collection, index)) {
+            self.records.entry(collection).or_default().push(index);
+        }
+    }
+    fn event(&mut self, sequence: usize) {
+        self.event_sequences.insert(sequence);
+    }
+    fn view(&self) -> CellJournalView {
+        CellJournalView {
+            start: self.start.clone(),
+            end: self.end.clone(),
+            source: None,
+            source_record_ref: self.source_record_ref.clone(),
+            code_record_index: self.code_record_index,
+            records: self
+                .records
+                .iter()
+                .map(|(key, values)| (key.label().into(), values.clone()))
+                .collect(),
+            event_sequences: self.event_sequences.iter().copied().collect(),
+            context_ids: self.context_ids.clone(),
+            stream_records: self
+                .stream_records
+                .iter()
+                .map(|(key, value)| (key.label().into(), *value))
+                .collect(),
+            stream_complete: self
+                .stream_complete
+                .iter()
+                .map(|(key, value)| (key.label().into(), *value))
+                .collect(),
+        }
+    }
+}
+#[derive(Clone, Default)]
+struct IndexedProvider {
+    records: Vec<(RecordCollection, usize)>,
+    events: Vec<usize>,
+    owner: Option<usize>,
+}
+#[derive(Clone)]
+enum HistoryEventData {
+    CellStart {
+        data: JournalCellStart,
+        metadata: Value,
+    },
+    CellEnd {
+        data: JournalCellEnd,
+        metadata: Value,
+    },
+    CellRecord(JournalCellRecord),
+    Accepted {
+        direct: bool,
+        command_id: Option<String>,
+    },
+    Code {
+        index: Option<usize>,
+    },
+    Stream {
+        collection: RecordCollection,
+        index: usize,
+        complete: Option<bool>,
+    },
+    Context {
+        id: String,
+        ranges: Vec<(usize, usize)>,
+        raw_index: Option<usize>,
+    },
+    Intent {
+        operation_type: Option<String>,
+        shell_source: bool,
+    },
+    OperationComplete {
+        operation_type: Option<String>,
+    },
+    WorkerReset {
+        active_cell: Option<usize>,
+        explicit: bool,
+    },
+    Record(RecordCollection),
+    Other,
+}
+#[derive(Clone)]
+struct HistoryEvent {
     sequence: usize,
-    views: HashMap<usize, Value>,
+    operation: Option<String>,
+    data: HistoryEventData,
+}
+impl HistoryEvent {
+    fn from_event(event: &JournalEvent) -> Self {
+        use JournalEventData as D;
+        use JournalEventKind as K;
+        let p = event.payload();
+        let operation = match &event.data {
+            D::CellStart(data) => Some(data.operation.clone()),
+            D::TextRecord(data) => data.operation.clone(),
+            D::Stream(data) => data.operation.clone(),
+            D::Intent(data) => data.operation.clone(),
+            D::ProviderRecord(data) => data.operation.clone(),
+            _ => p["operation"].as_str().map(str::to_owned),
+        };
+        let data = match (&event.kind, &event.data) {
+            (_, D::CellStart(data)) => HistoryEventData::CellStart {
+                data: data.clone(),
+                metadata: p.clone(),
+            },
+            (_, D::CellEnd(data)) => HistoryEventData::CellEnd {
+                data: data.clone(),
+                metadata: p.clone(),
+            },
+            (_, D::CellRecord(data)) => HistoryEventData::CellRecord(data.clone()),
+            (K::Accepted, _) => HistoryEventData::Accepted {
+                direct: matches!(p["command"]["kind"].as_str(), Some("python" | "shell")),
+                command_id: p["command_id"].as_str().map(str::to_owned),
+            },
+            (K::Code, D::TextRecord(data)) => HistoryEventData::Code {
+                index: data.record_index,
+            },
+            (_, D::Stream(data)) => HistoryEventData::Stream {
+                collection: data.collection,
+                index: data.record_index,
+                complete: data.complete,
+            },
+            (_, D::ContextAdd(item)) => HistoryEventData::Context {
+                id: item.id.clone(),
+                ranges: item.ranges.clone(),
+                raw_index: item.raw_index,
+            },
+            (K::Intent, D::Intent(data)) => HistoryEventData::Intent {
+                operation_type: data.operation_type.clone(),
+                shell_source: p["source"].is_string(),
+            },
+            (K::OperationComplete, D::Intent(data)) => HistoryEventData::OperationComplete {
+                operation_type: data.operation_type.clone(),
+            },
+            (
+                _,
+                D::WorkerReset {
+                    active_cell,
+                    explicit_active_cell,
+                    ..
+                },
+            ) => HistoryEventData::WorkerReset {
+                active_cell: *active_cell,
+                explicit: *explicit_active_cell,
+            },
+            (K::Request, _) => HistoryEventData::Record(RecordCollection::Requests),
+            (K::Response, _) => HistoryEventData::Record(RecordCollection::Responses),
+            (K::Usage, _) => HistoryEventData::Record(RecordCollection::Usage),
+            (K::User, _) => HistoryEventData::Record(RecordCollection::User),
+            (K::Stdin, _) => HistoryEventData::Record(RecordCollection::Stdin),
+            (K::Say, _) => HistoryEventData::Record(RecordCollection::Say),
+            (K::Raw, _) => HistoryEventData::Record(RecordCollection::Raw),
+            _ => HistoryEventData::Other,
+        };
+        Self {
+            sequence: event.seq,
+            operation,
+            data,
+        }
+    }
+    fn is_boundary(&self) -> bool {
+        matches!(
+            self.data,
+            HistoryEventData::CellStart { .. }
+                | HistoryEventData::CellEnd { .. }
+                | HistoryEventData::WorkerReset { .. }
+        )
+    }
+    fn proves_reset_preservation(&self, cell: usize) -> bool {
+        match &self.data {
+            HistoryEventData::CellStart { data, .. } => data.parent_cell == Some(cell),
+            HistoryEventData::CellEnd { data, .. } => data.cell == cell,
+            _ => false,
+        }
+    }
+}
+#[derive(Clone, Default)]
+struct HistoryIndexState {
+    cells: std::collections::BTreeMap<usize, CellMembership>,
+    active: Vec<usize>,
+    operations: HashMap<String, usize>,
+    record_events: HashMap<RecordCollection, Vec<usize>>,
+    user_sequences: HashMap<usize, usize>,
+    command_users: HashMap<String, Vec<usize>>,
+    direct_command: Option<String>,
+    selected_users: Vec<usize>,
+    providers: HashMap<String, IndexedProvider>,
+    pending_provider: Option<String>,
+    completed_generation: Option<String>,
+    error: Option<HistoryIndexError>,
+}
+impl HistoryIndexState {
+    fn cell_mut(
+        &mut self,
+        cell: usize,
+        error: &'static str,
+    ) -> std::result::Result<&mut CellMembership, HistoryIndexError> {
+        self.cells.get_mut(&cell).ok_or(HistoryIndexError(error))
+    }
+    fn record_sequence(
+        &self,
+        collection: RecordCollection,
+        index: usize,
+        error: &'static str,
+    ) -> std::result::Result<usize, HistoryIndexError> {
+        self.record_events
+            .get(&collection)
+            .and_then(|events| events.get(index))
+            .copied()
+            .ok_or(HistoryIndexError(error))
+    }
+    fn ingest(&mut self, event: &HistoryEvent, reset_preserved: Option<bool>) {
+        if self.error.is_none() {
+            self.error = self.apply(event, reset_preserved).err();
+        }
+    }
+    fn apply(
+        &mut self,
+        event: &HistoryEvent,
+        reset_preserved: Option<bool>,
+    ) -> std::result::Result<(), HistoryIndexError> {
+        use HistoryEventData as D;
+        let sequence = event.sequence;
+        if let D::WorkerReset {
+            active_cell,
+            explicit,
+        } = &event.data
+        {
+            let preserve = if *explicit {
+                if let Some(cell) = active_cell {
+                    if self.active.last() != Some(cell) {
+                        return Err(HistoryIndexError(
+                            "worker reset does not belong to the active cell",
+                        ));
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                reset_preserved.unwrap_or(false)
+            };
+            if !preserve {
+                self.active.clear();
+            }
+            self.completed_generation = None;
+        }
+        if let D::Accepted { direct, command_id } = &event.data {
+            self.direct_command = if *direct {
+                Some(
+                    command_id
+                        .clone()
+                        .ok_or(HistoryIndexError("accepted command ID missing"))?,
+                )
+            } else {
+                None
+            };
+            self.completed_generation = None;
+        }
+        if let D::CellStart { data, metadata } = &event.data {
+            let number = data.cell;
+            if self.cells.contains_key(&number) {
+                return Err(HistoryIndexError("duplicate cell number in journal"));
+            }
+            if data.parent_cell != self.active.last().copied() {
+                return Err(HistoryIndexError(
+                    "cell parent does not match active cell provenance",
+                ));
+            }
+            if self
+                .operations
+                .insert(data.operation.clone(), number)
+                .is_some()
+            {
+                return Err(HistoryIndexError("duplicate cell operation in journal"));
+            }
+            let mut view = CellMembership {
+                start: metadata.clone(),
+                ..CellMembership::default()
+            };
+            let inputs = data.user_record_indices.clone().unwrap_or_else(|| {
+                self.command_users
+                    .get(&data.operation)
+                    .cloned()
+                    .unwrap_or_else(|| self.selected_users.clone())
+            });
+            for index in inputs {
+                let seq = self.record_sequence(
+                    RecordCollection::User,
+                    index,
+                    "cell user provenance points to an unavailable record",
+                )?;
+                view.record(RecordCollection::User, index);
+                view.event(seq);
+            }
+            if let Some(indices) = &data.input_raw_indices {
+                for index in indices {
+                    let seq = self.record_sequence(
+                        RecordCollection::Raw,
+                        *index,
+                        "cell raw provenance points to an unavailable record",
+                    )?;
+                    view.record(RecordCollection::Raw, *index);
+                    view.event(seq);
+                }
+            }
+            let generation = if data.explicit_generation {
+                data.generation_request.clone()
+            } else if self.active.is_empty() && data.operation == format!("agent{sequence}") {
+                self.completed_generation.clone()
+            } else {
+                None
+            };
+            if let Some(operation) = generation {
+                let provider = self
+                    .providers
+                    .get_mut(&operation)
+                    .ok_or(HistoryIndexError("cell generation provenance missing"))?;
+                if provider.owner.is_some() {
+                    return Err(HistoryIndexError("generation already owned by a cell"));
+                }
+                provider.owner = Some(number);
+                for (collection, index) in &provider.records {
+                    view.record(*collection, *index);
+                }
+                for seq in &provider.events {
+                    view.event(*seq);
+                }
+            }
+            self.completed_generation = None;
+            view.event(sequence);
+            self.cells.insert(number, view);
+            self.active.push(number);
+            return Ok(());
+        }
+        let operation = event.operation.as_deref();
+        let operation_cell = operation.and_then(|op| self.operations.get(op).copied());
+        let owner = if matches!(event.data, D::Stream { .. }) {
+            operation_cell
+        } else {
+            operation_cell.or_else(|| self.active.last().copied())
+        };
+        if let Some(owner) = owner {
+            self.cell_mut(owner, "cell owner missing")?.event(sequence);
+        }
+        let intent = matches!(event.data, D::Intent { .. });
+        if let D::Intent { operation_type, .. } = &event.data {
+            if matches!(operation_type.as_deref(), Some("provider" | "image")) {
+                let operation = operation
+                    .ok_or(HistoryIndexError("provider operation missing"))?
+                    .to_owned();
+                let provider = self.providers.entry(operation.clone()).or_default();
+                provider.owner = self.active.last().copied();
+                provider.events.push(sequence);
+                self.pending_provider = Some(operation);
+            }
+        }
+        if !intent {
+            let provider_owner = operation
+                .and_then(|operation| self.providers.get_mut(operation))
+                .and_then(|provider| {
+                    provider.events.push(sequence);
+                    provider.owner
+                });
+            if let Some(owner) = provider_owner {
+                self.cell_mut(owner, "provider cell owner missing")?
+                    .event(sequence);
+            }
+        }
+        if let D::Record(collection) = &event.data {
+            let collection = *collection;
+            let events = self.record_events.entry(collection).or_default();
+            let index = events.len();
+            events.push(sequence);
+            match collection {
+                RecordCollection::User => {
+                    self.user_sequences.insert(sequence, index);
+                    if let Some(command) = &self.direct_command {
+                        self.command_users
+                            .entry(command.clone())
+                            .or_default()
+                            .push(index);
+                    }
+                }
+                RecordCollection::Requests
+                | RecordCollection::Responses
+                | RecordCollection::Usage => {
+                    let provenance = operation.map(str::to_owned).or_else(|| {
+                        if collection == RecordCollection::Requests {
+                            self.pending_provider.take()
+                        } else {
+                            None
+                        }
+                    });
+                    let provider = provenance
+                        .as_deref()
+                        .and_then(|operation| self.providers.get_mut(operation));
+                    if let Some(provider) = provider {
+                        provider.records.push((collection, index));
+                        provider.events.push(sequence);
+                        let provider_owner = provider.owner;
+                        if let Some(owner) = provider_owner {
+                            let view = self.cell_mut(owner, "provider cell owner missing")?;
+                            view.record(collection, index);
+                            view.event(sequence);
+                        }
+                    } else if let Some(owner) = owner {
+                        self.cell_mut(owner, "provider cell owner missing")?
+                            .record(collection, index);
+                    }
+                }
+                _ => {
+                    if let Some(owner) = owner {
+                        self.cell_mut(owner, "cell owner missing")?
+                            .record(collection, index);
+                    }
+                }
+            }
+        }
+        match &event.data {
+            D::CellEnd { data, metadata } => {
+                let view = self.cell_mut(data.cell, "cell end has no start")?;
+                if view.end.is_some() {
+                    return Err(HistoryIndexError("duplicate cell end"));
+                }
+                let mut end = metadata.clone();
+                end["status"] = json!(data.status);
+                end["elapsed_ms"] = json!(data.elapsed_ms);
+                view.end = Some(end);
+                view.event(sequence);
+                if self.active.last() != Some(&data.cell) {
+                    return Err(HistoryIndexError("cell end is not the active cell"));
+                }
+                self.active.pop();
+            }
+            D::Intent {
+                operation_type,
+                shell_source,
+            } if operation_type.as_deref() == Some("shell") => {
+                if let Some(owner) = operation_cell {
+                    if !shell_source {
+                        return Err(HistoryIndexError("shell source missing"));
+                    }
+                    let view = self.cell_mut(owner, "shell cell missing")?;
+                    view.source_event = Some(sequence);
+                    view.source_record_ref =
+                        Some(format!("H.records.events[{sequence}]['payload']['source']"));
+                }
+            }
+            D::Code { index } => {
+                if let Some(owner) = operation_cell {
+                    let index = index.ok_or(HistoryIndexError("code record index missing"))?;
+                    let view = self.cell_mut(owner, "code cell missing")?;
+                    view.source_event = Some(sequence);
+                    view.code_record_index = Some(index);
+                    view.source_record_ref = Some(format!("H.records.code[{index}]"));
+                }
+            }
+            D::Stream {
+                collection,
+                index,
+                complete,
+            } => {
+                if let Some(owner) = operation_cell {
+                    let view = self.cell_mut(owner, "stream cell missing")?;
+                    if view
+                        .stream_records
+                        .get(collection)
+                        .is_some_and(|old| old != index)
+                    {
+                        return Err(HistoryIndexError(
+                            "multiple stream records for one cell/collection",
+                        ));
+                    }
+                    view.stream_records.insert(*collection, *index);
+                    if let Some(complete) = complete {
+                        view.stream_complete.insert(*collection, *complete);
+                    }
+                }
+            }
+            D::Context {
+                id,
+                ranges,
+                raw_index,
+            } => {
+                if let Some(owner) = owner {
+                    self.cell_mut(owner, "cell owner missing")?
+                        .context_ids
+                        .push(id.clone());
+                }
+                let selected = ranges
+                    .iter()
+                    .filter_map(|(start, _)| self.user_sequences.get(start).copied())
+                    .collect::<Vec<_>>();
+                if !selected.is_empty() {
+                    self.selected_users = selected;
+                }
+                if let (Some(owner), Some(index)) = (owner, raw_index) {
+                    self.cell_mut(owner, "cell owner missing")?
+                        .record(RecordCollection::Raw, *index);
+                }
+            }
+            D::CellRecord(data) => {
+                let seq = self.record_sequence(
+                    data.collection,
+                    data.record_index,
+                    "cell record provenance unavailable",
+                )?;
+                let view = self.cell_mut(data.cell, "cell record owner unavailable")?;
+                view.record(data.collection, data.record_index);
+                view.event(seq);
+                view.event(sequence);
+            }
+            D::OperationComplete { operation_type }
+                if operation_type.as_deref() == Some("provider") =>
+            {
+                let operation =
+                    operation.ok_or(HistoryIndexError("completed provider operation missing"))?;
+                if let Some(provider) = self.providers.get_mut(operation) {
+                    provider.events.push(sequence);
+                    if provider.owner.is_none() {
+                        self.completed_generation = Some(operation.into());
+                    }
+                } else {
+                    self.completed_generation = None;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+// A legacy reset has no active_cell marker. Serve the EOF-cleared projection
+// immediately; keep a metadata-only checkpoint until a boundary proves that
+// the caller survives. Queries never clone/rebuild the session or rescan rows.
+struct PendingLegacyReset {
+    preserved: HistoryIndexState,
+    cell: usize,
+    events: Vec<HistoryEvent>,
+}
+#[derive(Default)]
+struct HistoryIndex {
+    state: HistoryIndexState,
+    pending_reset: Option<PendingLegacyReset>,
+    sequence: usize,
+}
+impl HistoryIndex {
+    fn apply(&mut self, event: &JournalEvent) {
+        if event.seq != self.sequence {
+            self.state.error = Some(HistoryIndexError("history index event sequence mismatch"));
+            return;
+        }
+        self.sequence += 1;
+        let event = HistoryEvent::from_event(event);
+        if event.is_boundary() {
+            if let Some(mut pending) = self.pending_reset.take() {
+                if event.proves_reset_preservation(pending.cell) {
+                    for buffered in &pending.events {
+                        pending.preserved.ingest(buffered, None);
+                    }
+                    self.state = pending.preserved;
+                }
+            }
+        }
+        if matches!(
+            event.data,
+            HistoryEventData::WorkerReset {
+                explicit: false,
+                ..
+            }
+        ) && self.state.error.is_none()
+        {
+            if let Some(cell) = self.state.active.last().copied() {
+                let mut preserved = self.state.clone();
+                preserved.ingest(&event, Some(true));
+                self.pending_reset = Some(PendingLegacyReset {
+                    preserved,
+                    cell,
+                    events: Vec::new(),
+                });
+            }
+        } else if let Some(pending) = &mut self.pending_reset {
+            pending.events.push(event.clone());
+        }
+        self.state.ingest(&event, None);
+    }
+    fn cell(&self, cell: usize) -> std::result::Result<(&CellMembership, bool), HistoryIndexError> {
+        if cell == 0 {
+            return Err(HistoryIndexError("cell numbers start at 1"));
+        }
+        if let Some(error) = self.state.error {
+            return Err(error);
+        }
+        let membership = self
+            .state
+            .cells
+            .get(&cell)
+            .ok_or(HistoryIndexError("cell does not exist"))?;
+        Ok((membership, self.state.active.contains(&cell)))
+    }
 }
 #[derive(Default)]
 struct CellJournalView {
@@ -9282,6 +16129,7 @@ struct CellJournalView {
     stream_records: HashMap<String, usize>,
     stream_complete: HashMap<String, bool>,
 }
+#[cfg(test)]
 impl CellJournalView {
     fn record(&mut self, collection: &str, index: usize) {
         let values = self.records.entry(collection.into()).or_default();
@@ -9295,6 +16143,304 @@ impl CellJournalView {
         }
     }
 }
+#[cfg(test)]
+mod history_index_tests {
+    use super::*;
+    fn host() -> crate::test_support::HostFixture {
+        crate::test_support::HostFixture::named(
+            "py-history-index",
+            Some(json!({"skills":{"enabled":false}})),
+        )
+    }
+    fn compare(host: &Host) {
+        assert_eq!(host.journal.history_index.sequence, host.journal.seq);
+        let cells = host
+            .journal
+            .history_index
+            .state
+            .cells
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for cell in cells {
+            assert_eq!(
+                host.cell_view(cell).unwrap(),
+                host.legacy_cell_view(cell).unwrap(),
+                "cell {cell}"
+            );
+        }
+    }
+    fn record(host: &mut Host, collection: &str, kind: &str, payload: Value) -> (usize, usize) {
+        let sequence = host.journal.append(kind, payload.clone()).unwrap();
+        let index = host.hist_push(collection, payload);
+        (index, sequence)
+    }
+    fn start(host: &mut Host, cell: usize, operation: &str, parent: Option<usize>, legacy: bool) {
+        let mut payload = json!({"cell":cell,"parent_cell":parent,"language":"python","operation":operation,
+            "history_view_version":1,"user_record_indices":[],"input_raw_indices":[],"generation_request":null});
+        if legacy {
+            payload
+                .as_object_mut()
+                .unwrap()
+                .remove("generation_request");
+        }
+        host.journal.append("cell_start", payload).unwrap();
+        host.execution.restore_cell(cell);
+    }
+    fn end(host: &mut Host, cell: usize) {
+        host.journal
+            .append(
+                "cell_end",
+                json!({"cell":cell,"status":"ok","elapsed_ms":1}),
+            )
+            .unwrap();
+    }
+    #[test]
+    fn incremental_views_match_scanner_for_nested_execution_multiple_rpcs_and_worker_reset() {
+        let mut host = host();
+        host.user("task", true).unwrap();
+        assert_eq!(host.execute("parent", "print('parent')\nagent.sh('printf shell')\nagent.say('first')\nagent.say('second')", false).unwrap()["status"], "ok");
+        compare(&host);
+        assert_eq!(
+            host.cell_view(1).unwrap()["say"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(host.cell_view(2).unwrap()["parent_cell"], 1);
+        assert_eq!(
+            host.execute(
+                "reset",
+                "agent.loop.reset_python(); print('reset after effects')",
+                false
+            )
+            .unwrap()["status"],
+            "ok"
+        );
+        compare(&host);
+        assert_eq!(
+            host.execute(
+                "crash",
+                "import os; print('crash prefix', flush=True); os._exit(5)",
+                false
+            )
+            .unwrap()["status"],
+            "worker_crashed"
+        );
+        compare(&host);
+        let home = host.home.clone();
+        let path = host.journal.path.clone();
+        drop(host.take_host());
+        let resumed = Host::new(home.clone(), Some(path), true, true, None, None).unwrap();
+        compare(&resumed);
+        drop(resumed);
+    }
+    #[test]
+    fn indexed_generation_and_records_match_legacy_inference_without_admitting_background_streams()
+    {
+        let mut host = host();
+        host.journal
+            .append(
+                "intent",
+                json!({"type":"provider","operation":"generation"}),
+            )
+            .unwrap();
+        record(&mut host, "requests", "request", json!({"model":"test"}));
+        record(
+            &mut host,
+            "responses",
+            "response",
+            json!({"operation":"generation","raw":{"usage":{"input_tokens":10,"output_tokens":2}}}),
+        );
+        record(
+            &mut host,
+            "usage",
+            "usage",
+            json!({"operation":"generation","input_tokens":10,"output_tokens":2}),
+        );
+        host.journal
+            .append(
+                "operation_complete",
+                json!({"type":"provider","operation":"generation"}),
+            )
+            .unwrap();
+        let operation = format!("agent{}", host.journal.seq);
+        start(&mut host, 1, &operation, None, true);
+        let index = host.hist_push("code", json!("print('generated')"));
+        host.journal
+            .append(
+                "code",
+                json!({"operation":operation,"index":index,"source":"print('generated')"}),
+            )
+            .unwrap();
+        record(&mut host, "stdin", "stdin", json!({"text":"one"}));
+        record(&mut host, "stdin", "stdin", json!({"text":"two"}));
+        record(&mut host, "say", "say", json!({"text":"one"}));
+        record(&mut host, "say", "say", json!({"text":"two"}));
+        let (raw, _) = record(
+            &mut host,
+            "raw",
+            "raw",
+            json!({"base64":"AA==","mime":"application/octet-stream"}),
+        );
+        host.journal
+            .append(
+                "cell_record",
+                json!({"cell":1,"collection":"raw","record_index":raw}),
+            )
+            .unwrap();
+        host.history.append(
+            RecordCollection::Stdout,
+            ArchivedRecord::Value(json!("detached task")),
+        );
+        host.journal.append("stream", json!({"operation":"task:detached","collection":"stdout","index":0,"base64":B64.encode(b"detached task")})).unwrap();
+        end(&mut host, 1);
+        compare(&host);
+        let view = host.cell_view(1).unwrap();
+        assert_eq!(view["requests"].as_array().unwrap().len(), 1);
+        assert_eq!(view["responses"].as_array().unwrap().len(), 1);
+        assert_eq!(view["usage"].as_array().unwrap().len(), 1);
+        assert_eq!(view["stdin"].as_array().unwrap().len(), 2);
+        assert_eq!(view["raw"].as_array().unwrap().len(), 1);
+        assert_eq!(view["stdout"], "");
+        assert_eq!(host.history_value("stdout", 0).unwrap(), "detached task");
+        drop(host.take_host());
+    }
+    #[test]
+    fn legacy_reset_eof_projection_is_revised_only_when_a_boundary_proves_preservation() {
+        let mut host = host();
+        start(&mut host, 1, "caller", None, false);
+        host.journal
+            .append("worker_reset", json!({"generation":1}))
+            .unwrap();
+        compare(&host);
+        assert_eq!(host.cell_view(1).unwrap()["status"], "unknown");
+        record(
+            &mut host,
+            "say",
+            "say",
+            json!({"text":"ambiguous until the boundary"}),
+        );
+        compare(&host);
+        assert_eq!(
+            host.cell_view(1).unwrap()["say"].as_array().unwrap().len(),
+            0
+        );
+        start(&mut host, 2, "startup", Some(1), false);
+        compare(&host);
+        assert_eq!(
+            host.cell_view(1).unwrap()["say"].as_array().unwrap().len(),
+            1
+        );
+        end(&mut host, 2);
+        end(&mut host, 1);
+        compare(&host);
+        start(&mut host, 3, "abandoned", None, false);
+        host.journal
+            .append("worker_reset", json!({"generation":2}))
+            .unwrap();
+        record(
+            &mut host,
+            "say",
+            "say",
+            json!({"text":"global after interrupted resume"}),
+        );
+        start(&mut host, 4, "new-root", None, false);
+        end(&mut host, 4);
+        compare(&host);
+        assert_eq!(
+            host.cell_view(3).unwrap()["say"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(host.cell_view(3).unwrap()["status"], "unknown");
+        let home = host.home.clone();
+        let path = host.journal.path.clone();
+        drop(host.take_host());
+        let resumed = Host::new(home.clone(), Some(path), true, true, None, None).unwrap();
+        compare(&resumed);
+        drop(resumed);
+    }
+    #[test]
+    fn query_reads_only_cell_membership_not_foreign_session_events_and_reopen_rebuilds_once() {
+        let mut host = host();
+        for cell in 1..=2 {
+            let operation = format!("cell-{cell}");
+            start(&mut host, cell, &operation, None, false);
+            let source = format!("value = {cell}");
+            let index = host.hist_push("code", json!(source));
+            host.journal
+                .append(
+                    "code",
+                    json!({"operation":operation,"index":index,"source":source}),
+                )
+                .unwrap();
+            end(&mut host, cell);
+        }
+        let foreign_start = host.journal.seq;
+        for _ in 0..256 {
+            host.journal
+                .append("extension:unrelated", json!({"opaque":"not selected"}))
+                .unwrap();
+        }
+        host.journal.event_reads.borrow_mut().clear();
+        for cell in 1..=2 {
+            assert_eq!(
+                host.cell_view(cell).unwrap()["code"],
+                format!("value = {cell}")
+            );
+        }
+        let reads = host.journal.event_reads.borrow().clone();
+        assert!(!reads.is_empty());
+        assert!(
+            reads.iter().all(|sequence| *sequence < foreign_start),
+            "foreign rows read: {reads:?}"
+        );
+        assert!(
+            reads.len() <= 8,
+            "cell query performed non-local work: {reads:?}"
+        );
+        assert_eq!(host.journal.history_index.sequence, host.journal.seq);
+        let home = host.home.clone();
+        let path = host.journal.path.clone();
+        drop(host.take_host());
+        let resumed = Host::new(home.clone(), Some(path), true, true, None, None).unwrap();
+        compare(&resumed);
+        let applied = resumed.journal.history_index.sequence;
+        resumed.cell_view(1).unwrap();
+        resumed.cell_view(2).unwrap();
+        assert_eq!(resumed.journal.history_index.sequence, applied);
+        drop(resumed);
+    }
+    #[test]
+    fn semantic_projection_errors_are_durable_and_do_not_poison_the_journal() {
+        let mut host = host();
+        start(&mut host, 1, "first", None, false);
+        end(&mut host, 1);
+        let before = host.journal.seq;
+        start(&mut host, 1, "duplicate", None, false);
+        assert_eq!(host.journal.seq, before + 1);
+        assert!(!host.journal.failed);
+        assert_eq!(
+            host.cell_view(1).unwrap_err().to_string(),
+            host.legacy_cell_view(1).unwrap_err().to_string()
+        );
+        assert_eq!(
+            host.cell_view(1).unwrap_err().to_string(),
+            "duplicate cell number in journal"
+        );
+        host.journal
+            .append("extension:still-authoritative", json!({}))
+            .unwrap();
+        let home = host.home.clone();
+        let path = host.journal.path.clone();
+        drop(host.take_host());
+        let resumed = Host::new(home.clone(), Some(path), true, true, None, None).unwrap();
+        assert_eq!(
+            resumed.cell_view(1).unwrap_err().to_string(),
+            "duplicate cell number in journal"
+        );
+        drop(resumed);
+    }
+}
+#[cfg(test)]
 #[derive(Default)]
 struct ProviderJournalView {
     records: Vec<(String, usize)>,
@@ -9303,8 +16449,8 @@ struct ProviderJournalView {
 }
 impl Host {
     fn resolve_cell_index(&self, index: i64) -> Result<usize> {
-        let len =
-            i64::try_from(self.cells).map_err(|_| "cell counter exceeds supported index range")?;
+        let len = i64::try_from(self.execution.cells())
+            .map_err(|_| "cell counter exceeds supported index range")?;
         let index = if index < 0 {
             len.checked_add(1)
                 .and_then(|len| len.checked_add(index))
@@ -9332,23 +16478,21 @@ impl Host {
             .ok_or_else(|| "cell history field missing".into())
     }
     fn cell_view(&self, cell: usize) -> Result<Value> {
-        {
-            let cache = self.cell_history_cache.borrow();
-            if cache.sequence == self.journal.seq {
-                if let Some(view) = cache.views.get(&cell) {
-                    return Ok(view.clone());
-                }
-            }
+        let (membership, running) = self.journal.history_index.cell(cell)?;
+        let mut view = membership.view();
+        if let Some(sequence) = membership.source_event {
+            let event = self.journal.decoded_event(sequence)?;
+            view.source = Some(match &event.data {
+                JournalEventData::TextRecord(record) => record.text.clone(),
+                _ => event.payload()["source"]
+                    .as_str()
+                    .ok_or("shell source missing")?
+                    .to_owned(),
+            });
         }
-        let view = self.cell_view_uncached(cell)?;
-        let mut cache = self.cell_history_cache.borrow_mut();
-        if cache.sequence != self.journal.seq {
-            cache.sequence = self.journal.seq;
-            cache.views.clear();
-        }
-        cache.views.insert(cell, view.clone());
-        Ok(view)
+        self.render_cell_view(cell, view, running)
     }
+    #[cfg(test)]
     fn reset_preserves_cell(
         &self,
         sequence: usize,
@@ -9387,7 +16531,9 @@ impl Host {
         }
         Ok(false)
     }
-    fn cell_view_uncached(&self, cell: usize) -> Result<Value> {
+    // Test-only compatibility oracle; production never rescans attribution.
+    #[cfg(test)]
+    fn legacy_cell_view(&self, cell: usize) -> Result<Value> {
         if cell == 0 {
             return Err("cell numbers start at 1".into());
         }
@@ -9782,8 +16928,15 @@ impl Host {
                 _ => {}
             }
         }
-        let mut view = cells.remove(&cell).ok_or("cell does not exist")?;
-        let running = active.contains(&cell);
+        let view = cells.remove(&cell).ok_or("cell does not exist")?;
+        self.render_cell_view(cell, view, active.contains(&cell))
+    }
+    fn render_cell_view(
+        &self,
+        cell: usize,
+        mut view: CellJournalView,
+        running: bool,
+    ) -> Result<Value> {
         let mut result = json!({"cell":cell,"parent_cell":view.start["parent_cell"],"language":view.start["language"],
             "operation":view.start["operation"],"status":if running{"running"}else{"unknown"},"complete":false,
             "source_ref":format!("H.code[{cell}]"),"code_ref":format!("H.code[{cell}]"),"context_ids":view.context_ids,
@@ -9894,40 +17047,8 @@ impl Host {
         Ok(result)
     }
     fn history_value(&self, name: &str, index: usize) -> Result<Value> {
-        if name == "events" {
-            return self.journal.event(index);
-        }
-        let value = self
-            .history
-            .get(name)
-            .and_then(|v| v.get(index))
-            .ok_or("history index missing")?;
-        if let Some(seq) = value["$event"].as_u64() {
-            let ev = self.journal.event(seq as usize)?;
-            let p = &ev["payload"];
-            return Ok(match name {
-                "code" => p["source"].clone(),
-                "user" | "stdin" | "say" => p["text"].clone(),
-                _ => p.clone(),
-            });
-        }
-        if let Some(chunks) = value["$chunks"].as_array() {
-            let mut bytes = Vec::new();
-            for chunk in chunks {
-                let ev = self
-                    .journal
-                    .event(chunk.as_u64().ok_or("invalid chunk")? as usize)?;
-                bytes.extend(
-                    B64.decode(
-                        ev["payload"]["base64"]
-                            .as_str()
-                            .ok_or("missing stream bytes")?,
-                    )?,
-                );
-            }
-            return Ok(json!(String::from_utf8_lossy(&bytes)));
-        }
-        Ok(value.clone())
+        self.history
+            .value(RecordCollection::decode(name)?, index, &self.journal)
     }
 }
 
@@ -9989,7 +17110,7 @@ fn write_private_json(path: &Path, value: &Value) -> Result<()> {
     File::open(path.parent().ok_or("missing directory")?)?.sync_all()?;
     Ok(())
 }
-impl Host {
+impl ProviderClient {
     fn credential(&self, provider: &str, env: &str) -> String {
         let stored = &self.auth[provider];
         stored["key"]
@@ -9999,19 +17120,14 @@ impl Host {
             .map(str::to_string)
             .unwrap_or_else(|| std::env::var(env).unwrap_or_default())
     }
+}
+impl Host {
     fn configure(&mut self) -> Result<()> {
-        if let Some(model) = self.config["model"].as_str() {
-            self.model = model.into();
-        }
-        if let Ok(model) = std::env::var("PY_MODEL") {
-            self.model = model;
-        }
-        if let Some(effort) = self.config["effort"].as_str() {
-            self.effort = effort.into();
-        }
-        self.set_model(self.model.clone())?;
-        Ok(())
+        let model = self.provider.configure_selection();
+        self.set_model(model)
     }
+}
+impl ProviderClient {
     fn model_limit(&self, model: &str) -> Result<usize> {
         let canonical = model
             .split_once('/')
@@ -10030,22 +17146,26 @@ impl Host {
         }
         Ok(limit)
     }
+}
+impl Host {
+    fn model_limit(&self, model: &str) -> Result<usize> {
+        self.provider.model_limit(model)
+    }
     fn set_model(&mut self, model: String) -> Result<()> {
         let limit = self.model_limit(&model)?;
-        if self.startup_ready {
+        if self.execution.ready() {
             self.check_model_system_budget(&model, limit)?;
         }
-        self.context_limit = limit;
-        self.model = model;
+        self.provider.set_session_model(model, limit);
         Ok(())
     }
     fn status(&self) -> Value {
-        json!({"state":self.state.label(),"cells":self.cells,"active_cell":self.active_cell,
-        "model":self.model,"effort":self.effort,
-        "context_usage":self.context_usage(),"usage":self.usage,"queue_depth":self.pending.len(),
-        "worker_generation":self.generation,"startup_ready":self.startup_ready,"session":self.journal.path,
-        "background_tasks":self.bg_tasks.len(),"active_background_tasks":self.bg_tasks.values().filter(|t|t.child.is_some()).count(),
-        "pending_wakeups":self.wakeups.values().filter(|w|matches!(w.metadata["state"].as_str(),Some("scheduled"|"ready"|"pending_confirmation"))).count()})
+        json!({"state":self.frontend.state().label(),"cells":self.execution.cells(),"active_cell":self.execution.cell(),
+        "model":self.provider.model,"effort":self.provider.effort,
+        "context_usage":self.context_usage(),"usage":self.provider.usage,"queue_depth":self.pending.len(),
+        "worker_generation":self.execution.generation(),"startup_ready":self.execution.ready(),"session":self.journal.path,
+        "background_tasks":self.scheduler.task_count(),"active_background_tasks":self.scheduler.active_count(),
+        "pending_wakeups":self.scheduler.pending_count()})
     }
 }
 const CATALOG: &str = r####"[{"id":"anthropic/claude-haiku-4-5","name":"Claude Haiku 4.5 (latest)","provider":"anthropic","base_url":"https://api.anthropic.com","api":"anthropic-messages","context_limit":200000,"max_tokens":64000,"image_input":true,"reasoning":true,"image_output":false},{"id":"anthropic/claude-opus-4-6","name":"Claude Opus 4.6","provider":"anthropic","base_url":"https://api.anthropic.com","api":"anthropic-messages","context_limit":200000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"anthropic/claude-sonnet-4-6","name":"Claude Sonnet 4.6","provider":"anthropic","base_url":"https://api.anthropic.com","api":"anthropic-messages","context_limit":200000,"max_tokens":64000,"image_input":true,"reasoning":true,"image_output":false},{"id":"cerebras/gpt-oss-120b","name":"GPT OSS 120B","provider":"cerebras","base_url":"https://api.cerebras.ai/v1","api":"openai-completions","context_limit":131072,"max_tokens":32768,"image_input":false,"reasoning":true,"image_output":false},{"id":"google/gemini-2.5-flash","name":"Gemini 2.5 Flash","provider":"google","base_url":"https://generativelanguage.googleapis.com/v1beta","api":"google-generative-ai","context_limit":1048576,"max_tokens":65536,"image_input":true,"reasoning":true,"image_output":false},{"id":"google/gemini-2.5-pro","name":"Gemini 2.5 Pro","provider":"google","base_url":"https://generativelanguage.googleapis.com/v1beta","api":"google-generative-ai","context_limit":1048576,"max_tokens":65536,"image_input":true,"reasoning":true,"image_output":false},{"id":"google/gemini-3-pro-preview","name":"Gemini 3 Pro Preview","provider":"google","base_url":"https://generativelanguage.googleapis.com/v1beta","api":"google-generative-ai","context_limit":1000000,"max_tokens":64000,"image_input":true,"reasoning":true,"image_output":false},{"id":"groq/llama-3.3-70b-versatile","name":"Llama 3.3 70B Versatile","provider":"groq","base_url":"https://api.groq.com/openai/v1","api":"openai-completions","context_limit":131072,"max_tokens":32768,"image_input":false,"reasoning":false,"image_output":false},{"id":"mistral/mistral-large-latest","name":"Mistral Large","provider":"mistral","base_url":"https://api.mistral.ai/v1","api":"openai-completions","context_limit":262144,"max_tokens":262144,"image_input":true,"reasoning":false,"image_output":false},{"id":"openai/gpt-4.1","name":"GPT-4.1","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":1047576,"max_tokens":32768,"image_input":true,"reasoning":false,"image_output":false},{"id":"openai/gpt-4o","name":"GPT-4o","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":128000,"max_tokens":16384,"image_input":true,"reasoning":false,"image_output":false},{"id":"openai/gpt-5","name":"GPT-5","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":400000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"openai/gpt-5.2","name":"GPT-5.2","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":400000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"openai/o3","name":"o3","provider":"openai","base_url":"https://api.openai.com/v1","api":"openai-responses","context_limit":200000,"max_tokens":100000,"image_input":true,"reasoning":true,"image_output":false},{"id":"openrouter/anthropic/claude-sonnet-4.6","name":"Anthropic: Claude Sonnet 4.6","provider":"openrouter","base_url":"https://openrouter.ai/api/v1","api":"openai-completions","context_limit":1000000,"max_tokens":128000,"image_input":true,"reasoning":true,"image_output":false},{"id":"xai/grok-4","name":"Grok 4","provider":"xai","base_url":"https://api.x.ai/v1","api":"openai-completions","context_limit":256000,"max_tokens":64000,"image_input":false,"reasoning":true,"image_output":false},{"id":"zai/glm-4.7","name":"GLM-4.7","provider":"zai","base_url":"https://api.z.ai/api/coding/paas/v4","api":"openai-completions","context_limit":204800,"max_tokens":131072,"image_input":false,"reasoning":true,"image_output":false},{"id":"openai/gpt-image-1","provider":"openai","name":"GPT Image 1","api":"image-generation","image_input":true,"image_output":true,"context_limit":128000}]"####;
@@ -10075,7 +17195,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-impl Host {
+impl ProviderClient {
     fn auth_status(&self) -> Value {
         json!(self
             .login_providers()
@@ -10120,6 +17240,11 @@ impl Host {
             })
             .collect::<Vec<_>>())
     }
+}
+impl Host {
+    fn auth_status(&self) -> Value {
+        self.provider.auth_status()
+    }
     fn key_login(&mut self, provider: &str, key: &str) -> Result<()> {
         self.with_state(UiState::Login, None, |host| {
             host.key_login_inner(provider, key)
@@ -10141,12 +17266,12 @@ impl Host {
     fn select_model_after_login(&mut self, provider: &str) {
         // Login must never disguise selection failures as authentication failures,
         // override a usable model, or write a global model default.
-        let cancel_revision = self.cancel_revision;
+        let cancel_revision = self.execution.cancel_revision();
         self.maybe_refresh_model_catalog(provider);
-        if self.cancel_revision != cancel_revision {
+        if self.execution.cancel_revision() != cancel_revision {
             return;
         }
-        if self.provider_config(&self.model).is_ok() {
+        if self.provider_config(&self.provider.model).is_ok() {
             return;
         }
         let models = self.models();
@@ -10157,7 +17282,7 @@ impl Host {
             .filter(|m| {
                 m["provider"] == provider
                     && m["ready"] == true
-                    && m["image_output"] != true
+                    && !ModelCapabilities::decode(m).image_output
                     && m["deprecated"] != true
                     && (m["catalog_listed"] != false || m["user_declared"] == true)
             })
@@ -10329,12 +17454,17 @@ impl Host {
     }
     fn refresh_copilot(&mut self) -> Result<()> {
         let _lock = self.auth_lock()?;
-        self.auth = load_json(&self.home.join("auth.json"))?;
-        let refresh = self.auth["github-copilot"]["refresh"]
+        self.provider
+            .accept_auth(load_json(&self.home.join("auth.json"))?);
+        let refresh = self.provider.auth["github-copilot"]["refresh"]
             .as_str()
             .ok_or("Copilot login required")?
             .to_string();
-        if self.auth["github-copilot"]["expires"].as_u64().unwrap_or(0) > now_ms() as u64 + 60000 {
+        if self.provider.auth["github-copilot"]["expires"]
+            .as_u64()
+            .unwrap_or(0)
+            > now_ms() as u64 + 60000
+        {
             return Ok(());
         }
         let url = std::env::var("PY_COPILOT_TOKEN_URL")
@@ -10353,9 +17483,12 @@ impl Host {
             .as_u64()
             .ok_or("Copilot exchange missing expiry")?
             * 1000;
-        self.auth["github-copilot"] = json!({"type":"oauth","refresh":refresh,"access":access,
-            "expires":expires,"base_url":body["endpoints"]["api"]});
-        write_private_json(&self.home.join("auth.json"), &self.auth)
+        self.provider.accept_credential(
+            "github-copilot",
+            json!({"type":"oauth","refresh":refresh,"access":access,
+            "expires":expires,"base_url":body["endpoints"]["api"]}),
+        );
+        write_private_json(&self.home.join("auth.json"), &self.provider.auth)
     }
 }
 
@@ -10413,109 +17546,20 @@ fn validate_image(data: &str) -> Result<(&'static str, usize)> {
 
 impl Host {
     fn recovery_status(&self) -> Result<Value> {
-        let mut operations = std::collections::BTreeMap::<String, Value>::new();
-        let mut queues = std::collections::BTreeMap::<String, Value>::new();
-        let mut streams = std::collections::BTreeMap::<(String, String, usize), Value>::new();
-        for sequence in 0..self.journal.seq {
-            let event = self.journal.event(sequence)?;
-            let p = &event["payload"];
-            match event["kind"].as_str().unwrap_or("") {
-                "intent" => {
-                    if let Some(id) = p["operation"].as_str() {
-                        operations.insert(
-                            id.into(),
-                            json!({"operation":id,"type":p["type"],
-                            "state":"unknown","replay_allowed":false,"intent_event":sequence}),
-                        );
-                    }
-                }
-                "completion" | "shell_completion" | "operation_complete" | "task_settled"
-                | "provider_cancelled" => {
-                    if let Some(id) = p["operation"].as_str().or(p["command_id"].as_str()) {
-                        if let Some(op) = operations.get_mut(id) {
-                            op["state"] = json!(if p["stdout"]["complete"] == false
-                                || p["status"] == "worker_crashed"
-                            {
-                                "unknown"
-                            } else if event["kind"] == "provider_cancelled" {
-                                "cancelled"
-                            } else {
-                                "completed"
-                            });
-                            op["completion_event"] = json!(sequence);
-                        }
-                    }
-                }
-                "stream" => {
-                    let id = p["operation"].as_str().ok_or("stream operation missing")?;
-                    let name = p["collection"]
-                        .as_str()
-                        .ok_or("stream collection missing")?;
-                    let index = p["index"].as_u64().ok_or("stream index missing")? as usize;
-                    let stream=streams.entry((id.into(),name.into(),index)).or_insert_with(||
-                        json!({"operation":id,"collection":name,"index":index,"complete":false,"chunks":0}));
-                    stream["chunks"] = json!(stream["chunks"].as_u64().unwrap_or(0) + 1);
-                }
-                "queue_arrival" => {
-                    if let Some(id) = p["command_id"].as_str() {
-                        queues.insert(
-                            id.into(),
-                            json!({"command_id":id,"command":p["command"],
-                            "user_index":p["user_index"],"state":"pending","auto_dispatch":false}),
-                        );
-                    }
-                }
-                "queue_delivered" | "queue_dispatched" | "queue_restored" | "queue_cancelled" => {
-                    if let Some(queue) = p["command_id"].as_str().and_then(|id| queues.get_mut(id))
-                    {
-                        queue["state"] = json!(event["kind"]
-                            .as_str()
-                            .unwrap()
-                            .strip_prefix("queue_")
-                            .unwrap());
-                    }
-                }
-                "stream_complete" | "stream_closed" => {
-                    let key = (
-                        p["operation"]
-                            .as_str()
-                            .ok_or("stream operation missing")?
-                            .into(),
-                        p["collection"]
-                            .as_str()
-                            .ok_or("stream collection missing")?
-                            .into(),
-                        p["metadata"]["index"]
-                            .as_u64()
-                            .ok_or("stream index missing")? as usize,
-                    );
-                    if let Some(stream) = streams.get_mut(&key) {
-                        stream["complete"] = p["metadata"]["complete"].clone();
-                        stream["counts"] = p["metadata"].clone();
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(
-            json!({"operations":operations.into_values().collect::<Vec<_>>(),
-            "streams":streams.into_values().collect::<Vec<_>>(),
-            "queues":queues.into_values().collect::<Vec<_>>(),
-            "policy":"Unknown outcome is never permission to replay. Fresh Python; captured chunks only."}),
-        )
+        self.journal.recovery_index.snapshot()
     }
 }
 
 impl Host {
-    fn queue_arrival(&mut self, command: Value) -> Result<()> {
-        if self.route_busy_command(command.clone(), false)? {
+    fn queue_arrival(&mut self, command: NativeCommand) -> Result<()> {
+        if self.route_busy_command(command.clone())? {
             return Ok(());
         }
-        if command["kind"] == "stdin_reply" {
+        if command.kind == NativeCommandKind::StdinReply {
             self.pending.push_back(command);
             return Ok(());
         }
-        let id = command["id"].as_str().unwrap_or("").to_string();
+        let id = command.id.clone();
         if id.is_empty() || self.ids.contains(&id) {
             self.event(
                 "rejected",
@@ -10523,16 +17567,11 @@ impl Host {
             );
             return Ok(());
         }
-        let recorded = redacted_command(command.clone())?;
+        let recorded = command.recorded()?;
         self.journal
             .append("accepted", json!({"command_id":id,"command":recorded}))?;
         self.ids.insert(id.clone());
-        let text = match command["kind"].as_str() {
-            Some("submit") => command["text"].as_str(),
-            Some("python") => command["source"].as_str(),
-            Some("shell") => command["command"].as_str(),
-            _ => None,
-        };
+        let text = command.user_text();
         let record = if let Some(text) = text {
             let sequence = self.journal.seq;
             Some((self.user(text, false)?, sequence))
@@ -10546,8 +17585,8 @@ impl Host {
         )?;
         self.queued.insert(id.clone(), record);
         let queued = json!({"command_id":id,"queue_depth":self.pending.len()+1,
-            "mode":command["mode"].as_str().unwrap_or("steering"),
-            "text":if command["kind"]=="submit"{command["text"].clone()}else{Value::Null}});
+            "mode":command.mode.label(),
+            "text":if command.kind==NativeCommandKind::Submit{command.user_text().map_or(Value::Null,|text|json!(text))}else{Value::Null}});
         self.pending.push_back(command);
         self.event("queued", queued);
         Ok(())
@@ -10556,76 +17595,23 @@ impl Host {
     // provenance proves the full original. Explicit reads and summaries are not
     // user routing; never strip suffixes heuristically or revive retired items.
     fn restore_full_user_context(&mut self, users: &[(usize, usize)]) -> Result<()> {
-        let mut next = self.context.clone();
-        let mut restored = Vec::new();
-        let mut ambiguous = Vec::new();
-        for item in &mut next {
-            if item.role != "user" || item.output || item.raw_index.is_some() {
-                continue;
-            }
-            // A real user can deliberately type a footer-looking string. If
-            // its own selected provenance already proves that exact full text,
-            // it is not a legacy projection and must not even be warned about.
-            if users.iter().any(|&(sequence, index)| {
-                item.ranges
-                    .iter()
-                    .any(|&(start, stop)| start <= sequence && sequence < stop)
-                    && self.history["user"].get(index).and_then(Value::as_str)
-                        == Some(item.text.as_str())
-            }) {
-                continue;
-            }
-            let mut candidates = Vec::new();
-            let mut known_legacy = false;
-            for &(sequence, index) in users {
-                let Some(full) = self.history["user"].get(index).and_then(Value::as_str) else {
-                    continue;
-                };
-                if item.text == full {
-                    continue;
-                }
-                let prefix: String = full.chars().take(8000).collect();
-                let count = full.chars().count();
-                let suffix = format!(
-                    "{} chars; {} lines; omitted {} chars;",
-                    count,
-                    full.lines().count(),
-                    count.saturating_sub(8000)
-                );
-                let recognized = ["H.records.user", "H.user"]
-                    .iter()
-                    .any(|archive| item.text == format!("{prefix}\n[{suffix} {archive}[{index}]]"));
-                if !recognized {
-                    continue;
-                }
-                known_legacy = true;
-                if item
-                    .ranges
-                    .iter()
-                    .any(|&(start, stop)| start <= sequence && sequence < stop)
-                {
-                    candidates.push((index, full.to_owned()));
-                }
-            }
-            match candidates.as_slice() {
-                [(index, full)] => {
-                    item.text = full.clone();
-                    restored.push(json!({"context_id":item.id,"user_record_index":index}));
-                }
-                [] if !known_legacy => {}
-                _ => ambiguous.push(item.id.clone()),
-            }
+        let originals = users
+            .iter()
+            .filter_map(|&(sequence, index)| {
+                self.history
+                    .literal_text(RecordCollection::User, index)
+                    .map(|text| UserOriginal {
+                        sequence,
+                        index,
+                        text,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let upgrade = self.context.prepare_full_users(&originals)?;
+        if let Some(transition) = upgrade.transition {
+            self.context.persist(&mut self.journal, transition)?;
         }
-        if !restored.is_empty() {
-            let revision = self
-                .revision
-                .checked_add(1)
-                .ok_or("context revision exhausted")?;
-            self.journal.append("context_replace", json!({
-                "reason":"user_messages_full","items":next.iter().map(item_json).collect::<Vec<_>>(),"restored":restored}))?;
-            self.context = next;
-            self.revision = revision;
-        }
+        let ambiguous = upgrade.ambiguous;
         if !ambiguous.is_empty() {
             self.event("notice", json!({"text":format!(
                 "Legacy user context has missing or ambiguous provenance for {}. Its text was not guessed or altered; inspect /save and explicitly correct it or start /new.", ambiguous.join(", "))}));
@@ -10648,20 +17634,11 @@ impl Host {
 mod full_user_context_tests {
     use super::*;
 
-    fn host() -> Host {
-        let home = std::env::temp_dir().join(format!(
-            "py-full-user-{}-{}-{}",
-            std::process::id(),
-            now_ms(),
-            unique_id()
-        ));
-        fs::create_dir(&home).unwrap();
-        fs::write(
-            home.join("config.json"),
-            json!({"skills":{"enabled":false}}).to_string(),
+    fn host() -> crate::test_support::HostFixture {
+        crate::test_support::HostFixture::named(
+            "py-full-user",
+            Some(json!({"skills":{"enabled":false}})),
         )
-        .unwrap();
-        Host::new(home, None, true, true, None, None).unwrap()
     }
     fn legacy_user(host: &mut Host, full: &str, archive: &str) -> (usize, usize, String) {
         let sequence = host.journal.seq;
@@ -10680,25 +17657,33 @@ mod full_user_context_tests {
     }
     #[test]
     fn legacy_user_migration_is_durable_full_and_does_not_revive_retired_items() {
-        let mut original = host();
+        let mut fixture = host();
+        let mut original = fixture.take_host();
         original
             .execute("once", "original_only_variable=123", false)
             .unwrap();
         let full = format!("{}\nretained-unicode-tail-🙂", "λ\n".repeat(6000));
         let (_, _, active_id) = legacy_user(&mut original, &full, "H.records.user");
         let (_, _, retired_id) = legacy_user(&mut original, "retired-user", "H.user");
-        original.context.retain(|item| item.id != retired_id);
+        let kept = original
+            .context
+            .items()
+            .iter()
+            .filter(|item| item.id != retired_id)
+            .cloned()
+            .collect();
+        let transition = original
+            .context
+            .prepare_replace(kept, json!({"reason":"fixture_retire"}))
+            .unwrap();
         original
-            .journal
-            .append(
-                "context_replace",
-                json!({"reason":"fixture_retire",
-            "items":original.context.iter().map(item_json).collect::<Vec<_>>() }),
-            )
+            .context
+            .persist(&mut original.journal, transition)
             .unwrap();
         let before_sequence = original.journal.seq;
         let before_ranges = original
             .context
+            .items()
             .iter()
             .find(|item| item.id == active_id)
             .unwrap()
@@ -10711,12 +17696,17 @@ mod full_user_context_tests {
             Host::new(home.clone(), Some(journal.clone()), true, true, None, None).unwrap();
         let active = resumed
             .context
+            .items()
             .iter()
             .find(|item| item.id == active_id)
             .unwrap();
         assert_eq!(active.text, full);
         assert_eq!(active.ranges, before_ranges);
-        assert!(!resumed.context.iter().any(|item| item.id == retired_id));
+        assert!(!resumed
+            .context
+            .items()
+            .iter()
+            .any(|item| item.id == retired_id));
         let migration = (before_sequence..resumed.journal.seq)
             .map(|seq| resumed.journal.event(seq).unwrap())
             .find(|event| {
@@ -10757,6 +17747,7 @@ mod full_user_context_tests {
         assert_eq!(
             again
                 .context
+                .items()
                 .iter()
                 .find(|item| item.id == active_id)
                 .unwrap()
@@ -10780,6 +17771,7 @@ mod full_user_context_tests {
         let (sequence, index, legacy_id) = legacy_user(&mut host, "original", "H.user");
         let legacy = host
             .context
+            .items()
             .iter()
             .find(|item| item.id == legacy_id)
             .unwrap()
@@ -10787,7 +17779,7 @@ mod full_user_context_tests {
             .clone();
         let literal_sequence = host.journal.seq;
         let literal_index = host.user(&legacy, true).unwrap();
-        let literal_id = host.context.last().unwrap().id.clone();
+        let literal_id = host.context.items().last().unwrap().id.clone();
         let read_id = host
             .add_context("user", legacy.clone(), true, vec![(sequence, sequence + 1)])
             .unwrap();
@@ -10806,6 +17798,7 @@ mod full_user_context_tests {
             .unwrap();
         assert_eq!(
             host.context
+                .items()
                 .iter()
                 .find(|item| item.id == legacy_id)
                 .unwrap()
@@ -10814,7 +17807,12 @@ mod full_user_context_tests {
         );
         for id in [literal_id, read_id, summary_id, unproven_id] {
             assert_eq!(
-                host.context.iter().find(|item| item.id == id).unwrap().text,
+                host.context
+                    .items()
+                    .iter()
+                    .find(|item| item.id == id)
+                    .unwrap()
+                    .text,
                 legacy
             );
         }
@@ -10825,21 +17823,27 @@ mod full_user_context_tests {
         let (sequence, index, id) = legacy_user(&mut host, &"X".repeat(12000), "H.records.user");
         let before = host
             .context
+            .items()
             .iter()
             .find(|item| item.id == id)
             .unwrap()
             .text
             .clone();
-        let revision = host.revision;
+        let revision = host.context.revision();
         host.journal.failed = true;
         assert!(host
             .restore_full_user_context(&[(sequence, index)])
             .is_err());
         assert_eq!(
-            host.context.iter().find(|item| item.id == id).unwrap().text,
+            host.context
+                .items()
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap()
+                .text,
             before
         );
-        assert_eq!(host.revision, revision);
+        assert_eq!(host.context.revision(), revision);
     }
 }
 
@@ -11841,7 +18845,8 @@ impl Host {
     }
     fn reload_auth(&mut self) -> Result<()> {
         let _lock = self.auth_lock()?;
-        self.auth = load_json(&self.home.join("auth.json"))?;
+        self.provider
+            .accept_auth(load_json(&self.home.join("auth.json"))?);
         Ok(())
     }
     fn store_credential(&mut self, provider: &str, credential: Option<Value>) -> Result<()> {
@@ -11869,63 +18874,20 @@ impl Host {
         // Successful atomic write is the commit boundary. Cancellation arriving
         // after this checkpoint cannot promise rollback of an already-saved login.
         write_private_json(&path, &auth)?;
-        self.auth = auth;
+        self.provider.accept_auth(auth);
         Ok(())
     }
     fn codex_cancel(&mut self, operation: &str) -> Result<bool> {
-        self.service_background()?;
-        let mut cancel = INTERRUPT.swap(false, std::sync::atomic::Ordering::SeqCst);
-        loop {
-            let command = match self.incoming.as_ref().map(|r| r.try_recv()) {
-                Some(Ok(v)) => v,
-                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                    self.input_closed = true;
-                    break;
-                }
-                _ => break,
-            };
-            if command["kind"] == "interrupt" {
-                if self.accept_input_control(&command)? {
-                    self.event(
-                        "completed",
-                        json!({"command_id":command["id"],"status":"ok"}),
-                    );
-                    cancel = true;
-                }
-            } else if !self.background_control(&command)? {
-                self.queue_arrival(command)?;
-            }
-        }
-        if cancel {
-            self.journal.append(
-                "provider_cancelled",
-                json!({"operation":operation,"billing":"unknown"}),
-            )?;
-            self.cancel_revision = self.cancel_revision.wrapping_add(1);
-        }
-        Ok(cancel)
+        Ok(self
+            .pump_control(WaitPolicy::Provider { operation })?
+            .cancelled)
     }
     fn codex_wait<T>(
         &mut self,
         future: impl std::future::Future<Output = Result<T>>,
         operation: &str,
     ) -> Result<T> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(async {
-            tokio::pin!(future);
-            loop {
-                if self.codex_cancel(operation)? {
-                    return Err("Codex operation cancelled; request outcome may be unknown".into());
-                }
-                self.supersede_pending_codex_retry(operation)?;
-                tokio::select! {
-                    response=&mut future=>return response,
-                    _=tokio::time::sleep(std::time::Duration::from_millis(15))=>{}
-                }
-            }
-        })
+        ProviderClient::wait_codex(future, operation, self)
     }
     fn codex_http(&mut self, request: reqwest::RequestBuilder) -> Result<(u16, Value)> {
         self.codex_wait(
@@ -12084,8 +19046,9 @@ impl Host {
     fn refresh_codex(&mut self) -> Result<()> {
         // Lock spans reload/check/exchange/write: rotating refresh tokens are used once.
         let _lock = self.auth_lock()?;
-        self.auth = load_json(&self.home.join("auth.json"))?;
-        let credential = &self.auth["openai-codex"];
+        self.provider
+            .accept_auth(load_json(&self.home.join("auth.json"))?);
+        let credential = &self.provider.auth["openai-codex"];
         let refresh = oauth_token(credential, "refresh")
             .map_err(|_| "Codex stored credential invalid; /login codex again")?
             .to_string();
@@ -12120,11 +19083,154 @@ impl Host {
             );
         }
         let next = codex_token_value(&body)?;
-        let mut auth = self.auth.clone();
+        let mut auth = self.provider.auth.clone();
         auth["openai-codex"] = next;
         write_private_json(&self.home.join("auth.json"), &auth)?;
-        self.auth = auth;
+        self.provider.accept_auth(auth);
         Ok(())
+    }
+}
+impl ProviderClient {
+    fn text_request(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        key: &str,
+        id: &str,
+        messages: Vec<Value>,
+        api: &ApiKind,
+        fields: &Value,
+        max: usize,
+        session_id: &str,
+        codex: bool,
+        anthropic_oauth: bool,
+    ) -> Result<reqwest::RequestBuilder> {
+        Ok(if codex {
+            self.codex_request(client, url, key, id, &messages, session_id)?
+        } else if *api == ApiKind::Responses {
+            let mut input = messages.clone();
+            for message in &mut input {
+                if let Some(parts) = message["content"].as_array_mut() {
+                    for part in parts {
+                        match part["type"].as_str() {
+                            Some("text") => part["type"] = json!("input_text"),
+                            Some("image_url") => {
+                                let url = part["image_url"]["url"].clone();
+                                *part = json!({"type":"input_image","image_url":url});
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let mut body = json!({"model":id,"input":input,"max_output_tokens":max,"store":false});
+            merge_reasoning_fields(&mut body, fields);
+            client
+                .post(format!("{url}/responses"))
+                .bearer_auth(key)
+                .json(&body)
+        } else if *api == ApiKind::Anthropic {
+            let system = messages
+                .iter()
+                .filter(|m| m["role"] == "system")
+                .filter_map(|m| m["content"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut msgs: Vec<_> = messages
+                .into_iter()
+                .filter(|m| m["role"] != "system")
+                .collect();
+            for message in &mut msgs {
+                if let Some(parts) = message["content"].as_array_mut() {
+                    for part in parts {
+                        if part["type"] == "image_url" {
+                            let url = part["image_url"]["url"]
+                                .as_str()
+                                .ok_or("image URL missing")?;
+                            let (mime, data) = image_data_url(url)?;
+                            *part = json!({"type":"image","source":{"type":"base64","media_type":mime,"data":data}});
+                        }
+                    }
+                }
+            }
+            let mut body = json!({"model":id,"system":system,"messages":msgs,"max_tokens":max});
+            merge_reasoning_fields(&mut body, fields);
+            let mut request = client
+                .post(format!("{url}/messages"))
+                .header("anthropic-version", "2023-06-01");
+            if anthropic_oauth {
+                // Subscription compatibility changes the wire, not stored context.
+                body["system"] = json!([
+                    {"type":"text","text":ANTHROPIC_OAUTH_SYSTEM},
+                    {"type":"text","text":system}
+                ]);
+                let mut beta =
+                    "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14"
+                        .to_string();
+                if body.get("thinking").is_some() {
+                    beta.push_str(",interleaved-thinking-2025-05-14");
+                }
+                request = request
+                    .bearer_auth(key)
+                    .header("anthropic-beta", beta)
+                    .header("x-app", "cli")
+                    .header(
+                        "User-Agent",
+                        "claude-cli/2.1.2 (external, cli) py-rust/0.1.0",
+                    )
+                    .header("Accept", "application/json");
+            } else {
+                request = request.header("x-api-key", key);
+                if body.get("thinking").is_some() {
+                    request = request.header("anthropic-beta", "interleaved-thinking-2025-05-14");
+                }
+            }
+            request.json(&body)
+        } else if *api == ApiKind::Google {
+            let system = messages
+                .iter()
+                .filter(|m| m["role"] == "system")
+                .filter_map(|m| m["content"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut contents = Vec::new();
+            for message in messages.iter().filter(|m| m["role"] != "system") {
+                let mut parts = Vec::new();
+                if let Some(text) = message["content"].as_str() {
+                    parts.push(json!({"text":text}));
+                } else if let Some(items) = message["content"].as_array() {
+                    for item in items {
+                        if item["type"] == "text" {
+                            parts.push(json!({"text":item["text"]}));
+                        } else if item["type"] == "image_url" {
+                            let (mime, data) = image_data_url(
+                                item["image_url"]["url"]
+                                    .as_str()
+                                    .ok_or("image URL missing")?,
+                            )?;
+                            parts.push(json!({"inlineData":{"mimeType":mime,"data":data}}));
+                        }
+                    }
+                }
+                contents.push(json!({"role":if message["role"]=="assistant"{"model"}else{"user"},"parts":parts}));
+            }
+            let mut body = json!({"contents":contents,"systemInstruction":{"parts":[{"text":system}]},
+                "generationConfig":{"maxOutputTokens":max}});
+            if let Some(config) = fields.get("thinkingConfig") {
+                body["generationConfig"]["thinkingConfig"] = config.clone();
+            }
+            client
+                .post(format!("{url}/models/{id}:generateContent"))
+                .header("x-goog-api-key", key)
+                .json(&body)
+        } else {
+            let mut body = json!({"model":id,"messages":messages,"max_tokens":max});
+            merge_reasoning_fields(&mut body, fields);
+            client
+                .post(format!("{url}/chat/completions"))
+                .bearer_auth(key)
+                .json(&body)
+        })
     }
     fn codex_request(
         &self,
@@ -12133,6 +19239,7 @@ impl Host {
         key: &str,
         id: &str,
         messages: &[Value],
+        session_id: &str,
     ) -> Result<reqwest::RequestBuilder> {
         let mut instructions = Vec::new();
         let mut input = Vec::new();
@@ -12188,7 +19295,7 @@ impl Host {
             }
             input.push(item);
         }
-        let session = self.journal.session_id.as_str();
+        let session = session_id;
         let mut body = json!({"model":id,"store":false,"stream":true,"instructions":instructions.join("\n"),"input":input,
             "text":{"verbosity":"medium"},"include":["reasoning.encrypted_content"],"prompt_cache_key":session});
         let effort = self.effort.as_str();
@@ -12228,17 +19335,28 @@ impl Host {
             .header("x-client-request-id", session)
             .json(&body))
     }
+}
+impl Host {
+    #[cfg(test)]
+    fn codex_request(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        key: &str,
+        id: &str,
+        messages: &[Value],
+    ) -> Result<reqwest::RequestBuilder> {
+        self.provider
+            .codex_request(client, url, key, id, messages, &self.journal.session_id)
+    }
     fn supersede_pending_codex_retry(&mut self, operation: &str) -> Result<()> {
         if self
-            .provider_retry
-            .as_ref()
+            .provider
+            .retry_snapshot()
             .is_some_and(|retry| retry.operation == operation && retry.waiting_delay_ms.is_some())
             && self.agent_turn
-            && self.active_cell.is_none()
-            && self.pending.iter().any(|command| {
-                command["kind"] == "submit"
-                    && command["mode"].as_str().unwrap_or("steering") == "steering"
-            })
+            && self.execution.cell().is_none()
+            && self.pending.iter().any(NativeCommand::steering)
         {
             self.journal.append(
                 "provider_retry_superseded",
@@ -12247,14 +19365,6 @@ impl Host {
             return Err(RetrySuperseded.into());
         }
         Ok(())
-    }
-    fn codex_retry_limit(&self) -> Result<u64> {
-        let Some(value) = self.config["providers"]["openai-codex"].get("request_retries") else {
-            return Ok(2);
-        };
-        value.as_u64().filter(|limit| *limit <= 5).ok_or_else(|| {
-            "providers.openai-codex.request_retries must be an integer from 0 to 5".into()
-        })
     }
     fn mark_codex_billing_unknown(&mut self) {
         self.mark_cache_usage_incomplete();
@@ -12265,10 +19375,20 @@ impl Host {
         operation: &str,
         max_retries: u64,
     ) -> Result<Value> {
-        let previous_retry = self.provider_retry.take();
+        let scope = self
+            .provider
+            .begin_request(operation, self.execution.cancel_revision());
         let result = self.codex_sse_retries(&request, operation, max_retries);
-        let changed = self.provider_retry.is_some();
-        self.provider_retry = previous_retry;
+        self.provider.settle_request(
+            operation,
+            if result.is_ok() {
+                ProviderRequestOutcome::Succeeded
+            } else {
+                ProviderRequestOutcome::Failed
+            },
+        );
+        let changed = self.provider.retry_snapshot().is_some();
+        drop(scope);
         if changed {
             self.event("state", self.state_payload());
         }
@@ -12280,6 +19400,13 @@ impl Host {
         operation: &str,
         max_retries: u64,
     ) -> Result<Value> {
+        let secrets = self.provider.codex_secrets();
+        let attempts = self.provider.attempts.clone();
+        ProviderClient::retry_codex(request, operation, max_retries, &secrets, attempts, self)
+    }
+}
+impl ProviderClient {
+    fn codex_secrets(&self) -> Vec<String> {
         let mut secrets = Vec::new();
         credential_secret_values(&self.auth, &mut secrets);
         if let Ok((_, key, _)) = self.provider_config("openai-codex/gpt-6.1-sol") {
@@ -12287,74 +19414,93 @@ impl Host {
                 secrets.push(key);
             }
         }
+        secrets
+    }
+    fn retry_codex(
+        request: &reqwest::RequestBuilder,
+        operation: &str,
+        max_retries: u64,
+        secrets: &[String],
+        attempts: ProviderAttempts,
+        control: &mut impl ProviderControl,
+    ) -> Result<Value> {
         for retry in 0..=max_retries {
-            // Cancellation/persistence failures are not transport errors and
-            // never permit another send. The durable attempt precedes dispatch.
-            if self.codex_cancel(operation)? {
+            if control.provider_checkpoint(operation)? {
                 return Err("Codex operation cancelled; request outcome may be unknown".into());
             }
-            self.supersede_pending_codex_retry(operation)?;
-            let attempt_request = request
+            control.provider_retry_checkpoint(operation)?;
+            let request = request
                 .try_clone()
                 .ok_or("Codex request cannot be cloned for retry")?;
-            self.provider_retry = Some(ProviderRetryState {
-                operation: operation.into(),
-                retry,
-                max_retries,
-                waiting_delay_ms: None,
-            });
-            if retry > 0 {
-                self.event("state", self.state_payload());
-            }
-            self.journal.append(
-                "provider_attempt",
-                json!({"operation":operation,"attempt":retry+1,
-                "retry":retry,"max_retries":max_retries,"scope":"provider request only"}),
-            )?;
-            let result = self.codex_wait(codex_sse_once(attempt_request, &secrets), operation);
+            attempts.transition(
+                operation,
+                ProviderAttemptPhase::Sending,
+                Some(ProviderRetryState {
+                    operation: operation.into(),
+                    retry,
+                    max_retries,
+                    waiting_delay_ms: None,
+                }),
+            );
+            // Journal acknowledgement remains outside transport and must precede send.
+            control.provider_attempt_started(operation, retry, max_retries)?;
+            let result = Self::wait_codex(
+                codex_sse_once(request, secrets, attempts.clone(), operation),
+                operation,
+                control,
+            );
             match result {
                 Ok(body) => return Ok(body),
                 Err(error) => {
                     let transient = error.downcast_ref::<RetryableProviderError>();
                     let billing_unknown = transient.is_some_and(|error| error.billing_unknown);
-                    self.journal.append("provider_attempt_failed",json!({"operation":operation,"attempt":retry+1,
-                        "retryable":transient.is_some(),"billing_unknown":billing_unknown,"error":error.to_string()}))?;
-                    if billing_unknown {
-                        self.mark_codex_billing_unknown();
-                    }
+                    control.provider_attempt_failed(
+                        operation,
+                        retry,
+                        transient.is_some(),
+                        billing_unknown,
+                        &error.to_string(),
+                    )?;
                     let Some(transient) = transient else {
                         return Err(error);
                     };
                     if retry == max_retries {
                         let exhausted = if max_retries == 0 {
-                            "automatic retries disabled".to_string()
+                            "automatic retries disabled".to_owned()
                         } else {
                             format!("retry limit exhausted ({} attempts)", max_retries + 1)
                         };
                         return Err(format!("{error}; {exhausted}; previous cell outputs remain available in H.cells").into());
                     }
                     let next_retry = retry + 1;
-                    let base_ms = (500u64 << retry).min(30000);
-                    let delay_ms = base_ms.max(transient.retry_after_ms.unwrap_or(0));
-                    self.journal.append("provider_retry",json!({"operation":operation,"retry":next_retry,
-                        "max_retries":max_retries,"delay_ms":delay_ms,"billing_unknown":billing_unknown,
-                        "reason":transient.reason,"scope":"provider request only"}))?;
-                    self.provider_retry = Some(ProviderRetryState {
-                        operation: operation.into(),
-                        retry: next_retry,
+                    let delay_ms = (500u64 << retry)
+                        .min(30000)
+                        .max(transient.retry_after_ms.unwrap_or(0));
+                    attempts.transition(
+                        operation,
+                        ProviderAttemptPhase::Backoff,
+                        Some(ProviderRetryState {
+                            operation: operation.into(),
+                            retry: next_retry,
+                            max_retries,
+                            waiting_delay_ms: Some(delay_ms),
+                        }),
+                    );
+                    control.provider_retry_scheduled(
+                        operation,
+                        next_retry,
                         max_retries,
-                        waiting_delay_ms: Some(delay_ms),
-                    });
-                    self.event("state", self.state_payload());
-                    // codex_wait continues cancellation, background polling and
-                    // input acceptance. Outer steering can supersede this
-                    // checkpoint; nested calls must finish their existing cell.
-                    self.codex_wait(
+                        delay_ms,
+                        billing_unknown,
+                        &transient.reason,
+                    )?;
+                    Self::wait_codex(
                         async {
                             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                             Ok(())
                         },
                         operation,
+                        control,
                     )?;
                 }
             }
@@ -12458,11 +19604,17 @@ fn codex_rejection_error(
     }
     .into()
 }
-async fn codex_sse_once(request: reqwest::RequestBuilder, secrets: &[String]) -> Result<Value> {
+async fn codex_sse_once(
+    request: reqwest::RequestBuilder,
+    secrets: &[String],
+    attempts: ProviderAttempts,
+    operation: &str,
+) -> Result<Value> {
     let mut response = request
         .send()
         .await
         .map_err(|error| codex_transport_error(error, "Codex provider network error"))?;
+    attempts.transition(operation, ProviderAttemptPhase::Streaming, None);
     let status = response.status();
     if !status.is_success() {
         let retry_after = response
@@ -13364,8 +20516,9 @@ impl Host {
     }
     fn refresh_anthropic(&mut self) -> Result<()> {
         let _lock = self.auth_lock()?;
-        self.auth = load_json(&self.home.join("auth.json"))?;
-        let credential = &self.auth["anthropic"];
+        self.provider
+            .accept_auth(load_json(&self.home.join("auth.json"))?);
+        let credential = &self.provider.auth["anthropic"];
         if credential["type"] != "oauth" {
             return Err(
                 "Anthropic subscription credential changed; retry operation without replaying code"
@@ -13392,13 +20545,13 @@ impl Host {
             .into());
         }
         let next = anthropic_token_value(&body)?;
-        let mut auth = self.auth.clone();
+        let mut auth = self.provider.auth.clone();
         auth["anthropic"] = next;
         if self.codex_cancel("auth")? {
             return Err("Anthropic OAuth refresh cancelled; stored credential unchanged".into());
         }
         write_private_json(&self.home.join("auth.json"), &auth)?;
-        self.auth = auth;
+        self.provider.accept_auth(auth);
         Ok(())
     }
 }
@@ -13500,6 +20653,51 @@ impl BgTask {
             reaped: None,
         })
     }
+    fn prepare(
+        metadata: Value,
+        stdout: Capture,
+        stderr: Capture,
+        dir: PathBuf,
+        timeout: Option<f64>,
+    ) -> Result<Self> {
+        let mut task = Self::from_metadata(metadata)?;
+        task.stdout = Some(stdout);
+        task.stderr = Some(stderr);
+        task.dir = dir;
+        task.deadline = timeout
+            .map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds));
+        Ok(task)
+    }
+    fn launch(&mut self, command: &mut Command) -> io::Result<()> {
+        match command.spawn() {
+            Ok(child) => {
+                self.status = BgTaskStatus::Running;
+                self.metadata["pid"] = json!(child.id());
+                self.child = Some(child);
+                Ok(())
+            }
+            Err(error) => {
+                self.status = BgTaskStatus::Settled(BgTaskOutcome::Failed);
+                Err(error)
+            }
+        }
+    }
+    fn finish_launch_failure(&mut self, io: &mut impl CaptureSink, error: io::Error) -> Result<()> {
+        self.stderr.as_mut().unwrap().commit(
+            io,
+            format!("Background launch failed: {error}\n").as_bytes(),
+        )?;
+        self.metadata["stdout"] = self.stdout.take().unwrap().finish(io, true)?;
+        self.metadata["stderr"] = self.stderr.take().unwrap().finish(io, true)?;
+        for name in ["stdout", "stderr"] {
+            self.metadata[name]
+                .as_object_mut()
+                .unwrap()
+                .remove("preview");
+        }
+        self.metadata["finished_ms"] = json!(now_ms());
+        Ok(())
+    }
     fn snapshot(&self) -> Value {
         debug_assert!(self.metadata.get("status").is_none());
         let mut metadata = self.metadata.clone();
@@ -13565,63 +20763,643 @@ mod background_status_tests {
         }
     }
 }
+#[derive(Clone, Debug, PartialEq)]
+enum WakeupState {
+    Scheduled,
+    Ready,
+    PendingConfirmation,
+    Dispatching,
+    Consumed,
+    Cancelled,
+    OutcomeUnknown,
+    // Preserve unknown historical extension states without assigning effects.
+    Unknown(Value),
+    Missing,
+}
+impl WakeupState {
+    fn parse(value: Value) -> Self {
+        match value.as_str() {
+            Some("scheduled") => Self::Scheduled,
+            Some("ready") => Self::Ready,
+            Some("pending_confirmation") => Self::PendingConfirmation,
+            Some("dispatching") => Self::Dispatching,
+            Some("consumed") => Self::Consumed,
+            Some("cancelled") => Self::Cancelled,
+            Some("outcome_unknown") => Self::OutcomeUnknown,
+            _ => Self::Unknown(value),
+        }
+    }
+    fn value(&self) -> Value {
+        match self {
+            Self::Scheduled => json!("scheduled"),
+            Self::Ready => json!("ready"),
+            Self::PendingConfirmation => json!("pending_confirmation"),
+            Self::Dispatching => json!("dispatching"),
+            Self::Consumed => json!("consumed"),
+            Self::Cancelled => json!("cancelled"),
+            Self::OutcomeUnknown => json!("outcome_unknown"),
+            Self::Unknown(value) => value.clone(),
+            Self::Missing => Value::Null,
+        }
+    }
+    fn pending(&self) -> bool {
+        matches!(
+            self,
+            Self::Scheduled | Self::Ready | Self::PendingConfirmation
+        )
+    }
+}
 struct Wakeup {
     metadata: Value,
+    state: WakeupState,
     deadline: Option<std::time::Instant>,
+}
+impl Wakeup {
+    fn from_metadata(mut metadata: Value, deadline: Option<std::time::Instant>) -> Result<Self> {
+        let object = metadata.as_object_mut().ok_or("invalid wakeup metadata")?;
+        let state = object
+            .remove("state")
+            .map(WakeupState::parse)
+            .unwrap_or(WakeupState::Missing);
+        Ok(Self {
+            metadata,
+            state,
+            deadline,
+        })
+    }
+    fn snapshot(&self) -> Value {
+        let mut metadata = self.metadata.clone();
+        if self.state != WakeupState::Missing {
+            metadata["state"] = self.state.value();
+        }
+        metadata
+    }
+}
+enum TaskKind {
+    Shell,
+    Python,
+}
+impl TaskKind {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Python => "python",
+        }
+    }
+    fn command(&self, source: &str) -> Command {
+        match self {
+            Self::Shell => {
+                let mut command = Command::new("/bin/sh");
+                command.args(["-c", source]);
+                command
+            }
+            Self::Python => {
+                let mut command =
+                    Command::new(std::env::var("PY_PYTHON").unwrap_or_else(|_| "python3".into()));
+                command.args(["-u", "-c", source]);
+                command
+            }
+        }
+    }
+}
+struct TaskLaunch {
+    source: String,
+    kind: TaskKind,
+    name: Option<String>,
+    wakeup_reason: Option<String>,
+    timeout: Option<f64>,
+    cwd: Option<String>,
+    env: Vec<(String, String)>,
+}
+impl TaskLaunch {
+    fn decode(value: &Value) -> Result<Self> {
+        let source = value["source"]
+            .as_str()
+            .ok_or("background source required")?;
+        if source.trim().is_empty() {
+            return Err("background source must not be empty".into());
+        }
+        let kind = match value.get("task_kind").or_else(|| value.get("kind")) {
+            None => TaskKind::Shell,
+            Some(value) => match value.as_str().ok_or("background kind must be a string")? {
+                "shell" => TaskKind::Shell,
+                "python" => TaskKind::Python,
+                _ => return Err("background kind must be shell or python".into()),
+            },
+        };
+        let options = value
+            .get("options")
+            .filter(|option| !option.is_null())
+            .unwrap_or(value);
+        if !options.is_object() {
+            return Err("background options must be an object".into());
+        }
+        let name = bg_text(options, "name", 128)?.map(str::to_owned);
+        let wakeup_reason = bg_text(options, "wakeup_reason", 512)?.map(str::to_owned);
+        let timeout = bg_seconds(&options["timeout"], 604800.0)?;
+        let cwd = match options.get("cwd") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(path)) => Some(path.clone()),
+            _ => return Err("cwd must be a string".into()),
+        };
+        let mut env = Vec::new();
+        if let Some(value) = options.get("env").filter(|value| !value.is_null()) {
+            for (key, value) in value.as_object().ok_or("env must be an object")? {
+                if key.is_empty() || key.contains(['=', '\0']) {
+                    return Err("invalid environment key".into());
+                }
+                let value = value.as_str().ok_or("environment values must be strings")?;
+                if value.contains('\0') {
+                    return Err("invalid environment value".into());
+                }
+                env.push((key.clone(), value.to_owned()));
+            }
+        }
+        Ok(Self {
+            source: source.to_owned(),
+            kind,
+            name,
+            wakeup_reason,
+            timeout,
+            cwd,
+            env,
+        })
+    }
+}
+#[derive(Default)]
+struct TaskScheduler {
+    tasks: HashMap<String, BgTask>,
+    wakeups: HashMap<String, Wakeup>,
+}
+impl TaskScheduler {
+    fn prepare_launch(&self, value: &Value) -> Result<TaskLaunch> {
+        if self.active_count() >= 4 {
+            return Err("at most four active background jobs".into());
+        }
+        TaskLaunch::decode(value)
+    }
+    fn task_ids(&self) -> impl Iterator<Item = &String> {
+        self.tasks.keys()
+    }
+    fn wakeup_ids(&self) -> impl Iterator<Item = &String> {
+        self.wakeups.keys()
+    }
+    fn task_count(&self) -> usize {
+        self.tasks.len()
+    }
+    fn new_task(&self, previous: &HashSet<String>) -> Option<Value> {
+        self.tasks
+            .iter()
+            .find(|(id, _)| !previous.contains(*id))
+            .map(|(_, task)| task.snapshot())
+    }
+    fn active_count(&self) -> usize {
+        self.tasks
+            .values()
+            .filter(|task| task.child.is_some())
+            .count()
+    }
+    fn has_poll_work(&self) -> bool {
+        self.tasks.values().any(|task| task.child.is_some())
+            || self
+                .wakeups
+                .values()
+                .any(|wakeup| wakeup.state == WakeupState::Scheduled && wakeup.deadline.is_some())
+    }
+    fn pending_count(&self) -> usize {
+        self.wakeups.values().filter(|w| w.state.pending()).count()
+    }
+    fn has_ready(&self) -> bool {
+        self.wakeups.values().any(|w| w.state == WakeupState::Ready)
+    }
+    fn active_ids(&self) -> Vec<String> {
+        self.tasks
+            .iter()
+            .filter_map(|(id, task)| task.child.as_ref().map(|_| id.clone()))
+            .collect()
+    }
+    fn is_active(&self, id: &str) -> bool {
+        self.tasks.get(id).is_some_and(|task| task.child.is_some())
+    }
+    fn insert_task(&mut self, id: String, task: BgTask) {
+        self.tasks.insert(id, task);
+    }
+    fn list(&self, state: Option<&str>) -> Result<Value> {
+        let exact = match state {
+            None | Some("all" | "finished") => None,
+            Some(state) => {
+                Some(BgTaskStatus::parse(&json!(state)).map_err(|_| "unknown task state filter")?)
+            }
+        };
+        let mut tasks: Vec<_> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                exact.is_none_or(|status| task.status == status)
+                    && (state != Some("finished") || !task.status.is_active())
+            })
+            .map(BgTask::snapshot)
+            .collect();
+        tasks.sort_by_key(|metadata| metadata["created_ms"].as_u64().unwrap_or(0));
+        Ok(json!(tasks))
+    }
+    fn get(&self, id: &str) -> Result<Value> {
+        Ok(self.tasks.get(id).ok_or("unknown task ID")?.snapshot())
+    }
+    fn kill(&mut self, id: &str, force: bool) -> Result<Option<Value>> {
+        let task = self.tasks.get_mut(id).ok_or("unknown task ID")?;
+        let Some(child) = task.child.as_ref().filter(|_| task.reaped.is_none()) else {
+            return Ok(None);
+        };
+        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+        if unsafe { libc::kill(-(child.id() as i32), signal) } < 0
+            && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        if task.cancel_at.is_none() {
+            task.cancel_at = Some(std::time::Instant::now());
+            task.terminal_status = Some(if force {
+                BgTaskOutcome::Killed
+            } else {
+                BgTaskOutcome::Cancelled
+            });
+        } else if force && task.terminal_status != Some(BgTaskOutcome::TimedOut) {
+            task.terminal_status = Some(BgTaskOutcome::Killed);
+        }
+        task.status = BgTaskStatus::Cancelling;
+        Ok(Some(task.snapshot()))
+    }
+    fn save_task(
+        io: &mut CaptureSession<'_>,
+        emit: &mut dyn FnMut(&str, Value),
+        metadata: &Value,
+    ) -> Result<()> {
+        BgTaskStatus::parse(&metadata["status"])?;
+        io.journal.append("task_state", metadata.clone())?;
+        emit("task_state", metadata.clone());
+        Ok(())
+    }
+    fn save_wakeup(
+        io: &mut CaptureSession<'_>,
+        emit: &mut dyn FnMut(&str, Value),
+        metadata: &Value,
+    ) -> Result<()> {
+        io.journal.append("wakeup_state", metadata.clone())?;
+        emit("wakeup_state", metadata.clone());
+        Ok(())
+    }
+    fn settle(
+        &mut self,
+        io: &mut CaptureSession<'_>,
+        emit: &mut dyn FnMut(&str, Value),
+        metadata: &Value,
+    ) -> Result<()> {
+        if BgTaskStatus::parse(&metadata["status"])?.is_active() {
+            return Err("cannot settle an active background task".into());
+        }
+        let wakeup = metadata["wakeup_reason"].as_str().map(|reason| json!({
+            "id":format!("wake{}",io.journal.seq),"reason":reason,"due_ms":now_ms(),"state":"ready","task":metadata}));
+        io.journal.append("task_settled", json!({"operation":metadata["id"],"status":metadata["status"],"task":metadata,"wakeup":wakeup}))?;
+        emit("task_state", metadata.clone());
+        if let Some(wakeup) = wakeup {
+            emit("wakeup_state", wakeup.clone());
+            self.wakeups.insert(
+                wakeup["id"].as_str().unwrap().into(),
+                Wakeup::from_metadata(wakeup, None)?,
+            );
+        }
+        Ok(())
+    }
+    fn abort(&mut self) {
+        for task in self.tasks.values_mut() {
+            if let Some(mut child) = task.child.take() {
+                if task.reaped.is_none() {
+                    unsafe {
+                        libc::kill(-(child.id() as i32), libc::SIGKILL);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                task.status = BgTaskStatus::Settled(BgTaskOutcome::OutcomeUnknown);
+                task.metadata.as_object_mut().unwrap().remove("pid");
+                for name in ["stdout", "stderr"] {
+                    task.metadata[name]["complete"] = json!(false);
+                }
+            }
+        }
+    }
+    fn poll(
+        &mut self,
+        io: &mut CaptureSession<'_>,
+        emit: &mut dyn FnMut(&str, Value),
+    ) -> Result<()> {
+        for id in self.active_ids() {
+            let mut task = self.tasks.remove(&id).unwrap();
+            let result = (|| -> Result<()> {
+                let more_out = if let Some(out) = task.stdout.as_mut() {
+                    let more = out.drain(io)?;
+                    task.metadata["stdout"]["bytes"] = json!(out.bytes);
+                    more
+                } else {
+                    false
+                };
+                let more_err = if let Some(err) = task.stderr.as_mut() {
+                    let more = err.drain(io)?;
+                    task.metadata["stderr"]["bytes"] = json!(err.bytes);
+                    more
+                } else {
+                    false
+                };
+                let now = std::time::Instant::now();
+                let pid = task.child.as_ref().unwrap().id() as i32;
+                let mut exit = if let Some(exit) = task.reaped {
+                    Some(exit)
+                } else {
+                    task.child.as_mut().unwrap().try_wait()?
+                };
+                if exit.is_none() {
+                    if task.cancel_at.is_none()
+                        && task.deadline.is_some_and(|deadline| now >= deadline)
+                    {
+                        unsafe {
+                            libc::kill(-pid, libc::SIGTERM);
+                        }
+                        task.cancel_at = Some(now);
+                        task.terminal_status = Some(BgTaskOutcome::TimedOut);
+                        task.status = BgTaskStatus::Cancelling;
+                        Self::save_task(io, emit, &task.snapshot())?;
+                    }
+                    if task.cancel_at.is_some_and(|at| {
+                        now.duration_since(at) >= std::time::Duration::from_millis(500)
+                    }) {
+                        unsafe {
+                            libc::kill(-pid, libc::SIGKILL);
+                        }
+                        exit = task.child.as_mut().unwrap().try_wait()?;
+                    }
+                }
+                if let Some(exit) = exit {
+                    if task.reaped.is_none() {
+                        unsafe {
+                            libc::kill(-pid, libc::SIGKILL);
+                        }
+                        task.reaped = Some(exit);
+                        return Ok(());
+                    }
+                    if more_out || more_err {
+                        return Ok(());
+                    }
+                    task.child.take();
+                    task.metadata["stdout"] =
+                        task.stdout.take().unwrap().finish_metadata(io, true)?;
+                    task.metadata["stderr"] =
+                        task.stderr.take().unwrap().finish_metadata(io, true)?;
+                    for key in ["stdout", "stderr"] {
+                        task.metadata[key]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("preview");
+                    }
+                    task.status =
+                        BgTaskStatus::Settled(task.terminal_status.unwrap_or_else(|| {
+                            if exit.success() {
+                                BgTaskOutcome::Succeeded
+                            } else {
+                                BgTaskOutcome::Failed
+                            }
+                        }));
+                    task.metadata["exit_code"] = json!(exit.code());
+                    task.metadata["finished_ms"] = json!(now_ms());
+                    self.settle(io, emit, &task.snapshot())?;
+                }
+                Ok(())
+            })();
+            self.tasks.insert(id, task);
+            result?;
+        }
+        let mut ready = Vec::new();
+        for wakeup in self.wakeups.values_mut() {
+            if wakeup.state == WakeupState::Scheduled
+                && wakeup
+                    .deadline
+                    .is_some_and(|due| due <= std::time::Instant::now())
+            {
+                wakeup.state = WakeupState::Ready;
+                ready.push(wakeup.snapshot());
+            }
+        }
+        for metadata in ready {
+            Self::save_wakeup(io, emit, &metadata)?;
+        }
+        Ok(())
+    }
+    fn schedule(
+        &mut self,
+        io: &mut CaptureSession<'_>,
+        emit: &mut dyn FnMut(&str, Value),
+        seconds: f64,
+        reason: &str,
+        task: Option<Value>,
+    ) -> Result<Value> {
+        bg_seconds(&json!(seconds), 604800.0)?;
+        bg_text(&json!({"reason":reason}), "reason", 512)?;
+        let metadata = json!({"id":format!("wake{}",io.journal.seq),"reason":reason,
+            "due_ms":now_ms()+(seconds*1000.0).ceil() as u128,"state":"scheduled","task":task,"stop_settled":task.is_none()});
+        Self::save_wakeup(io, emit, &metadata)?;
+        self.wakeups.insert(
+            metadata["id"].as_str().unwrap().into(),
+            Wakeup::from_metadata(
+                metadata.clone(),
+                Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds)),
+            )?,
+        );
+        Ok(metadata)
+    }
+    fn wakeup_list(&self) -> Value {
+        let mut entries: Vec<_> = self.wakeups.values().map(Wakeup::snapshot).collect();
+        entries.sort_by_key(|metadata| metadata["due_ms"].as_u64().unwrap_or(0));
+        json!(entries)
+    }
+    fn cancelled_wakeup(&self, id: &str) -> Option<Value> {
+        self.wakeups
+            .get(id)
+            .filter(|wakeup| wakeup.state == WakeupState::Cancelled)
+            .map(Wakeup::snapshot)
+    }
+    fn change_wakeup(&mut self, id: &str, state: WakeupState) -> Result<Value> {
+        let wakeup = self.wakeups.get_mut(id).ok_or("unknown wakeup ID")?;
+        if state == WakeupState::Cancelled && wakeup.state == WakeupState::Cancelled {
+            return Ok(wakeup.snapshot());
+        }
+        if !wakeup.state.pending() {
+            return Err("wakeup is already settled".into());
+        }
+        wakeup.state = state;
+        Ok(wakeup.snapshot())
+    }
+    fn ready_ids(&self) -> Vec<String> {
+        let mut ids: Vec<_> = self
+            .wakeups
+            .iter()
+            .filter_map(|(id, wakeup)| (wakeup.state == WakeupState::Ready).then_some(id.clone()))
+            .collect();
+        ids.sort();
+        ids
+    }
+    fn dispatch_wakeup(&mut self, id: &str, state: WakeupState) -> Value {
+        let wakeup = self.wakeups.get_mut(id).expect("selected wakeup missing");
+        wakeup.state = state;
+        wakeup.snapshot()
+    }
+    fn restore(&mut self, kind: &JournalEventKind, payload: &Value) -> Result<()> {
+        if kind == &JournalEventKind::TaskSettled {
+            let status = BgTaskStatus::parse(&payload["status"])?;
+            if status.is_active() || status != BgTaskStatus::parse(&payload["task"]["status"])? {
+                return Err("invalid settled background task status".into());
+            }
+            self.restore(&JournalEventKind::TaskState, &payload["task"])?;
+            if !payload["wakeup"].is_null() {
+                self.restore(&JournalEventKind::WakeupState, &payload["wakeup"])?;
+            }
+            return Ok(());
+        }
+        let id = payload["id"]
+            .as_str()
+            .ok_or("invalid background journal ID")?
+            .to_owned();
+        match kind {
+            JournalEventKind::TaskState => {
+                self.tasks
+                    .insert(id, BgTask::from_metadata(payload.clone())?);
+            }
+            JournalEventKind::WakeupState => {
+                self.wakeups
+                    .insert(id, Wakeup::from_metadata(payload.clone(), None)?);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn recover(
+        &mut self,
+        io: &mut CaptureSession<'_>,
+        emit: &mut dyn FnMut(&str, Value),
+    ) -> Result<()> {
+        let mut tasks = Vec::new();
+        let mut wakeups = Vec::new();
+        for task in self.tasks.values_mut() {
+            if task.status.is_active() {
+                task.status = BgTaskStatus::Settled(BgTaskOutcome::OutcomeUnknown);
+                task.metadata["replay_allowed"] = json!(false);
+                task.metadata.as_object_mut().unwrap().remove("pid");
+                for name in ["stdout", "stderr"] {
+                    let mut bytes = 0usize;
+                    if let Some(index) = task.metadata[name]["index"].as_u64() {
+                        if let Some(chunks) = io
+                            .history
+                            .stream_chunks(RecordCollection::decode(name)?, index as usize)
+                        {
+                            for seq in chunks {
+                                let event = io.journal.decoded_event(*seq)?;
+                                let JournalEventData::Stream(stream) = &event.data else {
+                                    return Err("invalid stream bytes".into());
+                                };
+                                let data =
+                                    stream.base64.as_deref().ok_or("invalid stream bytes")?;
+                                bytes += data.len() / 4 * 3
+                                    - data.bytes().rev().take_while(|byte| *byte == b'=').count();
+                            }
+                        }
+                    }
+                    task.metadata[name]["bytes"] = json!(bytes);
+                    task.metadata[name]["complete"] = json!(false);
+                }
+                tasks.push(task.snapshot());
+            }
+        }
+        for wakeup in self.wakeups.values_mut() {
+            if matches!(
+                wakeup.state,
+                WakeupState::Scheduled | WakeupState::Ready | WakeupState::Dispatching
+            ) {
+                wakeup.state = if wakeup.state == WakeupState::Dispatching {
+                    WakeupState::OutcomeUnknown
+                } else {
+                    WakeupState::PendingConfirmation
+                };
+                wakeups.push(wakeup.snapshot());
+            }
+        }
+        for metadata in tasks {
+            Self::save_task(io, emit, &metadata)?;
+        }
+        for metadata in wakeups {
+            Self::save_wakeup(io, emit, &metadata)?;
+        }
+        Ok(())
+    }
+    fn finish_partial(
+        &mut self,
+        io: &mut CaptureSession<'_>,
+        emit: &mut dyn FnMut(&str, Value),
+        id: &str,
+    ) -> Result<()> {
+        let mut task = self.tasks.remove(id).expect("active task missing");
+        let result = (|| -> Result<()> {
+            if let Some(mut child) = task.child.take() {
+                if task.reaped.is_none() {
+                    child.wait()?;
+                }
+                task.metadata["stdout"] = task.stdout.take().unwrap().finish_metadata(io, false)?;
+                task.metadata["stderr"] = task.stderr.take().unwrap().finish_metadata(io, false)?;
+                for name in ["stdout", "stderr"] {
+                    task.metadata[name]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("preview");
+                }
+                task.status =
+                    BgTaskStatus::Settled(task.terminal_status.unwrap_or(BgTaskOutcome::Cancelled));
+                task.metadata["finished_ms"] = json!(now_ms());
+                self.settle(io, emit, &task.snapshot())?;
+            }
+            Ok(())
+        })();
+        self.tasks.insert(id.to_owned(), task);
+        result
+    }
 }
 impl Host {
     fn commit_stop(&mut self) -> Result<()> {
-        if let Some((seconds, reason)) = self.stop_wakeup.take() {
+        if let Some((seconds, reason)) = self.execution.take_wakeup() {
             // One durable event commits both settled stop and its timer.
             self.schedule_wakeup(seconds, &reason, None)?;
         }
         Ok(())
     }
-    fn background_control(&mut self, v: &Value) -> Result<bool> {
-        if !matches!(
-            v["kind"].as_str(),
-            Some(
-                "task_list"
-                    | "task_get"
-                    | "task_logs"
-                    | "task_kill"
-                    | "wakeup_list"
-                    | "wakeup_cancel"
-                    | "wakeup_run"
-            )
-        ) {
+    fn background_control(&mut self, v: &NativeCommand) -> Result<bool> {
+        if !v.kind.background() {
             return Ok(false);
         }
         if !self.accept_input_control(v)? {
             return Ok(true);
         }
         if let Err(e) = self.finish_background_control(v) {
-            self.event("error", json!({"command_id":v["id"],"error":e.to_string()}));
+            self.event("error", json!({"command_id":v.id,"error":e.to_string()}));
         }
         Ok(true)
     }
-    fn finish_background_control(&mut self, v: &Value) -> Result<()> {
-        let result = match v["kind"].as_str().unwrap_or("") {
-            "task_list" => self.bg_list(
-                v.get("state")
-                    .filter(|x| !x.is_null())
-                    .map(|x| x.as_str().ok_or("state must be a string"))
-                    .transpose()?,
-            )?,
-            "task_get" | "task_logs" => {
-                let metadata = self.bg_get(v["task_id"].as_str().ok_or("task_id required")?)?;
-                if v["kind"] == "task_logs" {
-                    let stream = v
-                        .get("stream")
-                        .map(|x| x.as_str().ok_or("stream must be a string"))
-                        .transpose()?
-                        .unwrap_or("both");
-                    if !["both", "stdout", "stderr"].contains(&stream) {
-                        return Err("stream must be stdout, stderr or both".into());
-                    }
+    fn finish_background_control(&mut self, v: &NativeCommand) -> Result<()> {
+        let result = match v.kind {
+            NativeCommandKind::TaskList => self.bg_list(v.args.task_state.require()?.as_deref())?,
+            NativeCommandKind::TaskGet | NativeCommandKind::TaskLogs => {
+                let metadata = self.bg_get(v.args.task_id.require()?)?;
+                if v.kind == NativeCommandKind::TaskLogs {
+                    let stream = *v.args.stream.require()?;
                     let mut logs = json!({"task":metadata});
                     for name in ["stdout", "stderr"] {
-                        if stream == "both" || stream == name {
+                        if stream.includes(name) {
                             logs[name] = json!({"ref":logs["task"][name]["ref"],"preview":self.ui_stream_preview(name,logs["task"][name]["index"].as_u64().ok_or("missing stream index")? as usize)?});
                         }
                     }
@@ -13630,27 +21408,333 @@ impl Host {
                     metadata
                 }
             }
-            "task_kill" => self.bg_kill(
-                v["task_id"].as_str().ok_or("task_id required")?,
-                v.get("force")
-                    .map(|x| x.as_bool().ok_or("force must be boolean"))
-                    .transpose()?
-                    .unwrap_or(false),
-            )?,
-            "wakeup_list" => self.wakeup_list()?,
-            "wakeup_cancel" => {
-                self.wakeup_cancel(v["wakeup_id"].as_str().ok_or("wakeup_id required")?)?
+            NativeCommandKind::TaskKill => {
+                self.bg_kill(v.args.task_id.require()?, *v.args.force.require()?)?
             }
-            "wakeup_run" => {
-                self.wakeup_run(v["wakeup_id"].as_str().ok_or("wakeup_id required")?)?
-            }
+            NativeCommandKind::WakeupList => self.wakeup_list()?,
+            NativeCommandKind::WakeupCancel => self.wakeup_cancel(v.args.wakeup_id.require()?)?,
+            NativeCommandKind::WakeupRun => self.wakeup_run(v.args.wakeup_id.require()?)?,
             _ => return Err("unknown background control".into()),
         };
         self.event(
             "completed",
-            json!({"command_id":v["id"],"status":"ok","result":result}),
+            json!({"command_id":v.id,"status":"ok","result":result}),
         );
         Ok(())
+    }
+}
+#[cfg(test)]
+mod scheduler_frontend_tests {
+    use super::*;
+    struct Scratch(crate::test_support::TestDirectory);
+    impl Scratch {
+        fn new() -> Self {
+            Self(crate::test_support::TestDirectory::new(
+                "py-scheduler-frontend",
+            ))
+        }
+    }
+    fn histories() -> HistoryArchive {
+        HistoryArchive::default()
+    }
+    #[test]
+    fn idle_scheduler_polls_do_not_serialize_context_or_footer_status() {
+        let scratch = Scratch::new();
+        fs::write(
+            scratch.0.join("config.json"),
+            json!({"skills":{"enabled":false}}).to_string(),
+        )
+        .unwrap();
+        let mut host = Host::new(scratch.0.to_path_buf(), None, true, true, None, None).unwrap();
+        let before = STATUS_SNAPSHOT_CALLS.with(std::cell::Cell::get);
+        for _ in 0..1024 {
+            host.service_background().unwrap();
+            host.scheduler_operation(|_, _, _| Ok(())).unwrap();
+        }
+        assert_eq!(STATUS_SNAPSHOT_CALLS.with(std::cell::Cell::get), before);
+        host.state_payload();
+        assert_eq!(STATUS_SNAPSHOT_CALLS.with(std::cell::Cell::get), before + 1);
+    }
+    #[test]
+    fn scheduler_poll_work_includes_future_deadlines_but_not_ready_or_recovered_wakeups() {
+        let mut scheduler = TaskScheduler::default();
+        assert!(!scheduler.has_poll_work());
+        for state in ["ready", "pending_confirmation", "cancelled", "scheduled"] {
+            scheduler.wakeups.insert(
+                state.into(),
+                Wakeup::from_metadata(
+                    json!({"id":state,"state":state,"due_ms":0,"reason":"test"}),
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        assert!(!scheduler.has_poll_work());
+        scheduler.wakeups.get_mut("scheduled").unwrap().deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        assert!(scheduler.has_poll_work());
+        scheduler.wakeups.get_mut("scheduled").unwrap().state = WakeupState::Ready;
+        assert!(!scheduler.has_poll_work());
+    }
+    #[test]
+    fn recovered_tasks_and_wakeups_have_owned_states_without_pid_or_replay() {
+        let scratch = Scratch::new();
+        let mut journal = Journal::open(scratch.0.join("session.jsonl")).unwrap();
+        let mut history = histories();
+        let mut scheduler = TaskScheduler::default();
+        scheduler.restore(&JournalEventKind::TaskState, &json!({"id":"old-task","status":"running","pid":12345,
+            "stdout":{"index":0,"bytes":9,"complete":true},"stderr":{"index":0,"bytes":5,"complete":true}})).unwrap();
+        for state in ["scheduled", "ready", "dispatching", "cancelled"] {
+            scheduler
+                .restore(
+                    &JournalEventKind::WakeupState,
+                    &json!({"id":state,"state":state,"reason":"continuation","due_ms":0}),
+                )
+                .unwrap();
+        }
+        let mut notices = Vec::new();
+        let mut io = CaptureSession {
+            journal: &mut journal,
+            history: &mut history,
+            owner: None,
+        };
+        scheduler
+            .recover(&mut io, &mut |kind, value| {
+                notices.push((kind.to_owned(), value))
+            })
+            .unwrap();
+        let task = scheduler.get("old-task").unwrap();
+        assert_eq!(task["status"], "outcome_unknown");
+        assert_eq!(task["replay_allowed"], false);
+        assert!(task.get("pid").is_none());
+        assert_eq!(scheduler.active_count(), 0);
+        assert_eq!(task["stdout"]["complete"], false);
+        assert!(!scheduler.has_ready());
+        assert_eq!(scheduler.pending_count(), 2);
+        assert_eq!(
+            scheduler.wakeups["scheduled"].snapshot()["state"],
+            "pending_confirmation"
+        );
+        assert_eq!(
+            scheduler.wakeups["dispatching"].snapshot()["state"],
+            "outcome_unknown"
+        );
+        assert_eq!(
+            scheduler.wakeups["cancelled"].snapshot()["state"],
+            "cancelled"
+        );
+        assert_eq!(notices.len(), 4);
+        scheduler
+            .change_wakeup("ready", WakeupState::Ready)
+            .unwrap();
+        assert_eq!(scheduler.ready_ids(), vec!["ready".to_owned()]);
+        assert_eq!(
+            scheduler.dispatch_wakeup("ready", WakeupState::Dispatching)["state"],
+            "dispatching"
+        );
+        assert!(scheduler
+            .change_wakeup("ready", WakeupState::Ready)
+            .is_err());
+        assert_eq!(
+            scheduler.dispatch_wakeup("ready", WakeupState::Consumed)["state"],
+            "consumed"
+        );
+    }
+    #[test]
+    fn wakeup_state_has_one_interpretation_and_preserves_opaque_legacy_states() {
+        for metadata in [
+            json!({"id":"absent"}),
+            json!({"id":"null","state":null}),
+            json!({"id":"extension","state":"future-state"}),
+            json!({"id":"opaque","state":{"future":1}}),
+        ] {
+            let wakeup = Wakeup::from_metadata(metadata.clone(), None).unwrap();
+            assert!(wakeup.metadata.get("state").is_none());
+            assert_eq!(wakeup.snapshot(), metadata);
+            assert!(!wakeup.state.pending());
+        }
+        assert!(WakeupState::Ready.pending());
+        assert!(!WakeupState::OutcomeUnknown.pending());
+    }
+    #[test]
+    fn task_settlement_and_wakeup_creation_share_one_commit_and_never_admit_payloads() {
+        let scratch = Scratch::new();
+        let mut journal = Journal::open(scratch.0.join("session.jsonl")).unwrap();
+        let mut history = histories();
+        let mut scheduler = TaskScheduler::default();
+        let mut notices = Vec::new();
+        {
+            let mut io = CaptureSession {
+                journal: &mut journal,
+                history: &mut history,
+                owner: None,
+            };
+            scheduler.settle(&mut io, &mut |kind, value| notices.push((kind.to_owned(), value)),
+                &json!({"id":"done","status":"succeeded","wakeup_reason":"inspect refs","stdout":{"ref":"H.records.stdout[0]"}})).unwrap();
+        }
+        assert_eq!(journal.seq, 1);
+        assert_eq!(
+            journal.decoded_event(0).unwrap().kind,
+            JournalEventKind::TaskSettled
+        );
+        assert_eq!(scheduler.pending_count(), 1);
+        assert!(scheduler.has_ready());
+        assert_eq!(
+            notices
+                .iter()
+                .map(|(kind, _)| kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task_state", "wakeup_state"]
+        );
+        assert!(history.is_empty());
+        let path = scratch.0.join("failed.jsonl");
+        let mut failed = Journal::open(path).unwrap();
+        failed.failed = true;
+        let mut scheduler = TaskScheduler::default();
+        let mut io = CaptureSession {
+            journal: &mut failed,
+            history: &mut history,
+            owner: None,
+        };
+        assert!(scheduler
+            .settle(
+                &mut io,
+                &mut |_, _| panic!("failed commit must not emit"),
+                &json!({"id":"done","status":"succeeded","wakeup_reason":"no replay"})
+            )
+            .is_err());
+        assert_eq!(scheduler.pending_count(), 0);
+        assert_eq!(failed.seq, 0);
+    }
+    #[test]
+    fn task_launch_decodes_once_and_keeps_python_environment_and_options_semantics() {
+        let task = TaskLaunch::decode(&json!({"source":"print(42)","task_kind":"python",
+            "options":{"cwd":"/tmp","env":{"A":"λ"},"timeout":1.25,"name":"test"}}))
+        .unwrap();
+        assert_eq!(task.kind.label(), "python");
+        assert_eq!(task.source, "print(42)");
+        assert_eq!(task.env, vec![("A".to_owned(), "λ".to_owned())]);
+        assert_eq!(task.timeout, Some(1.25));
+        for value in [
+            json!({"source":""}),
+            json!({"source":"true","task_kind":true}),
+            json!({"source":"true","task_kind":"bad"}),
+            json!({"source":"true","options":{"env":{"=":"bad"}}}),
+            json!({"source":"true","options":{"timeout":-1}}),
+        ] {
+            assert!(TaskLaunch::decode(&value).is_err());
+        }
+    }
+    #[test]
+    fn frontend_phase_restore_preserves_outer_clock_draft_and_command_policy() {
+        let mut frontend = TerminalFrontend::new();
+        assert!(frontend.transition(UiState::Thinking, Some("outer".into())));
+        let before = frontend.phase();
+        assert!(!frontend.transition(UiState::Thinking, Some("outer".into())));
+        assert_eq!(frontend.phase.started, before.started);
+        assert!(frontend.transition(UiState::Running, None));
+        assert!(frontend.restore_phase(before.clone()));
+        assert_eq!(frontend.phase.started, before.started);
+        let mut draft = EditBuffer::default();
+        draft.line = "draft-tail".into();
+        draft.cursor = 5;
+        draft.killed = "saved".into();
+        frontend.save_draft(draft);
+        let id = "after".to_owned();
+        frontend.queue_command(LocalCommand {
+            id: id.clone(),
+            parsed: ParsedLocalCommand::parse("/new"),
+            phase: LocalCommandPhase::AfterTurn,
+        });
+        assert!(frontend.has_after_turn_command());
+        assert_eq!(
+            frontend.next_command_phase(),
+            Some(LocalCommandPhase::AfterTurn)
+        );
+        assert_eq!(frontend.pop_command().unwrap().id, id);
+        assert!(!frontend.has_commands());
+        let draft = frontend.take_draft();
+        assert_eq!(draft.line, "draft-tail");
+        assert_eq!(draft.cursor, 5);
+        assert_eq!(draft.killed, "saved");
+        frontend.admit_visible_change().unwrap();
+        assert_eq!(frontend.visible_revision(), 1);
+    }
+    #[test]
+    fn prompt_ownership_joins_busy_reader_preserves_nested_boundary_and_keeps_draft() {
+        let scratch = Scratch::new();
+        let output = scratch.0.join("terminal-output");
+        let terminal = EditTerminal {
+            io: TerminalIo {
+                input: File::open("/dev/null").unwrap(),
+                _raw: None,
+                eof_message: "closed",
+                read_interrupt_is_timeout: true,
+            },
+            output: OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&output)
+                .unwrap(),
+            cursor_row: 0,
+            rows: 1,
+            keyboard: false,
+            display: false,
+            headers: Vec::new(),
+        };
+        let mut buffer = EditBuffer::default();
+        buffer.line = "draft-middle-tail".into();
+        buffer.cursor = 12;
+        let display = std::sync::Arc::new(std::sync::Mutex::new(BusyDisplay {
+            terminal,
+            buffer,
+            status: json!({"state":"running","cell":2,"cells":2}),
+            began: std::time::Instant::now(),
+            sampled: std::time::Instant::now(),
+            pending_boundary: Some(
+                json!({"cell":2,"parent_cell":1,"language":"shell","elapsed_ms":1,"status":"ok"}),
+            ),
+        }));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader_joined = joined.clone();
+        let thread = std::thread::spawn(move || {
+            while !reader_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            reader_joined.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let (sender, lines) = std::sync::mpsc::channel();
+        sender.send(("queued".into(), "steer".into())).unwrap();
+        let mut frontend = TerminalFrontend::new();
+        frontend.input = InputOwnership::Busy(BusyInput {
+            stop,
+            lines,
+            display,
+            thread,
+        });
+        let lines = frontend
+            .acquire_prompt(json!({"state":"running","cell":1,"cells":2}))
+            .unwrap();
+        assert!(joined.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(lines, vec![("queued".to_owned(), "steer".to_owned())]);
+        assert!(matches!(
+            frontend.input,
+            InputOwnership::PromptExclusive { resume_busy: true }
+        ));
+        assert!(!frontend.start_busy(json!({})));
+        assert!(frontend.acquire_prompt(json!({})).is_err());
+        assert!(fs::read_to_string(output)
+            .unwrap()
+            .contains("── cell 1 › 2 · shell"));
+        assert!(frontend.release_prompt());
+        assert!(matches!(frontend.input, InputOwnership::Idle));
+        let draft = frontend.take_draft();
+        assert_eq!(draft.line, "draft-middle-tail");
+        assert_eq!(draft.cursor, 12);
+        assert!(!frontend.release_prompt());
     }
 }
 fn bg_text<'a>(v: &'a Value, key: &str, max: usize) -> Result<Option<&'a str>> {
@@ -13670,59 +21754,119 @@ fn bg_seconds(v: &Value, max: f64) -> Result<Option<f64>> {
     }
     Ok(Some(seconds))
 }
+#[cfg(test)]
+thread_local! {
+    static STATUS_SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+// Borrow only the immutable owners needed for a footer. Constructing these
+// inputs is cheap; serializing them is deferred until a renderer needs them.
+struct StatusSnapshotInputs<'a> {
+    frontend: &'a TerminalFrontend,
+    execution: &'a ExecutionController,
+    provider: &'a ProviderClient,
+    context: &'a ContextStore,
+    skills: &'a Value,
+    last_generation_failed: bool,
+}
+impl StatusSnapshotInputs<'_> {
+    fn context_usage(&self) -> Value {
+        let system_chars = self.skills["system"]
+            .as_str()
+            .unwrap_or(SYSTEM)
+            .chars()
+            .count();
+        let chars = self.context.rendered_chars(system_chars);
+        let estimated_tokens = chars.div_ceil(3);
+        let input_budget = model_input_budget(
+            self.provider.context_limit,
+            &self.provider.reasoning_metadata(&self.provider.model),
+            4096,
+        );
+        json!({"context_revision":self.context.revision(),"item_count":self.context.items().len(),
+            "rendered_chars":chars,"estimated_input_tokens":estimated_tokens,
+            "measured_last_input_tokens":self.provider.usage["last_input_tokens"],
+            "model_context_limit":self.provider.context_limit,"reserved_output_tokens":4096,
+            "input_token_budget":input_budget,"remaining_input_tokens":input_budget.saturating_sub(estimated_tokens),
+            "system_chars":system_chars,"skills_estimated_tokens":self.skills["estimated_added_tokens"],
+            "forced":estimated_tokens>input_budget*9/10,"force_threshold":0.9,
+            "estimator":"unicode-chars/3-v1 estimate; system/control allowance included; image budget separate"})
+    }
+    fn payload(&self) -> Value {
+        #[cfg(test)]
+        STATUS_SNAPSHOT_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let mut payload = json!({"state":self.frontend.state().label(),"cell":self.execution.cell(),"cells":self.execution.cells(),
+            "language":self.execution.language(),"cell_elapsed_ms":self.execution.started().map(|start|start.elapsed().as_millis().min(u64::MAX as u128) as u64),
+            "thinking_elapsed_ms":self.frontend.thinking_elapsed(),
+            "selected_model":self.provider.model(),"effort":self.provider.effort(),
+            "context_usage":self.context_usage(),"cache_hit_tokens":self.provider.usage["cache_hit_tokens"],
+            "reported_cache_hit_tokens":self.provider.usage["reported_cache_hit_tokens"],
+            "cache_hit_percentage":self.provider.cache_accounting.percentage(),
+            "cache_percentage_complete":self.provider.cache_accounting.complete()&&self.provider.usage["cache_usage_complete"]!=false,
+            "last_cell":self.execution.last_cell(),"generation_failed":self.last_generation_failed});
+        if self.frontend.state() == UiState::Thinking {
+            payload["model"] = json!(self.frontend.model().unwrap_or(&self.provider.model));
+        }
+        if let Some(retry) = self.provider.retry_snapshot() {
+            payload["retry"] = json!(retry.retry);
+            payload["max_retries"] = json!(retry.max_retries);
+            payload["retry_delay_ms"] = json!(retry.waiting_delay_ms);
+            payload["retry_operation"] = json!(retry.operation);
+        }
+        payload
+    }
+}
 impl Host {
+    fn scheduler_operation<T>(
+        &mut self,
+        action: impl FnOnce(
+            &mut TaskScheduler,
+            &mut CaptureSession<'_>,
+            &mut dyn FnMut(&str, Value),
+        ) -> Result<T>,
+    ) -> Result<T> {
+        // Do not call state_payload here: editor/picker paste calls this pump
+        // for every byte, even when there are no jobs or emitted events.
+        let status = StatusSnapshotInputs {
+            frontend: &self.frontend,
+            execution: &self.execution,
+            provider: &self.provider,
+            context: &self.context,
+            skills: &self.skills,
+            last_generation_failed: self.last_generation_failed,
+        };
+        let owner = self.execution.cell().zip(self.execution.operation());
+        let mut io = CaptureSession {
+            journal: &mut self.journal,
+            history: &mut self.history,
+            owner,
+        };
+        let mut emit = |kind: &str, payload: Value| {
+            self.frontend
+                .render(kind, payload, self.json, self.incoming.is_some(), || {
+                    status.payload()
+                })
+        };
+        action(&mut self.scheduler, &mut io, &mut emit)
+    }
     fn bg_save_task(&mut self, metadata: &Value) -> Result<()> {
-        BgTaskStatus::parse(&metadata["status"])?;
-        self.journal.append("task_state", metadata.clone())?;
-        self.event("task_state", metadata.clone());
-        Ok(())
+        self.scheduler_operation(|_, io, emit| TaskScheduler::save_task(io, emit, metadata))
     }
     fn bg_save_wakeup(&mut self, metadata: &Value) -> Result<()> {
-        self.journal.append("wakeup_state", metadata.clone())?;
-        self.event("wakeup_state", metadata.clone());
-        Ok(())
+        self.scheduler_operation(|_, io, emit| TaskScheduler::save_wakeup(io, emit, metadata))
     }
     fn bg_run(&mut self, v: &Value) -> Result<Value> {
         self.service_background()?;
-        if self.bg_tasks.values().filter(|t| t.child.is_some()).count() >= 4 {
-            return Err("at most four active background jobs".into());
-        }
-        let source = v["source"].as_str().ok_or("background source required")?;
-        if source.trim().is_empty() {
-            return Err("background source must not be empty".into());
-        }
-        let kind = match v.get("task_kind").or_else(|| v.get("kind")) {
-            None => "shell",
-            Some(value) => value.as_str().ok_or("background kind must be a string")?,
-        };
-        if !["shell", "python"].contains(&kind) {
-            return Err("background kind must be shell or python".into());
-        }
-        let options = v.get("options").filter(|p| !p.is_null()).unwrap_or(v);
-        if !options.is_object() {
-            return Err("background options must be an object".into());
-        }
-        let name = bg_text(options, "name", 128)?.map(str::to_owned);
-        let wakeup_reason = bg_text(options, "wakeup_reason", 512)?.map(str::to_owned);
-        let timeout = bg_seconds(&options["timeout"], 604800.0)?;
-        let cwd = match options.get("cwd") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(s.clone()),
-            _ => return Err("cwd must be a string".into()),
-        };
-        let mut env = Vec::new();
-        if let Some(value) = options.get("env").filter(|p| !p.is_null()) {
-            for (key, value) in value.as_object().ok_or("env must be an object")? {
-                if key.is_empty() || key.contains(['=', '\0']) {
-                    return Err("invalid environment key".into());
-                }
-                let value = value.as_str().ok_or("environment values must be strings")?;
-                if value.contains('\0') {
-                    return Err("invalid environment value".into());
-                }
-                env.push((key.clone(), value.to_owned()));
-            }
-        }
+        let TaskLaunch {
+            source,
+            kind,
+            name,
+            wakeup_reason,
+            timeout,
+            cwd,
+            env,
+        } = self.scheduler.prepare_launch(v)?;
+        let mut command = kind.command(&source);
+        let kind = kind.label();
         let id = format!("task{}", self.journal.seq);
         let dir = self
             .home
@@ -13756,22 +21900,7 @@ impl Host {
             "intent",
             json!({"operation":id,"type":"background","kind":kind,"source":source,"cwd":cwd}),
         )?;
-        let mut task = BgTask::from_metadata(metadata)?;
-        task.stdout = Some(stdout);
-        task.stderr = Some(stderr);
-        task.dir = dir;
-        task.deadline =
-            timeout.map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
-        let mut command = if kind == "shell" {
-            let mut c = Command::new("/bin/sh");
-            c.args(["-c", source]);
-            c
-        } else {
-            let mut c =
-                Command::new(std::env::var("PY_PYTHON").unwrap_or_else(|_| "python3".into()));
-            c.args(["-u", "-c", source]);
-            c
-        };
+        let mut task = BgTask::prepare(metadata, stdout, stderr, dir, timeout)?;
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
@@ -13788,32 +21917,12 @@ impl Host {
                 Ok(())
             });
         }
-        match command.spawn() {
-            Ok(child) => {
-                task.status = BgTaskStatus::Running;
-                task.metadata["pid"] = json!(child.id());
-                task.child = Some(child);
-            }
-            Err(error) => {
-                task.status = BgTaskStatus::Settled(BgTaskOutcome::Failed);
-                task.stderr.as_mut().unwrap().commit(
-                    self,
-                    format!("Background launch failed: {error}\n").as_bytes(),
-                )?;
-                task.metadata["stdout"] = task.stdout.take().unwrap().finish(self, true)?;
-                task.metadata["stderr"] = task.stderr.take().unwrap().finish(self, true)?;
-                for key in ["stdout", "stderr"] {
-                    task.metadata[key]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("preview");
-                }
-                task.metadata["finished_ms"] = json!(now_ms());
-            }
+        if let Err(error) = task.launch(&mut command) {
+            task.finish_launch_failure(self, error)?;
         }
         let failed = task.status == BgTaskStatus::Settled(BgTaskOutcome::Failed);
         let metadata = task.snapshot();
-        self.bg_tasks.insert(id.clone(), task);
+        self.scheduler.insert_task(id.clone(), task);
         if failed {
             self.bg_settle(&metadata)?;
         } else {
@@ -13823,79 +21932,26 @@ impl Host {
     }
     fn bg_list(&mut self, state: Option<&str>) -> Result<Value> {
         self.service_background()?;
-        let exact = match state {
-            None | Some("all" | "finished") => None,
-            Some(state) => {
-                Some(BgTaskStatus::parse(&json!(state)).map_err(|_| "unknown task state filter")?)
-            }
-        };
-        let mut tasks: Vec<_> = self
-            .bg_tasks
-            .values()
-            .filter(|task| {
-                exact.is_none_or(|status| task.status == status)
-                    && (state != Some("finished") || !task.status.is_active())
-            })
-            .map(BgTask::snapshot)
-            .collect();
-        tasks.sort_by_key(|m| m["created_ms"].as_u64().unwrap_or(0));
-        Ok(json!(tasks))
+        self.scheduler.list(state)
     }
     fn bg_get(&mut self, id: &str) -> Result<Value> {
         self.service_background()?;
-        Ok(self.bg_tasks.get(id).ok_or("unknown task ID")?.snapshot())
+        self.scheduler.get(id)
     }
     fn bg_kill(&mut self, id: &str, force: bool) -> Result<Value> {
         self.service_background()?;
-        let task = self.bg_tasks.get_mut(id).ok_or("unknown task ID")?;
-        if let Some(child) = task.child.as_ref().filter(|_| task.reaped.is_none()) {
-            let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
-            if unsafe { libc::kill(-(child.id() as i32), signal) } < 0
-                && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-            {
-                return Err(io::Error::last_os_error().into());
-            }
-            if task.cancel_at.is_none() {
-                task.cancel_at = Some(std::time::Instant::now());
-                task.terminal_status = Some(if force {
-                    BgTaskOutcome::Killed
-                } else {
-                    BgTaskOutcome::Cancelled
-                });
-            } else if force && task.terminal_status != Some(BgTaskOutcome::TimedOut) {
-                task.terminal_status = Some(BgTaskOutcome::Killed);
-            }
-            task.status = BgTaskStatus::Cancelling;
-            let metadata = task.snapshot();
+        if let Some(metadata) = self.scheduler.kill(id, force)? {
             self.bg_save_task(&metadata)?;
         }
-        Ok(self.bg_tasks.get(id).unwrap().snapshot())
+        self.scheduler.get(id)
     }
     fn bg_settle(&mut self, metadata: &Value) -> Result<()> {
-        if BgTaskStatus::parse(&metadata["status"])?.is_active() {
-            return Err("cannot settle an active background task".into());
-        }
-        let wakeup = metadata["wakeup_reason"].as_str().map(|reason| {
-            json!({
-            "id":format!("wake{}",self.journal.seq),"reason":reason,"due_ms":now_ms(),
-            "state":"ready","task":metadata})
-        });
-        // Terminal status and opt-in wakeup creation are one durable transition.
-        self.journal.append("task_settled",json!({"operation":metadata["id"],"status":metadata["status"],"task":metadata,"wakeup":wakeup}))?;
-        self.event("task_state", metadata.clone());
-        if let Some(w) = wakeup {
-            self.event("wakeup_state", w.clone());
-            self.wakeups.insert(
-                w["id"].as_str().unwrap().into(),
-                Wakeup {
-                    metadata: w,
-                    deadline: None,
-                },
-            );
-        }
-        Ok(())
+        self.scheduler_operation(|scheduler, io, emit| scheduler.settle(io, emit, metadata))
     }
     fn service_background(&mut self) -> Result<()> {
+        self.pump_control(WaitPolicy::Service).map(|_| ())
+    }
+    fn service_tasks(&mut self) -> Result<()> {
         if self.journal.failed {
             self.bg_abort();
             return Err(
@@ -13903,142 +21959,109 @@ impl Host {
                     .into(),
             );
         }
-        if self.servicing {
+        let Some(_lease) = self.control_pump.enter() else {
             return Ok(());
-        }
-        self.poll_busy_input()?;
-        self.servicing = true;
-        let result = self.service_background_inner();
-        self.servicing = false;
+        };
+        let result = (|| {
+            self.poll_busy_input()?;
+            self.service_background_inner()
+        })();
         if result.is_err() {
             self.bg_abort();
         }
         result
     }
+    fn pump_control(&mut self, policy: WaitPolicy<'_>) -> Result<ControlProgress> {
+        self.service_tasks()?;
+        if matches!(policy, WaitPolicy::Service) {
+            return Ok(ControlProgress {
+                cancelled: false,
+                revision: self.execution.cancel_revision(),
+            });
+        }
+        let mut cancelled = false;
+        if INTERRUPT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            cancelled = true;
+            if let WaitPolicy::Process { pid, signal } = policy {
+                self.journal.append(
+                    "cancel",
+                    json!({"generation":self.execution.generation(),"source":"SIGINT"}),
+                )?;
+                self.execution.cancelled();
+                unsafe {
+                    libc::kill(-pid, signal);
+                }
+            }
+        }
+        // A continuously writing peer cannot prevent the waiter from checking
+        // its deadline or progressing its transport. Remaining input stays FIFO.
+        for _ in 0..CONTROL_COMMANDS_PER_TICK {
+            let command = match self.incoming.as_ref().map(|receiver| receiver.try_recv()) {
+                Some(Ok(command)) => command,
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.input_closed = true;
+                    break;
+                }
+                _ => break,
+            };
+            if command.kind == NativeCommandKind::Interrupt {
+                if !self.accept_input_control(&command)? {
+                    continue;
+                }
+                if let WaitPolicy::Process { pid, signal } = policy {
+                    self.journal.append(
+                        "cancel",
+                        json!({"command_id":command.id,"generation":self.execution.generation()}),
+                    )?;
+                    self.execution.cancelled();
+                    unsafe {
+                        libc::kill(-pid, signal);
+                    }
+                }
+                self.event("completed", json!({"command_id":command.id,"status":"ok"}));
+                cancelled = true;
+            } else if !self.background_control(&command)? {
+                self.queue_arrival(command)?;
+            }
+        }
+        // Local /interrupt and /quit can raise the signal while commands are
+        // being classified. Consume it before allowing a write/request forward.
+        if INTERRUPT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            cancelled = true;
+            if let WaitPolicy::Process { pid, signal } = policy {
+                self.journal.append(
+                    "cancel",
+                    json!({"generation":self.execution.generation(),"source":"SIGINT"}),
+                )?;
+                self.execution.cancelled();
+                unsafe {
+                    libc::kill(-pid, signal);
+                }
+            }
+        }
+        if cancelled {
+            if let WaitPolicy::Provider { operation } = policy {
+                self.journal.append(
+                    "provider_cancelled",
+                    json!({"operation":operation,"billing":"unknown"}),
+                )?;
+                self.execution.cancelled();
+            }
+        }
+        Ok(ControlProgress {
+            cancelled,
+            revision: self.execution.cancel_revision(),
+        })
+    }
     fn bg_abort(&mut self) {
         // No more journal writes after a persistence failure, not even cleanup.
-        for task in self.bg_tasks.values_mut() {
-            if let Some(mut child) = task.child.take() {
-                if task.reaped.is_none() {
-                    unsafe {
-                        libc::kill(-(child.id() as i32), libc::SIGKILL);
-                    }
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                task.status = BgTaskStatus::Settled(BgTaskOutcome::OutcomeUnknown);
-                task.metadata.as_object_mut().unwrap().remove("pid");
-                for name in ["stdout", "stderr"] {
-                    task.metadata[name]["complete"] = json!(false);
-                }
-            }
-        }
+        self.scheduler.abort();
     }
     fn service_background_inner(&mut self) -> Result<()> {
-        let ids: Vec<_> = self
-            .bg_tasks
-            .iter()
-            .filter_map(|(id, t)| t.child.as_ref().map(|_| id.clone()))
-            .collect();
-        for id in ids {
-            let mut task = self.bg_tasks.remove(&id).unwrap();
-            let result = (|| -> Result<bool> {
-                let more_out = if let Some(out) = task.stdout.as_mut() {
-                    let more = out.drain(self)?;
-                    task.metadata["stdout"]["bytes"] = json!(out.bytes);
-                    more
-                } else {
-                    false
-                };
-                let more_err = if let Some(err) = task.stderr.as_mut() {
-                    let more = err.drain(self)?;
-                    task.metadata["stderr"]["bytes"] = json!(err.bytes);
-                    more
-                } else {
-                    false
-                };
-                let now = std::time::Instant::now();
-                let pid = task.child.as_ref().unwrap().id() as i32;
-                let mut exit = if let Some(exit) = task.reaped {
-                    Some(exit)
-                } else {
-                    task.child.as_mut().unwrap().try_wait()?
-                };
-                if exit.is_none() {
-                    if task.cancel_at.is_none() && task.deadline.is_some_and(|d| now >= d) {
-                        unsafe {
-                            libc::kill(-pid, libc::SIGTERM);
-                        }
-                        task.cancel_at = Some(now);
-                        task.terminal_status = Some(BgTaskOutcome::TimedOut);
-                        task.status = BgTaskStatus::Cancelling;
-                        self.bg_save_task(&task.snapshot())?;
-                    }
-                    if task.cancel_at.is_some_and(|t| {
-                        now.duration_since(t) >= std::time::Duration::from_millis(500)
-                    }) {
-                        unsafe {
-                            libc::kill(-pid, libc::SIGKILL);
-                        }
-                        exit = task.child.as_mut().unwrap().try_wait()?;
-                    }
-                }
-                if let Some(exit) = exit {
-                    // Reap once, then finish the backlog across bounded pump ticks.
-                    if task.reaped.is_none() {
-                        unsafe {
-                            libc::kill(-pid, libc::SIGKILL);
-                        }
-                        task.reaped = Some(exit);
-                        return Ok(false);
-                    }
-                    if more_out || more_err {
-                        return Ok(false);
-                    }
-                    task.child.take();
-                    task.metadata["stdout"] =
-                        task.stdout.take().unwrap().finish_metadata(self, true)?;
-                    task.metadata["stderr"] =
-                        task.stderr.take().unwrap().finish_metadata(self, true)?;
-                    for key in ["stdout", "stderr"] {
-                        task.metadata[key]
-                            .as_object_mut()
-                            .unwrap()
-                            .remove("preview");
-                    }
-                    task.status =
-                        BgTaskStatus::Settled(task.terminal_status.unwrap_or_else(|| {
-                            if exit.success() {
-                                BgTaskOutcome::Succeeded
-                            } else {
-                                BgTaskOutcome::Failed
-                            }
-                        }));
-                    task.metadata["exit_code"] = json!(exit.code());
-                    task.metadata["finished_ms"] = json!(now_ms());
-                    self.bg_settle(&task.snapshot())?;
-                    return Ok(true);
-                }
-                Ok(false)
-            })();
-            self.bg_tasks.insert(id, task);
-            result?;
+        if !self.scheduler.has_poll_work() {
+            return Ok(());
         }
-        let mut ready = Vec::new();
-        for wakeup in self.wakeups.values_mut() {
-            if wakeup.metadata["state"] == "scheduled"
-                && wakeup
-                    .deadline
-                    .is_some_and(|due| due <= std::time::Instant::now())
-            {
-                wakeup.metadata["state"] = json!("ready");
-                ready.push(wakeup.metadata.clone());
-            }
-        }
-        for metadata in ready {
-            self.bg_save_wakeup(&metadata)?;
-        }
-        Ok(())
+        self.scheduler_operation(|scheduler, io, emit| scheduler.poll(io, emit))
     }
     fn schedule_wakeup(
         &mut self,
@@ -14046,54 +22069,24 @@ impl Host {
         reason: &str,
         task: Option<Value>,
     ) -> Result<Value> {
-        bg_seconds(&json!(seconds), 604800.0)?;
-        bg_text(&json!({"reason":reason}), "reason", 512)?;
-        let metadata = json!({"id":format!("wake{}",self.journal.seq),"reason":reason,
-            "due_ms":now_ms()+(seconds*1000.0).ceil() as u128,"state":"scheduled","task":task,"stop_settled":task.is_none()});
-        self.bg_save_wakeup(&metadata)?;
-        self.wakeups.insert(
-            metadata["id"].as_str().unwrap().into(),
-            Wakeup {
-                metadata: metadata.clone(),
-                deadline: Some(
-                    std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds),
-                ),
-            },
-        );
-        Ok(metadata)
+        self.scheduler_operation(|scheduler, io, emit| {
+            scheduler.schedule(io, emit, seconds, reason, task)
+        })
     }
     fn wakeup_list(&mut self) -> Result<Value> {
         self.service_background()?;
-        let mut entries: Vec<_> = self.wakeups.values().map(|w| w.metadata.clone()).collect();
-        entries.sort_by_key(|m| m["due_ms"].as_u64().unwrap_or(0));
-        Ok(json!(entries))
+        Ok(self.scheduler.wakeup_list())
     }
     fn wakeup_cancel(&mut self, id: &str) -> Result<Value> {
-        let w = self.wakeups.get_mut(id).ok_or("unknown wakeup ID")?;
-        if w.metadata["state"] == "cancelled" {
-            return Ok(w.metadata.clone());
+        if let Some(metadata) = self.scheduler.cancelled_wakeup(id) {
+            return Ok(metadata);
         }
-        if !matches!(
-            w.metadata["state"].as_str(),
-            Some("scheduled" | "ready" | "pending_confirmation")
-        ) {
-            return Err("wakeup is already settled".into());
-        }
-        w.metadata["state"] = json!("cancelled");
-        let metadata = w.metadata.clone();
+        let metadata = self.scheduler.change_wakeup(id, WakeupState::Cancelled)?;
         self.bg_save_wakeup(&metadata)?;
         Ok(metadata)
     }
     fn wakeup_run(&mut self, id: &str) -> Result<Value> {
-        let w = self.wakeups.get_mut(id).ok_or("unknown wakeup ID")?;
-        if !matches!(
-            w.metadata["state"].as_str(),
-            Some("scheduled" | "ready" | "pending_confirmation")
-        ) {
-            return Err("wakeup is already settled".into());
-        }
-        w.metadata["state"] = json!("ready");
-        let metadata = w.metadata.clone();
+        let metadata = self.scheduler.change_wakeup(id, WakeupState::Ready)?;
         self.bg_save_wakeup(&metadata)?;
         Ok(metadata)
     }
@@ -14109,20 +22102,13 @@ impl Host {
             }
             return Ok(false);
         }
-        let mut ids: Vec<_> = self
-            .wakeups
-            .iter()
-            .filter_map(|(id, w)| (w.metadata["state"] == "ready").then_some(id.clone()))
-            .collect();
-        ids.sort();
+        let ids = self.scheduler.ready_ids();
         if ids.is_empty() {
             return Ok(false);
         }
         let mut batch = Vec::new();
         for id in &ids {
-            let w = self.wakeups.get_mut(id).unwrap();
-            w.metadata["state"] = json!("dispatching");
-            let metadata = w.metadata.clone();
+            let metadata = self.scheduler.dispatch_wakeup(id, WakeupState::Dispatching);
             self.bg_save_wakeup(&metadata)?;
             batch.push(metadata);
         }
@@ -14144,104 +22130,21 @@ impl Host {
             self.run_agent()
         };
         for id in ids {
-            let w = self.wakeups.get_mut(&id).unwrap();
-            w.metadata["state"] = json!("consumed");
-            let metadata = w.metadata.clone();
+            let metadata = self.scheduler.dispatch_wakeup(&id, WakeupState::Consumed);
             self.bg_save_wakeup(&metadata)?;
         }
         result?;
         Ok(true)
     }
-    fn bg_restore(&mut self, kind: &str, p: &Value) -> Result<()> {
-        if kind == "task_settled" {
-            let status = BgTaskStatus::parse(&p["status"])?;
-            if status.is_active() || status != BgTaskStatus::parse(&p["task"]["status"])? {
-                return Err("invalid settled background task status".into());
-            }
-            self.bg_restore("task_state", &p["task"])?;
-            if !p["wakeup"].is_null() {
-                self.bg_restore("wakeup_state", &p["wakeup"])?;
-            }
-            return Ok(());
-        }
-        let id = p["id"]
-            .as_str()
-            .ok_or("invalid background journal ID")?
-            .to_owned();
-        match kind {
-            "task_state" => {
-                self.bg_tasks.insert(id, BgTask::from_metadata(p.clone())?);
-            }
-            "wakeup_state" => {
-                self.wakeups.insert(
-                    id,
-                    Wakeup {
-                        metadata: p.clone(),
-                        deadline: None,
-                    },
-                );
-            }
-            _ => {}
-        }
-        Ok(())
+    fn bg_restore(&mut self, kind: &JournalEventKind, payload: &Value) -> Result<()> {
+        self.scheduler.restore(kind, payload)
     }
     fn bg_recover(&mut self) -> Result<()> {
-        let mut tasks = Vec::new();
-        let mut wakeups = Vec::new();
-        for task in self.bg_tasks.values_mut() {
-            if task.status.is_active() {
-                task.status = BgTaskStatus::Settled(BgTaskOutcome::OutcomeUnknown);
-                task.metadata["replay_allowed"] = json!(false);
-                task.metadata.as_object_mut().unwrap().remove("pid");
-                for name in ["stdout", "stderr"] {
-                    let mut bytes = 0usize;
-                    if let Some(index) = task.metadata[name]["index"].as_u64() {
-                        if let Some(chunks) = self.history[name]
-                            .get(index as usize)
-                            .and_then(|v| v["$chunks"].as_array())
-                        {
-                            for seq in chunks {
-                                let event = self
-                                    .journal
-                                    .event(seq.as_u64().ok_or("invalid stream chunk")? as usize)?;
-                                let data = event["payload"]["base64"]
-                                    .as_str()
-                                    .ok_or("invalid stream bytes")?;
-                                bytes += data.len() / 4 * 3
-                                    - data.bytes().rev().take_while(|b| *b == b'=').count();
-                            }
-                        }
-                    }
-                    task.metadata[name]["bytes"] = json!(bytes);
-                    task.metadata[name]["complete"] = json!(false);
-                }
-                tasks.push(task.snapshot());
-            }
-        }
-        for w in self.wakeups.values_mut() {
-            if matches!(
-                w.metadata["state"].as_str(),
-                Some("scheduled" | "ready" | "dispatching")
-            ) {
-                w.metadata["state"] = json!(if w.metadata["state"] == "dispatching" {
-                    "outcome_unknown"
-                } else {
-                    "pending_confirmation"
-                });
-                wakeups.push(w.metadata.clone());
-            }
-        }
-        for metadata in tasks {
-            self.bg_save_task(&metadata)?;
-        }
-        for metadata in wakeups {
-            self.bg_save_wakeup(&metadata)?;
-        }
-        Ok(())
+        self.scheduler_operation(|scheduler, io, emit| scheduler.recover(io, emit))
     }
     fn bg_guard(&mut self, cancel: bool) -> Result<()> {
         self.service_background()?;
-        if self.bg_tasks.values().any(|t| t.child.is_some()) {
+        if self.scheduler.active_count() > 0 {
             if !cancel {
                 return Err(
                     "background jobs are running; kill them first or request --cancel-tasks".into(),
@@ -14252,62 +22155,31 @@ impl Host {
         Ok(())
     }
     fn bg_shutdown(&mut self) -> Result<()> {
-        let ids: Vec<_> = self
-            .bg_tasks
-            .iter()
-            .filter_map(|(id, t)| t.child.as_ref().map(|_| id.clone()))
-            .collect();
+        let ids = self.scheduler.active_ids();
         for id in &ids {
             self.bg_kill(id, false)?;
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(750);
-        while self.bg_tasks.values().any(|t| t.child.is_some())
-            && std::time::Instant::now() < deadline
-        {
+        while self.scheduler.active_count() > 0 && std::time::Instant::now() < deadline {
             self.service_background()?;
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         for id in &ids {
-            if self.bg_tasks.get(id).is_some_and(|t| t.child.is_some()) {
+            if self.scheduler.is_active(id) {
                 self.bg_kill(id, true)?;
             }
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-        while self.bg_tasks.values().any(|t| t.child.is_some())
-            && std::time::Instant::now() < deadline
-        {
+        while self.scheduler.active_count() > 0 && std::time::Instant::now() < deadline {
             self.service_background()?;
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         // A large backlog or escaped writer must not make shutdown unbounded.
         // Preserve captured bytes explicitly as partial rather than claiming EOF.
         for id in ids {
-            let mut task = self.bg_tasks.remove(&id).unwrap();
-            let result = (|| -> Result<()> {
-                if let Some(mut child) = task.child.take() {
-                    if task.reaped.is_none() {
-                        child.wait()?;
-                    }
-                    task.metadata["stdout"] =
-                        task.stdout.take().unwrap().finish_metadata(self, false)?;
-                    task.metadata["stderr"] =
-                        task.stderr.take().unwrap().finish_metadata(self, false)?;
-                    for name in ["stdout", "stderr"] {
-                        task.metadata[name]
-                            .as_object_mut()
-                            .unwrap()
-                            .remove("preview");
-                    }
-                    task.status = BgTaskStatus::Settled(
-                        task.terminal_status.unwrap_or(BgTaskOutcome::Cancelled),
-                    );
-                    task.metadata["finished_ms"] = json!(now_ms());
-                    self.bg_settle(&task.snapshot())?;
-                }
-                Ok(())
-            })();
-            self.bg_tasks.insert(id, task);
-            result?;
+            self.scheduler_operation(|scheduler, io, emit| {
+                scheduler.finish_partial(io, emit, &id)
+            })?;
         }
         Ok(())
     }
@@ -14749,7 +22621,8 @@ fn load_model_catalog(path: &Path) -> Result<Value> {
     }
     Ok(cache)
 }
-impl Host {
+impl Host {}
+impl ProviderClient {
     fn catalog_endpoint(&self, provider: &str) -> Result<(String, String)> {
         let provider = provider_alias(provider);
         if !["openai", "openai-codex"].contains(&provider) {
@@ -14802,6 +22675,14 @@ impl Host {
                 .collect(),
         )
     }
+}
+impl Host {
+    fn catalog_endpoint(&self, provider: &str) -> Result<(String, String)> {
+        self.provider.catalog_endpoint(provider)
+    }
+    fn catalog_identity(&self, provider: &str) -> Option<String> {
+        self.provider.catalog_identity(provider)
+    }
     fn catalog_auto_enabled(&self) -> bool {
         match std::env::var("PY_MODEL_CATALOG_AUTO_REFRESH")
             .ok()
@@ -14809,7 +22690,7 @@ impl Host {
         {
             Some("0" | "false") => false,
             Some("1" | "true") => true,
-            _ => model_catalog_options(&self.config_defaults)
+            _ => model_catalog_options(&self.provider.config_defaults)
                 .map_or(false, |v| v["auto_refresh"] == true),
         }
     }
@@ -14831,9 +22712,9 @@ impl Host {
         let before = self
             .catalog_identity(&provider)
             .ok_or("catalog refresh requires credentials; /login the provider first")?;
-        let record = &self.catalog["providers"][&provider];
+        let record = &self.provider.catalog["providers"][&provider];
         let now = now_ms() as u64;
-        let options = model_catalog_options(&self.config_defaults)?;
+        let options = model_catalog_options(&self.provider.config_defaults)?;
         if !force && record["identity"] == before {
             let recent = |key: &str, seconds: u64| {
                 record[key]
@@ -14854,7 +22735,7 @@ impl Host {
             "notice",
             json!({"text":format!("Refreshing {provider} model catalog…")}),
         );
-        let cancel_revision = self.cancel_revision;
+        let cancel_revision = self.execution.cancel_revision();
         let result = self.with_state(UiState::Running, None, |host| {
             if provider == "openai-codex" {
                 host.refresh_codex()?;
@@ -14878,13 +22759,13 @@ impl Host {
                     )])
                     .header(
                         "chatgpt-account-id",
-                        host.auth["openai-codex"]["accountId"]
+                        host.provider.auth["openai-codex"]["accountId"]
                             .as_str()
                             .ok_or("Codex account ID missing")?,
                     );
             }
             let mut secrets = Vec::new();
-            credential_secret_values(&host.auth, &mut secrets);
+            credential_secret_values(&host.provider.auth, &mut secrets);
             secrets.push(key);
             let body = host.codex_wait(
                 async {
@@ -14925,7 +22806,7 @@ impl Host {
         });
         // Metadata/validation failures may echo a credential in an ID or label too.
         let mut secrets = Vec::new();
-        credential_secret_values(&self.auth, &mut secrets);
+        credential_secret_values(&self.provider.auth, &mut secrets);
         if let Ok((_, key)) = self.catalog_endpoint(&provider) {
             secrets.push(key);
         }
@@ -14945,13 +22826,13 @@ impl Host {
         }
         // Tokens can rotate during refresh; bind the response to the actual principal.
         let identity = self.catalog_identity(&provider).unwrap_or(before);
-        let mut record = if self.catalog["providers"][&provider]["identity"] == identity {
-            self.catalog["providers"][&provider].clone()
+        let mut record = if self.provider.catalog["providers"][&provider]["identity"] == identity {
+            self.provider.catalog["providers"][&provider].clone()
         } else {
             json!({"identity":identity})
         };
         record["attempted_at_ms"] = json!(now_ms() as u64);
-        if self.cancel_revision != cancel_revision {
+        if self.execution.cancel_revision() != cancel_revision {
             return Err("model catalog refresh cancelled; previous cache retained".into());
         }
         if let Ok(models) = &result {
@@ -14959,7 +22840,10 @@ impl Host {
             record["fetched_at_ms"] = json!(now_ms() as u64);
         }
         self.commit_model_catalog(&provider, record)?;
-        self.context_limit = self.model_limit(&self.model)?;
+        self.provider.set_session_model(
+            self.provider.model.clone(),
+            self.model_limit(&self.provider.model)?,
+        );
         match result {
             Ok(models) => {
                 self.journal.append("model_catalog_refresh",json!({"provider":provider,"count":models.len(),"fetched_at_ms":now_ms() as u64}))?;
@@ -15013,7 +22897,7 @@ impl Host {
             return Err("normalized model cache exceeds 8 MiB".into());
         }
         write_private_json(&path, &cache)?;
-        self.catalog = cache;
+        self.provider.accept_catalog(cache);
         Ok(())
     }
     fn model_list_command(&mut self, args: &str) -> Result<()> {
@@ -15023,6 +22907,7 @@ impl Host {
             .map(|(a, b)| (a, b.trim()))
             .unwrap_or((args, ""));
         let provider = self
+            .provider
             .model
             .split_once('/')
             .map(|p| provider_alias(p.0))
@@ -15434,7 +23319,7 @@ impl Host {
         self.skills["system"].as_str().unwrap_or(SYSTEM)
     }
     fn check_system_budget(&self, limit: usize) -> Result<()> {
-        self.check_model_system_budget(&self.model, limit)
+        self.check_model_system_budget(&self.provider.model, limit)
     }
     fn check_model_system_budget(&self, model: &str, limit: usize) -> Result<()> {
         let protected = (self.system_prompt().chars().count() + 512).div_ceil(3);
@@ -15445,8 +23330,8 @@ impl Host {
         Ok(())
     }
     fn initialize_skills(&mut self) -> Result<()> {
-        self.startup_ready = false;
-        self.check_system_budget(self.context_limit)?;
+        self.execution.block_startup();
+        self.check_system_budget(self.provider.context_limit)?;
         let entries = self.skills["entries"]
             .as_array()
             .ok_or("invalid skills snapshot entries")?
@@ -15455,11 +23340,11 @@ impl Host {
             .cloned()
             .collect::<Vec<_>>();
         if entries.is_empty() {
-            self.startup_ready = true;
+            self.execution.finish_startup(true);
             return Ok(());
         }
-        self.journal.append("startup_begin",json!({"generation":self.generation,"entries":entries.iter().map(|e|&e["filename"]).collect::<Vec<_>>()}))?;
-        self.initializing = true;
+        self.journal.append("startup_begin",json!({"generation":self.execution.generation(),"entries":entries.iter().map(|e|&e["filename"]).collect::<Vec<_>>()}))?;
+        self.execution.begin_startup();
         let outcome = (|| -> Result<()> {
             let mut validation = String::new();
             for entry in &entries {
@@ -15480,7 +23365,7 @@ impl Host {
             }
             for entry in entries {
                 let id = format!("startup-{}", self.journal.seq);
-                self.journal.append("startup_entry",json!({"operation":id,"generation":self.generation,"filename":entry["filename"],"sha256":entry["sha256"],"source":entry["python"]}))?;
+                self.journal.append("startup_entry",json!({"operation":id,"generation":self.execution.generation(),"filename":entry["filename"],"sha256":entry["sha256"],"source":entry["python"]}))?;
                 let result = self.execute(
                     &id,
                     entry["python"].as_str().ok_or("missing startup source")?,
@@ -15492,12 +23377,12 @@ impl Host {
             }
             Ok(())
         })();
-        self.initializing = false;
+        self.execution.finish_startup(false);
         self.journal.append(
             "startup_end",
-            json!({"generation":self.generation,"status":if outcome.is_ok(){"ok"}else{"error"}}),
+            json!({"generation":self.execution.generation(),"status":if outcome.is_ok(){"ok"}else{"error"}}),
         )?;
-        self.startup_ready = outcome.is_ok();
+        self.execution.finish_startup(outcome.is_ok());
         outcome
     }
     fn config_command(&mut self, args: &str) -> Result<()> {
@@ -15506,7 +23391,7 @@ impl Host {
             .map(|(a, b)| (a, b.trim()))
             .unwrap_or((args, ""));
         if verb.is_empty() {
-            self.ui_json("Configuration (loading changes apply on /new)",&json!({"path":self.home.join("config.json"),"effective":effective_config(&self.config_defaults)?,"session_skills_options":self.skills["options"],"skills_changes_pending":skills_options(&self.config_defaults)?!=self.skills["options"],"config_changes_pending":self.config_defaults!=self.config}));
+            self.ui_json("Configuration (loading changes apply on /new)",&json!({"path":self.home.join("config.json"),"effective":effective_config(&self.provider.config_defaults)?,"session_skills_options":self.skills["options"],"skills_changes_pending":skills_options(&self.provider.config_defaults)?!=self.skills["options"],"config_changes_pending":self.provider.config_defaults!=self.provider.config}));
             return Ok(());
         }
         if verb == "reload" {
@@ -15515,7 +23400,7 @@ impl Host {
             }
             let next = load_json(&self.home.join("config.json"))?;
             validate_config(&next)?;
-            self.config_defaults = next;
+            self.provider.accept_defaults(next);
             self.ui_text("Configuration reloaded. Session prompt/startup snapshot unchanged; catalog refresh preferences apply immediately, other loading defaults apply on /new.");
             return Ok(());
         }
@@ -15541,7 +23426,7 @@ impl Host {
             if !value.is_empty() {
                 return Err("usage: /config get <key>".into());
             }
-            let effective = effective_config(&self.config_defaults)?;
+            let effective = effective_config(&self.provider.config_defaults)?;
             let mut found = &effective;
             for part in &parts {
                 found = found.get(*part).ok_or("unknown configuration key")?;
@@ -15557,7 +23442,7 @@ impl Host {
         if verb == "unset" && !value.is_empty() {
             return Err("usage: /config unset <key>".into());
         }
-        let mut next = self.config_defaults.clone();
+        let mut next = self.provider.config_defaults.clone();
         let mut target = &mut next;
         for part in &parts[..parts.len() - 1] {
             let object = target
@@ -15590,11 +23475,11 @@ impl Host {
             return Err(io::Error::last_os_error().into());
         }
         let path = self.home.join("config.json");
-        if load_json(&path)? != self.config_defaults {
+        if load_json(&path)? != self.provider.config_defaults {
             return Err("config.json changed externally; /config reload before editing".into());
         }
         write_private_json(&path, &next)?;
-        self.config_defaults = next;
+        self.provider.accept_defaults(next);
         self.ui_text("Configuration saved. Current session snapshot unchanged; catalog refresh preferences apply immediately, other loading defaults apply on /new.");
         Ok(())
     }
@@ -16146,11 +24031,19 @@ Proposed CLI: --json (stdout events), --json-input (stdin commands), both
 combinable. "--json-inpout" was a tentative name, not a fixed spelling.
 No terminal escape sequences, progress prose or Markdown rendering in JSON.
 Each stdout line is a typed/versioned event; diagnostics use stderr.
-Input command kinds: submit (text + steering/follow-up), shell, python,
-interrupt, stdin_reply, reset, resume_session, context control, quit.
+Input commands include submit (text + steering/follow-up), shell, python,
+interrupt, stdin_reply, reset, resume, context control and quit.
+NativeCommandKind and NATIVE_COMMAND_NAMES are the authoritative names/aliases.
 Every command has an ID; emit accepted/rejected and eventual completion.
 Duplicate IDs must not dispatch code twice within a session.
-Local Rust/Python IPC uses separate framed pipes, not Python stdin/stdout.
+Local Rust/Python IPC uses a private newline-framed Unix socket, not Python
+stdin/stdout. WorkerTransport caps each UTF-8 JSON frame at 64 MiB (excluding
+its newline), checks bounds before extending inbound buffers or transmitting
+outbound frames, and preserves partial frames across finite 20 ms control ticks.
+The initial ready handshake has a 10-second deadline; core initializer execution
+is separate and retains its execution/cancellation policy. Disconnect, invalid
+framing/envelopes, excessive size and cancellation are explicit transport errors;
+the execution controller chooses recovery without replaying a cell.
 Thus print(), os.write(), subprocess output, input() and protocol replies
 cannot corrupt one another. Capture FD-level output, not only sys.stdout.
 A stdin prompt produces an event; replies are correlated to prompt/operation.
@@ -16158,14 +24051,15 @@ EOF/cancel is explicit. Invalid JSON cannot execute code or crash the loop.
 Partial final frames, Unicode, large streams and output backpressure are tested.
 
 ## 11. Single-file scope and verification discipline
-Target 10,000–15,000 lines MAX for main.rs, including spec, all handwritten
-runtime code, embedded Python, fixtures and tests. Aim smaller where possible.
-Do not inflate a smaller correct solution to reach 10k. No generated bulk
-catalogs/fixtures used to evade the line budget; dependencies are allowed but
-not a renamed out-of-tree harness. Minimal Cargo metadata may sit alongside.
+The historical 10,000–15,000-line budget is superseded by the approved
+ownership/readability refactor. Keep one handwritten main.rs, but impose no
+line-count cap: explicit contracts, cohesive ownership and readable transitions
+matter more than a shorter file. Do not add generated bulk catalogs/fixtures
+or a renamed out-of-tree harness. Dependencies and minimal Cargo metadata
+may sit alongside.
 E2E tests launch the actual CLI, which launches its embedded worker; no second
 handwritten Python implementation. External provider fixtures contain no keys.
-If scope cannot fit, narrow v1 with the user rather than splitting silently.
+Discuss scope changes with the user rather than splitting the runtime silently.
 No runtime implementation before the frozen contracts have failing E2E tests.
 
 Process:
@@ -16378,7 +24272,7 @@ This draft ledger does not replace the normative prose: audit remaining prose
 again before implementation so no requirement is overlooked.
 [ ] R01.01 Single handwritten Rust source contains spec, tests and Python bootstrap; no out-of-tree runtime.
       Tests: layout_is_single_source; evidence: not run; review: pending.
-[ ] R01.02 Total source stays <=15,000 lines; smaller is allowed.
+[ ] R01.02 Source remains one handwritten file with cohesive owners, explicit contracts and readable transitions; no line-count cap.
       Tests: source_line_budget; evidence: not run; review: pending.
 [ ] R01.03 No plugin discovery/loading or IPython/Jupyter dependency.
       Tests: no_plugins_or_notebook_runtime; evidence: not run; review: pending.
@@ -16714,10 +24608,11 @@ Provider/image acceptance:
 [ ] R09.11 Real image-input and image-generation workflows work via the running CLI/agent bridge.
       Tests: e2e_live_image_input_and_generation; evidence: not run; review: pending.
 
-## 19. E2E acceptance strategy (frozen)
+## 19. Verification strategy: CLI/PTY acceptance and focused transitions
 Every acceptance test runs the actual built CLI in a temporary isolated HOME
 and workspace. Python is the embedded ordinary-CPython worker. Tests may use
-Rust test functions as drivers, but do not test private functions in isolation.
+Rust test functions as drivers. Focused private decoder/index/controller/editor
+transition tests complement, rather than replace, actual CLI/PTY acceptance.
 All drivers, scenarios, test metadata and embedded fixture servers live here.
 Do not write a second standalone Python test/runtime tree.
 
@@ -17857,11 +25752,26 @@ _ide_keywords=tuple(keyword.kwlist)
 _ide_str=str
 _sock=socket.socket(fileno=int(sys.argv[1]))
 _wire=_sock.makefile('rwb',buffering=0)
+# Keep unbuffered writes for capture/protocol hooks, but buffer reads: reading a
+# multi-MiB history RPC one byte/syscall at a time needlessly stalls execution.
+_reader=_sock.makefile('rb',buffering=8192)
+_WORKER_MAX_MESSAGE_BYTES=64*1024*1024
 def _send(v):
-    _wire.write((json.dumps(v,ensure_ascii=True)+'\n').encode())
+    encoded=json.dumps(v,ensure_ascii=True).encode()
+    if len(encoded)>_WORKER_MAX_MESSAGE_BYTES:
+        raise RuntimeError('worker message exceeds 64 MiB limit')
+    frame=memoryview(encoded+b'\n')
+    sent=0
+    while sent<len(frame):
+        count=_wire.write(frame[sent:])
+        if not count:raise EOFError('host disconnected while writing')
+        sent+=count
 def _recv():
-    line=_wire.readline()
-    if not line: raise EOFError('host disconnected')
+    line=_reader.readline(_WORKER_MAX_MESSAGE_BYTES+2)
+    if not line:raise EOFError('host disconnected')
+    if len(line)>_WORKER_MAX_MESSAGE_BYTES+1:
+        raise RuntimeError('host message exceeds 64 MiB limit')
+    if not line.endswith(b'\n'):raise EOFError('host disconnected mid-frame')
     return json.loads(line)
 _rpc_signal=__import__('signal')
 _rpc_sequence=0
@@ -18201,137 +26111,77 @@ fn test_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
 mod e2e {
     use serde_json::{json, Value};
     use std::{fs, io::Write, path::PathBuf, process::Stdio};
-    fn run(commands: Vec<Value>) -> (Vec<Value>, PathBuf) {
-        let home = std::env::temp_dir().join(format!(
-            "py-e2e-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&home).unwrap();
+    fn run(commands: Vec<Value>) -> (Vec<Value>, crate::test_support::TestDirectory) {
+        let home = crate::test_support::TestDirectory::new("py-e2e");
         let bin = std::env::var("PY_HARNESS_BIN").expect("set PY_HARNESS_BIN to the built CLI");
-        let mut child = crate::test_command(bin)
+        let mut command = crate::test_command(bin);
+        command
             .args(["--json", "--json-input", "--no-model"])
-            .env("PY_HOME", &home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        for c in commands {
-            writeln!(stdin, "{}", c).unwrap();
-        }
-        drop(stdin);
-        let out = child.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "CLI failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            .env("PY_HOME", &home);
+        let out = crate::test_support::ProcessSession::spawn(command).collect(
+            &crate::test_support::jsonl_input(&commands),
+            std::time::Duration::from_secs(30),
         );
-        let events = String::from_utf8(out.stdout)
-            .unwrap()
-            .lines()
-            .map(|s| serde_json::from_str(s).expect("stdout must be JSONL"))
-            .collect::<Vec<Value>>();
-        (events, home)
+        (crate::test_support::jsonl_events(&out), home)
     }
 
-    fn model_run(codes: Vec<&str>, commands: Vec<Value>) -> (Vec<Value>, PathBuf, Vec<Value>) {
+    fn model_run(
+        codes: Vec<&str>,
+        commands: Vec<Value>,
+    ) -> (Vec<Value>, crate::test_support::TestDirectory, Vec<Value>) {
         model_run_with_context_limit(codes, commands, None)
     }
     fn model_run_with_context_limit(
         codes: Vec<&str>,
         commands: Vec<Value>,
         context_limit: Option<usize>,
-    ) -> (Vec<Value>, PathBuf, Vec<Value>) {
-        use std::io::{BufRead, BufReader, Read};
-        use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let codes: Vec<String> = codes.into_iter().map(str::to_string).collect();
-        let server = std::thread::spawn(move || {
-            let mut requests = vec![];
-            for code in codes {
-                let (mut socket, _) = listener.accept().unwrap();
-                socket
-                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+    ) -> (Vec<Value>, crate::test_support::TestDirectory, Vec<Value>) {
+        let mut codes = codes
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+            .into_iter();
+        let server = crate::test_support::MockProvider::json(codes.len(), move |request| {
+            let code = codes.next().unwrap();
+            let code = if code == "FIXTURE_COLLAPSE_ACTUAL_BOUNDARIES" {
+                let messages = request["messages"].as_array().unwrap();
+                let start = messages
+                    .iter()
+                    .filter_map(|m| m["content"].as_str())
+                    .find(|s| s.contains("large user task"))
                     .unwrap();
-                let mut reader = BufReader::new(socket.try_clone().unwrap());
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let mut length = 0;
-                loop {
-                    line.clear();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if line.to_lowercase().starts_with("content-length:") {
-                        length = line
-                            .split(':')
-                            .nth(1)
-                            .unwrap()
-                            .trim()
-                            .parse::<usize>()
-                            .unwrap();
-                    }
-                }
-                let mut bytes = vec![0; length];
-                reader.read_exact(&mut bytes).unwrap();
-                let request: Value = serde_json::from_slice(&bytes).unwrap();
-                let code = if code == "FIXTURE_COLLAPSE_ACTUAL_BOUNDARIES" {
-                    let messages = request["messages"].as_array().unwrap();
-                    let start = messages
-                        .iter()
-                        .filter_map(|m| m["content"].as_str())
-                        .find(|s| s.contains("large user task"))
-                        .unwrap();
-                    let end = messages
-                        .iter()
-                        .filter_map(|m| m["content"].as_str())
-                        .find(|s| s.contains("\nend-marker"))
-                        .unwrap();
-                    let boundary = |s: &str| {
-                        s.lines()
-                            .next()
-                            .unwrap()
-                            .strip_prefix("[boundary ")
-                            .unwrap()
-                            .strip_suffix(']')
-                            .unwrap()
-                            .to_string()
-                    };
-                    format!(
-                        "agent.context.collapse({:?}, {:?}, 'unique-condensed-summary')",
-                        boundary(start),
-                        boundary(end)
-                    )
-                } else {
-                    code
+                let end = messages
+                    .iter()
+                    .filter_map(|m| m["content"].as_str())
+                    .find(|s| s.contains("\nend-marker"))
+                    .unwrap();
+                let boundary = |s: &str| {
+                    s.lines()
+                        .next()
+                        .unwrap()
+                        .strip_prefix("[boundary ")
+                        .unwrap()
+                        .strip_suffix(']')
+                        .unwrap()
+                        .to_string()
                 };
-                requests.push(request);
-                let body = if code == "FIXTURE_TRUNCATED" {
-                    json!({"choices":[{"finish_reason":"length","message":{"content":"print('TRUNCATED-MUST-NOT-RUN')"}}]}).to_string()
-                } else {
-                    json!({"choices":[{"message":{"content":code}}],
+                format!(
+                    "agent.context.collapse({:?}, {:?}, 'unique-condensed-summary')",
+                    boundary(start),
+                    boundary(end)
+                )
+            } else {
+                code
+            };
+            if code == "FIXTURE_TRUNCATED" {
+                json!({"choices":[{"finish_reason":"length","message":{"content":"print('TRUNCATED-MUST-NOT-RUN')"}}]}).to_string()
+            } else {
+                json!({"choices":[{"message":{"content":code}}],
                     "usage":{"prompt_tokens":20,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":5}}}).to_string()
-                };
-                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
             }
-            requests
         });
-        let home = std::env::temp_dir().join(format!(
-            "py-model-e2e-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&home).unwrap();
+        let address = server.address;
+        let home = crate::test_support::TestDirectory::new("py-model-e2e");
         let bin = std::env::var("PY_HARNESS_BIN").unwrap();
         let mut command = crate::test_command(bin);
         command
@@ -18343,29 +26193,15 @@ mod e2e {
         if let Some(limit) = context_limit {
             command.env("PY_CONTEXT_LIMIT", limit.to_string());
         }
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        for c in commands {
-            writeln!(stdin, "{}", c).unwrap();
-        }
-        drop(stdin);
-        let out = child.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
+        let out = crate::test_support::ProcessSession::spawn(command).collect(
+            &crate::test_support::jsonl_input(&commands),
+            std::time::Duration::from_secs(30),
         );
-        let events = String::from_utf8(out.stdout)
-            .unwrap()
-            .lines()
-            .map(|s| serde_json::from_str(s).unwrap())
-            .collect();
-        (events, home, server.join().unwrap())
+        (
+            crate::test_support::jsonl_events(&out),
+            home,
+            server.finish(),
+        )
     }
     #[test]
     fn e2e_actual_requests_keep_code_and_hide_outputs() {
@@ -18896,15 +26732,14 @@ finally:
   except ProcessLookupError:pass
  if p.poll() is None:p.kill();p.wait()
 "#;
-        let out = crate::test_command("python3")
-            .args([
-                "-c",
-                script,
-                &std::env::var("PY_HARNESS_BIN").unwrap(),
-                home.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
+        let out = crate::test_support::run_python_fixture_with(
+            "py-shell-failure-fixture",
+            script,
+            std::time::Duration::from_secs(60),
+            |command| {
+                command.arg(home.to_str().unwrap());
+            },
+        );
         assert!(
             out.status.success(),
             "foreground shell failure fixture:\n{}\n{}",
@@ -19501,15 +27336,14 @@ except subprocess.TimeoutExpired:p.kill();sys.stderr.buffer.write(data);raise
 os.close(master)
 sys.stdout.buffer.write(data)
 "#;
-        let out = crate::test_command("python3")
-            .args([
-                "-c",
-                script,
-                &std::env::var("PY_HARNESS_BIN").unwrap(),
-                home.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
+        let out = crate::test_support::run_python_fixture_with(
+            "py-interactive-help-fixture",
+            script,
+            std::time::Duration::from_secs(60),
+            |command| {
+                command.arg(home.to_str().unwrap());
+            },
+        );
         assert!(
             out.status.success(),
             "{}",
@@ -19596,15 +27430,14 @@ finally:
  os.close(master)
  sys.stdout.buffer.write(transcript)
 "#;
-        let out = crate::test_command("python3")
-            .args([
-                "-c",
-                script,
-                &std::env::var("PY_HARNESS_BIN").unwrap(),
-                home.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
+        let out = crate::test_support::run_python_fixture_with(
+            "py-input-pty-fixture",
+            script,
+            std::time::Duration::from_secs(60),
+            |command| {
+                command.arg(home.to_str().unwrap());
+            },
+        );
         assert!(
             out.status.success(),
             "PTY failed:\n{}\n{}",
@@ -19830,15 +27663,14 @@ try:p.wait(timeout=3)
 except subprocess.TimeoutExpired:p.kill();raise
 sys.stdout.buffer.write(data)
 "#;
-        let out = crate::test_command("python3")
-            .args([
-                "-c",
-                script,
-                &std::env::var("PY_HARNESS_BIN").unwrap(),
-                home.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
+        let out = crate::test_support::run_python_fixture_with(
+            "py-cell-interrupt-fixture",
+            script,
+            std::time::Duration::from_secs(60),
+            |command| {
+                command.arg(home.to_str().unwrap());
+            },
+        );
         assert!(
             out.status.success(),
             "{}",
@@ -20041,15 +27873,14 @@ p=subprocess.run([sys.argv[1],'--json','--json-input','--no-model'],env=dict(os.
 print(p.stdout,end='')
 assert p.returncode==0,p.stderr
 "#;
-        let out = crate::test_command("python3")
-            .args([
-                "-c",
-                script,
-                &std::env::var("PY_HARNESS_BIN").unwrap(),
-                home.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
+        let out = crate::test_support::run_python_fixture_with(
+            "py-login-discovery-fixture",
+            script,
+            std::time::Duration::from_secs(60),
+            |command| {
+                command.arg(home.to_str().unwrap());
+            },
+        );
         assert!(out.status.success());
         let ev: Vec<Value> = String::from_utf8(out.stdout)
             .unwrap()
@@ -20708,7 +28539,7 @@ for view in (H,H.cells,H.code,H.stdout,H.stderr,H.user,H.stdin,H.say,H.requests,
                 .collect::<String>(),
         )
         .unwrap();
-        let mut restored = InputClient::new(Some((home, session)));
+        let mut restored = InputClient::new(Some((home.to_path_buf(), session)));
         restored.send(py("reset-resumed","assert H.code[1]==H.records.code[0]\nassert H.stdout[1]=='before-reset\\n'\nassert H[1].complete and H[1].status=='ok'\nassert H[2].complete and H.stdout[3]==''"));
         assert_eq!(
             restored.until("completed", Some("reset-resumed"))["status"],
@@ -20881,7 +28712,7 @@ print('seed-payload')"#;
                     .collect::<String>();
                 fs::write(&session, bytes).unwrap();
             }
-            let mut restored = InputClient::new(Some((home, session)));
+            let mut restored = InputClient::new(Some((home.to_path_buf(), session)));
             restored.send(py(
                 "raw-restored",
                 r#"assert H.stdout[1]=='seed-payload\n' and H.stderr[1]==''
@@ -21229,17 +29060,12 @@ assert 'image' not in globals()"#,
             .clone()
     }
     fn journal(home: &std::path::Path) -> Vec<Value> {
-        let p = std::fs::read_dir(home.join("sessions"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        std::fs::read_to_string(p)
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect()
+        crate::test_support::read_journal(
+            home,
+            crate::test_support::SessionSelection::Only,
+            crate::test_support::TornTailPolicy::Strict,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -21375,14 +29201,7 @@ mod background_ui_tests {
 import os,sys,tempfile,subprocess,json,glob,time,queue,threading,pty,fcntl,termios,select
 home=tempfile.mkdtemp(prefix='py-background-ui-');env=dict(os.environ,PY_HOME=home,TERM='xterm-256color')
 for key in ('PY_MODEL','PY_CONTEXT_LIMIT'):env.pop(key,None)
-def records():
- paths=glob.glob(home+'/sessions/*.jsonl')
- if not paths:return []
- result=[]
- for line in open(paths[0]):
-  try:result.append(json.loads(line))
-  except ValueError:pass
- return result
+def records():return fixture_journal(home,selection='only',torn_tail='ignore-final')
 def events(p):
  q=queue.Queue()
  def read():
@@ -21402,19 +29221,10 @@ def wait_event(q,predicate):
 {body}
 "#
         );
-        let out = crate::test_command("python3")
-            .args([
-                "-c",
-                &script,
-                &std::env::var("PY_HARNESS_BIN").expect("build CLI and set PY_HARNESS_BIN"),
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-background-ui-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -21691,15 +29501,14 @@ finally:
  if p.poll() is None:p.kill();p.wait()
  os.close(master)
 "#;
-        let out = crate::test_command("python3")
-            .args([
-                "-c",
-                script,
-                &std::env::var("PY_HARNESS_BIN").unwrap(),
-                home.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
+        let out = crate::test_support::run_python_fixture_with(
+            "py-render-width-fixture",
+            script,
+            std::time::Duration::from_secs(60),
+            |command| {
+                command.arg(home.to_str().unwrap());
+            },
+        );
         assert!(
             out.status.success(),
             "PTY width/render failure:\n{}\n{}",
@@ -21756,15 +29565,14 @@ start=len(data);os.write(m,b'@print("\\033[2JPYTHON")\r');wait(b'\\x1b[2JPYTHON'
 assert b'\x1b[2JPYTHON' not in data[start:],bytes(data[start:])
 os.write(m,b'/quit\r');p.wait(timeout=4);os.close(m)
 "#;
-        let out = crate::test_command("python3")
-            .args([
-                "-c",
-                script,
-                &std::env::var("PY_HARNESS_BIN").unwrap(),
-                home.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
+        let out = crate::test_support::run_python_fixture_with(
+            "py-shell-controls-fixture",
+            script,
+            std::time::Duration::from_secs(60),
+            |command| {
+                command.arg(home.to_str().unwrap());
+            },
+        );
         assert!(
             out.status.success(),
             "direct shell controls failure:\n{}\n{}",
@@ -21900,21 +29708,12 @@ mod provider_completion_tests {
 #[cfg(test)]
 mod codex_cache_tests {
     use super::*;
-    fn home() -> PathBuf {
-        let home = std::env::temp_dir().join(format!(
-            "py-codex-cache-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            unique_id()
-        ));
-        fs::create_dir(&home).unwrap();
-        home
+    fn home() -> crate::test_support::TestDirectory {
+        crate::test_support::TestDirectory::new("py-codex-cache")
     }
-    fn host() -> Host {
-        let home = home();
+    fn host() -> crate::test_support::HostFixture {
+        let directory = home();
+        let home = directory.to_path_buf();
         fs::write(
             home.join("auth.json"),
             json!({"openai-codex":{"type":"oauth",
@@ -21923,7 +29722,7 @@ mod codex_cache_tests {
             .to_string(),
         )
         .unwrap();
-        Host::new(
+        let host = Host::new(
             home,
             None,
             true,
@@ -21931,7 +29730,8 @@ mod codex_cache_tests {
             Some("openai-codex/gpt-5.3-codex"),
             Some("high"),
         )
-        .unwrap()
+        .unwrap();
+        crate::test_support::HostFixture::from_host(directory, host)
     }
     fn wire(host: &Host, messages: &[Value]) -> reqwest::Request {
         host.codex_request(
@@ -21982,7 +29782,7 @@ mod codex_cache_tests {
         let mixed = home.join("mixed.jsonl");
         fs::write(
             &mixed,
-            "{\"seq\":0,\"session_id\":\"first\"}\n{\"seq\":1,\"session_id\":\"second\"}\n",
+            "{\"seq\":0,\"kind\":\"test\",\"payload\":{},\"session_id\":\"first\"}\n{\"seq\":1,\"kind\":\"test\",\"payload\":{},\"session_id\":\"second\"}\n",
         )
         .unwrap();
         let error = Journal::open(mixed).err().unwrap().to_string();
@@ -22003,7 +29803,10 @@ mod codex_cache_tests {
         .enumerate()
         {
             let path = home.join(format!("invalid-{index}.jsonl"));
-            let original = format!("{}\n", json!({"seq":0,"session_id":identity}));
+            let original = format!(
+                "{}\n",
+                json!({"seq":0,"kind":"test","payload":{},"session_id":identity})
+            );
             fs::write(&path, &original).unwrap();
             let error = Journal::open(path.clone()).err().unwrap().to_string();
             assert_eq!(error, "invalid journal session ID");
@@ -22119,7 +29922,7 @@ mod codex_e2e {
         let prefix = r#"
 import os,sys,json,tempfile,threading,subprocess,time,base64,stat
 from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
-home=tempfile.mkdtemp(prefix='py-codex-e2e-')
+home=os.environ['PY_TEST_HOME']
 requests=[];responses=[]
 class Handler(BaseHTTPRequestHandler):
  def log_message(self,*a):pass
@@ -22166,20 +29969,7 @@ def journals():
 def completed(events,id):return next(v for v in events if v.get('kind')=='completed' and v.get('command_id')==id)
 "#;
         let script = format!("{prefix}\n{body}");
-        let out = crate::test_command("python3")
-            .args([
-                "-c",
-                &script,
-                &std::env::var("PY_HARNESS_BIN").expect("build CLI and set PY_HARNESS_BIN"),
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stderr),
-            String::from_utf8_lossy(&out.stdout)
-        );
+        crate::test_support::run_python_check(&script, std::time::Duration::from_secs(30));
     }
     #[test]
     fn e2e_codex_cache_identity_native_replay_resume_rename_new_and_retry() {
@@ -22896,11 +30686,7 @@ def wait_for(predicate,label):
   if predicate():return
   if p.poll() is not None:raise AssertionError(('CLI exited',p.returncode,bytes(transcript)))
  raise AssertionError((label,bytes(transcript)))
-def journal():
- try:
-  f=os.path.join(home,'sessions',os.listdir(os.path.join(home,'sessions'))[0])
-  return [json.loads(l) for l in open(f) if l.endswith('\n')]
- except (OSError,IndexError,json.JSONDecodeError):return []
+def journal():return fixture_journal(home,selection='only',torn_tail='ignore-final')
 def send(s):os.write(master,s.encode() if isinstance(s,str) else s)
 last_prompt_count=0
 def enter(s):
@@ -22956,10 +30742,11 @@ finally:
             "{setup}{}{teardown}",
             body.lines().map(|l| format!(" {l}\n")).collect::<String>()
         );
-        let output = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
+        let output = crate::test_support::run_python_fixture(
+            "py-completion-pty-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
+        );
         assert!(
             output.status.success(),
             "PTY fixture failed:\n{}\n{}",
@@ -23093,7 +30880,7 @@ mod cache_usage_e2e {
     fn fixture(body: &str) {
         let script = format!(
             r#"
-import json,os,pathlib,subprocess,sys,tempfile,threading,http.server
+import json,pathlib,threading,http.server
 replies=[];requests=[]
 class Handler(http.server.BaseHTTPRequestHandler):
  def log_message(self,*a):pass
@@ -23125,15 +30912,10 @@ def usages(history):return [v['payload'] for v in history if v['kind']=='usage']
 srv.shutdown()
 "#
         );
-        let out = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-cache-usage-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -23572,21 +31354,21 @@ assert seen[2][2]['generationConfig']['thinkingConfig']['thinkingBudget']==2048
 mod usable_provider_tests {
     use super::*;
 
-    fn host() -> Host {
-        let home =
-            std::env::temp_dir().join(format!("py-usable-{}-{}", std::process::id(), unique_id()));
-        fs::create_dir_all(&home).unwrap();
+    fn host() -> crate::test_support::HostFixture {
+        let directory = crate::test_support::TestDirectory::new("py-usable");
+        let home = directory.to_path_buf();
         let missing_env = format!("PY_MISSING_TEST_KEY_{}", unique_id());
         let config = json!({"skills":{"enabled":false},"model":"openai/gpt-4o",
             "providers":{"openai":{"key_env":missing_env},
                 "local":{"base_url":"http://localhost:9/v1","models":[{"id":"fixture","api":"openai-completions","context_limit":32000}]},
                 "fake-local":{"base_url":"http://127.0.0.1.example.invalid/v1","models":[{"id":"fixture","api":"openai-completions","context_limit":32000}]}}});
         fs::write(home.join("config.json"), config.to_string()).unwrap();
-        Host::new(home, None, true, true, None, None).unwrap()
+        let host = Host::new(home, None, true, true, None, None).unwrap();
+        crate::test_support::HostFixture::from_host(directory, host)
     }
     fn credential(host: &mut Host, value: Value) {
-        host.auth = json!({"openai-codex":value});
-        fs::write(host.home.join("auth.json"), host.auth.to_string()).unwrap();
+        host.provider.accept_auth(json!({"openai-codex":value}));
+        fs::write(host.home.join("auth.json"), host.provider.auth.to_string()).unwrap();
     }
     fn codex() -> Value {
         json!({"type":"oauth","access":"fixture-access-SECRET","refresh":"fixture-refresh-SECRET",
@@ -23618,7 +31400,7 @@ mod usable_provider_tests {
             models,
             home: host.home.clone(),
             python_cwd: host.home.clone(),
-            current_model: host.model.clone(),
+            current_model: host.provider.model.clone(),
             configured_providers: host.login_providers(),
             task_ids: vec![],
             wakeup_ids: vec![],
@@ -23638,7 +31420,7 @@ mod usable_provider_tests {
             .contains("not usable"));
         assert_eq!(fs::read(host.home.join("config.json")).unwrap(), before);
         host.choose_model("codex/sol61").unwrap();
-        assert_eq!(host.model, "openai-codex/gpt-6.1-sol");
+        assert_eq!(host.provider.model, "openai-codex/gpt-6.1-sol");
         host.logout("openai-codex").unwrap();
         assert!(host.matching_models("codex/").is_empty());
         assert!(host.choose_model("codex/sol61").is_err());
@@ -23678,10 +31460,10 @@ mod usable_provider_tests {
     fn login_status_is_noninteractive_secret_free_and_tracks_external_auth_changes() {
         let mut host = host();
         credential(&mut host, codex());
-        let before = host.cells;
+        let before = host.execution.cells();
         host.interactive_login("status").unwrap();
         host.interactive_login("").unwrap();
-        assert_eq!(host.cells, before);
+        assert_eq!(host.execution.cells(), before);
         let status = host.auth_status();
         assert!(!status.to_string().contains("SECRET"));
         assert!(status
@@ -23705,7 +31487,7 @@ mod usable_provider_tests {
             models: json!([]),
             home: host.home.clone(),
             python_cwd: host.home.clone(),
-            current_model: host.model.clone(),
+            current_model: host.provider.model.clone(),
             configured_providers: vec![],
             task_ids: vec![],
             wakeup_ids: vec![],
@@ -23738,10 +31520,10 @@ mod usable_provider_tests {
         assert!(host.provider_usable("local"));
         assert!(!host.provider_usable("fake-local"));
         host.choose_model("local/fixture").unwrap();
-        assert_eq!(host.model, "local/fixture");
+        assert_eq!(host.provider.model, "local/fixture");
         // Startup/CLI/offline restoration does not newly force authentication.
         host.choose_model_session("openai/gpt-4o").unwrap();
-        assert_eq!(host.model, "openai/gpt-4o");
+        assert_eq!(host.provider.model, "openai/gpt-4o");
     }
     #[test]
     fn environment_credentials_enable_json_model_list_selection_and_login_status() {
@@ -23795,21 +31577,16 @@ mod settings_persistence_tests {
             "providers":{"unchanged":{"base_url":"https://example.invalid/v1"}},
             "custom_key":{"preserve":true}})
     }
-    fn host() -> Host {
-        let home = std::env::temp_dir().join(format!(
-            "py-settings-{}-{}-{}",
-            std::process::id(),
-            now_ms(),
-            unique_id()
-        ));
-        fs::create_dir(&home).unwrap();
+    fn host() -> crate::test_support::HostFixture {
+        let directory = crate::test_support::TestDirectory::new("py-settings");
+        let home = directory.to_path_buf();
         fs::write(home.join("config.json"), initial_config().to_string()).unwrap();
         fs::write(home.join("auth.json"), json!({
             "anthropic":{"type":"api_key","key":"fixture-key"},
             "openai-codex":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh",
                 "accountId":"fixture-account","expires":now_ms() as u64+3_600_000}
         }).to_string()).unwrap();
-        Host::new(
+        let host = Host::new(
             home,
             None,
             true,
@@ -23817,7 +31594,8 @@ mod settings_persistence_tests {
             Some("openai/gpt-4o"),
             Some("medium"),
         )
-        .unwrap()
+        .unwrap();
+        crate::test_support::HostFixture::from_host(directory, host)
     }
     fn settings_count(host: &Host) -> usize {
         (0..host.journal.seq)
@@ -23838,7 +31616,7 @@ mod settings_persistence_tests {
         assert_eq!(config["providers"], initial_config()["providers"]);
         assert_eq!(config["custom_key"], initial_config()["custom_key"]);
         assert_eq!(host.skills, snapshot);
-        assert_eq!(host.config_defaults, config);
+        assert_eq!(host.provider.config_defaults, config);
         assert_eq!(
             fs::metadata(host.home.join("config.json"))
                 .unwrap()
@@ -23848,8 +31626,8 @@ mod settings_persistence_tests {
             0o600
         );
         let fresh = Host::new(host.home.clone(), None, true, true, None, None).unwrap();
-        assert_eq!(fresh.model, "anthropic/claude-sonnet-4-6");
-        assert_eq!(fresh.effort, "high");
+        assert_eq!(fresh.provider.model(), "anthropic/claude-sonnet-4-6");
+        assert_eq!(fresh.provider.effort(), "high");
     }
 
     #[test]
@@ -23858,11 +31636,11 @@ mod settings_persistence_tests {
         host.choose_model("anthropic/opus46").unwrap();
         host.change_effort("max").unwrap();
         host.choose_model("codex/53cod").unwrap();
-        assert_eq!(host.model, "openai-codex/gpt-5.3-codex");
-        assert_eq!(host.effort, "medium");
+        assert_eq!(host.provider.model, "openai-codex/gpt-5.3-codex");
+        assert_eq!(host.provider.effort, "medium");
         let config = load_json(&host.home.join("config.json")).unwrap();
-        assert_eq!(config["model"], host.model);
-        assert_eq!(config["effort"], host.effort);
+        assert_eq!(config["model"], host.provider.model);
+        assert_eq!(config["effort"], host.provider.effort);
     }
 
     #[test]
@@ -23883,7 +31661,7 @@ mod settings_persistence_tests {
         assert_eq!(fs::read(&path).unwrap(), original);
         // A call-local override is restored even if the request is invalid.
         assert!(host.inner_llm(&json!({"prompt":"test","options":{"model":"openai/gpt-4.1","effort":"low","max_tokens":0}})).is_err());
-        assert_eq!(host.effort, "high");
+        assert_eq!(host.provider.effort, "high");
         assert_eq!(fs::read(&path).unwrap(), original);
     }
 
@@ -23900,7 +31678,7 @@ mod settings_persistence_tests {
             .unwrap_err()
             .to_string()
             .contains("changed externally"));
-        assert_eq!(host.effort, "medium");
+        assert_eq!(host.provider.effort, "medium");
         assert_eq!(settings_count(&host), changes);
         assert_eq!(load_json(&path).unwrap(), external);
         host.config_command("reload").unwrap();
@@ -23918,7 +31696,7 @@ mod settings_persistence_tests {
             .unwrap_err()
             .to_string()
             .contains("changed externally"));
-        assert_eq!(second.effort, "medium");
+        assert_eq!(second.provider.effort(), "medium");
         assert_eq!(
             load_json(&first.home.join("config.json")).unwrap()["effort"],
             "high"
@@ -23931,13 +31709,13 @@ mod settings_persistence_tests {
         let changes = settings_count(&host);
         let path = host.home.join("config.json");
         let original = fs::read(&path).unwrap();
-        let limit = host.context_limit;
+        let limit = host.provider.context_limit;
         let conflicting = path.with_extension(format!("tmp-{}", std::process::id()));
         fs::create_dir(&conflicting).unwrap();
         assert!(host.choose_model("anthropic/son46").is_err());
-        assert_eq!(host.model, "openai/gpt-4o");
-        assert_eq!(host.effort, "medium");
-        assert_eq!(host.context_limit, limit);
+        assert_eq!(host.provider.model, "openai/gpt-4o");
+        assert_eq!(host.provider.effort, "medium");
+        assert_eq!(host.provider.context_limit, limit);
         assert_eq!(fs::read(&path).unwrap(), original);
         assert_eq!(settings_count(&host), changes);
     }
@@ -23953,7 +31731,7 @@ mod settings_persistence_tests {
             .unwrap_err()
             .to_string()
             .contains("previously failed"));
-        assert_eq!(host.effort, "medium");
+        assert_eq!(host.provider.effort, "medium");
         assert_eq!(fs::read(&path).unwrap(), original);
     }
 
@@ -23968,12 +31746,12 @@ mod settings_persistence_tests {
             error.contains("defaults were saved") && error.contains("session journal failed"),
             "{error}"
         );
-        assert_eq!(host.effort, "medium");
+        assert_eq!(host.provider.effort, "medium");
         assert!(host.journal.failed);
         assert_eq!(settings_count(&host), changes);
         let defaults = load_json(&host.home.join("config.json")).unwrap();
         assert_eq!(defaults["effort"], "high");
-        assert_eq!(host.config_defaults, defaults);
+        assert_eq!(host.provider.config_defaults, defaults);
     }
 }
 
@@ -23982,7 +31760,7 @@ mod ux_e2e {
     fn fixture(check: &str) {
         let script = format!(
             r#"
-import os,sys,tempfile,subprocess,json,glob
+import json,glob
 home=tempfile.mkdtemp(prefix='py-ux-'); env=dict(os.environ,PY_HOME=home)
 for k in ('PY_MODEL','PY_CONTEXT_LIMIT'):env.pop(k,None)
 def run(lines,extra=()):
@@ -23993,15 +31771,10 @@ def journals():return [json.loads(l) for f in glob.glob(home+'/sessions/*.jsonl'
 {check}
 "#
         );
-        let out = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-ux-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -24120,12 +31893,11 @@ mod secret_e2e {
     fn pty(check: &str) {
         let script = format!(
             r#"
-import os,sys,tempfile,subprocess,json,glob,pty,fcntl,termios,select,time,signal
+import json,glob,select,time
 home=tempfile.mkdtemp(prefix='py-secret-');env=dict(os.environ,PY_HOME=home,TERM='xterm-256color')
 for k in ('PY_MODEL','PY_CONTEXT_LIMIT'):env.pop(k,None)
-master,slave=pty.openpty();original=termios.tcgetattr(slave);transcript=bytearray()
-def session():
- os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
+master,slave=fixture_pty();original=termios.tcgetattr(slave);transcript=bytearray()
+session=fixture_controlling_terminal
 p=subprocess.Popen([sys.argv[1],'--no-model'],stdin=slave,stdout=slave,stderr=slave,env=env,preexec_fn=session)
 def read_until(needle):
  deadline=time.monotonic()+5
@@ -24165,15 +31937,10 @@ finally:
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
-        let out = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-secret-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -24231,15 +31998,10 @@ assert 'terminal' in p.stderr.lower() and 'still-safe' in p.stdout,(p.stdout,p.s
 assert 'getpass' not in p.stderr and 'Password input may be echoed' not in p.stderr,p.stderr
 assert not os.path.exists(home+'/auth.json')
 "#;
-        let out = crate::test_command("python3")
-            .args(["-c", script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-secret-pipe-fixture",
+            script,
+            std::time::Duration::from_secs(60),
         );
     }
 }
@@ -24251,7 +32013,7 @@ mod rpc_e2e {
         let script = format!(
             r#"
 import os,sys,tempfile,subprocess,json,glob,time,queue,threading,signal
-home=tempfile.mkdtemp(prefix='py-rpc-race-')
+home=os.environ['PY_TEST_HOME']
 p=subprocess.Popen([sys.argv[1],'--json','--json-input','--no-model'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(os.environ,PY_HOME=home))
 events=queue.Queue()
 def reader():
@@ -24266,7 +32028,7 @@ def until(kind,id=None):
   if v['kind']==kind and (id is None or v.get('command_id')==id):return v
  raise AssertionError((kind,id,'timed out'))
 def code(id,source):send(dict(id=id,kind='python',source=source))
-def journal():return [json.loads(l) for f in glob.glob(home+'/sessions/*.jsonl') for l in open(f)]
+def journal():return fixture_journal(home,selection='all',torn_tail='strict')
 try:
  until('ready')
  exec({check})
@@ -24277,16 +32039,7 @@ finally:
  p.wait()
 "#
         );
-        let out = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        crate::test_support::run_python_check(&script, std::time::Duration::from_secs(30));
     }
     #[test]
     fn e2e_rpc_input_reply_sigint_window_and_repeated_interrupts() {
@@ -24501,10 +32254,11 @@ def run(source,width=512,deadline=3):
 {body}
 "#
         );
-        let out = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
+        let out = crate::test_support::run_python_fixture(
+            "py-responsive-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
+        );
         assert!(
             out.status.success(),
             "{}\n{}",
@@ -24576,15 +32330,10 @@ assert content.splitlines()==['👩\u200d👩\u200d👧\u200d👦','👩🏽\u20
 #[cfg(test)]
 mod boundary_e2e {
     fn check(script: &str) {
-        let out = crate::test_command("python3")
-            .args(["-c", script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-boundary-fixture",
+            script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -24755,20 +32504,14 @@ def run(args,lines='',**kw):
 def events(p):
  assert p.returncode==0,(p.stdout,p.stderr)
  return [json.loads(l) for l in p.stdout.splitlines()]
-def records(path=None):
- return [json.loads(l) for f in ([path] if path else glob.glob(home+'/sessions/*.jsonl')) for l in open(f)]
+def records(path=None):return fixture_journal(home,selection=path if path is not None else 'all',torn_tail='strict')
 {body}
 "#
         );
-        let p = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            p.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&p.stdout),
-            String::from_utf8_lossy(&p.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-flags-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -24999,15 +32742,10 @@ class Terminal:
 server.shutdown()
 "#
         );
-        let output = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-browser-auth-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -25284,14 +33022,13 @@ mod env_e2e {
 
 #[cfg(test)]
 mod newline_e2e {
-    use super::*;
     fn pty(check: &str) {
         let script = format!(
             r#"
-import os,sys,pty,fcntl,termios,select,time,subprocess,tempfile,glob,json,struct,signal
+import select,time,glob,json
 home=tempfile.mkdtemp(prefix='py-newline-');env=dict(os.environ,PY_HOME=home,TERM='xterm-256color',NO_COLOR='1')
-m,s=pty.openpty();fcntl.ioctl(s,termios.TIOCSWINSZ,struct.pack('HHHH',32,160,0,0))
-def controlling():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
+m,s=fixture_pty(32,160)
+controlling=fixture_controlling_terminal
 p=subprocess.Popen([sys.argv[1],'--no-model'],stdin=s,stdout=s,stderr=s,env=env,preexec_fn=controlling)
 os.close(s);data=bytearray()
 def pump(duration=.08):
@@ -25318,15 +33055,10 @@ finally:
  p.wait(timeout=3);os.close(m)
 "#
         );
-        let out = test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-newline-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -25372,10 +33104,10 @@ mod picker_e2e {
     }
     fn fixture_inner(body: &str, model_credentials: bool) {
         let setup = r#"
-import os,sys,pty,fcntl,termios,struct,subprocess,select,time,json,tempfile,re,unicodedata
+import select,time,json,re,unicodedata
 home=tempfile.mkdtemp(prefix='py-picker-');cwd=tempfile.mkdtemp(prefix='py-picker-cwd-')
-m,s=pty.openpty();fcntl.ioctl(s,termios.TIOCSWINSZ,struct.pack('HHHH',24,80,0,0))
-def controlling():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
+m,s=fixture_pty(24,80)
+controlling=fixture_controlling_terminal
 env=dict(os.environ,PY_HOME=home,HOME=cwd,PY_MODEL='openai/gpt-5',TERM='xterm-256color',NO_COLOR='1');env['PATH']=cwd+os.pathsep+env.get('PATH','')
 # TEST_MODEL_CREDENTIALS
 p=subprocess.Popen([sys.argv[1],'--no-model'],stdin=s,stdout=s,stderr=s,cwd=cwd,env=env,preexec_fn=controlling);os.close(s);data=bytearray()
@@ -25392,11 +33124,7 @@ def wait(f,label):
   if p.poll() is not None:raise AssertionError((label,p.returncode,bytes(data)))
  raise AssertionError((label,bytes(data)))
 def send(v):os.write(m,v.encode() if isinstance(v,str) else v)
-def records():
- try:
-  import glob
-  return [json.loads(l) for path in glob.glob(home+'/sessions/*.jsonl') for l in open(path) if l.endswith('\n')]
- except (OSError,json.JSONDecodeError):return []
+def records():return fixture_journal(home,selection='all',torn_tail='ignore-final')
 def sources():return [v['payload']['source'] for v in records() if v['kind']=='code']
 def streams():return ''.join(v['payload']['text'] for v in records() if v['kind']=='stream' and v['payload']['collection']=='stdout')
 def command(line):
@@ -25425,10 +33153,11 @@ finally:
             "{setup}{}{teardown}",
             body.lines().map(|l| format!(" {l}\n")).collect::<String>()
         );
-        let output = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
+        let output = crate::test_support::run_python_fixture(
+            "py-picker-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
+        );
         assert!(
             output.status.success(),
             "picker PTY fixture failed:\n{}\n{}",
@@ -25530,10 +33259,11 @@ env['PY_HOME']=tempfile.mkdtemp(prefix='py-picker-pipe-')
 p=subprocess.run([sys.argv[1],'--no-model'],input='/help\n/quit\n',text=True,capture_output=True,env=env,timeout=7)
 assert p.returncode==0 and '\x1b' not in p.stdout+p.stderr,(p.stdout,p.stderr)
 "#;
-        let output = crate::test_command("python3")
-            .args(["-c", script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
+        let output = crate::test_support::run_python_fixture(
+            "py-picker-pipe-fixture",
+            script,
+            std::time::Duration::from_secs(60),
+        );
         assert!(
             output.status.success(),
             "{}",
@@ -25544,14 +33274,13 @@ assert p.returncode==0 and '\x1b' not in p.stdout+p.stderr,(p.stdout,p.stderr)
 
 #[cfg(test)]
 mod editor_e2e {
-    use super::*;
     fn pty(body: &str) {
         let script = format!(
             r#"
-import os,sys,pty,fcntl,termios,select,time,subprocess,tempfile,glob,json,struct,signal,re
+import select,time,glob,json,re
 home=tempfile.mkdtemp(prefix='py-editor-');env=dict(os.environ,PY_HOME=home,TERM='xterm-256color',NO_COLOR='1')
-m,s=pty.openpty();fcntl.ioctl(s,termios.TIOCSWINSZ,struct.pack('HHHH',30,100,0,0));initial=termios.tcgetattr(s)
-def controlling():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
+m,s=fixture_pty(30,100);initial=termios.tcgetattr(s)
+controlling=fixture_controlling_terminal
 p=subprocess.Popen([sys.argv[1],'--no-model'],stdin=s,stdout=s,stderr=s,env=env,preexec_fn=controlling)
 os.close(s);data=bytearray()
 def pump(duration=.05):
@@ -25566,9 +33295,7 @@ def wait(f,label):
   pump(.02)
   if time.monotonic()>end:raise AssertionError((label,bytes(data)))
 def send(v):os.write(m,v.encode() if isinstance(v,str) else v)
-def records():
- try:return [json.loads(l) for path in glob.glob(home+'/sessions/*.jsonl') for l in open(path) if l.endswith('\n')]
- except (OSError,json.JSONDecodeError):return []
+def records():return fixture_journal(home,selection='all',torn_tail='ignore-final')
 def sources():return [e['payload']['source'] for e in records() if e['kind']=='code']
 def output():return ''.join(e['payload'].get('text','') for e in records() if e['kind']=='stream' and e['payload']['collection']=='stdout')
 def command(text):
@@ -25582,15 +33309,10 @@ finally:
 "#,
             body = body.lines().map(|l| format!(" {l}\n")).collect::<String>()
         );
-        let out = test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-editor-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -25730,11 +33452,10 @@ assert len(data)<100000,len(data)
 
 #[cfg(test)]
 mod ui_state_e2e {
-    use super::*;
     fn fixture(check: &str) {
         let script = format!(
             r#"
-import os,sys,tempfile,subprocess,json,glob,threading,queue,time,signal
+import json,glob,threading,queue,time
 home=tempfile.mkdtemp(prefix='py-state-');env=dict(os.environ,PY_HOME=home)
 for k in ('PY_MODEL','PY_CONTEXT_LIMIT'):env.pop(k,None)
 class Client:
@@ -25756,15 +33477,10 @@ def events():return [json.loads(l) for f in glob.glob(home+'/sessions/*.jsonl') 
 {check}
 "#
         );
-        let out = test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-state-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -26110,10 +33826,10 @@ assert all(len(l)<=39 for l in (out.stdout+out.stderr).splitlines()),out.stdout
 mod picker_boundary_e2e {
     fn fixture(body: &str) {
         let setup = r#"
-import os,sys,pty,fcntl,termios,struct,subprocess,select,time,json,tempfile,glob
+import select,time,json,glob
 home=tempfile.mkdtemp(prefix='py-picker-boundary-')
-m,s=pty.openpty();fcntl.ioctl(s,termios.TIOCSWINSZ,struct.pack('HHHH',24,80,0,0))
-def controlling():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
+m,s=fixture_pty(24,80)
+controlling=fixture_controlling_terminal
 env=dict(os.environ,PY_HOME=home,PY_MODEL='openai/gpt-5',TERM='xterm-256color',NO_COLOR='1')
 p=subprocess.Popen([sys.argv[1],'--no-model'],stdin=s,stdout=s,stderr=s,env=env,preexec_fn=controlling);os.close(s);data=bytearray()
 def pump():
@@ -26129,8 +33845,7 @@ def wait(f,label):
   if p.poll() is not None:raise AssertionError((label,p.returncode,bytes(data)))
  raise AssertionError((label,bytes(data)))
 def send(v):os.write(m,v.encode() if isinstance(v,str) else v)
-def records():
- return [json.loads(l) for path in glob.glob(home+'/sessions/*.jsonl') for l in open(path) if l.endswith('\n')]
+def records():return fixture_journal(home,selection='all',torn_tail='ignore-final')
 def menu(line):
  start=len(data);send(line+'\t');wait(lambda:b'Fuzzy select' in data[start:],'picker opens');return start
 def paste(text):send(b'\x1b[200~'+(text.encode() if isinstance(text,str) else text)+b'\x1b[201~')
@@ -26149,10 +33864,11 @@ finally:
             "{setup}{}{teardown}",
             body.lines().map(|l| format!(" {l}\n")).collect::<String>()
         );
-        let output = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
+        let output = crate::test_support::run_python_fixture(
+            "py-picker-boundary-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
+        );
         assert!(
             output.status.success(),
             "{}\n{}",
@@ -26282,15 +33998,10 @@ def callback(url,path=None,**params):
 release.set();server.shutdown()
 "#
         );
-        let output = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-browser-boundary-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -26382,15 +34093,10 @@ def human(source,extraenv=None):
 {body}
 "#
         );
-        let out = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-styled-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -26518,7 +34224,7 @@ srv.shutdown()
 mod inline_picker_e2e {
     fn fixture(body: &str) {
         let setup = r#"
-import os,sys,pty,fcntl,termios,struct,subprocess,select,time,json,tempfile,re,glob,unicodedata,codecs
+import select,time,json,re,glob,unicodedata,codecs
 home=tempfile.mkdtemp(prefix='py-inline-picker-');env=dict(os.environ,PY_HOME=home,TERM='xterm-256color',NO_COLOR='1')
 class Screen:
  def __init__(self,rows=24,cols=80):
@@ -26569,8 +34275,8 @@ class Screen:
     if width==2 and self.c+1<self.cols:self.grid[self.r][self.c+1]=''
     self.c+=width
  def text(self):return '\n'.join(''.join(row).rstrip() for row in self.grid)
-screen=Screen();m,s=pty.openpty();fcntl.ioctl(s,termios.TIOCSWINSZ,struct.pack('HHHH',24,80,0,0))
-def controlling():os.setsid();fcntl.ioctl(0,termios.TIOCSCTTY,0)
+screen=Screen();m,s=fixture_pty(24,80)
+controlling=fixture_controlling_terminal
 json_mode=os.environ.get('INLINE_JSON_FIXTURE')=='1'
 p=subprocess.Popen([sys.argv[1],'--no-model',*(['--json'] if json_mode else [])],stdin=s,stdout=subprocess.PIPE if json_mode else s,stderr=s,env=env,preexec_fn=controlling);os.close(s);data=bytearray()
 def pump():
@@ -26588,7 +34294,7 @@ def wait(predicate,label):
 def send(value):os.write(m,value.encode() if isinstance(value,str) else value)
 def command(value):
  count=data.count(b'\x1b[?2004h');send(value+'\r');wait(lambda:data.count(b'\x1b[?2004h')>count,'next editor')
-def records():return [json.loads(l) for f in glob.glob(home+'/sessions/*.jsonl') for l in open(f) if l.endswith('\n')]
+def records():return fixture_journal(home,selection='all',torn_tail='ignore-final')
 def sources():return [v['payload']['source'] for v in records() if v['kind']=='code']
 def menu(value):
  start=len(data);send(value+'\t');wait(lambda:'Fuzzy select' in screen.text(),'menu visible')
@@ -26613,21 +34319,22 @@ finally:
  if p.poll() is None:p.kill();p.wait()
  os.close(m)
 "#;
-        let mut command = crate::test_command("python3");
-        let json_mode = body.contains("# JSON");
-        if json_mode {
-            command.env("INLINE_JSON_FIXTURE", "1");
-        } else {
-            command.env_remove("INLINE_JSON_FIXTURE");
-        }
         let script = format!(
             "{setup}{}{end}",
             body.lines().map(|l| format!(" {l}\n")).collect::<String>()
         );
-        let out = command
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
+        let out = crate::test_support::run_python_fixture_with(
+            "py-inline-picker-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
+            |command| {
+                if body.contains("# JSON") {
+                    command.env("INLINE_JSON_FIXTURE", "1");
+                } else {
+                    command.env_remove("INLINE_JSON_FIXTURE");
+                }
+            },
+        );
         assert!(
             out.status.success(),
             "{}\n{}",
@@ -26731,8 +34438,7 @@ home=tempfile.mkdtemp(prefix='py-bgtasks-');env=dict(os.environ,PY_HOME=home)
 for k in ('PY_MODEL','PY_CONTEXT_LIMIT'):env.pop(k,None)
 p=None;seen=[];counter=0
 q=queue.Queue()
-def records():
- return [json.loads(l) for f in glob.glob(home+'/sessions/*.jsonl') for l in open(f)]
+def records():return fixture_journal(home,selection='all',torn_tail='strict')
 def start(extra=(),model=False,preexec=None):
  global p,q,seen
  q=queue.Queue();seen=[]
@@ -26785,15 +34491,10 @@ def model_server(codes):
  return server,requests
 "#;
         let script=format!("{prelude}\ntry:\n{}\nfinally:\n if p is not None and p.poll() is None:p.kill();p.wait()\n",body.lines().map(|l|format!(" {l}")).collect::<Vec<_>>().join("\n"));
-        let out = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-background-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
     #[test]
@@ -27367,7 +35068,7 @@ mod catalog_normalization_tests {
 mod catalog_refresh_e2e {
     fn fixture(body: &str) {
         let prefix = r#"
-import os,sys,json,tempfile,threading,subprocess,time,base64,glob,pathlib,urllib.parse,select
+import json,threading,time,base64,glob,pathlib,urllib.parse,select
 from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
 home=tempfile.mkdtemp(prefix='py-catalog-e2e-')
 requests=[];responses=[];hold_refresh=False;release_refresh=threading.Event()
@@ -27460,15 +35161,14 @@ def no_secrets():
   assert secret not in text,(secret,text[:1000])
 "#;
         let script = format!("{prefix}\n{body}");
-        let output = crate::test_command("python3")
-            .args([
-                "-c",
-                &script,
-                &std::env::var("PY_HARNESS_BIN").expect("build CLI and set PY_HARNESS_BIN"),
-                env!("CARGO_PKG_VERSION"),
-            ])
-            .output()
-            .unwrap();
+        let output = crate::test_support::run_python_fixture_with(
+            "py-catalog-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
+            |command| {
+                command.arg(env!("CARGO_PKG_VERSION"));
+            },
+        );
         assert!(
             output.status.success(),
             "{}\n{}",
@@ -27754,8 +35454,7 @@ def run(lines='',args=None):
 def events(p):
  assert p.returncode==0,(p.stdout,p.stderr)
  return [json.loads(l) for l in p.stdout.splitlines()]
-def records(path=None):
- return [json.loads(l) for f in ([path] if path else glob.glob(home+'/sessions/*.jsonl')) for l in open(f)]
+def records(path=None):return fixture_journal(home,selection=path if path is not None else 'all',torn_tail='strict')
 def snapshot(path=None):
  snapshots=[v['payload'] for v in records(path) if v['kind']=='skills_snapshot']
  assert len(snapshots)==1,snapshots
@@ -27767,15 +35466,10 @@ def passed(ev):
 {body}
 "#
         );
-        let p = crate::test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            p.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&p.stdout),
-            String::from_utf8_lossy(&p.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-skills-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
 
@@ -28362,13 +36056,12 @@ mod skills_unit_tests {
 
 #[cfg(test)]
 mod busy_commands_e2e {
-    use super::*;
 
     // A held provider response makes immediacy observable without timing races:
     // local commands must complete while the response-release Event is unset.
     fn fixture(body: &str) {
         let script = [r###"
-import os,sys,json,time,tempfile,pathlib,subprocess,threading,queue,http.server,shlex,glob
+import json,time,pathlib,threading,queue,http.server,shlex,glob
 home=tempfile.mkdtemp(prefix='py-busy-controls-')
 env=dict(os.environ,PY_HOME=home)
 for key in ('PY_MODEL','PY_CONTEXT_LIMIT','PY_EFFORT'):env.pop(key,None)
@@ -28392,8 +36085,7 @@ def configure():
  config={'model':'openai/busy-m','effort':'low','model_catalog':{'auto_refresh':False},'providers':{'openai':{'base_url':'http://127.0.0.1:'+str(srv.server_port)+'/v1','models':[{'id':name,'api':'openai-completions','reasoning':True,'reasoning_efforts':['low','medium','high'],'context_limit':128000} for name in ['busy-m','busy-n']]}}}
  pathlib.Path(home,'config.json').write_text(json.dumps(config));env['OPENAI_API_KEY']='fixture-busy-key'
 configure()
-def records():
- return [json.loads(line) for file in sorted(glob.glob(home+'/sessions/*.jsonl')) for line in open(file)]
+def records():return fixture_journal(home,selection='all',torn_tail='strict')
 def wait(test,label):
  end=time.monotonic()+8
  while time.monotonic()<end:
@@ -28430,15 +36122,10 @@ class Client:
   assert self.p.wait(timeout=8)==0,self.p.stderr.read()
   assert not self.reader_errors,self.reader_errors
 "###, body].concat();
-        let output = test_command("python3")
-            .args(["-c", &script, &std::env::var("PY_HARNESS_BIN").unwrap()])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        crate::test_support::assert_python_fixture(
+            "py-busy-fixture",
+            &script,
+            std::time::Duration::from_secs(60),
         );
     }
 
