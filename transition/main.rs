@@ -44,6 +44,58 @@ struct Item {
     raw_index: Option<usize>,
 }
 
+// Assistant history is ordinary Python source. Keep its collapse boundary a
+// Python comment so copying a historical cell (including its marker) remains
+// valid source. User/selection markers retain their existing presentation.
+fn context_item_text(item: &Item) -> String {
+    let prefix = if item.role == "assistant" { "# " } else { "" };
+    format!("{prefix}[boundary {}]\n{}", item.id, item.text)
+}
+
+#[cfg(test)]
+mod context_rendering_tests {
+    use super::*;
+
+    fn item(role: &str, text: &str) -> Item {
+        Item {
+            id: "c42".into(),
+            role: role.into(),
+            text: text.into(),
+            output: false,
+            ranges: vec![],
+            raw_index: None,
+        }
+    }
+
+    #[test]
+    fn assistant_boundary_is_a_python_comment_and_preserves_source() {
+        let source = "value = '''[boundary c1]\\nnot a marker'''\nprint(value)";
+        let rendered = context_item_text(&item("assistant", source));
+        assert_eq!(rendered, format!("# [boundary c42]\n{source}"));
+        // Reusing the entire historical message, as a model sometimes does,
+        // must not turn its collapse metadata into a Python syntax error.
+        let status = Command::new("python3")
+            .args([
+                "-c",
+                "import sys; compile(sys.argv[1], '<history>', 'exec')",
+                &rendered,
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn user_and_selection_boundaries_keep_existing_rendering() {
+        for role in ["user", "summary"] {
+            assert_eq!(
+                context_item_text(&item(role, "selected text")),
+                "[boundary c42]\nselected text"
+            );
+        }
+    }
+}
+
 // Selected context is owned here. Preparing a transition never admits data;
 // persisting it commits the journal before publishing the new in-memory view.
 mod context_store {
@@ -4655,6 +4707,7 @@ trait ProviderControl {
         retryable: bool,
         billing_unknown: bool,
         error: &str,
+        diagnostic: Option<&Value>,
     ) -> Result<()>;
     fn provider_retry_scheduled(
         &mut self,
@@ -6674,6 +6727,7 @@ mod provider_domain_tests {
             _: bool,
             _: bool,
             _: &str,
+            _: Option<&Value>,
         ) -> Result<()> {
             Ok(())
         }
@@ -9291,7 +9345,7 @@ mod context_attachment_tests {
     }
 }
 
-const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences. Persistent CPython exposes agent and H. Treat Python as a workbench: build small reusable helpers for repeated workflows. For example, call agent.sh once, retrieve captured stdout/stderr from H using the returned indexes, then show it with agent.say or select useful ranges with agent.context.read_text(text, start=0, stop=4000). Compose helpers instead of repeating boilerplate; keep side effects and context selection explicit. All H histories use presented one-based cell numbers: H[n] and H.cells[n] are the same cell snapshot; H.code[n] (Python or shell source), H.stdout[n], H.stderr[n] are strings. H.user/stdin/say/requests/responses/usage/raw/events[n] are ordered lists of that cell's records, never a single lossy last record. Empty streams are empty strings, empty groups are lists; missing cells raise errors. Negative indexes count cells (-1 is last); slices use cell-number endpoints (stop excluded), [:] is all cells and [::-1] reverses them. Integer zero is invalid. H.records.<collection>[i] is the complete original zero-based record archive, including failed/unassigned/global operations; raw record references and journal coordinates use this namespace. Grouped dictionary records carry cell/index, offset, record_index, record_ref; event seq and payload remain original journal coordinates. Each executed agent cell adds one compact observation like Cell 23: OK · stdout: 3 bytes, 1 line · stderr: empty · python 62ms, not a JSON metadata dump; use that number in H.code/stdout/stderr. Payload enters model context only by explicit selection. User messages are delivered in full with no automatic stats/reference footer; boundary IDs remain for collapse. agent.context.read_text(text, *, start, stop) requires both keyword-only bounds: nonnegative integers, not bool or None, with stop>=start. It selects Unicode text[start:stop], returns a boundary ID, and rejects range widths above the fixed 8000-character cap or next-request-budget overflow without truncation. A stop past the text length clamps normally; the requested width must still fit the cap. There is no max_chars parameter. Example: agent.context.read_text(H.stderr[i], start=0, stop=4000). agent.context.read_raw(data) accepts PNG/JPEG bytes, a base64 dictionary, or a file-path string (not literal image text); max 512000 file bytes, 1536 pixels per axis, 4 active attachments; returns a boundary ID. agent.say(text) sends an intermediate user-only UI message and continues. Use agent.final(text) for every final response: it sends the strong final answer without stdout/context duplication and implicitly ends the turn after the successful cell. Never split a final answer and stopping across cells. Put agent.final last: final/stop do not return or exit Python; subsequent statements run, and a failed cell cancels the staged stop. Final publication is not transactional. agent.sh(command, cwd=None, env=None, timeout=None) runs /bin/sh -c with null stdin and no timeout by default; returns status/exit code and H stream metadata/refs, not text. agent.llm(prompt, model=..., system=..., max_tokens=2048, images=..., effort=...) returns a string; defaults to session model/effort and a helpful-assistant system. agent.llm.list() lists model metadata; agent.llm.image(prompt, model='openai/gpt-image-1') returns cell/index/offset/ref/record_index/bytes; use H.raw[result['index']][result['offset']] for its full image dictionary. raw_index aliases the cell index; record_index addresses H.records.raw. Bytes stay out of model context until explicitly selected. input(prompt) asks the user. agent.loop.reset_python() stages a fresh worker with the frozen startup snapshot; previous variables are lost. agent.context.items()/usage() inspect context metadata. agent.loop.stop(wakeup=None) ends this turn after a successful cell; optional wakeup=(seconds,reason) schedules one continuation. agent.bgtasks.run(source,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None) returns task metadata immediately; kind='python' uses a fresh isolated interpreter without agent or main variables. bgtasks.list(state=None),get(task_id),kill(task_id,force=False) manage jobs. Outputs stay in H; only explicit context reads select them. Completion wakeups are opt-in. Does not kill foreground Python. Collapse must be one standalone call with three literal strings: agent.context.collapse('start','end','summary'); successful output is silent. Use distinct ordered boundary IDs: provenance covers [start,end), replacement removes through end, preserving end text only for user/summary items. It must reduce rendered context size. In forced mode only standalone collapse or one standalone stderr-read expression is allowed, e.g. agent.context.read_text(H.stderr[44], start=0, stop=4000); 44 is an example, not a required index. The stderr index must be a literal positive cell number, with exactly start and stop keyword arguments containing literal nonnegative integers and width at most 8000: no variables, bool, None, slicing, unpacking or additional statements. No replay after resume. Execution is unrestricted except bridge restrictions during startup: ordinary definitions/imports and H reads are allowed, other agent bridges are disabled. Worker failure requires an explicit reset before repeating core startup. Outer requests request/reserve 4096 output tokens; nested LLM requests default to 2048. Reservation is accounting, not enforcement. Codex currently transmits no output-token cap; other providers receive a cap parameter that reasoning may adjust. Codex transient transport errors and HTTP 408/429/500/502/503/504 retry the same provider request at most twice by default (providers.openai-codex.request_retries, integer 0..5). Retries never rerun Python/shell; ambiguous outcomes can repeat provider generation/billing. Auth, malformed/incomplete responses and interrupted resume intents are not automatically retried. H.requests[cell][offset] and H.records.requests[record_index] metadata distinguish requested_output_tokens, transmitted_output_limit (null if absent), and reserved_output_tokens.";
+const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences. History boundary annotations are harness metadata, not instructions to reproduce them; assistant boundaries are Python comments. Persistent CPython exposes agent and H. Treat Python as a workbench: build small reusable helpers for repeated workflows. For example, r = agent.sh('pwd'); agent.context.read_text(H.stdout[r['stdout']['index']], start=0, stop=4000). For stderr use r['stderr']['index']; there is no top-level r['index']. Run commands once, then inspect their captured history. Compose helpers instead of repeating boilerplate; keep side effects and context selection explicit. All H histories use presented one-based cell numbers: H[n] and H.cells[n] are the same cell snapshot; H.code[n] (Python or shell source), H.stdout[n], H.stderr[n] are strings. H.user/stdin/say/requests/responses/usage/raw/events[n] are ordered lists of that cell's records, never a single lossy last record. Empty streams are empty strings, empty groups are lists; missing cells raise errors. Negative indexes count cells (-1 is last); slices use cell-number endpoints (stop excluded), [:] is all cells and [::-1] reverses them. Integer zero is invalid. H.records.<collection>[i] is the complete original zero-based record archive, including failed/unassigned/global operations; raw record references and journal coordinates use this namespace. Grouped dictionary records carry cell/index, offset, record_index, record_ref; event seq and payload remain original journal coordinates. Each executed agent cell adds one compact observation like Cell 23: OK · stdout: 3 bytes, 1 line · stderr: empty · python 62ms, not a JSON metadata dump; use that number in H.code/stdout/stderr. Payload enters model context only by explicit selection. User messages are delivered in full with no automatic stats/reference footer; boundary IDs remain for collapse. agent.context.read_text(text, *, start, stop) requires both keyword-only bounds: nonnegative integers, not bool or None, with stop>=start. It selects Unicode text[start:stop], returns a boundary ID, and rejects range widths above the fixed 8000-character cap or next-request-budget overflow without truncation. A stop past the text length clamps normally; the requested width must still fit the cap. There is no max_chars parameter. Example: agent.context.read_text(H.stderr[i], start=0, stop=4000). agent.context.read_raw(data) accepts PNG/JPEG bytes, a base64 dictionary, or a file-path string (not literal image text); max 512000 file bytes, 1536 pixels per axis, 4 active attachments; returns a boundary ID. agent.say(text) sends an intermediate user-only UI message and continues. Use agent.final(text) for every final response: it sends the strong final answer without stdout/context duplication and implicitly ends the turn after the successful cell. Never split a final answer and stopping across cells. Put agent.final last: final/stop do not return or exit Python; subsequent statements run, and a failed cell cancels the staged stop. Final publication is not transactional. agent.sh(command, cwd=None, env=None, timeout=None) runs /bin/sh -c with null stdin and no timeout by default; returns status/exit code and H stream metadata/refs, not text. agent.llm(prompt, model=..., system=..., max_tokens=2048, images=..., effort=...) returns a string; defaults to session model/effort and a helpful-assistant system. agent.llm.list() lists model metadata; agent.llm.image(prompt, model='openai/gpt-image-1') returns cell/index/offset/ref/record_index/bytes; use H.raw[result['index']][result['offset']] for its full image dictionary. raw_index aliases the cell index; record_index addresses H.records.raw. Bytes stay out of model context until explicitly selected. input(prompt) asks the user. agent.loop.reset_python() stages a fresh worker with the frozen startup snapshot; previous variables are lost. agent.context.items()/usage() inspect context metadata. agent.loop.stop(wakeup=None) ends this turn after a successful cell; optional wakeup=(seconds,reason) schedules one continuation. agent.bgtasks.run(source,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None) returns task metadata immediately; kind='python' uses a fresh isolated interpreter without agent or main variables. bgtasks.list(state=None),get(task_id),kill(task_id,force=False) manage jobs. Outputs stay in H; only explicit context reads select them. Completion wakeups are opt-in. Does not kill foreground Python. Collapse must be one standalone call with three literal strings: agent.context.collapse('start','end','summary'); successful output is silent. Use distinct ordered boundary IDs: provenance covers [start,end), replacement removes through end, preserving end text only for user/summary items. It must reduce rendered context size. In forced mode only standalone collapse or one standalone stderr-read expression is allowed, e.g. agent.context.read_text(H.stderr[44], start=0, stop=4000); 44 is an example, not a required index. The stderr index must be a literal positive cell number, with exactly start and stop keyword arguments containing literal nonnegative integers and width at most 8000: no variables, bool, None, slicing, unpacking or additional statements. No replay after resume. Execution is unrestricted except bridge restrictions during startup: ordinary definitions/imports and H reads are allowed, other agent bridges are disabled. Worker failure requires an explicit reset before repeating core startup. Outer requests request/reserve 4096 output tokens; nested LLM requests default to 2048. Reservation is accounting, not enforcement. Codex currently transmits no output-token cap; other providers receive a cap parameter that reasoning may adjust. Codex transient transport errors and HTTP 408/429/500/502/503/504 retry the same provider request at most twice by default (providers.openai-codex.request_retries, integer 0..5). Retries never rerun Python/shell; ambiguous outcomes can repeat provider generation/billing. Auth, malformed/incomplete responses and interrupted resume intents are not automatically retried. H.requests[cell][offset] and H.records.requests[record_index] metadata distinguish requested_output_tokens, transmitted_output_limit (null if absent), and reserved_output_tokens.";
 // Reasoning request fields follow the pinned Pi provider transformations, not
 // generic OpenAI-compatible guesses. This is a pure body-layout helper: it never
 // reads credentials, starts I/O or changes session state. A false/absent reasoning
@@ -9951,7 +10005,7 @@ impl Host {
             }
             let mut messages = vec![json!({"role":"system","content":system})];
             messages.extend(self.context.items().iter().map(|i|->Result<Value>{
-                let text=format!("[boundary {}]\n{}",i.id,i.text);
+                let text=context_item_text(i);
                 let content=if let Some(index)=i.raw_index{
                     let raw=self.history_value("raw",index)?;
                     let mime=raw["mime"].as_str().ok_or("context image MIME missing")?;
@@ -9973,7 +10027,12 @@ impl Host {
                     }
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if error.downcast_ref::<CodexTerminalFailure>().is_some() {
+                        return Err(format!("{error}. No generated code from this response was executed. Send 'continue' to try a new generation.").into());
+                    }
+                    return Err(error);
+                }
             };
             if self.exit_requested {
                 self.journal.append("provider_response_discarded", json!({
@@ -10429,6 +10488,14 @@ fn terminal_cell_end(v: &Value, width: usize) -> Vec<String> {
     } else {
         format!("cell {}", v["cell"])
     };
+    if v["parent_cell"].as_u64().is_some() {
+        let text = format!(
+            "  ↳ {identity} · {} {}ms · status: {status}",
+            v["language"].as_str().unwrap_or(""),
+            v["elapsed_ms"]
+        );
+        return terminal_style_lines(terminal_wrap(&text, width).0, terminal_result_style(status));
+    }
     let label = format!(
         "── {identity} · {} {}ms · status: {} · {} ",
         v["language"].as_str().unwrap_or(""),
@@ -16543,11 +16610,12 @@ impl ProviderControl for Host {
         retryable: bool,
         billing_unknown: bool,
         error: &str,
+        diagnostic: Option<&Value>,
     ) -> Result<()> {
         self.journal.append(
             "provider_attempt_failed",
             json!({"operation":operation,"attempt":retry+1,
-            "retryable":retryable,"billing_unknown":billing_unknown,"error":error}),
+            "retryable":retryable,"billing_unknown":billing_unknown,"error":error,"diagnostic":diagnostic}),
         )?;
         if billing_unknown {
             self.mark_codex_billing_unknown();
@@ -20570,6 +20638,9 @@ impl ProviderClient {
                         transient.is_some(),
                         billing_unknown,
                         &error.to_string(),
+                        error
+                            .downcast_ref::<CodexTerminalFailure>()
+                            .map(|failure| &failure.diagnostic),
                     )?;
                     let Some(transient) = transient else {
                         return Err(error);
@@ -20653,6 +20724,83 @@ mod provider_retry_tests {
         assert!(
             !footer.contains("cell 3") && !footer.contains("status: ok"),
             "{footer}"
+        );
+    }
+
+    #[test]
+    fn child_footer_omits_provider_metrics_but_preserves_identity_and_failure() {
+        let mut event = json!({"cell":50,"parent_cell":49,"language":"shell",
+            "elapsed_ms":28,"status":"ok","model":"codex/model","effort":"high",
+            "context_usage":{"estimated_tokens":100,"context_limit":200},
+            "cache_hit_percentage":75.6});
+        let child = terminal_cell_end(&event, 500).join("\n");
+        assert!(
+            child.starts_with("  ↳ cell 49 › 50 · shell 28ms · status: ok"),
+            "{child}"
+        );
+        for metric in ["ctx", "cache hit", "codex/model", "──"] {
+            assert!(!child.contains(metric), "{child}");
+        }
+        event["status"] = json!("error");
+        assert!(terminal_cell_end(&event, 40).join("\n").contains("error"));
+        event["parent_cell"] = Value::Null;
+        let parent = terminal_cell_end(&event, 500).join("\n");
+        assert!(parent.starts_with("── cell 50 · shell"), "{parent}");
+        assert!(
+            parent.contains("cache hit") && parent.contains("codex/model"),
+            "{parent}"
+        );
+    }
+    #[test]
+    fn codex_terminal_diagnostics_are_bounded_redacted_and_nonretryable() {
+        let secrets = vec![
+            "credential-SECRET".to_owned(),
+            "credential-SECRET-long".to_owned(),
+        ];
+        for kind in [
+            "error",
+            "response.failed",
+            "response.incomplete",
+            "response.completed",
+        ] {
+            let event = json!({"type":kind,"headers":{"authorization":"credential-SECRET"},
+                "response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},
+                    "error":{"code":"credential-SECRET-long","message":format!("credential-SECRET\n\u{1b}{}", "λ".repeat(1200)),
+                        "extra":"PRIVATE-RAW"},
+                    "output":[{"text":"PARTIAL-MUST-NOT-BE-RETAINED"}]}});
+            let error = codex_terminal_failure(&event, &secrets);
+            assert!(error.downcast_ref::<RetryableProviderError>().is_none());
+            let diagnostic = &error
+                .downcast_ref::<CodexTerminalFailure>()
+                .unwrap()
+                .diagnostic;
+            assert_eq!(diagnostic["event_type"], kind);
+            assert_eq!(diagnostic["reason"], "max_output_tokens");
+            assert_eq!(diagnostic["code"], "[redacted]");
+            assert_eq!(diagnostic.as_object().unwrap().len(), 5);
+            let text = error.to_string();
+            for forbidden in [
+                "credential-SECRET",
+                "PARTIAL-MUST",
+                "PRIVATE-RAW",
+                "authorization",
+                "\n",
+                "\u{1b}",
+            ] {
+                assert!(!text.contains(forbidden), "{text}");
+            }
+            assert!(diagnostic["message"].as_str().unwrap().chars().count() <= 1036);
+            assert!(text.contains("[truncated]") && text.contains("no automatic retry"));
+        }
+        let error = codex_terminal_failure(
+            &json!({"type":"error","code":"server_error","message":"try again"}),
+            &[],
+        );
+        assert!(error.to_string().contains("code=server_error"));
+        let error = codex_terminal_failure(&json!({"type":"response.failed"}), &[]);
+        assert_eq!(
+            error.to_string(),
+            "Codex response.failed; no automatic retry"
         );
     }
     #[test]
@@ -20765,7 +20913,7 @@ async fn codex_sse_once(
     }
     // Local parser state belongs to this attempt only; a later attempt receives
     // a new parser and cannot concatenate abandoned partial generated code.
-    codex_read_sse(response).await
+    codex_read_sse(response, secrets).await
 }
 fn credential_secret_values(value: &Value, out: &mut Vec<String>) {
     if let Some(object) = value.as_object() {
@@ -20843,6 +20991,65 @@ fn codex_error_detail(bytes: &[u8], secrets: &[String]) -> String {
         format!(": {}", safe.trim())
     }
 }
+
+// Failed events retain only bounded, credential-redacted fields, never partial
+// generated source or the raw SSE payload.
+#[derive(Debug)]
+struct CodexTerminalFailure {
+    diagnostic: Value,
+}
+impl std::fmt::Display for CodexTerminalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Codex {}",
+            self.diagnostic["event_type"]
+                .as_str()
+                .unwrap_or("response failure")
+        )?;
+        for key in ["status", "code", "reason", "message"] {
+            if let Some(value) = self.diagnostic[key].as_str() {
+                write!(f, "; {key}={value}")?;
+            }
+        }
+        write!(f, "; no automatic retry")
+    }
+}
+impl std::error::Error for CodexTerminalFailure {}
+fn codex_terminal_failure(event: &Value, secrets: &[String]) -> Box<dyn std::error::Error> {
+    let kind = match event["type"].as_str() {
+        Some("error") => "error",
+        Some("response.failed") => "response.failed",
+        Some("response.incomplete") => "response.incomplete",
+        Some("response.done") => "response.done",
+        _ => "response.completed",
+    };
+    let response = &event["response"];
+    let error = if event["error"].is_object() {
+        &event["error"]
+    } else if response["error"].is_object() {
+        &response["error"]
+    } else {
+        event
+    };
+    let mut diagnostic = json!({"event_type":kind});
+    for (key, value) in [
+        ("status", &response["status"]),
+        ("code", &error["code"]),
+        ("reason", &response["incomplete_details"]["reason"]),
+        ("message", &error["message"]),
+    ] {
+        if let Some(text) = value.as_str() {
+            let safe = codex_error_detail(json!({"error": text}).to_string().as_bytes(), secrets);
+            let safe = safe.strip_prefix(": ").unwrap_or(&safe);
+            if !safe.is_empty() {
+                diagnostic[key] = json!(safe);
+            }
+        }
+    }
+    Box::new(CodexTerminalFailure { diagnostic })
+}
+
 fn validate_provider_completion(body: &Value) -> Result<()> {
     let reason = if body["choices"][0]["finish_reason"] == "length" {
         Some("finish_reason=length")
@@ -20993,7 +21200,7 @@ impl CodexStreamText {
         json!(self.items.into_values().collect::<Vec<_>>())
     }
 }
-async fn codex_read_sse(mut response: reqwest::Response) -> Result<Value> {
+async fn codex_read_sse(mut response: reqwest::Response, secrets: &[String]) -> Result<Value> {
     let mut bytes = Vec::new();
     let mut data = Vec::new();
     let mut text_items = CodexStreamText::default();
@@ -21039,15 +21246,12 @@ async fn codex_read_sse(mut response: reqwest::Response) -> Result<Value> {
                 text_items.observe(&event)?;
                 match event["type"].as_str().unwrap_or("") {
                     "error" | "response.failed" | "response.incomplete" => {
-                        return Err("Codex response failed or incomplete; no automatic retry".into())
+                        return Err(codex_terminal_failure(&event, secrets))
                     }
                     "response.done" | "response.completed" => {
                         let mut body = event["response"].clone();
                         if body["status"] != "completed" {
-                            return Err(
-                                "Codex response did not complete successfully; no automatic retry"
-                                    .into(),
-                            );
+                            return Err(codex_terminal_failure(&event, secrets));
                         }
                         if body["output"].is_null()
                             || body["output"].as_array().is_some_and(Vec::is_empty)
@@ -22841,7 +23045,7 @@ mod scheduler_frontend_tests {
         assert!(frontend.acquire_prompt(json!({})).is_err());
         assert!(fs::read_to_string(output)
             .unwrap()
-            .contains("── cell 1 › 2 · shell"));
+            .contains("  ↳ cell 1 › 2 · shell"));
         assert!(frontend.release_prompt());
         assert!(matches!(frontend.input, InputOwnership::Idle));
         let draft = frontend.take_draft();
@@ -26810,7 +27014,12 @@ metadata uses 922000/1050000 input/combined tokens, while the current native Cod
 fallback uses 258400/272000 and remote discovery supplies authoritative values.
 Provider tokens are still
 estimated, not counted exactly.
-Codex HTTP rejections include bounded, credential-redacted service diagnostics;
+Codex HTTP rejections and failed/incomplete SSE terminal events include bounded,
+credential-redacted service diagnostics. Terminal failure attempt records preserve
+only event type, status, code, incomplete reason and message; raw event payloads and
+partial generated source are not retained. Outer terminal failures explain that
+no generated code from that response ran and 'continue' starts a new generation.
+Nested calls do not claim the enclosing Python cell had no side effects.
 There is no automatic model fallback. Codex has bounded request-only retries for
 transient transport failures and HTTP 408/429/500/502/503/504, with a default of
 2 retries and configurable providers.openai-codex.request_retries (0..5).
@@ -27411,6 +27620,17 @@ mod e2e {
         );
         assert_eq!(requests.len(), 2);
         let messages = requests[1]["messages"].as_array().unwrap();
+        let assistant = messages
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+        let retained = assistant["content"].as_str().unwrap();
+        assert!(retained.starts_with("# [boundary c"), "{retained}");
+        assert_eq!(retained.split_once('\n').unwrap().1, "x = 40 + 2\nprint(x)");
+        let system = requests[0]["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            system.contains("r['stdout']['index']") && system.contains("no top-level r['index']")
+        );
         let reports = messages
             .iter()
             .filter(|message| message["role"] == "user")
@@ -30761,7 +30981,7 @@ os.write(m,b'/quit\r');p.wait(timeout=4);os.close(m)
         let parent_source = output.find(source).unwrap();
         let child_source = output.find("\nprintf CHILD-OUTPUT\n").unwrap();
         let child_output = output.find("\nCHILD-OUTPUT\n").unwrap();
-        let child_end = output.find("── cell 1 › 2 · shell").unwrap();
+        let child_end = output.find("  ↳ cell 1 › 2 · shell").unwrap();
         let parent_output = output.find("\nPARENT-OUTPUT\n").unwrap();
         let parent_end = output.find("── cell 1 · python").unwrap();
         assert!(
@@ -31301,6 +31521,43 @@ from urllib.parse import parse_qs
 assert parse_qs(requests[0][2])['grant_type']==['refresh_token']
 assert json.load(open(home+'/auth.json'))['openai-codex']['expires']>time.time()*1000
 assert 'refresh-SECRET' not in journals()
+"#,
+        );
+    }
+
+    #[test]
+    fn e2e_codex_terminal_diagnostics_and_continue_do_not_execute_partial_source() {
+        fixture(
+            r#"
+auth(time.time()*1000+3600000)
+failure={'type':'response.incomplete','response':{'status':'incomplete',
+ 'incomplete_details':{'reason':'max_output_tokens'},
+ 'error':{'code':'limit_reached','message':'credential '+jwt()+'\nrefresh-SECRET'},
+ 'output':[{'type':'message','content':[{'type':'output_text','text':'raise RuntimeError("PARTIAL-MUST-NOT-RUN")'}]}]}}
+stream='data: '+json.dumps(failure)+'\n\n'
+responses.extend([(200,stream,'text/event-stream'),(200,sse('agent.final("recovered")'),'text/event-stream')])
+commands=[{'id':'fail','kind':'submit','text':'first'},{'id':'again','kind':'submit','text':'continue'}]
+p=subprocess.run([sys.argv[1],'--json','--json-input'],input=''.join(json.dumps(c)+'\n' for c in commands),capture_output=True,text=True,env=env,timeout=12)
+assert p.returncode==0,(p.stdout,p.stderr)
+events=[json.loads(line) for line in p.stdout.splitlines()]
+assert any(v['kind']=='error' for v in events) and any(v['kind']=='final' for v in events),events
+errors=[v['error'] for v in events if v['kind']=='error']
+assert any('reason=max_output_tokens' in e and "Send 'continue'" in e and 'No generated code from this response was executed' in e for e in errors),errors
+assert len(requests)==2,requests
+records=[json.loads(line) for line in journals().splitlines()]
+failures=[v['payload'] for v in records if v['kind']=='provider_attempt_failed']
+assert len(failures)==1 and not failures[0]['retryable'],failures
+d=failures[0]['diagnostic']
+assert d=={'event_type':'response.incomplete','status':'incomplete','code':'limit_reached','reason':'max_output_tokens','message':'credential [redacted] [redacted]'},d
+assert not any(v['kind']=='provider_retry' for v in records),records
+assert not any(secret in journals() for secret in [jwt(),'refresh-SECRET','PARTIAL-MUST-NOT-RUN']),journals()
+assert len([v for v in records if v['kind']=='code'])==1,records
+responses.append((200,stream,'text/event-stream'))
+nested=run([py("agent.llm('nested')")])
+assert completed(nested,'python')['status']=='error',nested
+assert len(requests)==3 and "Send 'continue'" not in json.dumps(nested),nested
+failures=[json.loads(line)['payload'] for line in journals().splitlines() if json.loads(line)['kind']=='provider_attempt_failed']
+assert len(failures)==2 and failures[-1]['diagnostic']==d,failures
 "#,
         );
     }
@@ -34927,7 +35184,7 @@ assert b'openai/fixture [medium]' in last and b'idle' in last,last
 # Cell 1 is an intermediate transcript boundary, not merely a redrawn footer.
 assert bytes(data).count(b'\xe2\x94\x80\xe2\x94\x80 cell 1 \xc2\xb7 python')==1,bytes(data[-8000:])
 # A nested boundary must survive relinquishing busy stdin to input().
-assert bytes(data).count(b'\xe2\x94\x80\xe2\x94\x80 cell 1 \xe2\x80\xba 2 \xc2\xb7 shell')==1,bytes(data[-8000:])
+assert bytes(data).count(b'  \xe2\x86\xb3 cell 1 \xe2\x80\xba 2 \xc2\xb7 shell')==1,bytes(data[-8000:])
 count=data.count(idle_ready);os.write(m,b'keep-\r');wait(lambda:data.count(idle_ready)>count,'draft submitted')
 commands=[v['payload']['source'] for v in events() if v['kind']=='intent' and v['payload']['type']=='shell']
 assert commands==['printf child-only','printf draft_keep-tail'],commands
