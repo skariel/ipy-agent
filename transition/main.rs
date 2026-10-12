@@ -81,8 +81,8 @@ mod context_store {
             Self {
                 items: Vec::new(),
                 revision: 0,
-                trigger: 20,
-                retain: 10,
+                trigger: 50,
+                retain: 20,
             }
         }
     }
@@ -1401,26 +1401,32 @@ mod context_store_tests {
         assert_eq!(store.items().len(), 1);
     }
     #[test]
-    fn default_batch_policy_keeps_ten_recent_selected_outputs_and_never_selects_payload_implicitly()
-    {
+    fn default_batch_policy_keeps_twenty_recent_selected_outputs_and_never_selects_payload_implicitly(
+    ) {
         let mut fixture = Fixture::new();
-        let outputs = (0..20)
+        let outputs = (0..50)
             .map(|n| item(&format!("c{n}"), &format!("selected {n}"), true, None))
-            .collect();
+            .collect::<Vec<_>>();
+        assert!(ContextStore::from_items(outputs[..49].to_vec())
+            .prepare_evict()
+            .unwrap()
+            .is_none());
         let mut store = ContextStore::from_items(outputs);
         let prepared = store.prepare_evict().unwrap().unwrap();
-        assert_eq!(store.items().iter().filter(|i| i.output).count(), 20);
+        assert_eq!(store.items().iter().filter(|i| i.output).count(), 50);
         store.persist(&mut fixture.journal, prepared).unwrap();
-        assert_eq!(store.items().iter().filter(|i| i.output).count(), 10);
+        assert_eq!(store.items().iter().filter(|i| i.output).count(), 20);
         assert!(store.items()[0].text.starts_with("[Output omitted:"));
-        assert_eq!(store.items()[19].text, "selected 19");
+        assert!(store.items()[29].text.starts_with("[Output omitted:"));
+        assert_eq!(store.items()[30].text, "selected 30");
+        assert_eq!(store.items()[49].text, "selected 49");
         assert_eq!(store.revision(), 1);
         assert_eq!(
             fixture.journal.event(0).unwrap()["payload"]["reason"],
             "output_batch"
         );
         let metadata = store.metadata().to_string();
-        assert!(!metadata.contains("selected 19"));
+        assert!(!metadata.contains("selected 49"));
     }
     #[test]
     fn collapse_owns_range_and_attachment_changes_and_keeps_endpoint_text_only() {
@@ -5941,6 +5947,7 @@ struct TerminalFrontend {
     input: InputOwnership,
     commands: std::collections::VecDeque<LocalCommand>,
     visible_revision: u64,
+    editor_cache: std::sync::Arc<std::sync::Mutex<BusyEditorCache>>,
 }
 impl TerminalFrontend {
     fn new() -> Self {
@@ -5955,6 +5962,7 @@ impl TerminalFrontend {
             input: InputOwnership::Idle,
             commands: std::collections::VecDeque::new(),
             visible_revision: 0,
+            editor_cache: std::sync::Arc::new(std::sync::Mutex::new(BusyEditorCache::default())),
         }
     }
     fn state(&self) -> UiState {
@@ -5997,7 +6005,7 @@ impl TerminalFrontend {
         if !matches!(self.input, InputOwnership::Idle) {
             return false;
         }
-        match BusyInput::start(status, self.draft.clone()) {
+        match BusyInput::start(status, self.draft.clone(), self.editor_cache.clone()) {
             Ok(busy) => {
                 self.draft = EditBuffer::default();
                 self.input = InputOwnership::Busy(busy);
@@ -9933,6 +9941,9 @@ impl Host {
             }
             self.check_system_budget(self.provider.context_limit)?;
             self.evict()?;
+            if self.frontend.busy().is_some() {
+                self.refresh_busy_catalog(true)?;
+            }
             let mut system = self.system_prompt().to_owned();
             if self.forced() {
                 // Keep only the safety-gate instruction, not a usage snapshot.
@@ -10471,9 +10482,79 @@ impl Host {
         {
             return false;
         }
+        if let Err(error) = self.refresh_busy_catalog(true) {
+            self.event("error", json!({"error":error.to_string()}));
+            return false;
+        }
         self.frontend.start_busy(self.state_payload())
     }
+    fn refresh_busy_catalog(&mut self, inspect_worker: bool) -> Result<()> {
+        if inspect_worker && self.execution.ready() && self.execution.cell().is_none() {
+            match editor_completion(self) {
+                Ok(helper) => {
+                    let mut cache = self.frontend.editor_cache.lock().unwrap();
+                    cache.catalog = Some(helper.catalog);
+                    cache.refreshed = Some(std::time::Instant::now());
+                    return Ok(());
+                }
+                Err(error) if error.downcast_ref::<WorkerTransportError>().is_some() => {
+                    // A failed inspection may leave a partial or late reply in
+                    // this connection. Never reuse it for an execute request.
+                    self.execution.block_startup();
+                    self.execution.signal_worker(libc::SIGKILL);
+                    let _ = self.execution.reap_worker();
+                    let replacement = self.replace_worker(false);
+                    // With no core Python, replace_worker(false) ordinarily
+                    // marks startup ready. Inspection faults require explicit
+                    // reset even in that case; no model request may proceed.
+                    self.execution.block_startup();
+                    if replacement.is_ok() {
+                        self.journal.append("startup_blocked", json!({
+                            "generation":self.execution.generation(),
+                            "reason":"busy completion inspection failed; explicit reset required"
+                        }))?;
+                    }
+                    return Err("Busy completion inspection failed; the worker connection was discarded. /reset is required before continuing.".into());
+                }
+                // Authentication/configuration failures before inspection do
+                // not make the otherwise healthy worker transport unsafe.
+                Err(error) => return Err(error),
+            }
+        }
+        let due = {
+            let cache = self.frontend.editor_cache.lock().unwrap();
+            cache.refreshed.map_or(true, |time| {
+                time.elapsed() >= std::time::Duration::from_millis(250)
+            })
+        };
+        if !due {
+            return Ok(());
+        }
+        let models = self.usable_models();
+        let providers = self.login_providers();
+        let mut cache = self.frontend.editor_cache.lock().unwrap();
+        let catalog = cache.catalog.get_or_insert_with(|| CompletionCatalog {
+            names: vec![],
+            models: json!([]),
+            home: self.home.clone(),
+            python_cwd: std::env::current_dir().unwrap_or_else(|_| self.home.clone()),
+            current_model: self.provider.model.clone(),
+            configured_providers: vec![],
+            task_ids: vec![],
+            wakeup_ids: vec![],
+        });
+        catalog.models = models;
+        catalog.current_model = self.provider.model.clone();
+        catalog.configured_providers = providers;
+        catalog.task_ids = self.scheduler.task_ids().cloned().collect();
+        catalog.wakeup_ids = self.scheduler.wakeup_ids().cloned().collect();
+        cache.refreshed = Some(std::time::Instant::now());
+        Ok(())
+    }
     fn poll_busy_input(&mut self) -> Result<()> {
+        if self.frontend.busy().is_some() {
+            self.refresh_busy_catalog(false)?;
+        }
         while let Some((text, mode)) = self.frontend.next_busy_line() {
             self.queue_busy_line(text, mode)?;
         }
@@ -11574,7 +11655,7 @@ mod context_html_export_tests {
     fn html_retains_selected_originals_after_output_eviction() {
         let directory = directory();
         let mut host = Host::new(directory.to_path_buf(), None, true, true, None, None).unwrap();
-        for number in 0..21 {
+        for number in 0..51 {
             host.add_context("user", format!("EVICT_SELECTED_{number}"), true, vec![])
                 .unwrap();
         }
@@ -12101,6 +12182,9 @@ fn cli() -> Result<()> {
             if host.exit_requested {
                 break;
             }
+            for line in host.frontend.pending_editor_history() {
+                editor.add_history_entry(&line)?;
+            }
             // Steering captured by the busy prompt is dispatched here if the
             // active turn ended before consuming it at a cell boundary.
             if let Some(command) = host.pending.pop_front() {
@@ -12126,6 +12210,10 @@ fn cli() -> Result<()> {
             )?;
             helper.catalog.task_ids = host.scheduler.task_ids().cloned().collect();
             helper.catalog.wakeup_ids = host.scheduler.wakeup_ids().cloned().collect();
+            host.frontend.seed_editor(
+                helper.catalog.clone(),
+                editor.history().iter().cloned().collect(),
+            );
             editor.set_helper(Some(helper));
             editor.bind_sequence(
                 rustyline::KeyEvent::from('\t'),
@@ -12158,6 +12246,7 @@ fn cli() -> Result<()> {
             if !line.trim_start().starts_with("/login") && !line.trim_start().starts_with("/config")
             {
                 editor.add_history_entry(&line)?;
+                host.frontend.remember_editor_line(&line);
             }
             if line.starts_with('/') {
                 match host.ui_command(line.trim()) {
@@ -12184,6 +12273,9 @@ fn cli() -> Result<()> {
                 Ok(true) => {}
                 Err(e) => host.event("error", json!({"error":e.to_string()})),
             }
+        }
+        for line in host.frontend.pending_editor_history() {
+            editor.add_history_entry(&line)?;
         }
         editor.save_history(&history)?;
         if history.exists() {
@@ -12214,6 +12306,434 @@ fn bind_multiline_keys(
 // One renderer owns the working footer. Agent events are inserted above it;
 // keyboard edits and status ticks share its lock, never an opaque canonical
 // tty buffer. The full draft (including cursor/undo) survives every transition.
+#[derive(Default)]
+struct BusyEditorCache {
+    catalog: Option<CompletionCatalog>,
+    history: Vec<String>,
+    pending_history: Vec<String>,
+    refreshed: Option<std::time::Instant>,
+}
+impl BusyEditorCache {
+    fn remember(&mut self, line: &str) {
+        if !editor_history_safe(line) || self.history.last().is_some_and(|old| old == line) {
+            return;
+        }
+        self.history.push(line.to_owned());
+        self.pending_history.push(line.to_owned());
+        if self.history.len() > 100 {
+            self.history.remove(0);
+        }
+        if self.pending_history.len() > 100 {
+            self.pending_history.remove(0);
+        }
+    }
+}
+fn editor_history_safe(line: &str) -> bool {
+    !line.trim().is_empty()
+        && !line.trim_start().starts_with("/login")
+        && !line.trim_start().starts_with("/config")
+}
+impl TerminalFrontend {
+    fn seed_editor(&mut self, catalog: CompletionCatalog, history: Vec<String>) {
+        let mut cache = self.editor_cache.lock().unwrap();
+        cache.catalog = Some(catalog);
+        cache.history = history;
+        cache.refreshed = Some(std::time::Instant::now());
+    }
+    fn pending_editor_history(&self) -> Vec<String> {
+        std::mem::take(&mut self.editor_cache.lock().unwrap().pending_history)
+    }
+    fn remember_editor_line(&self, line: &str) {
+        self.editor_cache.lock().unwrap().remember(line);
+    }
+}
+struct BusyCompletionMenu {
+    original: EditBuffer,
+    catalog: CompletionCatalog,
+    start: usize,
+    choices: Vec<rustyline::completion::Pair>,
+    selected: usize,
+}
+impl BusyCompletionMenu {
+    fn refresh(&mut self, buffer: &EditBuffer) {
+        if let Ok((start, choices)) = self.catalog.candidates(&buffer.line, buffer.cursor, false) {
+            self.start = start;
+            self.choices = choices;
+            self.selected = 0;
+        }
+    }
+    fn lines(&self, width: usize, room: usize) -> Vec<String> {
+        if room == 0 {
+            return vec![];
+        }
+        if room == 1 {
+            let label = self
+                .choices
+                .get(self.selected)
+                .map(|choice| format!("› {}", choice.display))
+                .unwrap_or_else(|| "completion · no matches".into());
+            return terminal_style_lines(
+                terminal_wrap(&label, width).0.into_iter().take(1).collect(),
+                "1;36",
+            );
+        }
+        let heading = terminal_wrap("completion · ↑↓/Tab · Enter choose · Esc cancel", width)
+            .0
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let mut lines = terminal_style_lines(vec![heading], "2");
+        let count = room.saturating_sub(1);
+        let start = self.selected.saturating_sub(count.saturating_sub(1));
+        for (index, choice) in self.choices.iter().enumerate().skip(start).take(count) {
+            let label = format!(
+                "{} {}",
+                if index == self.selected { "›" } else { " " },
+                choice.display
+            );
+            let label = terminal_wrap(&label, width)
+                .0
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            lines.extend(terminal_style_lines(
+                vec![label],
+                if index == self.selected { "1;36" } else { "2" },
+            ));
+        }
+        if self.choices.is_empty() && count > 0 {
+            lines.push("  no matches".into());
+        }
+        lines
+    }
+}
+enum BusyEditResult {
+    None,
+    Submit(String, String),
+    Interrupt,
+}
+#[cfg(test)]
+mod busy_editor_tests {
+    use super::*;
+    fn display() -> BusyDisplay {
+        let null = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let catalog = CompletionCatalog {
+            names: vec!["busy_helper".into(), "busy_other".into(), "λhelper".into()],
+            models: json!([]),
+            home: std::env::temp_dir(),
+            python_cwd: std::env::temp_dir(),
+            current_model: "test/model".into(),
+            configured_providers: vec![],
+            task_ids: vec![],
+            wakeup_ids: vec![],
+        };
+        BusyDisplay {
+            terminal: EditTerminal {
+                io: TerminalIo {
+                    input: null.try_clone().unwrap(),
+                    _raw: None,
+                    eof_message: "closed",
+                    read_interrupt_is_timeout: true,
+                },
+                output: null,
+                cursor_row: 0,
+                rows: 1,
+                keyboard: false,
+                display: false,
+                headers: vec![],
+            },
+            buffer: EditBuffer::default(),
+            status: json!({"state":"thinking"}),
+            began: std::time::Instant::now(),
+            sampled: std::time::Instant::now(),
+            pending_boundary: None,
+            cache: std::sync::Arc::new(std::sync::Mutex::new(BusyEditorCache {
+                catalog: Some(catalog),
+                ..BusyEditorCache::default()
+            })),
+            completion: None,
+        }
+    }
+    #[test]
+    fn busy_history_recalls_latest_and_restores_unsent_draft_cursor() {
+        let mut display = display();
+        display.cache.lock().unwrap().history = vec!["older".into(), "latest task".into()];
+        display.buffer.line = "draft-tail".into();
+        display.buffer.cursor = 5;
+        display.key(EditKey::Sequence("[A".into()));
+        assert_eq!(display.buffer.line, "latest task");
+        display.key(EditKey::Sequence("[B".into()));
+        assert_eq!(
+            (&display.buffer.line, display.buffer.cursor),
+            (&"draft-tail".to_owned(), 5)
+        );
+        display.key(EditKey::Byte(16));
+        assert_eq!(display.buffer.line, "latest task");
+        display.key(EditKey::Byte(14));
+        assert_eq!(display.buffer.cursor, 5);
+    }
+    #[test]
+    fn busy_history_remembers_submissions_but_excludes_credentials_and_duplicates() {
+        let mut display = display();
+        for line in [
+            "new task",
+            "new task",
+            " /login api-key secret",
+            "/config key secret",
+        ] {
+            display.buffer.line = line.into();
+            display.buffer.cursor = line.len();
+            assert!(matches!(
+                display.key(EditKey::Byte(13)),
+                BusyEditResult::Submit(_, _)
+            ));
+        }
+        let cache = display.cache.lock().unwrap();
+        assert_eq!(cache.history, vec!["new task"]);
+        assert_eq!(cache.pending_history, vec!["new task"]);
+        drop(cache);
+        display.key(EditKey::Sequence("[A".into()));
+        assert_eq!(display.buffer.line, "new task");
+    }
+    #[test]
+    fn cached_python_completion_requires_no_worker_transport_and_handles_unicode() {
+        let mut display = display();
+        for (prefix, full) in [("@busy_he", "@busy_helper"), ("@λh", "@λhelper")] {
+            display.buffer = EditBuffer::default();
+            display.buffer.line = prefix.into();
+            display.buffer.cursor = prefix.len();
+            display.key(EditKey::Byte(9));
+            if display.completion.is_some() {
+                display.key(EditKey::Byte(13));
+            }
+            assert_eq!(display.buffer.line, full);
+            assert!(display.completion.is_none());
+        }
+    }
+    #[test]
+    fn busy_menu_enter_selects_without_submit_then_next_enter_submits() {
+        let mut display = display();
+        display.buffer.line = "/mo".into();
+        display.buffer.cursor = 3;
+        display.key(EditKey::Byte(9));
+        assert!(display.completion.is_some());
+        let selected = display.completion.as_ref().unwrap().choices[0]
+            .replacement
+            .clone();
+        assert!(matches!(
+            display.key(EditKey::Byte(13)),
+            BusyEditResult::None
+        ));
+        assert_eq!(display.buffer.line, selected);
+        assert!(display.cache.lock().unwrap().pending_history.is_empty());
+        assert!(
+            matches!(display.key(EditKey::Byte(13)),BusyEditResult::Submit(line,mode) if line==selected && mode=="steering")
+        );
+    }
+    #[test]
+    fn busy_menu_escape_restores_exact_draft_cursor_undo_and_kill_state() {
+        let mut display = display();
+        display.buffer.line = "/mo tail".into();
+        display.buffer.cursor = 3;
+        display.buffer.killed = "saved kill".into();
+        display.buffer.checkpoint();
+        let original = display.buffer.clone();
+        display.key(EditKey::Byte(9));
+        display.key(EditKey::Text("dels".into()));
+        assert_ne!(display.buffer.line, original.line);
+        display.key(EditKey::Sequence("escape".into()));
+        assert_eq!(display.buffer.line, original.line);
+        assert_eq!(display.buffer.cursor, original.cursor);
+        assert_eq!(display.buffer.undo, original.undo);
+        assert_eq!(display.buffer.killed, original.killed);
+    }
+    #[test]
+    fn busy_menu_filter_backspace_and_arrow_selection_share_catalog_ranking() {
+        let mut display = display();
+        display.buffer.line = "/mo".into();
+        display.buffer.cursor = 3;
+        display.key(EditKey::Byte(9));
+        display.key(EditKey::Text("dels".into()));
+        assert_eq!(
+            display.completion.as_ref().unwrap().choices[0].replacement,
+            "/models"
+        );
+        display.key(EditKey::Byte(127));
+        let count = display.completion.as_ref().unwrap().choices.len();
+        assert!(count >= 2);
+        display.key(EditKey::Sequence("[B".into()));
+        assert_eq!(display.completion.as_ref().unwrap().selected, 1);
+        display.key(EditKey::Sequence("[A".into()));
+        assert_eq!(display.completion.as_ref().unwrap().selected, 0);
+        assert!(display.completion.as_ref().unwrap().lines(80, 3).len() <= 3);
+    }
+    #[test]
+    fn busy_path_completion_uses_cached_cwd_and_shell_escaping() {
+        let directory = crate::test_support::TestDirectory::new("py-busy-completion");
+        fs::write(directory.join("unique spaced.txt"), "").unwrap();
+        let mut display = display();
+        display
+            .cache
+            .lock()
+            .unwrap()
+            .catalog
+            .as_mut()
+            .unwrap()
+            .python_cwd = directory.to_path_buf();
+        display.buffer.line = format!("!cat {}/unique", directory.display());
+        display.buffer.cursor = display.buffer.line.len();
+        display.key(EditKey::Byte(9));
+        if display.completion.is_some() {
+            display.key(EditKey::Byte(13));
+        }
+        assert_eq!(
+            display.buffer.line,
+            format!("!cat '{}'", directory.join("unique spaced.txt").display())
+        );
+        display.buffer = EditBuffer::default();
+        display.buffer.line = "@open('unique".into();
+        display.buffer.cursor = display.buffer.line.len();
+        display.key(EditKey::Byte(9));
+        if display.completion.is_some() {
+            display.key(EditKey::Byte(13));
+        }
+        assert_eq!(display.buffer.line, "@open('unique spaced.txt");
+    }
+    #[test]
+    fn completion_inspection_fault_discards_transport_blocks_generation_and_preserves_cache() {
+        for fault in 0..3 {
+            let mut fixture =
+                crate::test_support::HostFixture::named("py-busy-inspection-fault", None);
+            let host = fixture.host();
+            let cached_catalog = display().cache.lock().unwrap().catalog.clone().unwrap();
+            host.frontend.editor_cache.lock().unwrap().catalog = Some(cached_catalog.clone());
+            let marker = host.home.join("core-must-not-replay");
+            if fault == 1 {
+                host.skills["entries"] = json!([{"core":true,"kind":"python","python":format!("open({:?},'w').write('bad')",marker.to_str().unwrap())}]);
+            }
+            let generation = host.execution.generation();
+            let code_count = host.history.len(RecordCollection::Code);
+            // Stop the real idle child before swapping its socket, so the
+            // original reader never observes a test-induced noisy EOF.
+            host.execution.signal_worker(libc::SIGKILL);
+            host.execution.reap_worker().unwrap();
+            let (socket, peer) = UnixStream::pair().unwrap();
+            host.execution.worker_mut().transport = WorkerTransport::new(socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(peer.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&line).unwrap()["kind"],
+                    "ide_inspect"
+                );
+                if fault == 1 {
+                    let mut writer = peer;
+                    writeln!(
+                        writer,
+                        "{}",
+                        json!({"kind":"ready","secret":"INSPECTION_PAYLOAD_MUST_NOT_LEAK"})
+                    )
+                    .unwrap();
+                } else if fault == 2 {
+                    let mut writer = peer;
+                    writer
+                        .write_all(b"{\"kind\":\"ide_names\",\"names\":[")
+                        .unwrap();
+                    reader
+                        .get_ref()
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    line.clear();
+                    // The timed-out transaction must close its old connection,
+                    // rather than let this partial reply poison a new request.
+                    assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+                }
+            });
+            let error = host.refresh_busy_catalog(true).unwrap_err().to_string();
+            server.join().unwrap();
+            assert!(
+                error.contains("inspection failed") && error.contains("/reset"),
+                "{error}"
+            );
+            assert!(
+                !error.contains("INSPECTION_PAYLOAD_MUST_NOT_LEAK"),
+                "{error}"
+            );
+            assert!(!host.execution.ready());
+            assert_eq!(host.execution.generation(), generation + 1);
+            assert_eq!(host.history.len(RecordCollection::Code), code_count);
+            assert!(!marker.exists());
+            assert_eq!(
+                host.frontend
+                    .editor_cache
+                    .lock()
+                    .unwrap()
+                    .catalog
+                    .as_ref()
+                    .unwrap()
+                    .names,
+                cached_catalog.names
+            );
+            assert!(host.run_agent_inner().is_err());
+            let events = (0..host.journal.seq)
+                .map(|sequence| host.journal.event(sequence).unwrap())
+                .collect::<Vec<_>>();
+            assert!(events.iter().any(|event| event["kind"] == "worker_reset"
+                && event["payload"]["generation"] == generation + 1));
+            assert!(events
+                .iter()
+                .any(|event| event["kind"] == "startup_blocked"));
+            assert!(!events
+                .iter()
+                .any(|event| event["kind"] == "startup_begin" || event["kind"] == "request"));
+            assert!(!serde_json::to_string(&events)
+                .unwrap()
+                .contains("INSPECTION_PAYLOAD_MUST_NOT_LEAK"));
+            // A fresh, deliberately uninitialized worker remains usable for
+            // idle inspection, so the UI can still accept an explicit reset.
+            let helper = editor_completion(host).unwrap();
+            assert!(helper.catalog.names.iter().any(|name| name == "agent"));
+            assert!(!host.execution.ready());
+        }
+    }
+    #[test]
+    fn non_transport_completion_preflight_error_keeps_healthy_worker() {
+        let mut fixture =
+            crate::test_support::HostFixture::named("py-busy-inspection-preflight", None);
+        let host = fixture.host();
+        fs::write(host.home.join("auth.json"), "not valid JSON").unwrap();
+        let generation = host.execution.generation();
+        assert!(host.refresh_busy_catalog(true).is_err());
+        assert!(host.execution.ready());
+        assert_eq!(host.execution.generation(), generation);
+        fs::remove_file(host.home.join("auth.json")).unwrap();
+        assert!(editor_completion(host).is_ok());
+    }
+    #[test]
+    fn active_worker_completion_refresh_does_not_send_ide_requests() {
+        use std::io::Read;
+        let mut fixture = crate::test_support::HostFixture::named("py-busy-no-ipc", None);
+        let host = fixture.host();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        host.execution.signal_worker(libc::SIGKILL);
+        host.execution.reap_worker().unwrap();
+        host.execution.worker_mut().transport = WorkerTransport::new(socket).unwrap();
+        let _scope = host.execution.begin_cell(100, "python", "active-test");
+        host.refresh_busy_catalog(true).unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            peer.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(host.frontend.editor_cache.lock().unwrap().catalog.is_some());
+    }
+}
 struct BusyDisplay {
     terminal: EditTerminal,
     buffer: EditBuffer,
@@ -12221,8 +12741,130 @@ struct BusyDisplay {
     began: std::time::Instant,
     sampled: std::time::Instant,
     pending_boundary: Option<Value>,
+    cache: std::sync::Arc<std::sync::Mutex<BusyEditorCache>>,
+    completion: Option<BusyCompletionMenu>,
 }
 impl BusyDisplay {
+    fn cancel_completion(&mut self) {
+        if let Some(menu) = self.completion.take() {
+            self.buffer = menu.original;
+        }
+    }
+    fn begin_completion(&mut self) {
+        let catalog = self.cache.lock().unwrap().catalog.clone();
+        let Some(catalog) = catalog else {
+            return;
+        };
+        if self.terminal.display && self.terminal.height() < 3 {
+            return;
+        }
+        let Ok((start, choices)) = catalog.candidates(&self.buffer.line, self.buffer.cursor, false)
+        else {
+            return;
+        };
+        if choices.len() == 1 {
+            self.buffer
+                .replace(start, self.buffer.cursor, &choices[0].replacement);
+        } else if !choices.is_empty() {
+            self.completion = Some(BusyCompletionMenu {
+                original: self.buffer.clone(),
+                catalog,
+                start,
+                choices,
+                selected: 0,
+            });
+        }
+    }
+    fn key(&mut self, key: EditKey) -> BusyEditResult {
+        if let Some(mut menu) = self.completion.take() {
+            match &key {
+                EditKey::Byte(27) => {
+                    self.buffer = menu.original;
+                    return BusyEditResult::None;
+                }
+                EditKey::Sequence(value) if value == "escape" => {
+                    self.buffer = menu.original;
+                    return BusyEditResult::None;
+                }
+                EditKey::Byte(3) => {
+                    self.buffer = EditBuffer::default();
+                    return BusyEditResult::Interrupt;
+                }
+                EditKey::Byte(13) => {
+                    if let Some(choice) = menu.choices.get(menu.selected) {
+                        self.buffer
+                            .replace(menu.start, self.buffer.cursor, &choice.replacement);
+                    }
+                    return BusyEditResult::None;
+                }
+                EditKey::Sequence(value) if value == "alt:enter" => {
+                    if let Some(choice) = menu.choices.get(menu.selected) {
+                        self.buffer
+                            .replace(menu.start, self.buffer.cursor, &choice.replacement);
+                    }
+                    return BusyEditResult::None;
+                }
+                EditKey::Byte(9 | 14) => {
+                    if !menu.choices.is_empty() {
+                        menu.selected = (menu.selected + 1) % menu.choices.len();
+                    }
+                }
+                EditKey::Byte(16) => {
+                    menu.selected = menu.selected.saturating_sub(1);
+                }
+                EditKey::Sequence(value) if matches!(value.as_str(), "[A" | "OA") => {
+                    menu.selected = menu.selected.saturating_sub(1);
+                }
+                EditKey::Sequence(value) if matches!(value.as_str(), "[B" | "OB") => {
+                    if !menu.choices.is_empty() {
+                        menu.selected = (menu.selected + 1) % menu.choices.len();
+                    }
+                }
+                _ => {
+                    if let Some(action) = EditAction::decode(key, EditMode::Busy) {
+                        self.buffer.apply(action);
+                        menu.refresh(&self.buffer);
+                    }
+                }
+            }
+            self.completion = Some(menu);
+            return BusyEditResult::None;
+        }
+        match editor_intent(EditMode::Busy, key, self.buffer.line.is_empty()) {
+            EditorIntent::Submit { followup } => {
+                if self.buffer.line.trim().is_empty() {
+                    return BusyEditResult::None;
+                }
+                let line = std::mem::take(&mut self.buffer.line);
+                self.cache.lock().unwrap().remember(&line);
+                self.buffer = EditBuffer::default();
+                BusyEditResult::Submit(line, if followup { "followup" } else { "steering" }.into())
+            }
+            EditorIntent::Interrupt => {
+                self.buffer = EditBuffer::default();
+                BusyEditResult::Interrupt
+            }
+            EditorIntent::Complete => {
+                self.begin_completion();
+                BusyEditResult::None
+            }
+            EditorIntent::History { up } => {
+                let history = self.cache.lock().unwrap().history.clone();
+                self.buffer.history(&history, up);
+                BusyEditResult::None
+            }
+            EditorIntent::Vertical { up } => {
+                let history = self.cache.lock().unwrap().history.clone();
+                self.buffer.vertical(&history, up);
+                BusyEditResult::None
+            }
+            EditorIntent::Edit(action) => {
+                self.buffer.apply(action);
+                BusyEditResult::None
+            }
+            _ => BusyEditResult::None,
+        }
+    }
     fn status(&mut self, status: Value) {
         if self.status["state"] != status["state"] {
             self.began = std::time::Instant::now();
@@ -12263,9 +12905,23 @@ impl BusyDisplay {
             status["cell_elapsed_ms"] = json!(base
                 .saturating_add(self.sampled.elapsed().as_millis().min(u64::MAX as u128) as u64));
         }
-        let lines = terminal_status(&status, self.terminal.width());
-        self.terminal
-            .draw_footer(&lines, &self.buffer.line, self.buffer.cursor)
+        let mut lines = terminal_status(&status, self.terminal.width());
+        if let Some(menu) = &self.completion {
+            let max_headers = self.terminal.height().saturating_sub(2);
+            if max_headers.saturating_sub(lines.len()) < 2 {
+                lines.truncate(max_headers.saturating_sub(2));
+            }
+            let room = max_headers.saturating_sub(lines.len()).min(6);
+            lines.extend(menu.lines(self.terminal.width(), room));
+        }
+        if self.completion.is_some() {
+            let limit = self.terminal.height().saturating_sub(2);
+            self.terminal
+                .draw_footer_limit(&lines, &self.buffer.line, self.buffer.cursor, limit)
+        } else {
+            self.terminal
+                .draw_footer(&lines, &self.buffer.line, self.buffer.cursor)
+        }
     }
 }
 struct BusyInput {
@@ -12275,7 +12931,11 @@ struct BusyInput {
     thread: std::thread::JoinHandle<()>,
 }
 impl BusyInput {
-    fn start(status: Value, buffer: EditBuffer) -> io::Result<Self> {
+    fn start(
+        status: Value,
+        buffer: EditBuffer,
+        cache: std::sync::Arc<std::sync::Mutex<BusyEditorCache>>,
+    ) -> io::Result<Self> {
         let mut terminal = EditTerminal::open(1)?;
         // The reader never renders and never holds the display lock while
         // waiting for a key or a paste; agent output can continue independently.
@@ -12297,6 +12957,8 @@ impl BusyInput {
             began: std::time::Instant::now(),
             sampled: std::time::Instant::now(),
             pending_boundary: None,
+            cache,
+            completion: None,
         }));
         display.lock().unwrap().draw()?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -12315,24 +12977,16 @@ impl BusyInput {
                 };
                 let edited = key.is_some();
                 let mut display = thread_display.lock().unwrap();
-                let buffer = &mut display.buffer;
-                let intent = key
-                    .map(|key| editor_intent(EditMode::Busy, key, buffer.line.is_empty()))
-                    .unwrap_or(EditorIntent::Ignore);
-                match intent {
-                    EditorIntent::Submit { followup } => {
-                        if !buffer.line.trim().is_empty() {
-                            let mode = if followup { "followup" } else { "steering" };
-                            let _ = line_tx.send((std::mem::take(&mut buffer.line), mode.into()));
-                            *buffer = EditBuffer::default();
+                if let Some(key) = key {
+                    match display.key(key) {
+                        BusyEditResult::Submit(line, mode) => {
+                            let _ = line_tx.send((line, mode));
                         }
+                        BusyEditResult::Interrupt => {
+                            INTERRUPT.store(true, std::sync::atomic::Ordering::SeqCst)
+                        }
+                        BusyEditResult::None => {}
                     }
-                    EditorIntent::Interrupt => {
-                        *buffer = EditBuffer::default();
-                        INTERRUPT.store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    EditorIntent::Edit(action) => buffer.apply(action),
-                    _ => {}
                 }
                 if !reader.input_ready()
                     && (edited || painted.elapsed() >= std::time::Duration::from_millis(100))
@@ -12416,6 +13070,7 @@ impl BusyInput {
         let _ = self.thread.join();
         let mut display = self.display.lock().unwrap();
         display.status(status);
+        display.cancel_completion();
         let lines = display.take_intermediate_boundary();
         let _ = display.hide();
         for line in lines {
@@ -12620,8 +13275,24 @@ impl EditTerminal {
         if !self.display {
             return Ok(());
         }
-        // Keep space for the draft and completion picker even on tiny screens.
-        let headers = &headers[..headers.len().min(self.height().saturating_sub(4).min(2))];
+        // Idle status reserves space for its separate picker. Busy completion
+        // supplies its own bounded inline rows through draw_footer_limit.
+        let limit = self.height().saturating_sub(4).min(2);
+        self.draw_footer_limit(headers, line, cursor, limit)
+    }
+    fn draw_footer_limit(
+        &mut self,
+        headers: &[String],
+        line: &str,
+        cursor: usize,
+        limit: usize,
+    ) -> io::Result<()> {
+        if !self.display {
+            return Ok(());
+        }
+        let headers = &headers[..headers
+            .len()
+            .min(limit.min(self.height().saturating_sub(2)))];
         let width = self.width();
         let pad = if width >= 4 {
             2
@@ -12895,8 +13566,8 @@ impl EditAction {
     }
 }
 // Non-editing interaction policy is decoded separately from buffer mutation.
-// Busy mode submits steering/follow-ups and deliberately has no history/picker;
-// idle mode validates Enter, navigates history, and owns completion interaction.
+// Both modes share history and completion candidates. Busy completion uses a
+// cached inline menu, never worker IPC; idle mode additionally validates Enter.
 #[derive(Debug, PartialEq, Eq)]
 enum EditorIntent {
     Edit(EditAction),
@@ -12913,20 +13584,16 @@ fn editor_intent(mode: EditMode, key: EditKey, empty: bool) -> EditorIntent {
         EditKey::Byte(13) => EditorIntent::Submit { followup: false },
         EditKey::Byte(3) => EditorIntent::Interrupt,
         EditKey::Byte(4) if mode == EditMode::Idle && empty => EditorIntent::Eof,
-        EditKey::Byte(9) if mode == EditMode::Idle => EditorIntent::Complete,
-        EditKey::Byte(16) if mode == EditMode::Idle => EditorIntent::History { up: true },
-        EditKey::Byte(14) if mode == EditMode::Idle => EditorIntent::History { up: false },
+        EditKey::Byte(9) => EditorIntent::Complete,
+        EditKey::Byte(16) => EditorIntent::History { up: true },
+        EditKey::Byte(14) => EditorIntent::History { up: false },
         EditKey::Sequence(ref sequence) if mode == EditMode::Busy && sequence == "alt:enter" => {
             EditorIntent::Submit { followup: true }
         }
-        EditKey::Sequence(ref sequence)
-            if mode == EditMode::Idle && matches!(sequence.as_str(), "[A" | "OA") =>
-        {
+        EditKey::Sequence(ref sequence) if matches!(sequence.as_str(), "[A" | "OA") => {
             EditorIntent::Vertical { up: true }
         }
-        EditKey::Sequence(ref sequence)
-            if mode == EditMode::Idle && matches!(sequence.as_str(), "[B" | "OB") =>
-        {
+        EditKey::Sequence(ref sequence) if matches!(sequence.as_str(), "[B" | "OB") => {
             EditorIntent::Vertical { up: false }
         }
         key => EditAction::decode(key, mode)
@@ -13210,7 +13877,7 @@ mod shared_editor_engine_tests {
         );
         assert_eq!(
             editor_intent(EditMode::Busy, EditKey::Byte(9), false),
-            EditorIntent::Ignore
+            EditorIntent::Complete
         );
         assert_eq!(
             editor_intent(EditMode::Idle, EditKey::Byte(16), false),
@@ -13218,7 +13885,7 @@ mod shared_editor_engine_tests {
         );
         assert_eq!(
             editor_intent(EditMode::Busy, EditKey::Byte(16), false),
-            EditorIntent::Ignore
+            EditorIntent::History { up: true }
         );
         assert_eq!(
             editor_intent(EditMode::Idle, EditKey::Byte(4), true),
@@ -13369,7 +14036,7 @@ fn editor_key_with(
     };
     if byte == 27 {
         let Some(first) = terminal.byte(35)? else {
-            return Ok(Some(EditKey::Ignore));
+            return Ok(Some(EditKey::Sequence("escape".into())));
         };
         if first == b'\r' {
             return Ok(Some(EditKey::Byte(10)));
@@ -13647,6 +14314,8 @@ fn terminal_readline(
     host: &mut Host,
 ) -> rustyline::Result<String> {
     use rustyline::error::ReadlineError;
+    host.frontend
+        .seed_editor(helper.catalog.clone(), history.to_vec());
     let mut terminal = EditTerminal::open(output_fd)?;
     terminal.headers = terminal_status(&host.state_payload(), terminal.width());
     let mut buffer = host.frontend.take_draft();
@@ -21695,6 +22364,8 @@ mod scheduler_frontend_tests {
             pending_boundary: Some(
                 json!({"cell":2,"parent_cell":1,"language":"shell","elapsed_ms":1,"status":"ok"}),
             ),
+            cache: std::sync::Arc::new(std::sync::Mutex::new(BusyEditorCache::default())),
+            completion: None,
         }));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -24651,10 +25322,10 @@ spec printer is only draft validation, never proof of an acceptance requirement.
 
 ## 20. Batched old-output eviction and cache stability
 Automatic output eviction is batched, never a sliding per-turn window.
-Proposed initial policy, matching this harness: when 20 evictable output
-payload items accumulate, replace the oldest items as one batch and retain
-the most recent 10. Make trigger/retention configurable, with trigger > retention.
-These numeric defaults are proposed; batching itself is required.
+Current default policy: when 50 evictable output payload items accumulate,
+replace the oldest items as one batch and retain the most recent 20.
+Future configurable trigger/retention must enforce trigger > retention.
+Batching itself is required.
 
 Eligible items are context payloads explicitly classified as execution/helper
 output. A read_text selection is output unless its typed provenance identifies
@@ -26651,11 +27322,18 @@ mod e2e {
     }
     #[test]
     fn e2e_batched_output_eviction_preserves_originals() {
-        let source = (0..20)
+        let source = (0..49)
             .map(|i| format!("agent.context.read_text('output-{i}', start=0, stop=20)"))
             .collect::<Vec<_>>()
             .join("\n");
-        let (_, home) = run(vec![py("a", &source), py("b", "print(len(H.events))")]);
+        let (_, home) = run(vec![
+            py("a", &source),
+            py(
+                "b",
+                "agent.context.read_text('output-49', start=0, stop=20)",
+            ),
+            py("c", "print(len(H.events))"),
+        ]);
         let j = journal(&home);
         let batches: Vec<_> = j
             .iter()
@@ -26663,8 +27341,17 @@ mod e2e {
             .collect();
         assert_eq!(batches.len(), 1);
         let items = batches[0]["payload"]["items"].as_array().unwrap();
-        assert_eq!(items.iter().filter(|i| i["output"] == true).count(), 10);
+        assert_eq!(items.iter().filter(|i| i["output"] == true).count(), 20);
         assert!(items[0]["text"].as_str().unwrap().contains("omitted"));
+        assert!(items[29]["text"].as_str().unwrap().contains("omitted"));
+        assert_eq!(items[30]["text"], "output-30");
+        assert_eq!(items[49]["text"], "output-49");
+        let adds_before_batch = j
+            .iter()
+            .take_while(|v| v["seq"] != batches[0]["seq"])
+            .filter(|v| v["kind"] == "context_add" && v["payload"]["output"] == true)
+            .count();
+        assert_eq!(adds_before_batch, 50);
         assert!(j
             .iter()
             .any(|v| v["kind"] == "context_add" && v["payload"]["text"] == "output-0"));
@@ -36126,6 +36813,103 @@ class Client:
             "py-busy-fixture",
             &script,
             std::time::Duration::from_secs(60),
+        );
+    }
+
+    fn tty_editor_fixture(body: &str) {
+        let script = [r###"
+import pty,select,fcntl,termios,struct
+env['TERM']='xterm-256color'
+master,slave=pty.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',40,160,0,0))
+p=subprocess.Popen([sys.argv[1]],stdin=slave,stdout=slave,stderr=slave,env=env);os.close(slave);data=bytearray()
+idle=b'\x1b[>1u\x1b[?2004h'
+busy=b'\x1b[?2004h\x1b[>1u'
+def pump():
+ ready,_,_=select.select([master],[],[],.02)
+ if ready:
+  try:data.extend(os.read(master,65536))
+  except OSError:pass
+def tty_wait(test,label):
+ end=time.monotonic()+8
+ while time.monotonic()<end:
+  pump()
+  if test():return
+ raise AssertionError((label,bytes(data[-12000:]),records()[-15:]))
+def send(value):os.write(master,value.encode() if isinstance(value,str) else value)
+def arrivals():return [event['payload']['command']['text'] for event in records() if event['kind']=='queue_arrival']
+answer_idle=2
+def finish(marker):
+ first_release.set()
+ tty_wait(lambda:marker.encode() in data and data.count(idle)>=answer_idle,'answer and idle editor')
+ send(b'\x15/quit\r')
+ assert p.wait(timeout=8)==0,bytes(data[-12000:])
+ os.close(master);srv.shutdown()
+tty_wait(lambda:idle in data,'idle editor ready')
+"###, body].concat();
+        fixture(&script);
+    }
+
+    #[test]
+    fn e2e_busy_tty_history_restores_draft_cursor_and_recalls_busy_submissions() {
+        tty_editor_fixture(
+            r###"
+codes[:]=['agent.final("discarded-response")','agent.final("history-complete")']
+send('history task\r');tty_wait(lambda:request_started.is_set() and busy in data,'busy input ready')
+send(b'unsent-tail\x1b[D\x1b[D\x1b[D\x1b[D\x1b[A')
+tty_wait(lambda:b'history task' in data,'latest idle submission recalled')
+send(b'\x1b[BX\r');tty_wait(lambda:arrivals()==['unsent-Xtail'],'down restores original draft and cursor')
+send(b'\x1b[A\r');tty_wait(lambda:arrivals()==['unsent-Xtail','unsent-Xtail'],'busy submission is in history')
+assert not first_release.is_set()
+finish('history-complete')
+assert len(requests)==3,requests
+assert 'unsent-Xtail' in json.dumps(requests[-1]),requests[-1]
+"###,
+        );
+    }
+
+    #[test]
+    fn e2e_busy_tty_python_completion_and_agent_events_share_live_menu() {
+        tty_editor_fixture(
+            r###"
+send('@busy_helper=7; busy_other=8\r');tty_wait(lambda:data.count(idle)>=2,'seeded Python globals')
+started=pathlib.Path(home,'completion-worker-started');announce=pathlib.Path(home,'completion-worker-announce');release=pathlib.Path(home,'completion-worker-release')
+codes[:]=['import pathlib,time\npathlib.Path('+repr(str(started))+').write_text("ready")\nwhile not pathlib.Path('+repr(str(announce))+').exists(): time.sleep(.01)\nagent.say("EVENT-WHILE-COMPLETING")\nwhile not pathlib.Path('+repr(str(release))+').exists(): time.sleep(.01)\nagent.final("before-steering")','agent.final("python-completion-done")']
+answer_idle=3
+first_release.set();send('complete a Python name\r');tty_wait(lambda:started.exists() and busy in data,'active worker and busy prompt')
+menu_from=len(data);send('@busy_he\t');tty_wait(lambda:b'completion' in data[menu_from:] and b'busy_helper' in data[menu_from:],'cached Python completion menu')
+announce_from=len(data);announce.write_text('announce')
+tty_wait(lambda:any(v['kind']=='say' and v['payload']['text']=='EVENT-WHILE-COMPLETING' for v in records()) and b'EVENT-WHILE-COMPLETING' in data[announce_from:],'agent output remains live during selection')
+tty_wait(lambda:data.rfind(b'completion')>data.rfind(b'EVENT-WHILE-COMPLETING'),'completion menu redrawn below agent event')
+send('\r');time.sleep(.05);pump();assert arrivals()==[],arrivals()
+send('\r');tty_wait(lambda:arrivals()==['@busy_helper'],'second enter submits completed draft')
+assert not release.exists();release.write_text('finish')
+finish('python-completion-done')
+assert len(requests)==2,requests
+assert '@busy_helper' in json.dumps(requests[1]),requests[1]
+"###,
+        );
+    }
+
+    #[test]
+    fn e2e_busy_tty_slash_and_quoted_path_completion_execute_locally() {
+        tty_editor_fixture(
+            r###"
+filename=pathlib.Path(home,'unique spaced.txt');filename.write_text('BUSY_COMPLETED_PATH')
+send('local autocomplete task\r');tty_wait(lambda:request_started.is_set() and busy in data,'held provider and busy input')
+menu_from=len(data);send('/mo\t');tty_wait(lambda:b'completion' in data[menu_from:],'slash command menu')
+send('dels\r');time.sleep(.05);pump()
+assert not any(v['kind']=='local_command_accepted' for v in records()),records()[-15:]
+send('\r');tty_wait(lambda:any(v['kind']=='local_command_completed' for v in records()),'completed models command executes while provider held')
+assert any(v['kind']=='local_command_accepted' and v['payload']['command']=='/models' for v in records()),records()[-15:]
+assert not first_release.is_set() and arrivals()==[]
+send('!cat '+str(pathlib.Path(home,'unique'))+'\t\r')
+tty_wait(lambda:any(v['kind']=='cell_end' and v['payload']['language']=='shell' for v in records()),'escaped completed path executes locally')
+intents=[v['payload'] for v in records() if v['kind']=='intent' and v['payload']['type']=='shell']
+assert intents[-1]['source']=='cat '+shlex.quote(str(filename)),intents
+assert b'BUSY_COMPLETED_PATH' in data,bytes(data[-10000:])
+assert not first_release.is_set() and arrivals()==[]
+finish('fixture-result')
+"###,
         );
     }
 
