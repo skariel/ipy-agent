@@ -116,15 +116,6 @@ mod context_store {
         event_kind: &'static str,
         payload: Value,
     }
-    pub(super) struct UserOriginal<'a> {
-        pub(super) sequence: usize,
-        pub(super) index: usize,
-        pub(super) text: &'a str,
-    }
-    pub(super) struct UserUpgrade {
-        pub(super) transition: Option<ContextTransition>,
-        pub(super) ambiguous: Vec<String>,
-    }
     impl Default for ContextStore {
         fn default() -> Self {
             Self {
@@ -381,10 +372,7 @@ mod context_store {
             Ok(())
         }
         pub(super) fn restore_replace(&mut self, items: &[Value]) -> Result<()> {
-            let next = items
-                .iter()
-                .map(|item| parse_replaced_item(item, &self.items))
-                .collect::<Result<Vec<_>>>()?;
+            let next = items.iter().map(parse_item).collect::<Result<Vec<_>>>()?;
             let revision = self
                 .revision
                 .checked_add(1)
@@ -392,83 +380,6 @@ mod context_store {
             self.items = next;
             self.revision = revision;
             Ok(())
-        }
-        pub(super) fn restore_attachment(&mut self, id: &str, index: usize) -> Result<()> {
-            if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
-                if item.role != "user" {
-                    return Err("attachment receipt cannot bind a non-user context item".into());
-                }
-                if item.raw_index.is_some_and(|owned| owned != index) {
-                    return Err("attachment receipt contradicts committed context ownership".into());
-                }
-                item.raw_index = Some(index);
-            }
-            Ok(())
-        }
-        pub(super) fn prepare_full_users(&self, users: &[UserOriginal<'_>]) -> Result<UserUpgrade> {
-            let mut next = self.snapshot();
-            let mut restored = Vec::new();
-            let mut ambiguous = Vec::new();
-            for item in &mut next {
-                if item.role != "user" || item.output || item.raw_index.is_some() {
-                    continue;
-                }
-                let has_provenance = |sequence| {
-                    item.ranges
-                        .iter()
-                        .any(|&(start, stop)| start <= sequence && sequence < stop)
-                };
-                if users
-                    .iter()
-                    .any(|u| has_provenance(u.sequence) && u.text == item.text)
-                {
-                    continue;
-                }
-                let mut candidates = Vec::new();
-                let mut known_legacy = false;
-                for u in users {
-                    if item.text == u.text {
-                        continue;
-                    }
-                    let prefix = u.text.chars().take(8000).collect::<String>();
-                    let count = u.text.chars().count();
-                    let suffix = format!(
-                        "{} chars; {} lines; omitted {} chars;",
-                        count,
-                        u.text.lines().count(),
-                        count.saturating_sub(8000)
-                    );
-                    if !["H.records.user", "H.user"].iter().any(|archive| {
-                        item.text == format!("{prefix}\n[{suffix} {archive}[{}]]", u.index)
-                    }) {
-                        continue;
-                    }
-                    known_legacy = true;
-                    if has_provenance(u.sequence) {
-                        candidates.push((u.index, u.text));
-                    }
-                }
-                match candidates.as_slice() {
-                    [(index, full)] => {
-                        item.text = (*full).to_owned();
-                        restored.push(json!({"context_id":item.id,"user_record_index":index}));
-                    }
-                    [] if !known_legacy => {}
-                    _ => ambiguous.push(item.id.clone()),
-                }
-            }
-            let transition = if restored.is_empty() {
-                None
-            } else {
-                Some(self.prepare_replace(
-                    next,
-                    json!({"reason":"user_messages_full","restored":restored}),
-                )?)
-            };
-            Ok(UserUpgrade {
-                transition,
-                ambiguous,
-            })
         }
         #[cfg(test)]
         pub(super) fn from_items(items: Vec<Item>) -> Self {
@@ -484,7 +395,7 @@ mod context_store {
         }
     }
 }
-use context_store::{ContextStore, UserOriginal};
+use context_store::ContextStore;
 
 #[cfg(test)]
 mod test_support {
@@ -623,7 +534,7 @@ mod test_support {
             json!({"schema_version":1,"seq":0,"session_id":"fixture-session","kind":kind,"payload":payload,"timestamp_ms":123})
         }
         pub(super) fn start(&mut self, cell: usize, operation: &str, parent: Option<usize>) {
-            self.journal.append("cell_start", json!({"cell":cell,"operation":operation,"parent_cell":parent,"language":"python"})).unwrap();
+            self.journal.append("cell_start", json!({"cell":cell,"operation":operation,"parent_cell":parent,"language":"python","user_record_indices":[],"input_raw_indices":[],"generation_request":null})).unwrap();
         }
         pub(super) fn end(&mut self, cell: usize) {
             self.journal
@@ -1509,24 +1420,6 @@ mod context_store_tests {
             .is_err());
     }
     #[test]
-    fn restoration_keeps_legacy_attachment_inheritance_without_resurrecting_replaced_text() {
-        let mut store = ContextStore::from_items(vec![item("c0", "original", false, Some(3))]);
-        let mut legacy = item_json(&store.items()[0]);
-        legacy.as_object_mut().unwrap().remove("raw_index");
-        store.restore_replace(&[legacy.clone()]).unwrap();
-        assert_eq!(store.raw_indices(), vec![3]);
-        legacy["text"] = json!("replacement");
-        store.restore_replace(&[legacy]).unwrap();
-        assert!(store.raw_indices().is_empty());
-        assert_eq!(store.revision(), 2);
-        store.restore_attachment("missing", 7).unwrap();
-        assert!(store.raw_indices().is_empty());
-        store.restore_attachment("c0", 4).unwrap();
-        assert!(store.restore_attachment("c0", 5).is_err());
-        assert_eq!(store.raw_indices(), vec![4]);
-        assert_eq!(store.revision(), 2);
-    }
-    #[test]
     fn bounded_selection_counts_unicode_and_metadata_contains_no_selected_payload() {
         let store =
             ContextStore::from_items(vec![item("c0", "PRIVATE_SELECTED_TEXT", false, None)]);
@@ -1873,11 +1766,6 @@ journal_event_kinds! {
     TaskSettled => "task_settled", TaskState => "task_state", Usage => "usage", User => "user",
     WakeupState => "wakeup_state", WorkerReset => "worker_reset",
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum JournalVersion {
-    Legacy,
-    V1,
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum RecordCollection {
     Code,
@@ -2042,12 +1930,6 @@ impl HistoryArchive {
         let tail = decode_output(&mut carry, &[], true);
         append_output_preview(&mut preview, &mut chars, &mut lines, &tail);
         Ok(preview.into_bytes())
-    }
-    fn literal_text(&self, collection: RecordCollection, index: usize) -> Option<&str> {
-        match self.records.get(&collection)?.get(index)? {
-            ArchivedRecord::Value(value) => value.as_str(),
-            _ => None,
-        }
     }
     #[cfg(test)]
     fn is_empty(&self) -> bool {
@@ -2242,26 +2124,19 @@ mod history_archive_recovery_tests {
     }
 
     #[test]
-    fn recovery_uses_decoder_version_and_does_not_apply_failed_appends() {
-        let directory = TestDirectory::new("py-recovery-legacy");
-        let path = directory.join("legacy.jsonl");
-        let mut event = JournalFixture::envelope("future-extension", json!({"opaque":true}));
+    fn recovery_rejects_old_envelopes_and_failed_appends_do_not_change_index() {
+        let directory = TestDirectory::new("py-recovery-current");
+        let path = directory.join("current.jsonl");
+        let mut event =
+            JournalFixture::envelope("future_recovery_extension", json!({"opaque":true}));
         event.as_object_mut().unwrap().remove("schema_version");
         fs::write(&path, format!("{event}\n")).unwrap();
+        assert!(Journal::open(path.clone()).is_err());
+        fs::remove_file(&path).unwrap();
         let mut journal = Journal::open(path).unwrap();
-        assert_eq!(
-            journal.recovery_index.snapshot().unwrap()["legacy_events"],
-            1
-        );
         let before = journal.recovery_index.snapshot().unwrap();
-        journal.failed = true;
-        assert!(journal
-            .append(
-                "intent",
-                json!({"operation":"not-committed","type":"shell"})
-            )
-            .is_err());
-        assert_eq!(before, journal.recovery_index.snapshot().unwrap());
+        assert!(journal.append("cell_start", json!({"cell":0})).is_err());
+        assert_eq!(journal.recovery_index.snapshot().unwrap(), before);
     }
 }
 #[derive(Clone, Debug)]
@@ -2269,11 +2144,9 @@ struct JournalCellStart {
     cell: usize,
     parent_cell: Option<usize>,
     operation: String,
-    // None differs from Some(empty): legacy events infer input attribution.
-    user_record_indices: Option<Vec<usize>>,
-    input_raw_indices: Option<Vec<usize>>,
+    user_record_indices: Vec<usize>,
+    input_raw_indices: Vec<usize>,
     generation_request: Option<String>,
-    explicit_generation: bool,
 }
 #[derive(Clone, Debug)]
 struct JournalCellEnd {
@@ -2328,7 +2201,6 @@ enum JournalEventData {
     WorkerReset {
         generation: usize,
         active_cell: Option<usize>,
-        explicit_active_cell: bool,
     },
     // Auth/provider bodies, task metadata, Python-facing data and unknown
     // extensions retain JSON. Their domain-specific owners validate semantics.
@@ -2337,8 +2209,7 @@ enum JournalEventData {
 #[derive(Clone)]
 struct JournalEvent {
     seq: usize,
-    schema_version: JournalVersion,
-    session_id: Option<String>,
+    session_id: String,
     kind: JournalEventKind,
     data: JournalEventData,
     raw: Value,
@@ -2369,29 +2240,20 @@ fn journal_optional_string(
         None => Ok(None),
     }
 }
-fn journal_indices(payload: &Value, name: &str, error: &'static str) -> Result<Option<Vec<usize>>> {
-    payload
-        .get(name)
-        .map(|value| {
-            value
-                .as_array()
-                .ok_or(error)?
-                .iter()
-                .map(|value| journal_index(value, error))
-                .collect()
-        })
-        .transpose()
+fn journal_indices(payload: &Value, name: &str, error: &'static str) -> Result<Vec<usize>> {
+    payload[name]
+        .as_array()
+        .ok_or(error)?
+        .iter()
+        .map(|value| journal_index(value, error))
+        .collect()
 }
 impl JournalEvent {
     fn decode(raw: Value, expected_sequence: usize) -> Result<Self> {
         let envelope = raw.as_object().ok_or("journal event must be an object")?;
-        let schema_version = match envelope.get("schema_version") {
-            None => JournalVersion::Legacy,
-            Some(value) => match value.as_u64().ok_or("invalid journal schema version")? {
-                0 => JournalVersion::Legacy,
-                1 => JournalVersion::V1,
-                _ => return Err("unsupported journal schema version".into()),
-            },
+        match envelope.get("schema_version").and_then(Value::as_u64) {
+            Some(1) => {}
+            _ => return Err("unsupported journal schema version; start a new session".into()),
         };
         let seq = journal_index(&raw["seq"], "invalid journal sequence")?;
         if seq != expected_sequence {
@@ -2403,13 +2265,11 @@ impl JournalEvent {
                 .filter(|kind| !kind.is_empty())
                 .ok_or("journal event kind missing")?,
         );
-        let session_id = journal_optional_string(&raw, "session_id", "invalid journal session ID")?;
-        if session_id
-            .as_deref()
-            .is_some_and(|identity| !valid_journal_session_id(identity))
-        {
-            return Err("invalid journal session ID".into());
-        }
+        let session_id = raw["session_id"]
+            .as_str()
+            .filter(|id| valid_journal_session_id(id))
+            .ok_or("journal session ID missing or invalid")?
+            .to_owned();
         let payload = envelope
             .get("payload")
             .ok_or("journal event payload missing")?;
@@ -2419,7 +2279,6 @@ impl JournalEvent {
         let data = Self::decode_data(&kind, payload)?;
         Ok(Self {
             seq,
-            schema_version,
             session_id,
             kind,
             data,
@@ -2448,6 +2307,15 @@ impl JournalEvent {
                 if parent_cell == Some(0) {
                     return Err("invalid parent cell".into());
                 }
+                for key in [
+                    "user_record_indices",
+                    "input_raw_indices",
+                    "generation_request",
+                ] {
+                    if !p.as_object().unwrap().contains_key(key) {
+                        return Err("cell provenance missing".into());
+                    }
+                }
                 JournalEventData::CellStart(JournalCellStart {
                     cell,
                     parent_cell,
@@ -2471,7 +2339,6 @@ impl JournalEvent {
                         "generation_request",
                         "invalid generation provenance",
                     )?,
-                    explicit_generation: p.get("generation_request").is_some(),
                 })
             }
             K::CellEnd => {
@@ -2552,10 +2419,7 @@ impl JournalEvent {
                 let index = if chunk {
                     &p["index"]
                 } else {
-                    p["metadata"]
-                        .get("record_index")
-                        .filter(|value| !value.is_null())
-                        .unwrap_or(&p["metadata"]["index"])
+                    &p["metadata"]["record_index"]
                 };
                 JournalEventData::Stream(JournalStream {
                     collection,
@@ -2621,12 +2485,13 @@ impl JournalEvent {
                 let billing_unknown = unknown("billing_unknown")?;
                 let outcome_unknown = unknown("outcome_unknown")?;
                 JournalEventData::ProviderRecord(JournalProviderRecord {
-                    // Request attribution was historically supplied by its intent.
-                    operation: journal_optional_string(
-                        p,
-                        "operation",
-                        "invalid provider operation",
-                    )?,
+                    operation: Some(
+                        p["operation"]
+                            .as_str()
+                            .filter(|op| !op.is_empty())
+                            .ok_or("provider operation missing")?
+                            .to_owned(),
+                    ),
                     attempt: number("attempt")?,
                     retry: number("retry")?,
                     billing_unknown: billing_unknown
@@ -2642,6 +2507,9 @@ impl JournalEvent {
                     .clone(),
             ),
             K::WorkerReset => {
+                if p.get("active_cell").is_none() {
+                    return Err("worker reset ownership missing".into());
+                }
                 let active_cell = journal_optional_index(
                     p,
                     "active_cell",
@@ -2653,7 +2521,6 @@ impl JournalEvent {
                 JournalEventData::WorkerReset {
                     generation: journal_index(&p["generation"], "invalid worker generation")?,
                     active_cell,
-                    explicit_active_cell: p.get("active_cell").is_some(),
                 }
             }
             _ => JournalEventData::Opaque,
@@ -2708,14 +2575,10 @@ struct RecoveryIndex {
     streams: std::collections::BTreeMap<(String, String, usize), RecoveryStream>,
     queues: std::collections::BTreeMap<String, RecoveryQueue>,
     unknown_attempts: Vec<RecoveryUnknownAttempt>,
-    legacy_events: usize,
     error: Option<&'static str>,
 }
 impl RecoveryIndex {
     fn apply(&mut self, event: &JournalEvent) {
-        if event.schema_version == JournalVersion::Legacy {
-            self.legacy_events += 1;
-        }
         let payload = event.payload();
         match &event.data {
             JournalEventData::Intent(intent) if event.kind == JournalEventKind::Intent => {
@@ -2846,7 +2709,7 @@ impl RecoveryIndex {
             "attempt":record.attempt,"retry":record.retry,"billing":"unknown","replay_allowed":false})).collect::<Vec<_>>();
         Ok(
             json!({"operations":operations,"streams":streams,"queues":queues,
-            "unknown_provider_attempts":unknown_attempts,"legacy_events":self.legacy_events,
+            "unknown_provider_attempts":unknown_attempts,
             "policy":"Unknown outcome is never permission to replay. Fresh Python; captured chunks only."}),
         )
     }
@@ -2904,15 +2767,14 @@ impl Journal {
                 break;
             }
             let event = JournalEvent::decode(serde_json::from_slice(&line)?, offsets.len())?;
-            if let Some(identity) = event.session_id.as_deref() {
-                if session_id
-                    .as_deref()
-                    .is_some_and(|previous| previous != identity)
-                {
-                    return Err("journal contains mixed session IDs; restore a consistent journal before resuming".into());
-                }
-                session_id.get_or_insert_with(|| identity.to_owned());
+            let identity = event.session_id.as_str();
+            if session_id
+                .as_deref()
+                .is_some_and(|previous| previous != identity)
+            {
+                return Err("journal contains mixed session IDs; restore a consistent journal before resuming".into());
             }
+            session_id.get_or_insert_with(|| identity.to_owned());
             history_index.apply(&event);
             recovery_index.apply(&event);
             offsets.push((position, size as u64));
@@ -2999,6 +2861,78 @@ impl Journal {
         Ok(n)
     }
 }
+
+#[cfg(test)]
+mod current_format_contract_tests {
+    use super::*;
+    #[test]
+    fn old_envelopes_missing_provenance_and_attachment_ownership_are_rejected() {
+        let envelope = |kind, payload| crate::test_support::JournalFixture::envelope(kind, payload);
+        let start = json!({"cell":1,"parent_cell":null,"operation":"cell","user_record_indices":[],"input_raw_indices":[],"generation_request":null});
+        for key in [
+            "user_record_indices",
+            "input_raw_indices",
+            "generation_request",
+        ] {
+            let mut payload = start.clone();
+            payload.as_object_mut().unwrap().remove(key);
+            assert!(
+                JournalEvent::decode(envelope("cell_start", payload), 0).is_err(),
+                "{key}"
+            );
+        }
+        assert!(
+            JournalEvent::decode(envelope("worker_reset", json!({"generation":1})), 0).is_err()
+        );
+        assert!(JournalEvent::decode(
+            envelope(
+                "stream_complete",
+                json!({"collection":"stdout","metadata":{"index":0,"complete":true}})
+            ),
+            0
+        )
+        .is_err());
+        let item = json!({"id":"c1","role":"user","text":"text","output":true,"ranges":[],"raw_index":null});
+        for key in ["raw_index", "role", "output", "ranges"] {
+            let mut payload = item.clone();
+            payload.as_object_mut().unwrap().remove(key);
+            assert!(parse_item(&payload).is_err(), "{key}");
+        }
+        assert!(ProviderClient::new()
+            .restore_usage(&json!({"input_tokens":1}), false)
+            .is_err());
+    }
+    #[test]
+    fn resume_without_frozen_snapshot_is_rejected_before_startup() {
+        let mut fixture = crate::test_support::HostFixture::named(
+            "py-current-contract",
+            Some(json!({"skills":{"enabled":false}})),
+        );
+        let home = fixture.host().home.clone();
+        let journal_path = fixture.host().journal.path.clone();
+        drop(fixture.take_host());
+        let mut rows = fs::read_to_string(&journal_path)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .collect::<Vec<_>>();
+        rows.retain(|e| e["kind"] != "skills_snapshot");
+        for (i, row) in rows.iter_mut().enumerate() {
+            row["seq"] = json!(i);
+        }
+        fs::write(
+            &journal_path,
+            rows.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let error = Host::new(home, Some(journal_path), true, true, None, None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("frozen skills snapshot"), "{error}");
+    }
+}
+
 #[cfg(test)]
 mod journal_decoder_tests {
     use super::*;
@@ -3012,33 +2946,21 @@ mod journal_decoder_tests {
             json!(["opaque",{"arbitrary":"payload"}]),
         );
         let decoded = JournalEvent::decode(raw.clone(), 0).unwrap();
-        assert_eq!(decoded.schema_version, JournalVersion::V1);
+        assert_eq!(decoded.raw["schema_version"], 1);
         assert_eq!(decoded.seq, 0);
         assert_eq!(
             decoded.kind,
             JournalEventKind::Unknown("future_extension".into())
         );
         assert_eq!(decoded.into_raw(), raw);
-        let mut legacy = event("user", json!({"text":"legacy without an index"}));
-        legacy.as_object_mut().unwrap().remove("schema_version");
-        legacy.as_object_mut().unwrap().remove("session_id");
-        let decoded = JournalEvent::decode(legacy.clone(), 0).unwrap();
-        assert_eq!(decoded.schema_version, JournalVersion::Legacy);
-        assert_eq!(decoded.session_id, None);
-        let JournalEventData::TextRecord(record) = &decoded.data else {
-            panic!("not a typed user record")
-        };
-        assert_eq!(record.text, "legacy without an index");
-        assert_eq!(record.record_index, None);
-        assert_eq!(decoded.into_raw(), legacy);
-        let mut explicit_zero = event("user", json!({"index":0,"text":"ok"}));
-        explicit_zero["schema_version"] = json!(0);
-        assert_eq!(
-            JournalEvent::decode(explicit_zero, 0)
-                .unwrap()
-                .schema_version,
-            JournalVersion::Legacy
-        );
+        for key in ["schema_version", "session_id"] {
+            let mut missing = event("user", json!({"index":0,"text":"current"}));
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(JournalEvent::decode(missing, 0).is_err());
+        }
+        let mut zero = event("user", json!({"index":0,"text":"current"}));
+        zero["schema_version"] = json!(0);
+        assert!(JournalEvent::decode(zero, 0).is_err());
     }
     #[test]
     fn unsupported_or_malformed_envelopes_fail_without_payload_disclosure() {
@@ -3081,25 +3003,15 @@ mod journal_decoder_tests {
             "cell_start",
             json!({"cell":1,"parent_cell":null,"operation":"cell-one"}),
         );
-        let decoded = JournalEvent::decode(raw.clone(), 0).unwrap();
-        let JournalEventData::CellStart(start) = decoded.data else {
-            panic!("missing typed start")
-        };
-        assert_eq!(start.cell, 1);
-        assert_eq!(start.parent_cell, None);
-        assert_eq!(start.operation, "cell-one");
-        assert_eq!(start.user_record_indices, None);
-        assert_eq!(start.input_raw_indices, None);
-        assert!(!start.explicit_generation);
+        assert!(JournalEvent::decode(raw.clone(), 0).is_err());
         raw["payload"]["user_record_indices"] = json!([]);
         raw["payload"]["input_raw_indices"] = json!([0]);
         raw["payload"]["generation_request"] = Value::Null;
         let JournalEventData::CellStart(start) = JournalEvent::decode(raw, 0).unwrap().data else {
             panic!("missing typed start")
         };
-        assert_eq!(start.user_record_indices, Some(vec![]));
-        assert_eq!(start.input_raw_indices, Some(vec![0]));
-        assert!(start.explicit_generation);
+        assert!(start.user_record_indices.is_empty());
+        assert_eq!(start.input_raw_indices, vec![0]);
         assert_eq!(start.generation_request, None);
         let JournalEventData::CellEnd(end) = JournalEvent::decode(
             event("cell_end", json!({"cell":1,"status":"ok","elapsed_ms":9})),
@@ -3162,7 +3074,7 @@ mod journal_decoder_tests {
         }
     }
     #[test]
-    fn stream_provider_and_context_records_keep_legacy_payload_semantics() {
+    fn stream_provider_and_context_records_have_explicit_payload_semantics() {
         let JournalEventData::Stream(stream) = JournalEvent::decode(
             event(
                 "stream",
@@ -3182,7 +3094,7 @@ mod journal_decoder_tests {
         let JournalEventData::Stream(stream) = JournalEvent::decode(
             event(
                 "stream_closed",
-                json!({"collection":"stderr","metadata":{"index":3,"complete":false}}),
+                json!({"collection":"stderr","metadata":{"index":3,"record_index":3,"complete":false}}),
             ),
             0,
         )
@@ -3208,7 +3120,7 @@ mod journal_decoder_tests {
         let JournalEventData::ProviderRecord(request) = JournalEvent::decode(
             event(
                 "request",
-                json!({"messages":[],"opaque_option":{"anything":true}}),
+                json!({"operation":"op","messages":[],"opaque_option":{"anything":true}}),
             ),
             0,
         )
@@ -3217,7 +3129,7 @@ mod journal_decoder_tests {
         else {
             panic!("missing typed request")
         };
-        assert_eq!(request.operation, None); // Legacy request ownership comes from its preceding intent.
+        assert_eq!(request.operation.as_deref(), Some("op"));
         let JournalEventData::ProviderRecord(attempt) = JournalEvent::decode(
             event(
                 "provider_attempt_failed",
@@ -3243,7 +3155,7 @@ mod journal_decoder_tests {
         .is_err());
         let raw = event(
             "context_add",
-            json!({"id":"c0","text":"selected","ranges":[[1,2]]}),
+            json!({"id":"c0","role":"user","text":"selected","output":false,"ranges":[[1,2]],"raw_index":null}),
         );
         let JournalEventData::ContextAdd(item) = JournalEvent::decode(raw, 0).unwrap().data else {
             panic!("missing typed context")
@@ -3254,16 +3166,17 @@ mod journal_decoder_tests {
         let JournalEventData::WorkerReset {
             generation,
             active_cell,
-            explicit_active_cell,
-        } = JournalEvent::decode(event("worker_reset", json!({"generation":2})), 0)
-            .unwrap()
-            .data
+        } = JournalEvent::decode(
+            event("worker_reset", json!({"generation":2,"active_cell":null})),
+            0,
+        )
+        .unwrap()
+        .data
         else {
             panic!("missing typed reset")
         };
         assert_eq!(generation, 2);
         assert_eq!(active_cell, None);
-        assert!(!explicit_active_cell);
     }
     #[test]
     fn append_validation_precedes_durable_write_and_open_uses_the_same_decoder() {
@@ -4949,7 +4862,7 @@ struct ParsedLocalCommand {
     model_list_query: Option<String>,
     // Historically busy /model accepts any whitespace after "list", whereas
     // ordinary dispatch recognizes the documented ASCII-space form. Keep this
-    // compatibility difference explicit rather than reparsing at execution.
+    // idle/busy whitespace difference explicit rather than reparsing at execution.
     busy_model_list_query: Option<String>,
 }
 impl ParsedLocalCommand {
@@ -5232,7 +5145,7 @@ mod local_command_contract_tests {
         );
     }
     #[test]
-    fn parser_keeps_opaque_arguments_and_legacy_busy_whitespace_semantics() {
+    fn parser_keeps_opaque_arguments_and_busy_whitespace_semantics() {
         let parsed = ParsedLocalCommand::parse(
             "/config\tset provider {\"secret\": \"value with spaces\"}  ",
         );
@@ -5405,7 +5318,7 @@ enum ExecutionOutcome {
     TimedOut,
     WorkerCrashed,
     WorkerProtocolError,
-    // On-disk legacy/future labels retain their presentation without being
+    // Unknown on-disk labels retain their presentation without being
     // mistaken for a successful current execution.
     Other(String),
 }
@@ -6508,36 +6421,17 @@ impl ProviderClient {
     fn accept_credential(&mut self, provider: &str, credential: Value) {
         self.auth[provider] = credential;
     }
-    fn restore_usage(
-        &mut self,
-        report: &Value,
-        response_recorded: bool,
-        any_responses: bool,
-    ) -> Result<()> {
+    fn restore_usage(&mut self, report: &Value, response_recorded: bool) -> Result<()> {
+        let snapshot = report
+            .get("cache_accounting")
+            .ok_or("usage accounting snapshot missing")?;
+        let mut recovered = CacheAccounting::from_snapshot(snapshot)?;
         self.usage = report.clone();
-        if !response_recorded {
-            if let Some(snapshot) = report.get("cache_accounting") {
-                let mut recovered = CacheAccounting::from_snapshot(snapshot)?;
-                recovered.merge_coverage(&self.cache_accounting);
-                self.cache_accounting = recovered;
-            } else if !any_responses {
-                let input = report["input_tokens"].as_u64();
-                let cached = report["cache_hit_tokens"]
-                    .as_u64()
-                    .or(report["reported_cache_hit_tokens"].as_u64());
-                let mut legacy = CacheAccounting::default();
-                legacy.observe(input, cached, input)?;
-                legacy.mark_incomplete();
-                self.cache_accounting = legacy;
-            } else {
-                self.cache_accounting.mark_incomplete();
-            }
-        } else if let Some(snapshot) = report.get("cache_accounting") {
-            self.cache_accounting
-                .merge_coverage(&CacheAccounting::from_snapshot(snapshot)?);
-        } else if report["cache_usage_complete"] == false {
-            self.cache_accounting.cache_complete = false;
-            self.cache_accounting.rate_complete = false;
+        if response_recorded {
+            self.cache_accounting.merge_coverage(&recovered);
+        } else {
+            recovered.merge_coverage(&self.cache_accounting);
+            self.cache_accounting = recovered;
         }
         Ok(())
     }
@@ -6952,25 +6846,6 @@ mod provider_client_owner_tests {
         assert_eq!(client.config_defaults, defaults);
         assert_eq!(client.config["model"], "openai/gpt-4o");
     }
-
-    #[test]
-    fn owner_restore_preserves_partial_legacy_cache_coverage() {
-        let mut client = ProviderClient::new();
-        client
-            .restore_usage(
-                &json!({"input_tokens":100,"cache_hit_tokens":50,"output_tokens":2}),
-                false,
-                false,
-            )
-            .unwrap();
-        client.refresh_usage_report();
-        assert_eq!(client.usage["cache_hit_percentage"], 50.0);
-        assert_eq!(client.usage["cache_percentage_complete"], false);
-        client.restore_unknown_attempt();
-        client.observe_response(&json!({"usage":{"input_tokens":900,"output_tokens":3,"input_tokens_details":{"cached_tokens":0}}}), "next").unwrap();
-        assert_eq!(client.usage["cache_hit_percentage"], 5.0);
-        assert_eq!(client.usage["cache_percentage_complete"], false);
-    }
 }
 // Decode client envelopes once. Deferred field errors preserve accepted/error ordering.
 #[derive(Clone)]
@@ -7347,7 +7222,7 @@ mod native_command_tests {
         assert!(shell.kind == NativeCommandKind::Shell);
         assert_eq!(shell.args.command.require().unwrap(), "printf ok");
         assert!(shell.args.visible && !shell.args.terminal_controls);
-        assert!(shell.args.options.is_null()); // Legacy submit-prefix normalization discards options/mode.
+        assert!(shell.args.options.is_null()); // Submit-prefix routing discards options/mode.
         assert!(shell.mode == SubmissionMode::Steering);
     }
     #[test]
@@ -7638,7 +7513,7 @@ impl Host {
         Ok(id)
     }
     // Provider retry/cancellation code should use this narrow transition. The
-    // compatibility JSON flag is still merged on the next successful response.
+    // Coverage flags are merged on the next successful response.
     fn mark_cache_usage_incomplete(&mut self) {
         self.provider.mark_cache_incomplete();
     }
@@ -7930,7 +7805,7 @@ fn stream_info(bytes: &[u8], name: &str, index: usize) -> Value {
         "omitted_lines":lines.saturating_sub(12),"complete":true})
 }
 // Public indexes identify cells. Record coordinates remain explicit and are
-// never reinterpreted when restoring an old stream/code journal entry.
+// never reinterpreted when restoring a recorded stream/code journal entry.
 fn cell_metadata(mut metadata: Value, collection: &str, cell: usize) -> Value {
     metadata["cell"] = json!(cell);
     metadata["index"] = json!(cell);
@@ -8576,11 +8451,10 @@ impl Host {
             }
             snapshot
         } else {
-            let snapshot = if resumed {
-                json!({"version":1,"system":SYSTEM,"entries":[],"options":{"enabled":false},"estimated_added_tokens":0,"legacy":true})
-            } else {
-                build_skills_snapshot(&home, &config)?
-            };
+            if resumed {
+                return Err("session lacks its frozen skills snapshot; start a new session".into());
+            }
+            let snapshot = build_skills_snapshot(&home, &config)?;
             journal.append("skills_snapshot", snapshot.clone())?;
             snapshot
         };
@@ -8614,7 +8488,6 @@ impl Host {
             skills,
         };
         let mut settings = None;
-        let mut user_provenance = Vec::<(usize, usize)>::new();
         let mut cache_response_operations = HashSet::<String>::new();
         let mut cache_pending_operations = HashSet::<String>::new();
         let mut cache_intended_operation: Option<String> = None;
@@ -8626,10 +8499,7 @@ impl Host {
                     let JournalEventData::TextRecord(record) = &ev.data else {
                         return Err("text record decoder invariant failed".into());
                     };
-                    let index = host.hist_push(ev.kind.label(), json!(record.text));
-                    if ev.kind == JournalEventKind::User {
-                        user_provenance.push((sequence, index));
-                    }
+                    host.hist_push(ev.kind.label(), json!(record.text));
                 }
                 "stdin" => {
                     host.history
@@ -8647,7 +8517,8 @@ impl Host {
                         return Err("cell start decoder invariant failed".into());
                     };
                     host.execution.restore_cell(start.cell);
-                    if let Some(values) = &start.user_record_indices {
+                    {
+                        let values = &start.user_record_indices;
                         host.cell_input_records = values.clone();
                         if host
                             .cell_input_records
@@ -8736,11 +8607,7 @@ impl Host {
                         .operation
                         .as_deref()
                         .is_some_and(|operation| cache_response_operations.contains(operation));
-                    host.provider.restore_usage(
-                        p,
-                        response_recorded,
-                        !cache_response_operations.is_empty(),
-                    )?;
+                    host.provider.restore_usage(p, response_recorded)?;
                 }
                 "request" => {
                     host.history
@@ -8785,27 +8652,10 @@ impl Host {
                     host.history
                         .restore_reference(RecordCollection::Raw, sequence);
                 }
-                "attachment" => {
-                    let id = p["context_id"]
-                        .as_str()
-                        .ok_or("invalid attachment context ID")?;
-                    let index = p["raw_index"]
-                        .as_u64()
-                        .and_then(|n| usize::try_from(n).ok())
-                        .ok_or("invalid attachment raw index")?;
-                    if index >= host.history.len(RecordCollection::Raw) {
-                        return Err("attachment raw history index missing".into());
-                    }
-                    // Legacy attachment events bind only to the item currently
-                    // present at this point in replay; discarded IDs never
-                    // survive as entries in a separate attachment map.
-                    host.context.restore_attachment(id, index)?;
-                }
+                // Attachment receipts are audit records; context_add/replace
+                // already carries explicit selection ownership.
                 _ => {}
             }
-        }
-        if resumed {
-            host.restore_full_user_context(&user_provenance)?;
         }
         if !cache_pending_operations.is_empty() {
             host.provider.restore_unknown_attempt();
@@ -8864,7 +8714,7 @@ impl Host {
         }
         if resumed {
             host.bg_recover()?;
-            let notice="Session loaded into fresh Python. Previous variables are undefined; H and context are restored. H[n], H.cells[n], and H.code/stdout/stderr[n] use presented one-based cell numbers; other H histories group records by cell. Use H.records.<collection>[record_index] for legacy zero-based/global records, including old recorded references.";
+            let notice="Session loaded into fresh Python. Previous variables are undefined; H and context are restored. H[n], H.cells[n], and H.code/stdout/stderr[n] use presented one-based cell numbers; other H histories group records by cell. Use H.records.<collection>[record_index] for original zero-based/global records.";
             host.journal.append(
                 "worker_reset",
                 json!({"generation":host.execution.generation(),"active_cell":null}),
@@ -9184,161 +9034,62 @@ impl Host {
 fn parse_item(p: &Value) -> Result<Item> {
     let ranges = p["ranges"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| Some((v[0].as_u64()? as usize, v[1].as_u64()? as usize)))
-                .collect()
+        .ok_or("context ranges must be an array")?
+        .iter()
+        .map(|v| {
+            let pair = v
+                .as_array()
+                .filter(|a| a.len() == 2)
+                .ok_or("invalid context range")?;
+            let start = pair[0]
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or("invalid context range start")?;
+            let stop = pair[1]
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or("invalid context range stop")?;
+            if stop < start {
+                return Err("reversed context range".into());
+            }
+            Ok((start, stop))
         })
-        .unwrap_or_default();
-    let raw_index = match p.get("raw_index").filter(|value| !value.is_null()) {
-        Some(value) => Some(
-            value
+        .collect::<Result<Vec<_>>>()?;
+    let ownership = p
+        .get("raw_index")
+        .ok_or("context attachment ownership missing")?;
+    let raw_index = if ownership.is_null() {
+        None
+    } else {
+        Some(
+            ownership
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or("invalid context attachment raw index")?,
-        ),
-        None => None,
+        )
     };
-    let role = p["role"].as_str().unwrap_or("user");
+    let role = p["role"].as_str().ok_or("context role missing")?;
+    if !["user", "assistant", "system", "summary"].contains(&role) {
+        return Err("invalid context role".into());
+    }
     if raw_index.is_some() && role != "user" {
         return Err("only user context items may own raw attachments".into());
     }
     Ok(Item {
-        id: p["id"].as_str().unwrap_or("").into(),
+        id: p["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or("context ID missing")?
+            .into(),
         role: role.into(),
-        text: p["text"].as_str().unwrap_or("").into(),
-        output: p["output"].as_bool().unwrap_or(false),
+        text: p["text"].as_str().ok_or("context text missing")?.into(),
+        output: p["output"].as_bool().ok_or("context output flag missing")?,
         ranges,
         raw_index,
     })
 }
-fn parse_replaced_item(p: &Value, previous: &[Item]) -> Result<Item> {
-    let mut item = parse_item(p)?;
-    if p.get("raw_index").is_none() {
-        // Legacy context_replace did not serialize attachments. Only an
-        // unchanged item inherits its existing selection: retained start IDs,
-        // preserved end text and output-omission markers are replacements,
-        // not permission to retain a consumed image.
-        if let Some(old) = previous.iter().find(|old| {
-            old.id == item.id
-                && old.role == item.role
-                && old.text == item.text
-                && old.output == item.output
-                && old.ranges == item.ranges
-        }) {
-            item.raw_index = old.raw_index;
-        }
-    }
-    Ok(item)
-}
-
 // Only outer generated source passes here. A separate isolated stdlib-only
 // interpreter tokenizes it without running it or touching the persistent worker.
-const NORMALIZE_GENERATED_SOURCE: &str = r###"
-import io, re, sys, tokenize
-source = sys.stdin.buffer.read().decode('utf-8')
-lines = io.StringIO(source).readlines()
-try:
-    tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
-except (tokenize.TokenError, SyntaxError):
-    cleaned = source
-else:
-    for token in tokens:
-        if token.type != tokenize.COMMENT:
-            continue
-        row, column = token.start
-        line = lines[row - 1]
-        body = line.rstrip('\r\n')
-        if (not line[:column].strip()
-                and re.fullmatch(r'# \[boundary c[0-9]+\][ \t]*', token.string)
-                and not body[token.end[1]:].strip()):
-            lines[row - 1] = line[len(body):]
-    cleaned = ''.join(lines)
-sys.stdout.buffer.write(cleaned.encode('utf-8'))
-"###;
-
-fn normalize_generated_source(source: &str) -> Result<String> {
-    // The common case needs no process, but never regex-strip whole source:
-    // marker-looking lines can be data in multiline strings.
-    if !source.contains("# [boundary c") {
-        return Ok(source.to_owned());
-    }
-    let mut child = Command::new(std::env::var("PY_PYTHON").unwrap_or_else(|_| "python3".into()))
-        .args(["-I", "-S", "-c", NORMALIZE_GENERATED_SOURCE])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|_| {
-            "Generated source normalization interpreter could not start; no code executed"
-        })?;
-    let mut input = child.stdin.take().ok_or("normalization stdin missing")?;
-    let (written, output) = std::thread::scope(|scope| {
-        let writer = scope.spawn(move || input.write_all(source.as_bytes()));
-        let output = child.wait_with_output();
-        (writer.join(), output)
-    });
-    let output = output.map_err(|_| "Generated source normalization failed; no code executed")?;
-    if !output.status.success() || !matches!(written, Ok(Ok(()))) {
-        return Err("Generated source normalization failed; no code executed".into());
-    }
-    String::from_utf8(output.stdout).map_err(|_| {
-        "Generated source normalization returned invalid UTF-8; no code executed".into()
-    })
-}
-
-#[cfg(test)]
-mod generated_source_boundary_tests {
-    use super::*;
-
-    #[test]
-    fn strips_only_standalone_boundary_comments_preserving_line_numbers() {
-        let source = concat!(
-            "# [boundary c12]\r\n",
-            "  # [boundary c13]  \n",
-            "\t# [boundary c14]\n",
-            "x = '# [boundary c15]'\n",
-            "value = '''literal\n# [boundary c16]\nliteral'''\n",
-            "f = f'''literal\n# [boundary c17]\n{x}'''\n",
-            "x = 1 # [boundary c18]\n",
-            "# [boundary cno]\n",
-            "# [boundary c19] explanation\n",
-            "# ordinary comment\n",
-            "# [boundary c20]",
-        );
-        let expected = source
-            .replacen("# [boundary c12]", "", 1)
-            .replacen("  # [boundary c13]  ", "", 1)
-            .replacen("\t# [boundary c14]", "", 1)
-            .replacen("# [boundary c20]", "", 1);
-        let cleaned = normalize_generated_source(source).unwrap();
-        assert_eq!(cleaned, expected);
-        assert_eq!(normalize_generated_source(&cleaned).unwrap(), cleaned);
-        assert_eq!(source.matches('\n').count(), cleaned.matches('\n').count());
-    }
-
-    #[test]
-    fn boundary_normalization_handles_non_newline_unicode_and_empty_results() {
-        let source = "value = '\u{2028}\u{000b}'\n# [boundary c123]\npass\n";
-        assert_eq!(
-            normalize_generated_source(source).unwrap(),
-            "value = '\u{2028}\u{000b}'\n\npass\n"
-        );
-        assert_eq!(normalize_generated_source("# [boundary c1]").unwrap(), "");
-        assert_eq!(
-            normalize_generated_source("# [boundary c1]\n").unwrap(),
-            "\n"
-        );
-        assert_eq!(normalize_generated_source("pass\n").unwrap(), "pass\n");
-    }
-
-    #[test]
-    fn malformed_tokenization_is_not_rewritten() {
-        let source = "# [boundary c21]\nx = '''unterminated\n# [boundary c22]";
-        assert_eq!(normalize_generated_source(source).unwrap(), source);
-    }
-}
-
 #[cfg(test)]
 mod cache_append_only_tests {
     use super::*;
@@ -9373,7 +9124,6 @@ mod cache_append_only_tests {
             .unwrap_err()
             .to_string()
             .contains("PY_CACHE_APPEND_ONLY"));
-        host.restore_full_user_context(&[]).unwrap();
         assert_eq!(
             host.context
                 .items()
@@ -9573,7 +9323,7 @@ mod context_attachment_tests {
     }
 
     #[test]
-    fn resume_does_not_resurrect_collapsed_image_from_legacy_attachment_events() {
+    fn resume_preserves_explicit_attachment_ownership_without_resurrection() {
         let mut fixture = host();
         let mut host = fixture.take_host();
         let data = image_data();
@@ -9588,42 +9338,12 @@ mod context_attachment_tests {
         let home = host.home.clone();
         let path = host.journal.path.clone();
         drop(host);
-        // Build legacy-format fixture data only. Production journals are never rewritten.
-        let mut events: Vec<Value> = fs::read_to_string(&path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        for event in &mut events {
-            match event["kind"].as_str().unwrap_or("") {
-                "context_add" => {
-                    event["payload"]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("raw_index");
-                }
-                "context_replace" => {
-                    for item in event["payload"]["items"].as_array_mut().unwrap() {
-                        item.as_object_mut().unwrap().remove("raw_index");
-                    }
-                }
-                _ => {}
-            }
-        }
-        fs::write(
-            &path,
-            events
-                .iter()
-                .map(|event| format!("{event}\n"))
-                .collect::<String>(),
-        )
-        .unwrap();
         let restored = Host::new(home, Some(path), true, true, None, None).unwrap();
         assert_eq!(raw_index(&restored, &start), None);
         assert_eq!(
             raw_index(&restored, &outside),
             Some(1),
-            "unchanged legacy selections survive replacement/replay"
+            "unchanged selections survive replacement/replay"
         );
         assert_eq!(
             restored
@@ -9638,7 +9358,7 @@ mod context_attachment_tests {
     }
 
     #[test]
-    fn committed_context_add_owns_image_without_later_attachment_receipt() {
+    fn committed_context_add_owns_image_without_redundant_receipt() {
         let mut fixture = host();
         let mut host = fixture.take_host();
         let data = image_data();
@@ -9646,21 +9366,15 @@ mod context_attachment_tests {
         let home = host.home.clone();
         let path = host.journal.path.clone();
         drop(host);
-        let mut lines: Vec<String> = fs::read_to_string(&path)
-            .unwrap()
+        let rows = fs::read_to_string(&path).unwrap();
+        let last: Value = serde_json::from_str(rows.lines().last().unwrap()).unwrap();
+        assert_eq!(last["kind"], "context_add");
+        assert!(rows
             .lines()
-            .map(str::to_owned)
-            .collect();
-        let receipt: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
-        assert_eq!(receipt["kind"], "attachment");
-        lines.pop();
-        fs::write(&path, lines.join("\n") + "\n").unwrap();
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .all(|e| e["kind"] != "attachment"));
         let restored = Host::new(home, Some(path), true, true, None, None).unwrap();
-        assert_eq!(
-            raw_index(&restored, &image),
-            Some(0),
-            "selection is committed in context_add, not the optional later receipt"
-        );
+        assert_eq!(raw_index(&restored, &image), Some(0));
         assert_eq!(restored.history_value("raw", 0).unwrap()["base64"], data);
     }
 
@@ -9670,10 +9384,10 @@ mod context_attachment_tests {
             assert!(parse_item(&json!({"id":"c0","role":"user","text":"image","output":true,"ranges":[],"raw_index":raw_index})).is_err());
         }
         assert!(parse_item(&json!({"id":"c0","role":"summary","text":"image reference only","output":false,"ranges":[],"raw_index":0})).is_err());
-        let legacy =
-            parse_item(&json!({"id":"c0","role":"user","text":"image","output":true,"ranges":[]}))
-                .unwrap();
-        assert_eq!(legacy.raw_index, None);
+        assert!(parse_item(
+            &json!({"id":"c0","role":"user","text":"image","output":true,"ranges":[]})
+        )
+        .is_err());
     }
 }
 
@@ -10253,6 +9967,7 @@ impl Host {
             .map_or(Value::Null, |limit| json!(limit));
         request["cache_policy"] =
             provider_cache_policy(&wire, &wire_body, &self.journal.session_id);
+        request["operation"] = json!(operation);
         self.journal.append("request", request.clone())?;
         self.hist_push("requests", request);
         let body = if codex {
@@ -10441,7 +10156,6 @@ impl Host {
             }
             // Normalize before staging cell ownership: normalization failure
             // leaves the raw response global, with no code or cell executed.
-            let code = normalize_generated_source(&code)?;
             // Bind pre-cell request/response/usage records only after a complete
             // generation succeeds. Failed/global requests stay in H.records.
             self.execution
@@ -10493,7 +10207,7 @@ impl Host {
         let operation = format!("img{}", self.journal.seq);
         self.journal
             .append("intent", json!({"operation":operation,"type":"image"}))?;
-        let request_record = json!({"model":model,"prompt":prompt});
+        let request_record = json!({"operation":operation,"model":model,"prompt":prompt});
         self.journal.append("request", request_record.clone())?;
         self.hist_push("requests", request_record);
         let request = ProviderClient::image_request(&url, &key, &id, prompt);
@@ -10564,7 +10278,6 @@ impl Host {
             .append("raw", json!({"index":index,"base64":data,"mime":mime}))?;
         self.hist_push("raw", json!({"base64":data,"mime":mime}));
         // context_add commits text and attachment ownership together. Keep the
-        // attachment event as a compatibility/audit receipt, not separate state.
         let id = self.add_context_item(
             "user",
             format!("[image H.records.raw[{index}]]"),
@@ -10572,8 +10285,6 @@ impl Host {
             vec![],
             Some(index),
         )?;
-        self.journal
-            .append("attachment", json!({"context_id":id,"raw_index":index}))?;
         Ok(json!(id))
     }
 }
@@ -11086,7 +10797,7 @@ impl Host {
         let input_raw_indices = self.context.raw_indices();
         let public_source_ref = format!("H.code[{cell}]");
         let start = json!({"cell":cell,"parent_cell":parent,"language":language,"operation":operation,
-            "source_ref":public_source_ref,"source_record_ref":source_ref,"history_view_version":1,
+            "source_ref":public_source_ref,"source_record_ref":source_ref,
             "user_record_indices":self.cell_input_records,"input_raw_indices":input_raw_indices,"generation_request":generation_request});
         self.journal.append("cell_start", start.clone())?;
         if parent.is_none() {
@@ -11830,10 +11541,7 @@ impl Host {
             match &event.data {
                 JournalEventData::ContextAdd(item) => selected.push(item.clone()),
                 JournalEventData::ContextReplace(items) => {
-                    let next = items
-                        .iter()
-                        .map(|item| parse_replaced_item(item, &selected))
-                        .collect::<Result<Vec<_>>>()?;
+                    let next = items.iter().map(parse_item).collect::<Result<Vec<_>>>()?;
                     let before = selected
                         .iter()
                         .filter(|item| {
@@ -12635,17 +12343,16 @@ fn cli() -> Result<()> {
             }
         }
     } else {
-        let mut editor =
-            rustyline::Editor::<Completion, rustyline::history::DefaultHistory>::new()?;
-        bind_multiline_keys(&mut editor);
+        use rustyline::history::History;
+        let mut editor_history = rustyline::history::DefaultHistory::new();
         let history = host.home.join("editor-history");
-        let _ = editor.load_history(&history);
+        let _ = editor_history.load(&history);
         loop {
             if host.exit_requested {
                 break;
             }
             for line in host.frontend.pending_editor_history() {
-                editor.add_history_entry(&line)?;
+                editor_history.add(line.as_str())?;
             }
             // Steering captured by the busy prompt is dispatched here if the
             // active turn ended before consuming it at a cell boundary.
@@ -12674,22 +12381,17 @@ fn cli() -> Result<()> {
             helper.catalog.wakeup_ids = host.scheduler.wakeup_ids().cloned().collect();
             host.frontend.seed_editor(
                 helper.catalog.clone(),
-                editor.history().iter().cloned().collect(),
-            );
-            editor.set_helper(Some(helper));
-            editor.bind_sequence(
-                rustyline::KeyEvent::from('\t'),
-                editor.helper().unwrap().picker_handler(),
+                editor_history.iter().cloned().collect(),
             );
             let line = match if terminal_editor_available(host.json) {
                 terminal_readline(
-                    editor.helper().unwrap(),
-                    &editor.history().iter().cloned().collect::<Vec<_>>(),
+                    &helper,
+                    &editor_history.iter().cloned().collect::<Vec<_>>(),
                     if host.json { 2 } else { 1 },
                     &mut host,
                 )
             } else {
-                serviceable_readline(editor.helper().unwrap(), prompt, &mut host)
+                serviceable_readline(&helper, prompt, &mut host)
             } {
                 Ok(s) => s,
                 Err(rustyline::error::ReadlineError::Interrupted) => {
@@ -12707,7 +12409,7 @@ fn cli() -> Result<()> {
             // pasted credential. Keys are accepted only by the hidden tty prompt.
             if !line.trim_start().starts_with("/login") && !line.trim_start().starts_with("/config")
             {
-                editor.add_history_entry(&line)?;
+                editor_history.add(line.as_str())?;
                 host.frontend.remember_editor_line(&line);
             }
             if line.starts_with('/') {
@@ -12737,9 +12439,9 @@ fn cli() -> Result<()> {
             }
         }
         for line in host.frontend.pending_editor_history() {
-            editor.add_history_entry(&line)?;
+            editor_history.add(line.as_str())?;
         }
-        editor.save_history(&history)?;
+        editor_history.save(&history)?;
         if history.exists() {
             fs::set_permissions(
                 &history,
@@ -12749,20 +12451,6 @@ fn cli() -> Result<()> {
     }
     host.bg_shutdown()?;
     Ok(())
-}
-
-fn bind_multiline_keys(
-    editor: &mut rustyline::Editor<Completion, rustyline::history::DefaultHistory>,
-) {
-    // Ctrl-J is a newline, never accept-or-validate. Native backends that report
-    // Shift-Enter can use the same action. Rustyline 15's Unix byte parser does
-    // not decode CSI-u / modifyOtherKeys Enter: do not enable those protocols or
-    // map UnknownEscSeq to newline (it would reinterpret unrelated responses).
-    editor.bind_sequence(rustyline::KeyEvent::ctrl('J'), rustyline::Cmd::Newline);
-    editor.bind_sequence(
-        rustyline::KeyEvent(rustyline::KeyCode::Enter, rustyline::Modifiers::SHIFT),
-        rustyline::Cmd::Newline,
-    );
 }
 
 // One renderer owns the working footer. Agent events are inserted above it;
@@ -14070,7 +13758,6 @@ fn terminal_editor_available(json: bool) -> bool {
 #[derive(Clone, Copy)]
 enum RawTerminalMode {
     Editor,
-    Picker,
 }
 struct RawTerminal {
     input: File,
@@ -14086,8 +13773,6 @@ impl RawTerminal {
         let mut raw = previous;
         match mode {
             RawTerminalMode::Editor => unsafe { libc::cfmakeraw(&mut raw) },
-            // Preserve the picker's existing input/output translation flags.
-            RawTerminalMode::Picker => raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG),
         }
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
@@ -14125,7 +13810,7 @@ impl TerminalIo {
             input,
             _raw: Some(raw),
             eof_message,
-            read_interrupt_is_timeout: matches!(mode, RawTerminalMode::Editor),
+            read_interrupt_is_timeout: true,
         })
     }
     fn reader_clone(&self) -> io::Result<Self> {
@@ -14575,7 +14260,7 @@ impl EditAction {
             EditKey::Byte(6) => Move(EditMotion::Right),
             EditKey::Byte(21) => Kill(EditKill::LineStart),
             EditKey::Byte(23) => Kill(EditKill::WordLeft),
-            // Intentional legacy difference: idle Ctrl-K can join lines,
+            // Intentional idle/busy difference: idle Ctrl-K can join lines,
             // whereas the busy draft kills only through the current line end.
             EditKey::Byte(11) => Kill(EditKill::LineEnd {
                 include_newline: mode == EditMode::Idle,
@@ -15025,7 +14710,7 @@ mod shared_editor_engine_tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _io = TerminalIo::raw(
                 slave.try_clone().unwrap(),
-                RawTerminalMode::Picker,
+                RawTerminalMode::Editor,
                 "test input closed",
             )
             .unwrap();
@@ -15734,7 +15419,6 @@ struct CompletionCatalog {
 }
 struct Completion {
     catalog: CompletionCatalog,
-    selection: std::sync::Arc<std::sync::Mutex<Option<(usize, String)>>>,
     // Idle validation alone uses this cloned socket; names are cached and never
     // queried while a cell is running. Settle each validation reply before reuse.
     ipc: std::cell::RefCell<WorkerTransport>,
@@ -15773,15 +15457,8 @@ impl Completion {
                 task_ids: vec![],
                 wakeup_ids: vec![],
             },
-            selection: std::sync::Arc::new(std::sync::Mutex::new(None)),
             ipc: std::cell::RefCell::new(worker.transport.clone_idle()?),
         })
-    }
-    fn picker_handler(&self) -> rustyline::EventHandler {
-        rustyline::EventHandler::Conditional(Box::new(PickerTab {
-            catalog: self.catalog.clone(),
-            selection: self.selection.clone(),
-        }))
     }
 }
 fn editor_completion(host: &mut Host) -> Result<Completion> {
@@ -15818,24 +15495,6 @@ impl CompletionCatalog {
         providers.sort();
         providers.dedup();
         providers
-    }
-}
-impl rustyline::Helper for Completion {}
-impl rustyline::hint::Hinter for Completion {
-    type Hint = String;
-}
-impl rustyline::highlight::Highlighter for Completion {}
-impl rustyline::validate::Validator for Completion {
-    fn validate(
-        &self,
-        ctx: &mut rustyline::validate::ValidationContext<'_>,
-    ) -> rustyline::Result<rustyline::validate::ValidationResult> {
-        use rustyline::validate::ValidationResult;
-        Ok(if self.incomplete(ctx.input())? {
-            ValidationResult::Incomplete
-        } else {
-            ValidationResult::Valid(None)
-        })
     }
 }
 impl Completion {
@@ -16194,7 +15853,6 @@ mod completion_transaction_tests {
                 task_ids: vec![],
                 wakeup_ids: vec![],
             },
-            selection: Arc::new(std::sync::Mutex::new(None)),
             ipc: std::cell::RefCell::new(WorkerTransport::new(host).unwrap()),
         };
         assert!(matches!(
@@ -16206,26 +15864,6 @@ mod completion_transaction_tests {
             .incomplete_with_interrupt("@value=2", || interrupted.load(Ordering::SeqCst))
             .unwrap());
         server.join().unwrap();
-    }
-}
-impl rustyline::completion::Completer for Completion {
-    type Candidate = rustyline::completion::Pair;
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &rustyline::Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        if let Some((start, value)) = self.selection.lock().unwrap().take() {
-            return Ok((
-                start,
-                vec![rustyline::completion::Pair {
-                    display: terminal_safe(&value),
-                    replacement: value,
-                }],
-            ));
-        }
-        self.catalog.candidates(line, pos, false)
     }
 }
 impl CompletionCatalog {
@@ -16560,124 +16198,6 @@ fn completion_file_query(word: &str, all: bool) -> &str {
 }
 // Only this immutable, between-cell snapshot enters the key handler. Python IPC
 // and the worker are deliberately absent from selection and query filtering.
-struct PickerTab {
-    catalog: CompletionCatalog,
-    selection: std::sync::Arc<std::sync::Mutex<Option<(usize, String)>>>,
-}
-impl rustyline::ConditionalEventHandler for PickerTab {
-    fn handle(
-        &self,
-        _event: &rustyline::Event,
-        _count: rustyline::RepeatCount,
-        _positive: bool,
-        ctx: &rustyline::EventContext<'_>,
-    ) -> Option<rustyline::Cmd> {
-        let (start, matching) = self.catalog.candidates(ctx.line(), ctx.pos(), false).ok()?;
-        let selected = if matching.len() == 1 {
-            Some(matching[0].replacement.clone())
-        } else if matching.is_empty() {
-            None
-        } else {
-            let (_, choices) = self.catalog.candidates(ctx.line(), ctx.pos(), true).ok()?;
-            let prefix = &ctx.line()[..ctx.pos()];
-            let python = prefix.starts_with('@');
-            let offset = if prefix.starts_with("@@") || prefix.starts_with("!!") {
-                2
-            } else if python || prefix.starts_with('!') {
-                1
-            } else {
-                0
-            };
-            let (_, quote) = completion_token(prefix, offset);
-            let query = completion_unescape(&prefix[start..], python, quote);
-            picker_select(&choices, &query, 1, 1, 1).ok().flatten()
-        };
-        Some(if let Some(value) = selected {
-            // Cmd::Replace is unsuitable here: Emacs redo overrides its count,
-            // and insert_str leaves the cursor before inserted text. Complete
-            // delegates atomic range replacement + cursor placement to rustyline.
-            *self.selection.lock().unwrap() = Some((start, value));
-            rustyline::Cmd::Complete
-        } else {
-            rustyline::Cmd::Repaint
-        })
-    }
-}
-struct PickerTerminal {
-    io: TerminalIo,
-    tty: File,
-    active: bool,
-    slots: usize,
-    cursor_row: usize,
-    origin_up: usize,
-    prompt_rows: usize,
-}
-impl PickerTerminal {
-    fn open(output_fd: i32, prompt_rows: usize, origin_up: usize) -> Result<Option<Self>> {
-        let input = TerminalIo::duplicate(0)?;
-        let tty = TerminalIo::duplicate(output_fd)?;
-        let height = TerminalIo::size(tty.as_raw_fd()).1;
-        // At most half the screen: reserve room for the source and recent output.
-        // Multiline input can consume that room; a tiny screen declines the menu.
-        let slots = picker_slots(height, prompt_rows);
-        if slots < 2 {
-            return Ok(None);
-        }
-        let io = TerminalIo::raw(input, RawTerminalMode::Picker, "selection input closed")?;
-        let mut guard = Self {
-            io,
-            tty,
-            active: false,
-            slots: 0,
-            cursor_row: 0,
-            origin_up: origin_up.max(1),
-            prompt_rows,
-        };
-        guard.tty.write_all(b"\r")?;
-        if guard.origin_up > 1 {
-            write!(guard.tty, "\x1b[{}B", guard.origin_up - 1)?;
-        }
-        // Newlines reserve owned rows and naturally scroll at the bottom. The
-        // source scrolls with them; no saved absolute cursor becomes stale.
-        for _ in 0..slots {
-            guard.tty.write_all(b"\r\n")?;
-            if guard.active {
-                guard.cursor_row += 1;
-            }
-            guard.active = true;
-            guard.slots += 1;
-        }
-        guard.top()?;
-        guard.tty.flush()?;
-        Ok(Some(guard))
-    }
-    fn top(&mut self) -> io::Result<()> {
-        self.tty.write_all(b"\r")?;
-        if self.cursor_row > 0 {
-            write!(self.tty, "\x1b[{}A", self.cursor_row)?;
-        }
-        self.cursor_row = 0;
-        Ok(())
-    }
-    fn byte(&mut self, timeout: i32) -> Result<Option<u8>> {
-        Ok(self.io.byte(timeout)?)
-    }
-    fn size(&self) -> (usize, usize) {
-        TerminalIo::size(self.tty.as_raw_fd())
-    }
-}
-impl Drop for PickerTerminal {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = self.top();
-            // Clear only below the prompt, return to its original caret row.
-            let _ = self.tty.write_all(b"\x1b[0J");
-            let _ = write!(self.tty, "\x1b[{}A\r\x1b[?25h", self.origin_up);
-            let _ = self.tty.flush();
-        }
-        // TerminalIo's raw lease restores termios after picker cleanup.
-    }
-}
 fn picker_clip(text: &str, width: usize) -> String {
     let mut result = String::new();
     let mut used = 0;
@@ -16716,200 +16236,8 @@ fn picker_filter(choices: &[rustyline::completion::Pair], query: &str) -> Vec<us
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     ranked.into_iter().map(|p| p.1).collect()
 }
-fn picker_draw(terminal: &mut PickerTerminal, picker: &PickerState) -> Result<()> {
-    let layout = picker.layout(terminal.size().0, terminal.slots);
-    terminal.top()?;
-    terminal.tty.write_all(b"\x1b[?25l")?;
-    for (index, (text, style)) in layout.lines.iter().enumerate() {
-        if index > 0 {
-            terminal.tty.write_all(b"\r\n")?;
-            terminal.cursor_row += 1;
-        }
-        terminal.tty.write_all(b"\x1b[2K")?;
-        terminal
-            .tty
-            .write_all(terminal_styled_for(text, style, terminal.tty.as_raw_fd()).as_bytes())?;
-    }
-    terminal.tty.write_all(b"\r")?;
-    let up = terminal.cursor_row - layout.query_row;
-    if up > 0 {
-        write!(terminal.tty, "\x1b[{up}A")?;
-    }
-    terminal.cursor_row = layout.query_row;
-    if layout.cursor_column > 0 {
-        write!(terminal.tty, "\x1b[{}C", layout.cursor_column)?;
-    }
-    terminal.tty.write_all(b"\x1b[?25h")?;
-    terminal.tty.flush()?;
-    Ok(())
-}
 // Nested selection keeps bracketed paste enabled. Consume it atomically so
 // pasted Enter/Escape/control bytes can never select, navigate or submit cells.
-fn picker_paste_service(
-    terminal: &mut PickerTerminal,
-    service: &mut impl FnMut() -> Result<()>,
-) -> Result<Option<String>> {
-    let mut paste = Vec::new();
-    let mut overflow = false;
-    loop {
-        service()?;
-        if INTERRUPT.load(std::sync::atomic::Ordering::SeqCst) {
-            unsafe {
-                libc::tcflush(terminal.io.input.as_raw_fd(), libc::TCIFLUSH);
-            }
-            return Ok(None);
-        }
-        let Some(byte) = terminal.byte(50)? else {
-            continue;
-        };
-        paste.push(byte);
-        if paste.ends_with(b"\x1b[201~") {
-            paste.truncate(paste.len() - 6);
-            if overflow {
-                return Ok(None);
-            }
-            let Ok(text) = String::from_utf8(paste) else {
-                return Ok(None);
-            };
-            // Pasted multiline text is one query edit. Collapse whitespace and
-            // drop other controls; they are data, never picker key commands.
-            return Ok(Some(normalize_picker_paste(&text)));
-        }
-        if paste.len() > 1_048_576 + 6 {
-            overflow = true;
-            paste.drain(..paste.len() - 6);
-        }
-    }
-}
-fn picker_select(
-    choices: &[rustyline::completion::Pair],
-    initial_query: &str,
-    output_fd: i32,
-    prompt_rows: usize,
-    origin_up: usize,
-) -> Result<Option<String>> {
-    picker_select_service(
-        choices,
-        initial_query,
-        output_fd,
-        prompt_rows,
-        origin_up,
-        || Ok(()),
-    )
-}
-fn picker_select_service(
-    choices: &[rustyline::completion::Pair],
-    initial_query: &str,
-    output_fd: i32,
-    prompt_rows: usize,
-    origin_up: usize,
-    mut service: impl FnMut() -> Result<()>,
-) -> Result<Option<String>> {
-    if unsafe { libc::isatty(0) } != 1
-        || unsafe { libc::isatty(output_fd) } != 1
-        || std::env::var("TERM").is_ok_and(|t| t == "dumb")
-    {
-        return Ok(None);
-    }
-    let Some(mut terminal) = PickerTerminal::open(output_fd, prompt_rows, origin_up)? else {
-        return Ok(None);
-    };
-    let mut picker = PickerState::new(choices.to_vec(), initial_query);
-    let mut dirty = true;
-    let mut size = terminal.size();
-    loop {
-        service()?;
-        if INTERRUPT.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            return Ok(None);
-        }
-        if size != terminal.size() {
-            size = terminal.size();
-            if size.1.saturating_sub(terminal.prompt_rows) < terminal.slots {
-                return Ok(None);
-            }
-            dirty = true;
-        }
-        if dirty {
-            picker_draw(&mut terminal, &picker)?;
-            dirty = false;
-        }
-        let Some(byte) = terminal.byte(50)? else {
-            continue;
-        };
-        let action = match byte {
-            3 | 4 => {
-                INTERRUPT.store(false, std::sync::atomic::Ordering::SeqCst);
-                PickerAction::Cancel
-            }
-            27 => {
-                let Some(next) = terminal.byte(35)? else {
-                    return Ok(None);
-                };
-                if next != b'[' && next != b'O' {
-                    return Ok(None);
-                }
-                let mut sequence = vec![next];
-                for _ in 0..256 {
-                    let Some(key) = terminal.byte(35)? else {
-                        return Ok(None);
-                    };
-                    sequence.push(key);
-                    if (0x40..=0x7e).contains(&key) {
-                        break;
-                    }
-                }
-                if !sequence.last().is_some_and(|b| (0x40..=0x7e).contains(b)) {
-                    return Err("oversized picker terminal key report".into());
-                }
-                if sequence.as_slice() == b"[200~" {
-                    picker_paste_service(&mut terminal, &mut service)?
-                        .map(PickerAction::Append)
-                        .unwrap_or(PickerAction::Ignore)
-                } else {
-                    PickerAction::from_edit_key(EditKey::Sequence(
-                        String::from_utf8(sequence).unwrap_or_default(),
-                    ))
-                }
-            }
-            c if c >= 128 => {
-                let length = if c & 0xe0 == 0xc0 {
-                    2
-                } else if c & 0xf0 == 0xe0 {
-                    3
-                } else if c & 0xf8 == 0xf0 {
-                    4
-                } else {
-                    0
-                };
-                let mut bytes = vec![c];
-                for _ in 1..length {
-                    if let Some(byte) = terminal.byte(100)? {
-                        bytes.push(byte);
-                    } else {
-                        break;
-                    }
-                }
-                if length > 0 {
-                    std::str::from_utf8(&bytes)
-                        .ok()
-                        .filter(|text| !text.chars().any(char::is_control))
-                        .map(|text| PickerAction::Append(text.into()))
-                        .unwrap_or(PickerAction::Ignore)
-                } else {
-                    PickerAction::Ignore
-                }
-            }
-            byte => PickerAction::from_edit_key(EditKey::Byte(byte)),
-        };
-        match picker.apply(action) {
-            PickerDecision::Accepted(value) => return Ok(Some(value)),
-            PickerDecision::Cancelled => return Ok(None),
-            PickerDecision::Changed => dirty = true,
-            PickerDecision::Unchanged => {}
-        }
-    }
-}
-
 impl Host {
     fn deliver_steering(&mut self) -> Result<bool> {
         self.poll_commands()?;
@@ -17182,6 +16510,15 @@ struct IndexedProvider {
 }
 #[derive(Clone)]
 enum HistoryEventData {
+    OperationComplete {
+        operation_type: Option<String>,
+    },
+
+    Context {
+        id: String,
+        raw_index: Option<usize>,
+    },
+
     CellStart {
         data: JournalCellStart,
         metadata: Value,
@@ -17191,10 +16528,6 @@ enum HistoryEventData {
         metadata: Value,
     },
     CellRecord(JournalCellRecord),
-    Accepted {
-        direct: bool,
-        command_id: Option<String>,
-    },
     Code {
         index: Option<usize>,
     },
@@ -17203,21 +16536,12 @@ enum HistoryEventData {
         index: usize,
         complete: Option<bool>,
     },
-    Context {
-        id: String,
-        ranges: Vec<(usize, usize)>,
-        raw_index: Option<usize>,
-    },
     Intent {
         operation_type: Option<String>,
         shell_source: bool,
     },
-    OperationComplete {
-        operation_type: Option<String>,
-    },
     WorkerReset {
         active_cell: Option<usize>,
-        explicit: bool,
     },
     Record(RecordCollection),
     Other,
@@ -17242,6 +16566,15 @@ impl HistoryEvent {
             _ => p["operation"].as_str().map(str::to_owned),
         };
         let data = match (&event.kind, &event.data) {
+            (K::OperationComplete, D::Intent(data)) => HistoryEventData::OperationComplete {
+                operation_type: data.operation_type.clone(),
+            },
+
+            (_, D::ContextAdd(item)) => HistoryEventData::Context {
+                id: item.id.clone(),
+                raw_index: item.raw_index,
+            },
+
             (_, D::CellStart(data)) => HistoryEventData::CellStart {
                 data: data.clone(),
                 metadata: p.clone(),
@@ -17251,10 +16584,6 @@ impl HistoryEvent {
                 metadata: p.clone(),
             },
             (_, D::CellRecord(data)) => HistoryEventData::CellRecord(data.clone()),
-            (K::Accepted, _) => HistoryEventData::Accepted {
-                direct: matches!(p["command"]["kind"].as_str(), Some("python" | "shell")),
-                command_id: p["command_id"].as_str().map(str::to_owned),
-            },
             (K::Code, D::TextRecord(data)) => HistoryEventData::Code {
                 index: data.record_index,
             },
@@ -17263,28 +16592,12 @@ impl HistoryEvent {
                 index: data.record_index,
                 complete: data.complete,
             },
-            (_, D::ContextAdd(item)) => HistoryEventData::Context {
-                id: item.id.clone(),
-                ranges: item.ranges.clone(),
-                raw_index: item.raw_index,
-            },
             (K::Intent, D::Intent(data)) => HistoryEventData::Intent {
                 operation_type: data.operation_type.clone(),
                 shell_source: p["source"].is_string(),
             },
-            (K::OperationComplete, D::Intent(data)) => HistoryEventData::OperationComplete {
-                operation_type: data.operation_type.clone(),
-            },
-            (
-                _,
-                D::WorkerReset {
-                    active_cell,
-                    explicit_active_cell,
-                    ..
-                },
-            ) => HistoryEventData::WorkerReset {
+            (_, D::WorkerReset { active_cell, .. }) => HistoryEventData::WorkerReset {
                 active_cell: *active_cell,
-                explicit: *explicit_active_cell,
             },
             (K::Request, _) => HistoryEventData::Record(RecordCollection::Requests),
             (K::Response, _) => HistoryEventData::Record(RecordCollection::Responses),
@@ -17301,21 +16614,6 @@ impl HistoryEvent {
             data,
         }
     }
-    fn is_boundary(&self) -> bool {
-        matches!(
-            self.data,
-            HistoryEventData::CellStart { .. }
-                | HistoryEventData::CellEnd { .. }
-                | HistoryEventData::WorkerReset { .. }
-        )
-    }
-    fn proves_reset_preservation(&self, cell: usize) -> bool {
-        match &self.data {
-            HistoryEventData::CellStart { data, .. } => data.parent_cell == Some(cell),
-            HistoryEventData::CellEnd { data, .. } => data.cell == cell,
-            _ => false,
-        }
-    }
 }
 #[derive(Clone, Default)]
 struct HistoryIndexState {
@@ -17323,13 +16621,7 @@ struct HistoryIndexState {
     active: Vec<usize>,
     operations: HashMap<String, usize>,
     record_events: HashMap<RecordCollection, Vec<usize>>,
-    user_sequences: HashMap<usize, usize>,
-    command_users: HashMap<String, Vec<usize>>,
-    direct_command: Option<String>,
-    selected_users: Vec<usize>,
     providers: HashMap<String, IndexedProvider>,
-    pending_provider: Option<String>,
-    completed_generation: Option<String>,
     error: Option<HistoryIndexError>,
 }
 impl HistoryIndexState {
@@ -17352,53 +16644,24 @@ impl HistoryIndexState {
             .copied()
             .ok_or(HistoryIndexError(error))
     }
-    fn ingest(&mut self, event: &HistoryEvent, reset_preserved: Option<bool>) {
+    fn ingest(&mut self, event: &HistoryEvent) {
         if self.error.is_none() {
-            self.error = self.apply(event, reset_preserved).err();
+            self.error = self.apply(event).err();
         }
     }
-    fn apply(
-        &mut self,
-        event: &HistoryEvent,
-        reset_preserved: Option<bool>,
-    ) -> std::result::Result<(), HistoryIndexError> {
+    fn apply(&mut self, event: &HistoryEvent) -> std::result::Result<(), HistoryIndexError> {
         use HistoryEventData as D;
         let sequence = event.sequence;
-        if let D::WorkerReset {
-            active_cell,
-            explicit,
-        } = &event.data
-        {
-            let preserve = if *explicit {
-                if let Some(cell) = active_cell {
-                    if self.active.last() != Some(cell) {
-                        return Err(HistoryIndexError(
-                            "worker reset does not belong to the active cell",
-                        ));
-                    }
-                    true
-                } else {
-                    false
+        if let D::WorkerReset { active_cell } = &event.data {
+            if let Some(cell) = active_cell {
+                if self.active.last() != Some(cell) {
+                    return Err(HistoryIndexError(
+                        "worker reset does not belong to the active cell",
+                    ));
                 }
             } else {
-                reset_preserved.unwrap_or(false)
-            };
-            if !preserve {
                 self.active.clear();
             }
-            self.completed_generation = None;
-        }
-        if let D::Accepted { direct, command_id } = &event.data {
-            self.direct_command = if *direct {
-                Some(
-                    command_id
-                        .clone()
-                        .ok_or(HistoryIndexError("accepted command ID missing"))?,
-                )
-            } else {
-                None
-            };
-            self.completed_generation = None;
         }
         if let D::CellStart { data, metadata } = &event.data {
             let number = data.cell;
@@ -17421,12 +16684,7 @@ impl HistoryIndexState {
                 start: metadata.clone(),
                 ..CellMembership::default()
             };
-            let inputs = data.user_record_indices.clone().unwrap_or_else(|| {
-                self.command_users
-                    .get(&data.operation)
-                    .cloned()
-                    .unwrap_or_else(|| self.selected_users.clone())
-            });
+            let inputs = data.user_record_indices.clone();
             for index in inputs {
                 let seq = self.record_sequence(
                     RecordCollection::User,
@@ -17436,7 +16694,8 @@ impl HistoryIndexState {
                 view.record(RecordCollection::User, index);
                 view.event(seq);
             }
-            if let Some(indices) = &data.input_raw_indices {
+            {
+                let indices = &data.input_raw_indices;
                 for index in indices {
                     let seq = self.record_sequence(
                         RecordCollection::Raw,
@@ -17447,13 +16706,7 @@ impl HistoryIndexState {
                     view.event(seq);
                 }
             }
-            let generation = if data.explicit_generation {
-                data.generation_request.clone()
-            } else if self.active.is_empty() && data.operation == format!("agent{sequence}") {
-                self.completed_generation.clone()
-            } else {
-                None
-            };
+            let generation = data.generation_request.clone();
             if let Some(operation) = generation {
                 let provider = self
                     .providers
@@ -17470,7 +16723,6 @@ impl HistoryIndexState {
                     view.event(*seq);
                 }
             }
-            self.completed_generation = None;
             view.event(sequence);
             self.cells.insert(number, view);
             self.active.push(number);
@@ -17478,7 +16730,10 @@ impl HistoryIndexState {
         }
         let operation = event.operation.as_deref();
         let operation_cell = operation.and_then(|op| self.operations.get(op).copied());
-        let owner = if matches!(event.data, D::Stream { .. }) {
+        let owner = if matches!(
+            event.data,
+            D::Stream { .. } | D::Record(RecordCollection::User)
+        ) {
             operation_cell
         } else {
             operation_cell.or_else(|| self.active.last().copied())
@@ -17495,7 +16750,6 @@ impl HistoryIndexState {
                 let provider = self.providers.entry(operation.clone()).or_default();
                 provider.owner = self.active.last().copied();
                 provider.events.push(sequence);
-                self.pending_provider = Some(operation);
             }
         }
         if !intent {
@@ -17516,25 +16770,13 @@ impl HistoryIndexState {
             let index = events.len();
             events.push(sequence);
             match collection {
-                RecordCollection::User => {
-                    self.user_sequences.insert(sequence, index);
-                    if let Some(command) = &self.direct_command {
-                        self.command_users
-                            .entry(command.clone())
-                            .or_default()
-                            .push(index);
-                    }
-                }
+                // A queued user record is not owned by whichever cell happens
+                // to be running. Ownership is explicit in cell_start inputs.
+                RecordCollection::User => {}
                 RecordCollection::Requests
                 | RecordCollection::Responses
                 | RecordCollection::Usage => {
-                    let provenance = operation.map(str::to_owned).or_else(|| {
-                        if collection == RecordCollection::Requests {
-                            self.pending_provider.take()
-                        } else {
-                            None
-                        }
-                    });
+                    let provenance = operation.map(str::to_owned);
                     let provider = provenance
                         .as_deref()
                         .and_then(|operation| self.providers.get_mut(operation));
@@ -17621,26 +16863,26 @@ impl HistoryIndexState {
                     }
                 }
             }
-            D::Context {
-                id,
-                ranges,
-                raw_index,
-            } => {
+            D::Context { id, raw_index, .. } => {
                 if let Some(owner) = owner {
-                    self.cell_mut(owner, "cell owner missing")?
-                        .context_ids
-                        .push(id.clone());
+                    let view = self.cell_mut(owner, "cell owner missing")?;
+                    view.context_ids.push(id.clone());
+                    if let Some(index) = raw_index {
+                        view.record(RecordCollection::Raw, *index);
+                    }
                 }
-                let selected = ranges
-                    .iter()
-                    .filter_map(|(start, _)| self.user_sequences.get(start).copied())
-                    .collect::<Vec<_>>();
-                if !selected.is_empty() {
-                    self.selected_users = selected;
-                }
-                if let (Some(owner), Some(index)) = (owner, raw_index) {
-                    self.cell_mut(owner, "cell owner missing")?
-                        .record(RecordCollection::Raw, *index);
+            }
+            D::OperationComplete { operation_type }
+                if operation_type.as_deref() == Some("provider") =>
+            {
+                let operation =
+                    operation.ok_or(HistoryIndexError("completed provider operation missing"))?;
+                if let Some(provider) = self.providers.get_mut(operation) {
+                    provider.events.push(sequence);
+                } else {
+                    return Err(HistoryIndexError(
+                        "completed provider operation has no intent",
+                    ));
                 }
             }
             D::CellRecord(data) => {
@@ -17654,37 +16896,14 @@ impl HistoryIndexState {
                 view.event(seq);
                 view.event(sequence);
             }
-            D::OperationComplete { operation_type }
-                if operation_type.as_deref() == Some("provider") =>
-            {
-                let operation =
-                    operation.ok_or(HistoryIndexError("completed provider operation missing"))?;
-                if let Some(provider) = self.providers.get_mut(operation) {
-                    provider.events.push(sequence);
-                    if provider.owner.is_none() {
-                        self.completed_generation = Some(operation.into());
-                    }
-                } else {
-                    self.completed_generation = None;
-                }
-            }
             _ => {}
         }
         Ok(())
     }
 }
-// A legacy reset has no active_cell marker. Serve the EOF-cleared projection
-// immediately; keep a metadata-only checkpoint until a boundary proves that
-// the caller survives. Queries never clone/rebuild the session or rescan rows.
-struct PendingLegacyReset {
-    preserved: HistoryIndexState,
-    cell: usize,
-    events: Vec<HistoryEvent>,
-}
 #[derive(Default)]
 struct HistoryIndex {
     state: HistoryIndexState,
-    pending_reset: Option<PendingLegacyReset>,
     sequence: usize,
 }
 impl HistoryIndex {
@@ -17695,37 +16914,7 @@ impl HistoryIndex {
         }
         self.sequence += 1;
         let event = HistoryEvent::from_event(event);
-        if event.is_boundary() {
-            if let Some(mut pending) = self.pending_reset.take() {
-                if event.proves_reset_preservation(pending.cell) {
-                    for buffered in &pending.events {
-                        pending.preserved.ingest(buffered, None);
-                    }
-                    self.state = pending.preserved;
-                }
-            }
-        }
-        if matches!(
-            event.data,
-            HistoryEventData::WorkerReset {
-                explicit: false,
-                ..
-            }
-        ) && self.state.error.is_none()
-        {
-            if let Some(cell) = self.state.active.last().copied() {
-                let mut preserved = self.state.clone();
-                preserved.ingest(&event, Some(true));
-                self.pending_reset = Some(PendingLegacyReset {
-                    preserved,
-                    cell,
-                    events: Vec::new(),
-                });
-            }
-        } else if let Some(pending) = &mut self.pending_reset {
-            pending.events.push(event.clone());
-        }
-        self.state.ingest(&event, None);
+        self.state.ingest(&event);
     }
     fn cell(&self, cell: usize) -> std::result::Result<(&CellMembership, bool), HistoryIndexError> {
         if cell == 0 {
@@ -17756,19 +16945,6 @@ struct CellJournalView {
     stream_complete: HashMap<String, bool>,
 }
 #[cfg(test)]
-impl CellJournalView {
-    fn record(&mut self, collection: &str, index: usize) {
-        let values = self.records.entry(collection.into()).or_default();
-        if !values.contains(&index) {
-            values.push(index);
-        }
-    }
-    fn event(&mut self, sequence: usize) {
-        if !self.event_sequences.contains(&sequence) {
-            self.event_sequences.push(sequence);
-        }
-    }
-}
 #[cfg(test)]
 mod history_index_tests {
     use super::*;
@@ -17789,27 +16965,28 @@ mod history_index_tests {
             .copied()
             .collect::<Vec<_>>();
         for cell in cells {
-            assert_eq!(
-                host.cell_view(cell).unwrap(),
-                host.legacy_cell_view(cell).unwrap(),
-                "cell {cell}"
-            );
+            let snapshot = host.cell_view(cell).unwrap();
+            assert_eq!(snapshot["cell"], cell);
+            assert!(snapshot["code"].is_string());
+            assert!(snapshot["stdout"].is_string());
+            assert!(snapshot["stderr"].is_string());
+            for collection in [
+                "user",
+                "stdin",
+                "say",
+                "requests",
+                "responses",
+                "usage",
+                "raw",
+                "events",
+            ] {
+                assert!(snapshot[collection].is_array(), "{collection}");
+            }
         }
     }
-    fn record(host: &mut Host, collection: &str, kind: &str, payload: Value) -> (usize, usize) {
-        let sequence = host.journal.append(kind, payload.clone()).unwrap();
-        let index = host.hist_push(collection, payload);
-        (index, sequence)
-    }
-    fn start(host: &mut Host, cell: usize, operation: &str, parent: Option<usize>, legacy: bool) {
-        let mut payload = json!({"cell":cell,"parent_cell":parent,"language":"python","operation":operation,
-            "history_view_version":1,"user_record_indices":[],"input_raw_indices":[],"generation_request":null});
-        if legacy {
-            payload
-                .as_object_mut()
-                .unwrap()
-                .remove("generation_request");
-        }
+    fn start(host: &mut Host, cell: usize, operation: &str, parent: Option<usize>) {
+        let payload = json!({"cell":cell,"parent_cell":parent,"language":"python","operation":operation,
+            "user_record_indices":[],"input_raw_indices":[],"generation_request":null});
         host.journal.append("cell_start", payload).unwrap();
         host.execution.restore_cell(cell);
     }
@@ -17822,7 +16999,8 @@ mod history_index_tests {
             .unwrap();
     }
     #[test]
-    fn incremental_views_match_scanner_for_nested_execution_multiple_rpcs_and_worker_reset() {
+    fn incremental_views_keep_explicit_ownership_for_nested_execution_multiple_rpcs_and_worker_reset(
+    ) {
         let mut host = host();
         host.user("task", true).unwrap();
         assert_eq!(host.execute("parent", "print('parent')\nagent.sh('printf shell')\nagent.say('first')\nagent.say('second')", false).unwrap()["status"], "ok");
@@ -17861,136 +17039,11 @@ mod history_index_tests {
         drop(resumed);
     }
     #[test]
-    fn indexed_generation_and_records_match_legacy_inference_without_admitting_background_streams()
-    {
-        let mut host = host();
-        host.journal
-            .append(
-                "intent",
-                json!({"type":"provider","operation":"generation"}),
-            )
-            .unwrap();
-        record(&mut host, "requests", "request", json!({"model":"test"}));
-        record(
-            &mut host,
-            "responses",
-            "response",
-            json!({"operation":"generation","raw":{"usage":{"input_tokens":10,"output_tokens":2}}}),
-        );
-        record(
-            &mut host,
-            "usage",
-            "usage",
-            json!({"operation":"generation","input_tokens":10,"output_tokens":2}),
-        );
-        host.journal
-            .append(
-                "operation_complete",
-                json!({"type":"provider","operation":"generation"}),
-            )
-            .unwrap();
-        let operation = format!("agent{}", host.journal.seq);
-        start(&mut host, 1, &operation, None, true);
-        let index = host.hist_push("code", json!("print('generated')"));
-        host.journal
-            .append(
-                "code",
-                json!({"operation":operation,"index":index,"source":"print('generated')"}),
-            )
-            .unwrap();
-        record(&mut host, "stdin", "stdin", json!({"text":"one"}));
-        record(&mut host, "stdin", "stdin", json!({"text":"two"}));
-        record(&mut host, "say", "say", json!({"text":"one"}));
-        record(&mut host, "say", "say", json!({"text":"two"}));
-        let (raw, _) = record(
-            &mut host,
-            "raw",
-            "raw",
-            json!({"base64":"AA==","mime":"application/octet-stream"}),
-        );
-        host.journal
-            .append(
-                "cell_record",
-                json!({"cell":1,"collection":"raw","record_index":raw}),
-            )
-            .unwrap();
-        host.history.append(
-            RecordCollection::Stdout,
-            ArchivedRecord::Value(json!("detached task")),
-        );
-        host.journal.append("stream", json!({"operation":"task:detached","collection":"stdout","index":0,"base64":B64.encode(b"detached task")})).unwrap();
-        end(&mut host, 1);
-        compare(&host);
-        let view = host.cell_view(1).unwrap();
-        assert_eq!(view["requests"].as_array().unwrap().len(), 1);
-        assert_eq!(view["responses"].as_array().unwrap().len(), 1);
-        assert_eq!(view["usage"].as_array().unwrap().len(), 1);
-        assert_eq!(view["stdin"].as_array().unwrap().len(), 2);
-        assert_eq!(view["raw"].as_array().unwrap().len(), 1);
-        assert_eq!(view["stdout"], "");
-        assert_eq!(host.history_value("stdout", 0).unwrap(), "detached task");
-        drop(host.take_host());
-    }
-    #[test]
-    fn legacy_reset_eof_projection_is_revised_only_when_a_boundary_proves_preservation() {
-        let mut host = host();
-        start(&mut host, 1, "caller", None, false);
-        host.journal
-            .append("worker_reset", json!({"generation":1}))
-            .unwrap();
-        compare(&host);
-        assert_eq!(host.cell_view(1).unwrap()["status"], "unknown");
-        record(
-            &mut host,
-            "say",
-            "say",
-            json!({"text":"ambiguous until the boundary"}),
-        );
-        compare(&host);
-        assert_eq!(
-            host.cell_view(1).unwrap()["say"].as_array().unwrap().len(),
-            0
-        );
-        start(&mut host, 2, "startup", Some(1), false);
-        compare(&host);
-        assert_eq!(
-            host.cell_view(1).unwrap()["say"].as_array().unwrap().len(),
-            1
-        );
-        end(&mut host, 2);
-        end(&mut host, 1);
-        compare(&host);
-        start(&mut host, 3, "abandoned", None, false);
-        host.journal
-            .append("worker_reset", json!({"generation":2}))
-            .unwrap();
-        record(
-            &mut host,
-            "say",
-            "say",
-            json!({"text":"global after interrupted resume"}),
-        );
-        start(&mut host, 4, "new-root", None, false);
-        end(&mut host, 4);
-        compare(&host);
-        assert_eq!(
-            host.cell_view(3).unwrap()["say"].as_array().unwrap().len(),
-            0
-        );
-        assert_eq!(host.cell_view(3).unwrap()["status"], "unknown");
-        let home = host.home.clone();
-        let path = host.journal.path.clone();
-        drop(host.take_host());
-        let resumed = Host::new(home.clone(), Some(path), true, true, None, None).unwrap();
-        compare(&resumed);
-        drop(resumed);
-    }
-    #[test]
     fn query_reads_only_cell_membership_not_foreign_session_events_and_reopen_rebuilds_once() {
         let mut host = host();
         for cell in 1..=2 {
             let operation = format!("cell-{cell}");
-            start(&mut host, cell, &operation, None, false);
+            start(&mut host, cell, &operation, None);
             let source = format!("value = {cell}");
             let index = host.hist_push("code", json!(source));
             host.journal
@@ -18039,16 +17092,12 @@ mod history_index_tests {
     #[test]
     fn semantic_projection_errors_are_durable_and_do_not_poison_the_journal() {
         let mut host = host();
-        start(&mut host, 1, "first", None, false);
+        start(&mut host, 1, "first", None);
         end(&mut host, 1);
         let before = host.journal.seq;
-        start(&mut host, 1, "duplicate", None, false);
+        start(&mut host, 1, "duplicate", None);
         assert_eq!(host.journal.seq, before + 1);
         assert!(!host.journal.failed);
-        assert_eq!(
-            host.cell_view(1).unwrap_err().to_string(),
-            host.legacy_cell_view(1).unwrap_err().to_string()
-        );
         assert_eq!(
             host.cell_view(1).unwrap_err().to_string(),
             "duplicate cell number in journal"
@@ -18066,13 +17115,6 @@ mod history_index_tests {
         );
         drop(resumed);
     }
-}
-#[cfg(test)]
-#[derive(Default)]
-struct ProviderJournalView {
-    records: Vec<(String, usize)>,
-    events: Vec<usize>,
-    owner: Option<usize>,
 }
 impl Host {
     fn resolve_cell_index(&self, index: i64) -> Result<usize> {
@@ -18119,445 +17161,6 @@ impl Host {
         }
         self.render_cell_view(cell, view, running)
     }
-    #[cfg(test)]
-    fn reset_preserves_cell(
-        &self,
-        sequence: usize,
-        payload: &Value,
-        active: &[usize],
-    ) -> Result<bool> {
-        if let Some(value) = payload.get("active_cell") {
-            if value.is_null() {
-                return Ok(false);
-            }
-            let cell = value
-                .as_u64()
-                .and_then(|n| usize::try_from(n).ok())
-                .filter(|cell| *cell > 0)
-                .ok_or("invalid worker reset cell provenance")?;
-            if active.last() != Some(&cell) {
-                return Err("worker reset does not belong to the active cell".into());
-            }
-            return Ok(true);
-        }
-        let Some(cell) = active.last() else {
-            return Ok(false);
-        };
-        // Legacy journals did not distinguish a resume from a worker replacement
-        // inside execute_inner. Retain a caller only when the next cell boundary
-        // proves it: its own end or a nested startup cell naming it as parent.
-        for next in sequence + 1..self.journal.seq {
-            let event = self.journal.event(next)?;
-            let p = &event["payload"];
-            match event["kind"].as_str() {
-                Some("cell_start") => return Ok(p["parent_cell"].as_u64() == Some(*cell as u64)),
-                Some("cell_end") => return Ok(p["cell"].as_u64() == Some(*cell as u64)),
-                Some("worker_reset") => return Ok(false),
-                _ => {}
-            }
-        }
-        Ok(false)
-    }
-    // Test-only compatibility oracle; production never rescans attribution.
-    #[cfg(test)]
-    fn legacy_cell_view(&self, cell: usize) -> Result<Value> {
-        if cell == 0 {
-            return Err("cell numbers start at 1".into());
-        }
-        let mut cells = std::collections::BTreeMap::<usize, CellJournalView>::new();
-        let mut active = Vec::<usize>::new();
-        let mut operations = HashMap::<String, usize>::new();
-        let mut record_events = HashMap::<String, Vec<usize>>::new();
-        let mut user_sequences = HashMap::<usize, usize>::new();
-        let mut command_users = HashMap::<String, Vec<usize>>::new();
-        let mut direct_command: Option<String> = None;
-        let mut selected_users = Vec::<usize>::new();
-        let mut providers = HashMap::<String, ProviderJournalView>::new();
-        let mut pending_provider: Option<String> = None;
-        let mut completed_generation: Option<String> = None;
-        for sequence in 0..self.journal.seq {
-            let event = self.journal.event(sequence)?;
-            let kind = event["kind"].as_str().ok_or("journal event kind missing")?;
-            let p = &event["payload"];
-            if kind == "worker_reset" {
-                if !self.reset_preserves_cell(sequence, p, &active)? {
-                    active.clear();
-                }
-                completed_generation = None;
-            }
-            if kind == "accepted" {
-                direct_command =
-                    if matches!(p["command"]["kind"].as_str(), Some("python" | "shell")) {
-                        Some(
-                            p["command_id"]
-                                .as_str()
-                                .ok_or("accepted command ID missing")?
-                                .into(),
-                        )
-                    } else {
-                        None
-                    };
-                completed_generation = None;
-            }
-            if kind == "cell_start" {
-                let number = p["cell"]
-                    .as_u64()
-                    .and_then(|n| usize::try_from(n).ok())
-                    .filter(|n| *n > 0)
-                    .ok_or("invalid cell number")?;
-                if cells.contains_key(&number) {
-                    return Err("duplicate cell number in journal".into());
-                }
-                let parent = match p.get("parent_cell") {
-                    Some(value) if value.is_null() => None,
-                    Some(value) => Some(
-                        value
-                            .as_u64()
-                            .and_then(|n| usize::try_from(n).ok())
-                            .ok_or("invalid parent cell")?,
-                    ),
-                    None => return Err("parent cell provenance missing".into()),
-                };
-                if parent != active.last().copied() {
-                    return Err("cell parent does not match active cell provenance".into());
-                }
-                let operation = p["operation"]
-                    .as_str()
-                    .ok_or("cell operation missing")?
-                    .to_owned();
-                if operations.insert(operation.clone(), number).is_some() {
-                    return Err("duplicate cell operation in journal".into());
-                }
-                let mut view = CellJournalView {
-                    start: p.clone(),
-                    ..CellJournalView::default()
-                };
-                let inputs = if let Some(values) = p.get("user_record_indices") {
-                    values
-                        .as_array()
-                        .ok_or("invalid cell input provenance")?
-                        .iter()
-                        .map(|v| {
-                            v.as_u64()
-                                .and_then(|n| usize::try_from(n).ok())
-                                .ok_or("invalid user record index".into())
-                        })
-                        .collect::<Result<Vec<_>>>()?
-                } else {
-                    command_users
-                        .get(&operation)
-                        .cloned()
-                        .unwrap_or_else(|| selected_users.clone())
-                };
-                for index in inputs {
-                    let seq = *record_events
-                        .get("user")
-                        .and_then(|values| values.get(index))
-                        .ok_or("cell user provenance points to an unavailable record")?;
-                    view.record("user", index);
-                    view.event(seq);
-                }
-                if let Some(values) = p.get("input_raw_indices") {
-                    for value in values
-                        .as_array()
-                        .ok_or("invalid cell raw input provenance")?
-                    {
-                        let index = value
-                            .as_u64()
-                            .and_then(|n| usize::try_from(n).ok())
-                            .ok_or("invalid raw record index")?;
-                        let seq = *record_events
-                            .get("raw")
-                            .and_then(|values| values.get(index))
-                            .ok_or("cell raw provenance points to an unavailable record")?;
-                        view.record("raw", index);
-                        view.event(seq);
-                    }
-                }
-                // New journals bind generation explicitly. Legacy inference is
-                // restricted to the actual outer loop's sequence-derived ID,
-                // with no intervening accepted command or failed generation.
-                let generation = if let Some(value) = p.get("generation_request") {
-                    if value.is_null() {
-                        None
-                    } else {
-                        Some(
-                            value
-                                .as_str()
-                                .ok_or("invalid generation provenance")?
-                                .to_owned(),
-                        )
-                    }
-                } else if active.is_empty() && operation == format!("agent{sequence}") {
-                    completed_generation.clone()
-                } else {
-                    None
-                };
-                if let Some(operation) = generation {
-                    let provider = providers
-                        .get_mut(&operation)
-                        .ok_or("cell generation provenance missing")?;
-                    if provider.owner.is_some() {
-                        return Err("generation already owned by a cell".into());
-                    }
-                    provider.owner = Some(number);
-                    for (collection, index) in &provider.records {
-                        view.record(collection, *index);
-                    }
-                    for seq in &provider.events {
-                        view.event(*seq);
-                    }
-                }
-                completed_generation = None;
-                view.event(sequence);
-                cells.insert(number, view);
-                active.push(number);
-                continue;
-            }
-            let operation = p["operation"].as_str();
-            let operation_cell = operation.and_then(|op| operations.get(op).copied());
-            let owner = match kind {
-                "stream" | "stream_complete" | "stream_closed" => operation_cell,
-                _ => operation_cell.or_else(|| active.last().copied()),
-            };
-            if let Some(owner) = owner {
-                cells
-                    .get_mut(&owner)
-                    .ok_or("cell owner missing")?
-                    .event(sequence);
-            }
-            if kind == "intent" && matches!(p["type"].as_str(), Some("provider" | "image")) {
-                let operation = operation.ok_or("provider operation missing")?.to_owned();
-                let provider = providers.entry(operation.clone()).or_default();
-                provider.owner = active.last().copied();
-                provider.events.push(sequence);
-                pending_provider = Some(operation);
-            }
-            if kind != "intent" {
-                if let Some(provider) = operation.and_then(|operation| providers.get_mut(operation))
-                {
-                    provider.events.push(sequence);
-                    if let Some(owner) = provider.owner {
-                        cells
-                            .get_mut(&owner)
-                            .ok_or("provider cell owner missing")?
-                            .event(sequence);
-                    }
-                }
-            }
-            let collection = match kind {
-                "request" => Some("requests"),
-                "response" => Some("responses"),
-                "usage" => Some("usage"),
-                "user" => Some("user"),
-                "stdin" => Some("stdin"),
-                "say" => Some("say"),
-                "raw" => Some("raw"),
-                _ => None,
-            };
-            if let Some(collection) = collection {
-                let events = record_events.entry(collection.into()).or_default();
-                let index = events.len();
-                events.push(sequence);
-                match collection {
-                    "user" => {
-                        user_sequences.insert(sequence, index);
-                        if let Some(command) = &direct_command {
-                            command_users
-                                .entry(command.clone())
-                                .or_default()
-                                .push(index);
-                        }
-                    }
-                    "requests" | "responses" | "usage" => {
-                        let provenance = operation.map(str::to_owned).or_else(|| {
-                            if collection == "requests" {
-                                pending_provider.take()
-                            } else {
-                                None
-                            }
-                        });
-                        if let Some(provider) = provenance
-                            .as_deref()
-                            .and_then(|operation| providers.get_mut(operation))
-                        {
-                            provider.records.push((collection.into(), index));
-                            provider.events.push(sequence);
-                            if let Some(owner) = provider.owner {
-                                let view =
-                                    cells.get_mut(&owner).ok_or("provider cell owner missing")?;
-                                view.record(collection, index);
-                                view.event(sequence);
-                            }
-                        } else if let Some(owner) = owner {
-                            // A cell's journal interval proves ownership even
-                            // for legacy records without explicit operation tags.
-                            cells
-                                .get_mut(&owner)
-                                .ok_or("provider cell owner missing")?
-                                .record(collection, index);
-                        }
-                        // Global records without provable ownership deliberately
-                        // remain in H.records; never guess their future cell.
-                    }
-                    _ => {
-                        if let Some(owner) = owner {
-                            cells
-                                .get_mut(&owner)
-                                .ok_or("cell owner missing")?
-                                .record(collection, index);
-                        }
-                    }
-                }
-            }
-            match kind {
-                "cell_end" => {
-                    let number = p["cell"]
-                        .as_u64()
-                        .and_then(|n| usize::try_from(n).ok())
-                        .ok_or("invalid cell end")?;
-                    let view = cells.get_mut(&number).ok_or("cell end has no start")?;
-                    p["status"]
-                        .as_str()
-                        .filter(|status| !status.is_empty())
-                        .ok_or("cell end status missing")?;
-                    p["elapsed_ms"]
-                        .as_u64()
-                        .ok_or("cell end elapsed time missing")?;
-                    if view.end.is_some() {
-                        return Err("duplicate cell end".into());
-                    }
-                    view.end = Some(p.clone());
-                    view.event(sequence);
-                    if active.last() != Some(&number) {
-                        return Err("cell end is not the active cell".into());
-                    }
-                    active.pop();
-                }
-                "intent" if p["type"] == "shell" => {
-                    if let Some(owner) = operation_cell {
-                        let view = cells.get_mut(&owner).ok_or("shell cell missing")?;
-                        view.source =
-                            Some(p["source"].as_str().ok_or("shell source missing")?.into());
-                        view.source_record_ref =
-                            Some(format!("H.records.events[{sequence}]['payload']['source']"));
-                    }
-                }
-                "code" => {
-                    if let Some(owner) = operation_cell {
-                        let view = cells.get_mut(&owner).ok_or("code cell missing")?;
-                        view.source =
-                            Some(p["source"].as_str().ok_or("code source missing")?.into());
-                        let index = p["index"].as_u64().ok_or("code record index missing")?;
-                        view.code_record_index = Some(index as usize);
-                        view.source_record_ref = Some(format!("H.records.code[{index}]"));
-                    }
-                }
-                "stream" | "stream_complete" | "stream_closed" => {
-                    if let Some(owner) = operation_cell {
-                        let collection = p["collection"]
-                            .as_str()
-                            .filter(|name| matches!(*name, "stdout" | "stderr"))
-                            .ok_or("invalid cell stream collection")?;
-                        let index = if kind == "stream" {
-                            p["index"].as_u64()
-                        } else {
-                            p["metadata"]["record_index"]
-                                .as_u64()
-                                .or(p["metadata"]["index"].as_u64())
-                        }
-                        .and_then(|n| usize::try_from(n).ok())
-                        .ok_or("stream record index missing")?;
-                        let view = cells.get_mut(&owner).ok_or("stream cell missing")?;
-                        if view
-                            .stream_records
-                            .get(collection)
-                            .is_some_and(|old| *old != index)
-                        {
-                            return Err("multiple stream records for one cell/collection".into());
-                        }
-                        view.stream_records.insert(collection.into(), index);
-                        if kind != "stream" {
-                            view.stream_complete.insert(
-                                collection.into(),
-                                p["metadata"]["complete"]
-                                    .as_bool()
-                                    .ok_or("stream completeness missing")?,
-                            );
-                        }
-                    }
-                }
-                "context_add" => {
-                    if let Some(owner) = owner {
-                        cells
-                            .get_mut(&owner)
-                            .unwrap()
-                            .context_ids
-                            .push(p["id"].as_str().ok_or("context ID missing")?.into());
-                    }
-                    if let Some(ranges) = p["ranges"].as_array() {
-                        let selected = ranges
-                            .iter()
-                            .filter_map(|range| {
-                                range[0]
-                                    .as_u64()
-                                    .and_then(|n| user_sequences.get(&(n as usize)).copied())
-                            })
-                            .collect::<Vec<_>>();
-                        if !selected.is_empty() {
-                            selected_users = selected;
-                        }
-                    }
-                    if let (Some(owner), Some(index)) = (
-                        owner,
-                        p["raw_index"]
-                            .as_u64()
-                            .and_then(|n| usize::try_from(n).ok()),
-                    ) {
-                        cells.get_mut(&owner).unwrap().record("raw", index);
-                    }
-                }
-                "cell_record" => {
-                    let owner = p["cell"]
-                        .as_u64()
-                        .and_then(|n| usize::try_from(n).ok())
-                        .ok_or("cell record owner missing")?;
-                    let collection = p["collection"]
-                        .as_str()
-                        .filter(|name| CELL_GROUPS.contains(name) && *name != "events")
-                        .ok_or("invalid cell record collection")?;
-                    let index = p["record_index"]
-                        .as_u64()
-                        .and_then(|n| usize::try_from(n).ok())
-                        .ok_or("cell record index missing")?;
-                    let seq = *record_events
-                        .get(collection)
-                        .and_then(|values| values.get(index))
-                        .ok_or("cell record provenance unavailable")?;
-                    let view = cells
-                        .get_mut(&owner)
-                        .ok_or("cell record owner unavailable")?;
-                    view.record(collection, index);
-                    view.event(seq);
-                    view.event(sequence);
-                }
-                "operation_complete" if p["type"] == "provider" => {
-                    let operation = operation.ok_or("completed provider operation missing")?;
-                    if let Some(provider) = providers.get_mut(operation) {
-                        provider.events.push(sequence);
-                        if provider.owner.is_none() {
-                            completed_generation = Some(operation.into());
-                        }
-                    } else {
-                        completed_generation = None;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let view = cells.remove(&cell).ok_or("cell does not exist")?;
-        self.render_cell_view(cell, view, active.contains(&cell))
-    }
     fn render_cell_view(
         &self,
         cell: usize,
@@ -18567,7 +17170,7 @@ impl Host {
         let mut result = json!({"cell":cell,"parent_cell":view.start["parent_cell"],"language":view.start["language"],
             "operation":view.start["operation"],"status":if running{"running"}else{"unknown"},"complete":false,
             "source_ref":format!("H.code[{cell}]"),"code_ref":format!("H.code[{cell}]"),"context_ids":view.context_ids,
-            "explicit_provenance":view.start["history_view_version"]==1,"record_indices":{},"record_refs":{}});
+            "explicit_provenance":true,"record_indices":{},"record_refs":{}});
         if let Some(end) = view.end {
             for (key, value) in end.as_object().ok_or("invalid cell end metadata")? {
                 if ![
@@ -19218,36 +17821,6 @@ impl Host {
         self.event("queued", queued);
         Ok(())
     }
-    // Upgrade only recognized old harness presentations whose recorded user
-    // provenance proves the full original. Explicit reads and summaries are not
-    // user routing; never strip suffixes heuristically or revive retired items.
-    fn restore_full_user_context(&mut self, users: &[(usize, usize)]) -> Result<()> {
-        if self.cache_append_only {
-            return Ok(());
-        }
-        let originals = users
-            .iter()
-            .filter_map(|&(sequence, index)| {
-                self.history
-                    .literal_text(RecordCollection::User, index)
-                    .map(|text| UserOriginal {
-                        sequence,
-                        index,
-                        text,
-                    })
-            })
-            .collect::<Vec<_>>();
-        let upgrade = self.context.prepare_full_users(&originals)?;
-        if let Some(transition) = upgrade.transition {
-            self.context.persist(&mut self.journal, transition)?;
-        }
-        let ambiguous = upgrade.ambiguous;
-        if !ambiguous.is_empty() {
-            self.event("notice", json!({"text":format!(
-                "Legacy user context has missing or ambiguous provenance for {}. Its text was not guessed or altered; inspect /save and explicitly correct it or start /new.", ambiguous.join(", "))}));
-        }
-        Ok(())
-    }
     fn select_user(&mut self, text: &str, index: usize, sequence: usize) -> Result<()> {
         self.cell_input_records = vec![index];
         self.add_context(
@@ -19257,262 +17830,6 @@ impl Host {
             vec![(sequence, sequence + 1)],
         )?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod full_user_context_tests {
-    use super::*;
-
-    fn host() -> crate::test_support::HostFixture {
-        crate::test_support::HostFixture::named(
-            "py-full-user",
-            Some(json!({"skills":{"enabled":false}})),
-        )
-    }
-    fn legacy_user(host: &mut Host, full: &str, archive: &str) -> (usize, usize, String) {
-        let sequence = host.journal.seq;
-        let index = host.user(full, false).unwrap();
-        let text = format!(
-            "{}\n[{} chars; {} lines; omitted {} chars; {archive}[{index}]]",
-            full.chars().take(8000).collect::<String>(),
-            full.chars().count(),
-            full.lines().count(),
-            full.chars().count().saturating_sub(8000)
-        );
-        let id = host
-            .add_context("user", text, false, vec![(sequence, sequence + 1)])
-            .unwrap();
-        (sequence, index, id)
-    }
-    #[test]
-    fn legacy_user_migration_is_durable_full_and_does_not_revive_retired_items() {
-        let mut fixture = host();
-        let mut original = fixture.take_host();
-        original
-            .execute("once", "original_only_variable=123", false)
-            .unwrap();
-        let full = format!("{}\nretained-unicode-tail-🙂", "λ\n".repeat(6000));
-        let (_, _, active_id) = legacy_user(&mut original, &full, "H.records.user");
-        let (_, _, retired_id) = legacy_user(&mut original, "retired-user", "H.user");
-        let kept = original
-            .context
-            .items()
-            .iter()
-            .filter(|item| item.id != retired_id)
-            .cloned()
-            .collect();
-        let transition = original
-            .context
-            .prepare_replace(kept, json!({"reason":"fixture_retire"}))
-            .unwrap();
-        original
-            .context
-            .persist(&mut original.journal, transition)
-            .unwrap();
-        let before_sequence = original.journal.seq;
-        let before_ranges = original
-            .context
-            .items()
-            .iter()
-            .find(|item| item.id == active_id)
-            .unwrap()
-            .ranges
-            .clone();
-        let home = original.home.clone();
-        let journal = original.journal.path.clone();
-        drop(original);
-        let mut resumed =
-            Host::new(home.clone(), Some(journal.clone()), true, true, None, None).unwrap();
-        let active = resumed
-            .context
-            .items()
-            .iter()
-            .find(|item| item.id == active_id)
-            .unwrap();
-        assert_eq!(active.text, full);
-        assert_eq!(active.ranges, before_ranges);
-        assert!(!resumed
-            .context
-            .items()
-            .iter()
-            .any(|item| item.id == retired_id));
-        let migration = (before_sequence..resumed.journal.seq)
-            .map(|seq| resumed.journal.event(seq).unwrap())
-            .find(|event| {
-                event["kind"] == "context_replace"
-                    && event["payload"]["reason"] == "user_messages_full"
-            })
-            .unwrap();
-        assert_eq!(
-            migration["payload"]["restored"].as_array().unwrap().len(),
-            1
-        );
-        assert_eq!(
-            migration["payload"]["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|item| item["id"] == active_id)
-                .unwrap()["text"],
-            full
-        );
-        let result = resumed
-            .execute(
-                "fresh",
-                "assert 'original_only_variable' not in globals()",
-                false,
-            )
-            .unwrap();
-        assert_eq!(result["status"], "ok");
-        let migrations = (0..resumed.journal.seq)
-            .filter(|&seq| {
-                let event = resumed.journal.event(seq).unwrap();
-                event["kind"] == "context_replace"
-                    && event["payload"]["reason"] == "user_messages_full"
-            })
-            .count();
-        drop(resumed);
-        let again = Host::new(home, Some(journal), true, true, None, None).unwrap();
-        assert_eq!(
-            again
-                .context
-                .items()
-                .iter()
-                .find(|item| item.id == active_id)
-                .unwrap()
-                .text,
-            full
-        );
-        assert_eq!(
-            (0..again.journal.seq)
-                .filter(|&seq| {
-                    let event = again.journal.event(seq).unwrap();
-                    event["kind"] == "context_replace"
-                        && event["payload"]["reason"] == "user_messages_full"
-                })
-                .count(),
-            migrations
-        );
-    }
-    #[test]
-    fn migration_preserves_literal_footer_full_text_explicit_reads_and_summaries() {
-        let mut host = host();
-        let (sequence, index, legacy_id) = legacy_user(&mut host, "original", "H.user");
-        let legacy = host
-            .context
-            .items()
-            .iter()
-            .find(|item| item.id == legacy_id)
-            .unwrap()
-            .text
-            .clone();
-        let literal_sequence = host.journal.seq;
-        let literal_index = host.user(&legacy, true).unwrap();
-        let literal_id = host.context.items().last().unwrap().id.clone();
-        let read_id = host
-            .add_context("user", legacy.clone(), true, vec![(sequence, sequence + 1)])
-            .unwrap();
-        let summary_id = host
-            .add_context(
-                "summary",
-                legacy.clone(),
-                false,
-                vec![(sequence, sequence + 1)],
-            )
-            .unwrap();
-        let unproven_id = host
-            .add_context("user", legacy.clone(), false, vec![])
-            .unwrap();
-        host.restore_full_user_context(&[(sequence, index), (literal_sequence, literal_index)])
-            .unwrap();
-        assert_eq!(
-            host.context
-                .items()
-                .iter()
-                .find(|item| item.id == legacy_id)
-                .unwrap()
-                .text,
-            "original"
-        );
-        for id in [literal_id, read_id, summary_id, unproven_id] {
-            assert_eq!(
-                host.context
-                    .items()
-                    .iter()
-                    .find(|item| item.id == id)
-                    .unwrap()
-                    .text,
-                legacy
-            );
-        }
-    }
-    #[test]
-    fn cache_append_only_skips_proven_legacy_user_upgrade() {
-        let mut host = host();
-        host.cache_append_only = true;
-        let (sequence, index, id) = legacy_user(&mut host, &"X".repeat(12000), "H.records.user");
-        let before = host
-            .context
-            .items()
-            .iter()
-            .map(item_json)
-            .collect::<Vec<_>>();
-        let revision = host.context.revision();
-        let journal_seq = host.journal.seq;
-        host.restore_full_user_context(&[(sequence, index)])
-            .unwrap();
-        assert_eq!(
-            host.context
-                .items()
-                .iter()
-                .map(item_json)
-                .collect::<Vec<_>>(),
-            before
-        );
-        assert_eq!(host.context.revision(), revision);
-        assert_eq!(host.journal.seq, journal_seq);
-        host.cache_append_only = false;
-        host.restore_full_user_context(&[(sequence, index)])
-            .unwrap();
-        assert_eq!(
-            host.context
-                .items()
-                .iter()
-                .find(|item| item.id == id)
-                .unwrap()
-                .text,
-            "X".repeat(12000)
-        );
-    }
-
-    #[test]
-    fn legacy_user_migration_failure_preserves_memory_and_revision() {
-        let mut host = host();
-        let (sequence, index, id) = legacy_user(&mut host, &"X".repeat(12000), "H.records.user");
-        let before = host
-            .context
-            .items()
-            .iter()
-            .find(|item| item.id == id)
-            .unwrap()
-            .text
-            .clone();
-        let revision = host.context.revision();
-        host.journal.failed = true;
-        assert!(host
-            .restore_full_user_context(&[(sequence, index)])
-            .is_err());
-        assert_eq!(
-            host.context
-                .items()
-                .iter()
-                .find(|item| item.id == id)
-                .unwrap()
-                .text,
-            before
-        );
-        assert_eq!(host.context.revision(), revision);
     }
 }
 
@@ -23358,7 +21675,7 @@ mod scheduler_frontend_tests {
         );
     }
     #[test]
-    fn wakeup_state_has_one_interpretation_and_preserves_opaque_legacy_states() {
+    fn wakeup_state_has_one_interpretation_and_preserves_opaque_unknown_states() {
         for metadata in [
             json!({"id":"absent"}),
             json!({"id":"null","state":null}),
@@ -25340,11 +23657,11 @@ partial; unchecked families are not accepted as complete.
 - Much smaller than the existing implementation. Prefer direct functions and
   enums, not a service/plugin framework. No architecture layers for their own sake.
 
-## 2. Migration and reference baseline
-Keep the existing Python harness unchanged until the replacement meets the
-approved tests. Work only in transition/. Do spec -> failing behavioral tests ->
-implementation -> passing tests. No claim that draft-validation tests prove
-the future harness works.
+## 2. Reference baseline and development process
+The Rust implementation is the repository application. Backward compatibility
+with old sessions or the retired Python application is not required.
+Do spec -> behavioral tests -> implementation -> passing tests. Passing offline
+tests does not establish live-provider parity.
 
 Adopt Pi/Pig behavior for login, model listing/resolution, provider invocation,
 and basic terminal workflow, except explicitly listed differences.
@@ -25361,25 +23678,12 @@ The harness's ordinary-file durable entries are defined independently in section
 Review licenses/attribution before copying code or catalog data.
 Provider priorities and exact compatibility surface remain decisions.
 
-Current harness findings: persistent IPython worker; automatic expression,
-stdout/stderr and display inclusion; injected say/preview/llm/collapse;
-plugin coordinator; partially redacted SQLite journal. These are not the new
-architecture. Existing completion covers explicit-Tab commands and paths.
-
 ## 3. Durable history is not model context (frozen)
 H is append-only, complete and immutable. Context is an ordered selected view.
 Saving a record does not itself select its payload for the model.
-Before recording or executing outer model-generated Python, normalize echoed
-harness metadata: remove standalone COMMENT-token lines exactly matching
-`# [boundary c<digits>]`, allowing leading/trailing whitespace. Preserve line
-endings and line numbers by blanking the comment line. Tokenize Python; never
-strip matching text inside strings, inline comments, or unrelated comments.
-On tokenization error retain original source for normal syntax diagnostics.
-On normalization interpreter failure reject before execution. H.code, previews,
-worker input and assistant context all use normalized source. Raw provider
-responses remain unchanged. Direct user Python and nested agent.llm results are
-not normalized. Completion observations expose the authoritative source boundary.
-Beyond this narrow normalization never edit, truncate or evict retained source.
+Record and execute generated Python exactly as returned. Do not strip comments,
+rewrite source or infer metadata from source text. Completion observations carry
+the authoritative source boundary. Never edit, truncate or evict retained source.
 Automatic context housekeeping may drop only old output payloads, retaining
 their H references/counts. It may not discard user messages, code or summaries.
 Explicit collapse can replace any selected non-system history, including code,
@@ -25626,8 +23930,7 @@ resurrect an attachment from an older attachment event.
 
 Expose only retained assistant source IDs in their completion observations;
 never prefix user messages, selections, summaries or assistant source with markers.
-Internal item IDs remain available through agent.context.items() for legacy and
-summary endpoints. Source IDs identify source items, not observation items.
+Internal item IDs remain available through agent.context.items() for summary endpoints. Source IDs identify source items, not observation items.
 Every 50 model responses, remind the model to compact unnecessary history.
 Above 90% context usage, insert a fresh end marker and FORCE collapse.
 In forced mode accept only standalone collapse or restricted explicit stderr
@@ -25886,9 +24189,7 @@ EOF/cancel is explicit. Invalid JSON cannot execute code or crash the loop.
 Partial final frames, Unicode, large streams and output backpressure are tested.
 
 ## 11. Single-file scope and verification discipline
-The historical 10,000–15,000-line budget is superseded by the approved
-ownership/readability refactor. Keep one handwritten main.rs, but impose no
-line-count cap: explicit contracts, cohesive ownership and readable transitions
+Keep one handwritten main.rs with no line-count cap: explicit contracts, cohesive ownership and readable transitions
 matter more than a shorter file. Do not add generated bulk catalogs/fixtures
 or a renamed out-of-tree harness. Dependencies and minimal Cargo metadata
 may sit alongside.
@@ -26291,8 +24592,8 @@ again before implementation so no requirement is overlooked.
       Tests: requirement_test_manifest_audit; evidence: not run; review: pending.
 [ ] R13.02 Every [x] has retained passing evidence and semantic review; changes reset verification.
       Tests: verified_requirement_evidence_audit; evidence: not run; review: pending.
-[ ] R13.03 Old Python is removed only after approved replacement scope is verified.
-      Tests: migration_removal_gate; evidence: not run; review: pending.
+[x] R13.03 Superseded Python application removed; install/run/CI target Rust.
+      Tests: current_format_contract_tests and install smoke tests; evidence: 466-test passing suite and isolated installation; review: complete for removal scope.
 
 ## 17. Adversarial review before freezing
 A. "Saved in full" is not a durability guarantee by itself. Define commit as
@@ -26494,7 +24795,7 @@ submitted Python, not the last shell command. Shell result stream refs/index
 address the enclosing cell; record_ref/record_index retain per-command captures.
 Timeout/exit status belongs to the returned shell result; cancellation remains
 sticky for the enclosing Python cell. Standalone user shell submissions may
-still create one top-level shell cell. Existing journals retain old numbering.
+still create one top-level shell cell. Only current explicit cell ownership is supported.
 
 
 ### Model-visible collapse addresses (approved)
@@ -26506,9 +24807,8 @@ item or cell number. Use those source IDs to collapse assistant-to-assistant spa
 including intervening user messages and selections. Internal item IDs, ordering,
 provenance, metadata access and collapse semantics are unchanged.
 Do not advertise a source ID removed by that cell's collapse. Summary IDs and
-legacy session IDs remain discoverable through agent.context.items(); do not
+summary IDs remain discoverable through agent.context.items(); do not
 rewrite historical source/observations or frozen session system snapshots.
-Legacy standalone boundary comments are still normalized from generated source.
 Witnesses: context_rendering_tests; e2e_model_execution_observation_is_compact_but_protocol_metadata_is_full;
 e2e_user_messages_are_full_and_have_no_status_footer_in_actual_requests;
 e2e_source_boundaries_collapse_intervening_payloads_and_survive_resume.
@@ -26570,11 +24870,32 @@ terminal_cell_separator_spacing; e2e_idle_and_busy_completion_have_identical_bel
 Verification: background build and formatting checks passed; full suite
 477 passed, 0 failed (66.77s), including idle/busy PTY spacing and menu parity.
 
+
+### Current-format-only development cutover (approved)
+Backward compatibility is not a requirement. Only schema_version=1 journals
+with session identity, explicit cell inputs/generating request/reset ownership,
+current context ownership and a frozen skills snapshot may be resumed.
+Reject unsupported or incomplete formats; do not infer ownership, migrate user
+presentations, inherit image attachments or synthesize startup snapshots.
+Generated Python is executed as returned, without boundary-comment rewriting.
+The custom terminal editor/shared footer is the sole interactive input path;
+remove the unused Rustyline editor and standalone picker rendering stack.
+Rustyline may remain only for history/candidate/error types.
+The Rust CLI is the supported repository application. Remove the superseded
+Python application, plugin examples, packaging/CI and obsolete documentation;
+install/run/README/CI must target the Rust implementation.
+Current crash recovery, live provider formats, missing-usage accounting,
+terminal key encodings and plain-input fallback remain supported.
+Witnesses: current_format_contract_tests; current CLI/PTY/history/resume tests;
+installation shell smoke tests. Verification: background build/format checks
+and full suite passed: 466 tests, 0 failed (64.69s). Isolated PREFIX release
+installation, installed --help, run.sh --help and shell syntax checks passed.
+
 ## 20. Batched old-output eviction and cache stability
 
 Temporary cache experiment: launch with PY_CACHE_APPEND_ONLY=1 to disable
 manual collapse (/compact and the collapse RPC), automatic output eviction,
-legacy user-context upgrades, and pressure-forced collapse. The flag is sampled
+pressure-forced collapse. The flag is sampled
 when a Host is created and is not persisted; set it again when resuming.
 Existing journal replacements are still restored faithfully, not undone.
 The frozen system snapshot is unchanged. New context items still append, so
@@ -26610,7 +24931,7 @@ active attachment set from the resulting items. If any future policy replaces
 an attachment-bearing item with a text-only omission reference, it must detach
 the binary in that same atomic transaction even when the replacement preserves
 the old context ID. Resume replays the latest committed membership and must not
-reactivate superseded attachment events.
+reactivate consumed attachment selections.
 
 Replace each eligible old payload in place with a stable compact reference:
 H reference, selected offsets where known, original size/counts, and omission
@@ -26949,7 +25270,7 @@ context compaction added.
       no-output/error/interrupt cells. agent.sh inside Python does not allocate a
       cell; standalone native shell submissions retain their own cell/attribution.
       Resume retains numbering; new sessions restart it. End-of-cell status
-      gives result and elapsed time. Existing journals retain legacy subcells.
+      gives result and elapsed time. No historical subcell conversion is supported.
 [x] R06.28 Codex uses the upstream ChatGPT login page; social sign-in buttons
       (e.g. Google) are provider-managed, never separate Google credentials in py.
       Do not invent undocumented identity-provider OAuth parameters or claim the
@@ -27011,7 +25332,7 @@ Scoped witness audit (reviewed assertions, not test-name coverage alone):
   cover input, reset, HTTP/login failure and sticky caught cancellation. Cell
   start/end are durable; state notifications are not added to H/model context.
   Shell nesting restores outer attribution. Preview no longer duplicates the
-  legacy operation-ID cell header; operation/source refs remain in numbered start.
+  duplicate operation-ID cell header; operation/source refs remain in numbered start.
 - R06.28: browser PKCE fixtures assert originator/client/state/challenge/callback;
   opener-failure witness proves browser wrapper selection does not alter OAuth.
   Official https://developers.openai.com/codex/auth documents Google/social login
@@ -27051,7 +25372,7 @@ local fixture credentials/endpoints.
 This supersedes browser-OAuth/no-style exclusions only for the witnessed paths.
 No live subscription login/invocation, Google/Gemini browser OAuth, exhaustive
 terminal/grapheme/vendor proof, configurable theme framework, reverse-search or
-external editor is claimed. Full R01-R13 migration acceptance remains unchecked.
+external editor is claimed. Full R01-R13 acceptance remains unchecked.
 
 ## 28. Inline completion menus (current user request)
 [x] R10.31 Ambiguous Tab completion renders a compact live fuzzy menu immediately
@@ -27089,7 +25410,7 @@ Post-restart baseline witness: the five initial tests all fail against the old
 release (alternate screen/input lost/JSON picker absent), 0/5 in
 /tmp/py-inline-baseline-red.log. New scope passes in /tmp/py-inline-edge.log.
 Existing CLI/PTY drivers now wait for menu-region cleanup/repaint instead of the
-old alternate-buffer exit; original source, selection, paste and control-safety
+alternate-buffer exit; original source, selection, paste and control-safety
 assertions remain. Menu rows are bounded by eight and half the screen, leaving
 space for source and recent output where possible; preceding output scrolls
 naturally, never gets intentionally erased. Selection filtering is still bounded.
@@ -27336,10 +25657,8 @@ Files created, changed, deleted or renamed after initialization do not modify
 the current prompt, inventory or startup-source snapshot. /new observes current
 files and skill configuration. /resume restores the original snapshot even if
 files are missing or changed; /reset preserves that snapshot. Resume/reset do
-not silently refresh entries or render with newer metadata/defaults. A legacy
-session without a snapshot receives a frozen SYSTEM-only snapshot with empty
-inventory and no startup entries; it never loads current files. /new opts into
-the current entry collection. Record this compatibility snapshot in the journal.
+not silently refresh entries or render with newer metadata/defaults.
+A session without its frozen startup snapshot is rejected; use /new instead.
 
 Ordinary explicit reads of newer files may append selected content via existing
 agent.context.read_text rules. Merely returning/printing a file's contents does
@@ -27678,8 +25997,8 @@ agent.say('...') renders human Markdown without silently adding context payloads
 Use --help for flags and /help for editor/commands. JSON mode:
   transition/target/release/py --json --json-input --no-model
   {"id":"cell1","kind":"python","source":"print(42)"}
-Keep the old Python harness unchanged: this is still a transition, not full
-R01–R13 acceptance.
+The Rust CLI is the supported application. Outstanding acceptance families
+remain explicit above; removal of the previous application is not live parity.
 "####;
 
 const PYTHON: &str = r####"
@@ -28053,7 +26372,7 @@ instead of retrying earlier than requested.
 Cache hit percentage is a cumulative ratio of measured cached input to measured
 total input, not an average of per-request percentages or context occupancy.
 Only valid input/cache pairs contribute to the ratio. Missing usage, unknown
-attempts or incomplete legacy coverage mark the metric partial; later successful
+attempts or missing usage coverage mark the metric partial; later successful
 measurements do not erase earlier missing data.
 Usage reports distinguish reported_input_tokens/reported_cache_hit_tokens
 from complete totals, with cache_percentage_complete/cache_usage_complete flags.
@@ -28324,7 +26643,7 @@ mod e2e {
                 )
             } else if code == "FIXTURE_COLLAPSE_ACTUAL_BOUNDARIES" {
                 // Forced mode cannot perform an items() lookup. This fixture
-                // uses internal IDs to test the unchanged legacy collapse gate.
+                // uses internal IDs to test the standalone collapse gate.
                 let records = journal(&fixture_home);
                 let id_for = |needle: &str| {
                     records
@@ -28424,54 +26743,6 @@ print('normal execution still allowed')"#;
         assert_eq!(selected, 55);
         let records = journal(&home);
         assert!(!records.iter().any(|r| r["kind"] == "context_replace"));
-        assert!(events.iter().any(|e| e["kind"] == "final"));
-        assert!(!events.iter().any(|e| e["kind"] == "error"));
-    }
-
-    #[test]
-    fn e2e_generated_boundary_comments_are_normalized_before_recording_and_execution() {
-        let raw = concat!(
-            "# [boundary c90001]\n",
-            "# [boundary c90002]\n",
-            "literal = '''keep this literal\n# [boundary c90003]\n'''\n",
-            "assert '# [boundary c90003]' in literal\n",
-            "print('executed normalized source')\n",
-        );
-        let (events, home, requests) = model_run(
-            vec![raw, "agent.final('done')"],
-            vec![
-                json!({"id":"manual","kind":"python","source":"# [boundary c90004]\nmanual = 1"}),
-                json!({"id":"normalize","kind":"submit","text":"normalize source"}),
-            ],
-        );
-        assert_eq!(requests.len(), 2);
-        let records = journal(&home);
-        let codes = records
-            .iter()
-            .filter(|r| r["kind"] == "code")
-            .map(|r| r["payload"]["source"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert!(codes.iter().any(|s| s.starts_with("# [boundary c90004]")));
-        let cleaned = codes.iter().find(|s| s.contains("literal =")).unwrap();
-        assert!(cleaned.starts_with("\n\nliteral ="));
-        assert!(!cleaned.contains("c90001") && !cleaned.contains("c90002"));
-        assert!(cleaned.contains("# [boundary c90003]"));
-        let retained = requests[1]["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|m| {
-                m["role"] == "assistant"
-                    && m["content"].as_str().unwrap_or("").contains("literal =")
-            })
-            .unwrap()["content"]
-            .as_str()
-            .unwrap();
-        assert_eq!(retained, *cleaned);
-        assert!(!retained.contains("c90001") && !retained.contains("c90002"));
-        assert!(records
-            .iter()
-            .any(|r| r["kind"] == "response" && r["payload"].to_string().contains("c90001")));
         assert!(events.iter().any(|e| e["kind"] == "final"));
         assert!(!events.iter().any(|e| e["kind"] == "error"));
     }
@@ -29864,10 +28135,6 @@ finally:
 
     #[test]
     fn e2e_image_generation_then_explicit_image_input() {
-        use std::io::{BufRead, BufReader, Read};
-        use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
         let png = {
             let mut out = std::io::Cursor::new(Vec::new());
             image::DynamicImage::new_rgb8(2, 2)
@@ -29875,76 +28142,54 @@ finally:
                 .unwrap();
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, out.into_inner())
         };
-        let server = std::thread::spawn(move || {
-            let mut bodies = vec![];
-            for step in 0..4 {
-                let (mut socket, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(socket.try_clone().unwrap());
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let mut length = 0;
-                loop {
-                    line.clear();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if line.to_lowercase().starts_with("content-length:") {
-                        length = line
-                            .split(':')
-                            .nth(1)
-                            .unwrap()
-                            .trim()
-                            .parse::<usize>()
-                            .unwrap();
-                    }
-                }
-                let mut bytes = vec![0; length];
-                reader.read_exact(&mut bytes).unwrap();
-                let request: Value = serde_json::from_slice(&bytes).unwrap();
-                bodies.push(request);
-                let body = if step == 1 {
-                    json!({"data":[{"b64_json":png}]})
-                } else {
-                    let code = match step {
-                        0 => "r=agent.llm.image('draw a square',model='openai/gpt-image-1')",
-                        2 => "agent.context.read_raw(H.records.raw[0])",
-                        _ => "agent.loop.stop()",
-                    };
-                    json!({"choices":[{"message":{"content":code}}]})
-                }
-                .to_string();
-                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+        let mut step = 0;
+        let server = crate::test_support::MockProvider::json(4, move |_| {
+            let current = step;
+            step += 1;
+            if current == 1 {
+                json!({"data":[{"b64_json":png}]}).to_string()
+            } else {
+                let code = match current {
+                    0 => "r=agent.llm.image('draw a square',model='openai/gpt-image-1')",
+                    2 => "agent.context.read_raw(H.records.raw[0])",
+                    _ => "agent.loop.stop()",
+                };
+                json!({"choices":[{"message":{"content":code}}]}).to_string()
             }
-            bodies
         });
-        let home = std::env::temp_dir().join(format!("py-image-e2e-{}", super::now_ms()));
-        std::fs::create_dir_all(&home).unwrap();
-        let mut child = crate::test_command(std::env::var("PY_HARNESS_BIN").unwrap())
+        let home = crate::test_support::TestDirectory::new("py-image-e2e");
+        let mut command = crate::test_command(std::env::var("PY_HARNESS_BIN").unwrap());
+        command
             .args(["--json", "--json-input"])
-            .env("PY_HOME", &home)
-            .env("OPENAI_BASE_URL", format!("http://{address}/v1"))
+            .env("PY_HOME", home.path())
+            .env("OPENAI_BASE_URL", format!("http://{}/v1", server.address))
             .env("OPENAI_API_KEY", "fixture")
-            .env("PY_MODEL", "openai/fixture")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        writeln!(
-            child.stdin.take().unwrap(),
-            "{}",
-            json!({"id":"a","kind":"submit","text":"make then inspect image"})
-        )
-        .unwrap();
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success());
-        let bodies = server.join().unwrap();
+            .env("PY_MODEL", "openai/fixture");
+        let output = crate::test_support::ProcessSession::spawn(command).collect(
+            &crate::test_support::jsonl_input(&[
+                json!({"id":"a","kind":"submit","text":"make then inspect image"}),
+            ]),
+            std::time::Duration::from_secs(30),
+        );
+        let events = crate::test_support::jsonl_events(&output);
+        assert!(
+            events
+                .iter()
+                .filter(|e| e["kind"] == "completed")
+                .all(|e| e["status"] == "ok"),
+            "{events:?}"
+        );
+        let bodies = server.finish();
         assert!(!bodies[2]["messages"].to_string().contains("data:image"));
         assert!(bodies[3]["messages"]
             .to_string()
             .contains("data:image/png;base64,"));
-        assert!(journal(&home).iter().any(|v| v["kind"] == "raw"));
+        let records = journal(home.path());
+        assert!(records.iter().any(|v| v["kind"] == "raw"));
+        assert!(records
+            .iter()
+            .filter(|v| v["kind"] == "request")
+            .all(|v| v["payload"]["operation"].is_string()));
     }
     #[test]
     fn e2e_invalid_raw_image_is_rejected_without_attachment() {
@@ -31164,7 +29409,7 @@ for view in (H,H.cells,H.code,H.stdout,H.stderr,H.user,H.stdin,H.say,H.requests,
         );
     }
     #[test]
-    fn e2e_cell_histories_survive_in_cell_worker_reset_and_legacy_resume() {
+    fn e2e_cell_histories_survive_in_cell_worker_reset_and_resume() {
         let source = "print('before-reset'); agent.loop.reset_python()";
         let inspect="assert H.code[1]==H.records.code[0]\nassert H.stdout[1]=='before-reset\\n' and H.stderr[1]==''\nassert H[1].complete and H[1].status=='ok'\nassert H.stdout[2]=='' and not H[2].stdout_complete";
         let (events, home) = run(vec![py("reset-cell", source), py("reset-inspect", inspect)]);
@@ -31178,25 +29423,6 @@ for view in (H,H.cells,H.code,H.stdout,H.stderr,H.user,H.stdin,H.say,H.requests,
                     .is_some_and(|extension| extension == "jsonl")
             })
             .unwrap();
-        // Test fixture only: emulate older reset records while preserving the
-        // original cell boundaries and immutable source/stream coordinates.
-        let mut history = journal(&home);
-        for event in &mut history {
-            if event["kind"] == "worker_reset" {
-                event["payload"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("active_cell");
-            }
-        }
-        fs::write(
-            &session,
-            history
-                .iter()
-                .map(|event| format!("{event}\n"))
-                .collect::<String>(),
-        )
-        .unwrap();
         let mut restored = InputClient::new(Some((home.to_path_buf(), session)));
         restored.send(py("reset-resumed","assert H.code[1]==H.records.code[0]\nassert H.stdout[1]=='before-reset\\n'\nassert H[1].complete and H[1].status=='ok'\nassert H[2].complete and H.stdout[3]==''"));
         assert_eq!(
@@ -31283,8 +29509,9 @@ assert len([event for event in H.events[1] if event['kind']=='request'])==2"#;
     }
     #[test]
     fn e2e_cell_histories_bind_outer_generation_and_selected_user_by_provenance() {
-        let inspect = r#"assert H.user[1]==['hello'] and H.say[1]==['FIRST','SECOND']
-assert len(H.requests[1])==len(H.responses[1])==len(H.usage[1])==1
+        let inspect = r#"assert H.user[1]==['hello'], H.user[1]
+assert H.say[1]==['FIRST','SECOND'], H.say[1]
+assert len(H.requests[1])==len(H.responses[1])==len(H.usage[1])==1, (H.requests[1], H.responses[1], H.usage[1])
 assert H.requests[1][0]['requested_output_tokens']==4096 and H.requests[2]==[]
 assert H[1].record_indices['requests']==[0] and H[1].record_indices['responses']==[0]
 assert H[1].record_indices['usage']==[0] and H[1].explicit_provenance
@@ -31314,7 +29541,7 @@ assert 'user' in kinds and 'request' in kinds and 'response' in kinds and 'code'
         assert_eq!(start["payload"]["user_record_indices"], json!([0]));
     }
     #[test]
-    fn e2e_cell_histories_restore_new_and_legacy_raw_records_without_renumbering() {
+    fn e2e_cell_histories_restore_raw_records_without_renumbering() {
         let seed = r#"import struct,zlib
 def chunk(kind,data):return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data)&0xffffffff)
 image=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',1,1,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(b'\x00\xff\x00\x00\xff'))+chunk(b'IEND',b'')
@@ -31324,7 +29551,7 @@ assert len(H.raw[1])==2 and len(H.records.raw)==2
 assert H.raw[1][0]['base64']==H.records.raw[0]['base64'] and H.raw[1][0]['index']==1
 assert H.raw[1][1]['record_index']==1 and H.raw[1][1]['ref']=='H.raw[1][1]'
 print('seed-payload')"#;
-        for legacy in [false, true] {
+        {
             let (events, home) = run(vec![py("raw-seed", seed)]);
             assert!(
                 events
@@ -31340,36 +29567,6 @@ print('seed-payload')"#;
                         .is_some_and(|extension| extension == "jsonl")
                 })
                 .unwrap();
-            if legacy {
-                // Test data only: emulate an older journal without changing
-                // sequence numbers, cell IDs, or durable capture record indexes.
-                let mut history = journal(&home);
-                for event in &mut history {
-                    if event["kind"] == "cell_start" {
-                        let payload = event["payload"].as_object_mut().unwrap();
-                        for key in [
-                            "history_view_version",
-                            "user_record_indices",
-                            "input_raw_indices",
-                            "generation_request",
-                            "source_record_ref",
-                        ] {
-                            payload.remove(key);
-                        }
-                        payload.insert("source_ref".into(), json!("H.code[0]"));
-                    }
-                    if event["kind"] == "stream_complete" || event["kind"] == "stream_closed" {
-                        let metadata = event["payload"]["metadata"].as_object_mut().unwrap();
-                        metadata.remove("record_index");
-                        metadata.remove("record_ref");
-                    }
-                }
-                let bytes = history
-                    .iter()
-                    .map(|event| format!("{event}\n"))
-                    .collect::<String>();
-                fs::write(&session, bytes).unwrap();
-            }
             let mut restored = InputClient::new(Some((home.to_path_buf(), session)));
             restored.send(py(
                 "raw-restored",
@@ -32253,7 +30450,7 @@ os.write(m,b'/quit\r');p.wait(timeout=4);os.close(m)
         );
         assert!(
             !output.contains("── cell render-cell"),
-            "no duplicate legacy operation header: {output}"
+            "no duplicate operation header: {output}"
         );
         assert!(output.contains("── stdout") && output.contains("── stderr"));
         assert!(output.contains("alpha beta gamma delta"));
@@ -32421,25 +30618,22 @@ mod codex_cache_tests {
         assert_ne!(fresh.session_id, identity);
     }
     #[test]
-    fn journal_legacy_identity_is_persisted_and_mixed_ids_fail_explicitly() {
+    fn journal_current_identity_survives_rename_and_mixed_ids_fail() {
         let home = home();
-        let path = home.join("legacy.jsonl");
-        fs::write(&path, "{\"seq\":0,\"kind\":\"test\",\"payload\":{}}\n").unwrap();
+        let path = home.join("current.jsonl");
         let mut journal = Journal::open(path.clone()).unwrap();
-        assert_eq!(journal.session_id, "legacy");
         journal.append("test", json!({})).unwrap();
         drop(journal);
         fs::rename(path, home.join("moved.jsonl")).unwrap();
         assert_eq!(
             Journal::open(home.join("moved.jsonl")).unwrap().session_id,
-            "legacy"
+            "current"
         );
         let mixed = home.join("mixed.jsonl");
-        fs::write(
-            &mixed,
-            "{\"seq\":0,\"kind\":\"test\",\"payload\":{},\"session_id\":\"first\"}\n{\"seq\":1,\"kind\":\"test\",\"payload\":{},\"session_id\":\"second\"}\n",
-        )
-        .unwrap();
+        fs::write(&mixed, concat!(
+            "{\"schema_version\":1,\"seq\":0,\"kind\":\"test\",\"payload\":{},\"session_id\":\"first\"}\n",
+            "{\"schema_version\":1,\"seq\":1,\"kind\":\"test\",\"payload\":{},\"session_id\":\"second\"}\n"
+        )).unwrap();
         let error = Journal::open(mixed).err().unwrap().to_string();
         assert!(error.contains("mixed session IDs"), "{error}");
     }
@@ -32460,11 +30654,11 @@ mod codex_cache_tests {
             let path = home.join(format!("invalid-{index}.jsonl"));
             let original = format!(
                 "{}\n",
-                json!({"seq":0,"kind":"test","payload":{},"session_id":identity})
+                json!({"schema_version":1,"seq":0,"kind":"test","payload":{},"session_id":identity})
             );
             fs::write(&path, &original).unwrap();
             let error = Journal::open(path.clone()).err().unwrap().to_string();
-            assert_eq!(error, "invalid journal session ID");
+            assert_eq!(error, "journal session ID missing or invalid");
             assert!(!error.contains("secret-value"));
             assert_eq!(fs::read_to_string(path).unwrap(), original);
         }
@@ -32998,16 +31192,7 @@ assert usage['cache_hit_tokens'] is None and usage['reported_cache_hit_tokens']=
 record=[v['payload'] for v in history if v['kind']=='request'][0]
 assert record['requested_output_tokens']==2048 and record['transmitted_output_limit'] is None and record['reserved_output_tokens']==4096,record
 assert len(requests)==3 and all('max_output_tokens' not in json.loads(r[2]) for r in requests),requests
-# Produce a legacy-format fixture with a lost prefix after a missing sample.
-# This edits test data only; production histories are never rewritten.
 path=next(home+'/sessions/'+n for n in os.listdir(home+'/sessions') if n.endswith('.jsonl'))
-legacy=[json.loads(line) for line in open(path)];number=0
-for event in legacy:
- if event['kind']=='usage':
-  value=event['payload'];value.pop('cache_usage_complete',None);value.pop('reported_cache_hit_tokens',None)
-  value['cache_hit_tokens']=(30,None,40)[number];number+=1
-with open(path,'w') as f:
- for event in legacy:f.write(json.dumps(event)+'\n')
 responses.append((200,sse('ok'),'text/event-stream'))
 p=subprocess.Popen([sys.argv[1],'--json','--json-input','--no-model','--session',path],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
 out,err=p.communicate((json.dumps({'id':'resumed','kind':'python','source':'agent.llm("test",model="codex/gpt-5.3-codex")'})+'\n').encode(),timeout=12)
@@ -33639,33 +31824,6 @@ assert usage[2]['input_tokens']==200 and usage[2]['reported_cache_hit_tokens']==
 replies.append(measured(900,0));session,events,history=run(path,1,session);usage=usages(history)[-1]
 assert usage['cache_hit_percentage']==5 and usage['cache_percentage_complete'] is False,usage
 assert usage['input_tokens']==1100 and usage['cache_percentage_input_tokens']==1000,usage
-"#,
-        );
-    }
-    #[test]
-    fn e2e_cache_legacy_restore_reconstructs_raw_measurements_and_unknown_attempt_coverage() {
-        fixture(
-            r#"
-path=home();replies.extend([measured(100,50),measured(900,0)])
-session,events,history=run(path,2)
-# Only fixture data is rewritten to simulate the old lossy aggregate format.
-for event in history:
- if event['kind']=='usage':
-  value=event['payload'];value.pop('cache_accounting',None)
-  for key in list(value):
-   if key.startswith('cache_percentage') or key=='cache_hit_percentage':value.pop(key)
-  value['cache_hit_tokens']=0;value['reported_cache_hit_tokens']=0
-session.write_text(''.join(json.dumps(v)+'\n' for v in history))
-replies.append(measured(1000,950));session,events,history=run(path,1,session);usage=usages(history)[-1]
-assert usage['cache_hit_percentage']==50 and usage['cache_percentage_complete'] is True,usage
-assert usage['input_tokens']==2000 and usage['cache_hit_tokens']==1000,usage
-# A failed transport attempt can have unreported provider input/billing; its
-# durable event must prevent exact percentages after the next resume.
-event=dict(history[-1]);event.update(seq=len(history),kind='provider_attempt_failed',payload={'operation':'lost-provider-attempt','attempt':1,'billing_unknown':True})
-with session.open('a') as f:f.write(json.dumps(event)+'\n')
-session,events,history=run(path,0,session)
-idle=[v for v in events if v['kind']=='state' and v['state']=='idle'][-1]
-assert idle['cache_hit_percentage']==50 and idle['cache_percentage_complete'] is False,idle
 "#,
         );
     }
@@ -37468,7 +35626,7 @@ base=records()
 for state in ('starting','running','cancelling'):
  payload={'id':'restored-'+state,'kind':'shell','created_ms':0,'status':state,'pid':os.getpid(),
           'stdout':{'bytes':0,'complete':False},'stderr':{'bytes':0,'complete':False}}
- base.append({'schema_version':1,'seq':len(base),'kind':'task_state','payload':payload})
+ base.append({'schema_version':1,'session_id':base[0]['session_id'],'seq':len(base),'kind':'task_state','payload':payload})
 with open(path,'w') as f:
  for event in base:f.write(json.dumps(event)+'\n')
 start(['--resume',path])
@@ -37487,7 +35645,7 @@ cases=[('task_state',{'id':'malformed'}),
        ('task_settled',{'status':'running','task':{'id':'malformed','status':'running'},'wakeup':None}),
        ('task_settled',{'status':'succeeded','task':{'id':'malformed','status':'failed'},'wakeup':None})]
 for kind,payload in cases:
- bad={'schema_version':1,'seq':len(base),'kind':kind,'payload':payload}
+ bad={'schema_version':1,'session_id':base[0]['session_id'],'seq':len(base),'kind':kind,'payload':payload}
  with open(path,'w') as f:
   for event in [*base,bad]:f.write(json.dumps(event)+'\n')
  result=subprocess.run([sys.argv[1],'--json','--json-input','--no-model','--resume',path],input='',capture_output=True,text=True,env=env,timeout=6)
