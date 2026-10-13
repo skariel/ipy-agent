@@ -41,6 +41,8 @@ The agent replies with ordinary Python and executes it in a persistent namespace
 `agent` provides shell/model/background/context operations; `H` exposes durable
 history. Outputs remain in history until explicitly selected into model context.
 Use `agent.help()` for on-demand API documentation and `/help` for CLI commands.
+For focused command help, use `/help resume` or `/help /resume`; aliases work too
+(e.g. `/help thinking`). Tab completes command names after `/help `.
 
 Sessions restore history and selected context into **fresh Python**, never by
 replaying old code. Journals require the current schema, explicit ownership, and
