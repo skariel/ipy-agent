@@ -2017,7 +2017,9 @@ impl HistoryArchive {
             .get(&collection)
             .and_then(|records| records.get(index))
             .ok_or("missing task stream")?;
-        let mut bytes = Vec::new();
+        let mut preview = String::new();
+        let (mut chars, mut lines) = (0, 0);
+        let mut carry = Vec::new();
         match record {
             ArchivedRecord::StreamChunks(chunks) => {
                 for sequence in chunks {
@@ -2027,21 +2029,22 @@ impl HistoryArchive {
                     };
                     let chunk =
                         B64.decode(stream.base64.as_deref().ok_or("missing stream bytes")?)?;
-                    bytes.extend_from_slice(&chunk[..chunk.len().min(16384 - bytes.len())]);
-                    if bytes.len() >= 16384
-                        || bytes.iter().filter(|byte| **byte == b'\n').count() >= 12
-                    {
+                    let text = decode_output(&mut carry, &chunk, false);
+                    append_output_preview(&mut preview, &mut chars, &mut lines, &text);
+                    if chars >= 8000 || lines >= 12 {
                         break;
                     }
                 }
             }
             ArchivedRecord::Value(value) => {
                 let text = value.as_str().ok_or("invalid task stream")?;
-                bytes.extend_from_slice(&text.as_bytes()[..text.len().min(16384)]);
+                append_output_preview(&mut preview, &mut chars, &mut lines, text);
             }
             _ => return Err("invalid task stream".into()),
         }
-        Ok(bytes)
+        let tail = decode_output(&mut carry, &[], true);
+        append_output_preview(&mut preview, &mut chars, &mut lines, &tail);
+        Ok(preview.into_bytes())
     }
     fn literal_text(&self, collection: RecordCollection, index: usize) -> Option<&str> {
         match self.records.get(&collection)?.get(index)? {
@@ -3311,16 +3314,104 @@ fn now_ms() -> u128 {
 
 // Captures bounded chunks as execution proceeds; payload lives only in the journal.
 // A lazy index permits nested helper commands without preallocating empty streams.
+// Decode assembled output exactly as String::from_utf8_lossy does, retaining
+// incomplete UTF-8 between chunks rather than inventing replacement characters.
+fn decode_output(carry: &mut Vec<u8>, bytes: &[u8], finish: bool) -> String {
+    carry.extend_from_slice(bytes);
+    let mut text = String::new();
+    let mut consumed = 0;
+    while consumed < carry.len() {
+        match std::str::from_utf8(&carry[consumed..]) {
+            Ok(valid) => {
+                text.push_str(valid);
+                consumed = carry.len();
+            }
+            Err(error) => {
+                let end = consumed + error.valid_up_to();
+                text.push_str(std::str::from_utf8(&carry[consumed..end]).unwrap());
+                consumed = end;
+                if let Some(length) = error.error_len() {
+                    text.push('\u{fffd}');
+                    consumed += length;
+                } else {
+                    if finish {
+                        text.push('\u{fffd}');
+                        consumed = carry.len();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    carry.drain(..consumed);
+    text
+}
+
+fn append_output_preview(preview: &mut String, chars: &mut usize, lines: &mut usize, text: &str) {
+    for ch in text.chars() {
+        if *chars >= 8000 || *lines >= 12 {
+            break;
+        }
+        preview.push(ch);
+        *chars += 1;
+        *lines += usize::from(ch == '\n');
+    }
+}
+
+#[cfg(test)]
+mod output_character_tests {
+    use super::*;
+
+    #[test]
+    fn chunked_decoding_matches_assembled_lossy_text() {
+        let cases: &[&[u8]] = &[
+            "你好🙂e\u{301}".as_bytes(),
+            b"a\xff\xe2\x82\xac\xc0\xafz",
+            b"\xe2\x82",
+            b"\xf0\x9f\x92x\x80",
+            b"\xed\xa0\x80",
+        ];
+        for bytes in cases {
+            for width in 1..=bytes.len() {
+                let mut carry = Vec::new();
+                let mut decoded = String::new();
+                for chunk in bytes.chunks(width) {
+                    decoded.push_str(&decode_output(&mut carry, chunk, false));
+                }
+                decoded.push_str(&decode_output(&mut carry, &[], true));
+                assert_eq!(decoded, String::from_utf8_lossy(bytes), "width {width}");
+                assert!(carry.is_empty());
+                assert_eq!(
+                    stream_info(bytes, "stdout", 0)["chars"],
+                    decoded.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn previews_are_character_bounded_without_splitting_unicode() {
+        let text = "🙂".repeat(8001);
+        let info = stream_info(text.as_bytes(), "stdout", 0);
+        assert_eq!(info["chars"], 8001);
+        assert_eq!(info["preview"].as_str().unwrap(), "🙂".repeat(8000));
+        assert_eq!(info["preview_truncated"], true);
+    }
+}
+
 struct Capture {
     file: File,
+    // Nested shell capture also appends bytes to its enclosing Python stream.
+    mirror: Option<File>,
     name: String,
     operation: String,
     index: Option<usize>,
     bytes: usize,
     newlines: usize,
-    chars: Option<usize>,
+    chars: usize,
     last: Option<u8>,
-    preview: Vec<u8>,
+    preview: String,
+    preview_chars: usize,
     preview_lines: usize,
     carry: Vec<u8>,
     chunk: usize,
@@ -3383,20 +3474,25 @@ impl Capture {
     fn open(path: &Path, name: &str, operation: &str) -> Result<Self> {
         Ok(Self {
             file: File::open(path)?,
+            mirror: None,
             name: name.into(),
             operation: operation.into(),
             index: None,
             bytes: 0,
             newlines: 0,
-            chars: Some(0),
+            chars: 0,
             last: None,
-            preview: vec![],
+            preview: String::new(),
+            preview_chars: 0,
             preview_lines: 0,
             carry: vec![],
             chunk: 0,
         })
     }
     fn commit(&mut self, host: &mut impl CaptureSink, bytes: &[u8]) -> Result<()> {
+        if let Some(mirror) = &mut self.mirror {
+            mirror.write_all(bytes)?;
+        }
         let index = *self
             .index
             .get_or_insert_with(|| host.stream_length(&self.name));
@@ -3413,33 +3509,14 @@ impl Capture {
         if !bytes.is_empty() {
             self.last = bytes.last().copied();
         }
-        if let Some(count) = self.chars {
-            self.carry.extend_from_slice(bytes);
-            match std::str::from_utf8(&self.carry) {
-                Ok(s) => {
-                    self.chars = Some(count + s.chars().count());
-                    self.carry.clear();
-                }
-                Err(e) => {
-                    let prefix = std::str::from_utf8(&self.carry[..e.valid_up_to()])?;
-                    self.chars = if e.error_len().is_some() {
-                        None
-                    } else {
-                        Some(count + prefix.chars().count())
-                    };
-                    self.carry = self.carry[e.valid_up_to()..].to_vec();
-                }
-            }
-        }
-        for &b in bytes {
-            if self.preview_lines >= 12 || self.preview.len() >= 8000 {
-                break;
-            }
-            self.preview.push(b);
-            if b == b'\n' {
-                self.preview_lines += 1;
-            }
-        }
+        let text = decode_output(&mut self.carry, bytes, false);
+        self.chars += text.chars().count();
+        append_output_preview(
+            &mut self.preview,
+            &mut self.preview_chars,
+            &mut self.preview_lines,
+            &text,
+        );
         Ok(())
     }
     fn drain(&mut self, host: &mut impl CaptureSink) -> Result<bool> {
@@ -3463,16 +3540,21 @@ impl Capture {
         if self.index.is_none() {
             self.commit(host, &[])?;
         }
-        if !self.carry.is_empty() {
-            self.chars = None;
-        }
+        let tail = decode_output(&mut self.carry, &[], true);
+        self.chars += tail.chars().count();
+        append_output_preview(
+            &mut self.preview,
+            &mut self.preview_chars,
+            &mut self.preview_lines,
+            &tail,
+        );
         let index = self.index.ok_or("missing capture index")?;
         let lines = self.newlines + usize::from(self.last.is_some() && self.last != Some(b'\n'));
         let metadata = json!({"ref":format!("H.records.{}[{index}]",self.name),"index":index,
             "record_index":index,"record_ref":format!("H.records.{}[{index}]",self.name),
             "bytes":self.bytes,"chars":self.chars,"lines":lines,
-            "preview":String::from_utf8_lossy(&self.preview).lines().take(12).collect::<Vec<_>>().join("\n"),
-            "preview_truncated":self.preview.len()<self.bytes,
+            "preview":self.preview.lines().take(12).collect::<Vec<_>>().join("\n"),
+            "preview_truncated":self.preview_chars<self.chars,
             "omitted_lines":lines.saturating_sub(12),"complete":complete});
         let mut durable = metadata.clone();
         durable.as_object_mut().unwrap().remove("preview");
@@ -7390,6 +7472,8 @@ struct Host {
     journal: Journal,
     home: PathBuf,
     context: ContextStore,
+    // Temporary cache experiment; sampled once at process/session creation.
+    cache_append_only: bool,
     history: HistoryArchive,
     ids: HashSet<String>,
     json: bool,
@@ -7573,7 +7657,7 @@ impl Host {
         )
     }
     fn forced(&self) -> bool {
-        self.chars().div_ceil(3) > self.input_budget() * 9 / 10
+        !self.cache_append_only && self.chars().div_ceil(3) > self.input_budget() * 9 / 10
     }
     fn context_usage(&self) -> Value {
         self.status_snapshot_inputs().context_usage()
@@ -7706,7 +7790,7 @@ impl Host {
                 Ok(Value::Null)
             }
             "collapse" => self.collapse(v),
-            "sh" => self.shell(v),
+            "sh" => self.shell_in_python(v),
             "llm" => self.inner_llm(v),
             "models" => {
                 self.reload_auth()?;
@@ -7719,6 +7803,12 @@ impl Host {
         }
     }
     fn collapse(&mut self, v: &Value) -> Result<Value> {
+        if self.cache_append_only {
+            return Err(
+                "Collapse is disabled by PY_CACHE_APPEND_ONLY=1 (temporary cache experiment)"
+                    .into(),
+            );
+        }
         let transition = self
             .context
             .prepare_collapse(v, self.current_code.as_deref())?;
@@ -7747,10 +7837,10 @@ fn execution_observation(
     let mut parts = vec![format!("Cell {cell}: {}", status.to_ascii_uppercase())];
     for stream in ["stdout", "stderr"] {
         let value = &metadata[stream];
-        let bytes = value["bytes"]
+        let chars = value["chars"]
             .as_u64()
-            .ok_or("execution stream byte count missing")?;
-        if bytes == 0 {
+            .ok_or("execution stream character count missing")?;
+        if chars == 0 {
             parts.push(format!("{stream}: empty"));
             continue;
         }
@@ -7758,8 +7848,8 @@ fn execution_observation(
             .as_u64()
             .ok_or("execution stream line count missing")?;
         parts.push(format!(
-            "{stream}: {bytes} {}, {lines} {}",
-            if bytes == 1 { "byte" } else { "bytes" },
+            "{stream}: {chars} {}, {lines} {}",
+            if chars == 1 { "char" } else { "chars" },
             if lines == 1 { "line" } else { "lines" }
         ));
     }
@@ -7777,18 +7867,18 @@ mod execution_observation_tests {
         let line = execution_observation(23, "python", 62, &metadata).unwrap();
         assert_eq!(
             line,
-            "Cell 23: OK · stdout: 3 bytes, 1 line · stderr: empty · python 62ms"
+            "Cell 23: OK · stdout: 3 chars, 1 line · stderr: empty · python 62ms"
         );
         assert_eq!(line.lines().count(), 1);
         assert!(!line.contains("42") && !line.contains("context_usage") && !line.contains("900"));
     }
     #[test]
-    fn observation_reports_bytes_lines_and_empty_streams() {
+    fn observation_reports_chars_lines_and_empty_streams() {
         let metadata = json!({"status":"error","stdout":{"bytes":0,"chars":0,"lines":0},
-            "stderr":{"bytes":5,"chars":null,"lines":2,"preview":"not selected"}});
+            "stderr":{"bytes":8,"chars":5,"lines":2,"preview":"not selected"}});
         assert_eq!(
             execution_observation(7, "shell", 10, &metadata).unwrap(),
-            "Cell 7: ERROR · stdout: empty · stderr: 5 bytes, 2 lines · shell 10ms"
+            "Cell 7: ERROR · stdout: empty · stderr: 5 chars, 2 lines · shell 10ms"
         );
         let empty = json!({"status":"ok","stdout":{"bytes":0,"chars":0,"lines":0},"stderr":{"bytes":0,"chars":0,"lines":0}});
         assert_eq!(
@@ -7797,21 +7887,37 @@ mod execution_observation_tests {
         );
         assert!(execution_observation(0, "python", 0, &empty).is_err());
     }
+    #[test]
+    fn observation_uses_unicode_chars_not_encoded_bytes() {
+        let metadata = json!({"status":"ok","stdout":{"bytes":6,"chars":2,"lines":1},
+            "stderr":{"bytes":4,"chars":1,"lines":1}});
+        assert_eq!(
+            execution_observation(2, "python", 0, &metadata).unwrap(),
+            "Cell 2: OK · stdout: 2 chars, 1 line · stderr: 1 char, 1 line · python 0ms"
+        );
+        let mut invalid = metadata;
+        invalid["stdout"]["chars"] = Value::Null;
+        assert!(execution_observation(2, "python", 0, &invalid).is_err());
+    }
 }
 
 fn stream_info(bytes: &[u8], name: &str, index: usize) -> Value {
-    let decoded = std::str::from_utf8(bytes).ok();
+    let decoded = String::from_utf8_lossy(bytes);
     let lines = bytes.iter().filter(|&&b| b == b'\n').count()
         + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
-    let preview = String::from_utf8_lossy(bytes)
-        .lines()
-        .take(12)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut preview = String::new();
+    let (mut preview_chars, mut preview_lines) = (0, 0);
+    append_output_preview(
+        &mut preview,
+        &mut preview_chars,
+        &mut preview_lines,
+        &decoded,
+    );
+    let preview = preview.lines().take(12).collect::<Vec<_>>().join("\n");
     json!({"ref":format!("H.records.{name}[{index}]"),"index":index,
         "record_index":index,"record_ref":format!("H.records.{name}[{index}]"),"bytes":bytes.len(),
-        "chars":decoded.map(|s|s.chars().count()),"lines":lines,
-        "preview":preview,"preview_truncated":lines>12,
+        "chars":decoded.chars().count(),"lines":lines,
+        "preview":preview,"preview_truncated":preview_chars<decoded.chars().count(),
         "omitted_lines":lines.saturating_sub(12),"complete":true})
 }
 // Public indexes identify cells. Record coordinates remain explicit and are
@@ -8081,6 +8187,12 @@ impl Host {
                             response
                         }
                     };
+                    // Nested helpers append to the same capture files. Commit
+                    // their output before Python resumes or queries H.stdout.
+                    if let Some((stdout, stderr)) = captures.as_mut() {
+                        stdout.drain(self)?;
+                        stderr.drain(self)?;
+                    }
                     if self.reply_worker(&json!(rpc_id), response).is_err() {
                         complete = false;
                         self.execution.stage_reset(false);
@@ -8197,6 +8309,13 @@ impl Host {
             self.initialize_skills()
         }
     }
+    fn shell_in_python(&mut self, v: &Value) -> Result<Value> {
+        if self.execution.cell().is_none() {
+            return Err("agent.sh requires an active Python cell".into());
+        }
+        let id = format!("sh{}", self.journal.seq);
+        self.shell_inner(v, &id)
+    }
     fn shell(&mut self, v: &Value) -> Result<Value> {
         v["command"].as_str().ok_or("shell command required")?;
         let id = format!("sh{}", self.journal.seq);
@@ -8209,6 +8328,7 @@ impl Host {
     }
     fn shell_inner(&mut self, v: &Value, id: &str) -> Result<Value> {
         let command = v["command"].as_str().ok_or("shell command required")?;
+        let nested = self.execution.operation().as_deref() != Some(id);
         let source_event = self.journal.append(
             "intent",
             json!({"operation":id,"type":"shell","source":command}),
@@ -8251,7 +8371,7 @@ impl Host {
                 Ok(())
             });
         }
-        if !self.json {
+        if !self.json && !nested {
             let mut code = stream_info(command.as_bytes(), "events", source_event);
             code["record_ref"] = json!(format!(
                 "H.records.events[{source_event}]['payload']['source']"
@@ -8270,6 +8390,18 @@ impl Host {
         let pid = child.pid();
         let mut stdout = Capture::open(&out_path, "stdout", id)?;
         let mut stderr = Capture::open(&err_path, "stderr", id)?;
+        if nested {
+            stdout.mirror = Some(
+                OpenOptions::new()
+                    .append(true)
+                    .open(self.execution.worker().dir.join("stdout"))?,
+            );
+            stderr.mirror = Some(
+                OpenOptions::new()
+                    .append(true)
+                    .open(self.execution.worker().dir.join("stderr"))?,
+            );
+        }
         let began = std::time::Instant::now();
         let mut stopped = None;
         let mut state = None;
@@ -8300,8 +8432,16 @@ impl Host {
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         // try_wait already killed/disarmed the group and reaped its leader.
-        let stdout = stdout.finish(self, true)?;
-        let stderr = stderr.finish(self, true)?;
+        let mut stdout = stdout.finish(self, true)?;
+        let mut stderr = stderr.finish(self, true)?;
+        if nested {
+            let cell = self
+                .execution
+                .cell()
+                .ok_or("enclosing Python cell missing")?;
+            stdout = cell_metadata(stdout, "stdout", cell);
+            stderr = cell_metadata(stderr, "stderr", cell);
+        }
         capture_files.remove()?;
         let mut code = stream_info(command.as_bytes(), "events", source_event);
         code["record_ref"] = json!(format!(
@@ -8318,7 +8458,9 @@ impl Host {
         if !self.json {
             preview.as_object_mut().unwrap().remove("code");
         }
-        self.event("preview", preview);
+        if !nested {
+            self.event("preview", preview);
+        }
         let mut result = json!({"cell":self.execution.cell(),"exit_code":exit.code(),"status":state.unwrap_or(if exit.success(){"ok"}else{"error"}),
             "stdout":stdout,"stderr":stderr});
         for stream in ["stdout", "stderr"] {
@@ -8330,6 +8472,9 @@ impl Host {
         Ok(result)
     }
     fn evict(&mut self) -> Result<()> {
+        if self.cache_append_only {
+            return Ok(());
+        }
         if let Some(transition) = self.context.prepare_evict()? {
             self.context.persist(&mut self.journal, transition)?;
         }
@@ -8437,6 +8582,7 @@ impl Host {
             journal,
             home,
             context: ContextStore::default(),
+            cache_append_only: std::env::var("PY_CACHE_APPEND_ONLY").as_deref() == Ok("1"),
             history: HistoryArchive::default(),
             ids: HashSet::new(),
             json: json_mode,
@@ -9071,6 +9217,177 @@ fn parse_replaced_item(p: &Value, previous: &[Item]) -> Result<Item> {
     Ok(item)
 }
 
+// Only outer generated source passes here. A separate isolated stdlib-only
+// interpreter tokenizes it without running it or touching the persistent worker.
+const NORMALIZE_GENERATED_SOURCE: &str = r###"
+import io, re, sys, tokenize
+source = sys.stdin.buffer.read().decode('utf-8')
+lines = io.StringIO(source).readlines()
+try:
+    tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+except (tokenize.TokenError, SyntaxError):
+    cleaned = source
+else:
+    for token in tokens:
+        if token.type != tokenize.COMMENT:
+            continue
+        row, column = token.start
+        line = lines[row - 1]
+        body = line.rstrip('\r\n')
+        if (not line[:column].strip()
+                and re.fullmatch(r'# \[boundary c[0-9]+\][ \t]*', token.string)
+                and not body[token.end[1]:].strip()):
+            lines[row - 1] = line[len(body):]
+    cleaned = ''.join(lines)
+sys.stdout.buffer.write(cleaned.encode('utf-8'))
+"###;
+
+fn normalize_generated_source(source: &str) -> Result<String> {
+    // The common case needs no process, but never regex-strip whole source:
+    // marker-looking lines can be data in multiline strings.
+    if !source.contains("# [boundary c") {
+        return Ok(source.to_owned());
+    }
+    let mut child = Command::new(std::env::var("PY_PYTHON").unwrap_or_else(|_| "python3".into()))
+        .args(["-I", "-S", "-c", NORMALIZE_GENERATED_SOURCE])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|_| {
+            "Generated source normalization interpreter could not start; no code executed"
+        })?;
+    let mut input = child.stdin.take().ok_or("normalization stdin missing")?;
+    let (written, output) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || input.write_all(source.as_bytes()));
+        let output = child.wait_with_output();
+        (writer.join(), output)
+    });
+    let output = output.map_err(|_| "Generated source normalization failed; no code executed")?;
+    if !output.status.success() || !matches!(written, Ok(Ok(()))) {
+        return Err("Generated source normalization failed; no code executed".into());
+    }
+    String::from_utf8(output.stdout).map_err(|_| {
+        "Generated source normalization returned invalid UTF-8; no code executed".into()
+    })
+}
+
+#[cfg(test)]
+mod generated_source_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn strips_only_standalone_boundary_comments_preserving_line_numbers() {
+        let source = concat!(
+            "# [boundary c12]\r\n",
+            "  # [boundary c13]  \n",
+            "\t# [boundary c14]\n",
+            "x = '# [boundary c15]'\n",
+            "value = '''literal\n# [boundary c16]\nliteral'''\n",
+            "f = f'''literal\n# [boundary c17]\n{x}'''\n",
+            "x = 1 # [boundary c18]\n",
+            "# [boundary cno]\n",
+            "# [boundary c19] explanation\n",
+            "# ordinary comment\n",
+            "# [boundary c20]",
+        );
+        let expected = source
+            .replacen("# [boundary c12]", "", 1)
+            .replacen("  # [boundary c13]  ", "", 1)
+            .replacen("\t# [boundary c14]", "", 1)
+            .replacen("# [boundary c20]", "", 1);
+        let cleaned = normalize_generated_source(source).unwrap();
+        assert_eq!(cleaned, expected);
+        assert_eq!(normalize_generated_source(&cleaned).unwrap(), cleaned);
+        assert_eq!(source.matches('\n').count(), cleaned.matches('\n').count());
+    }
+
+    #[test]
+    fn boundary_normalization_handles_non_newline_unicode_and_empty_results() {
+        let source = "value = '\u{2028}\u{000b}'\n# [boundary c123]\npass\n";
+        assert_eq!(
+            normalize_generated_source(source).unwrap(),
+            "value = '\u{2028}\u{000b}'\n\npass\n"
+        );
+        assert_eq!(normalize_generated_source("# [boundary c1]").unwrap(), "");
+        assert_eq!(
+            normalize_generated_source("# [boundary c1]\n").unwrap(),
+            "\n"
+        );
+        assert_eq!(normalize_generated_source("pass\n").unwrap(), "pass\n");
+    }
+
+    #[test]
+    fn malformed_tokenization_is_not_rewritten() {
+        let source = "# [boundary c21]\nx = '''unterminated\n# [boundary c22]";
+        assert_eq!(normalize_generated_source(source).unwrap(), source);
+    }
+}
+
+#[cfg(test)]
+mod cache_append_only_tests {
+    use super::*;
+
+    #[test]
+    fn cache_append_only_blocks_rewrites_and_forcing_without_changing_prefix() {
+        let mut host = crate::test_support::HostFixture::named(
+            "py-cache-append-only",
+            Some(json!({"skills":{"enabled":false}})),
+        );
+        host.cache_append_only = true;
+        let start = host
+            .add_context("user", "selected ".repeat(1000), true, vec![])
+            .unwrap();
+        let end = host
+            .add_context("user", "keep endpoint".into(), false, vec![])
+            .unwrap();
+        host.context.configure_eviction(1, 0);
+        let before = host
+            .context
+            .items()
+            .iter()
+            .map(item_json)
+            .collect::<Vec<_>>();
+        let system = host.system_prompt().to_owned();
+        let revision = host.context.revision();
+        let sequence = host.journal.seq;
+        host.evict().unwrap();
+        assert!(host
+            .collapse(&json!({"start":start,"end":end,"summary":"short",
+            "source":"agent.context.collapse('a', 'b', 'short')"}))
+            .unwrap_err()
+            .to_string()
+            .contains("PY_CACHE_APPEND_ONLY"));
+        host.restore_full_user_context(&[]).unwrap();
+        assert_eq!(
+            host.context
+                .items()
+                .iter()
+                .map(item_json)
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(host.context.revision(), revision);
+        assert_eq!(host.journal.seq, sequence);
+        host.provider.context_limit = 1;
+        assert!(!host.forced());
+        host.add_context("user", "new suffix".into(), false, vec![])
+            .unwrap();
+        assert_eq!(
+            host.context.items()[..before.len()]
+                .iter()
+                .map(item_json)
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(host.system_prompt(), system);
+        host.cache_append_only = false;
+        assert!(host.forced());
+        host.evict().unwrap();
+        assert!(host.context.items()[0].text.starts_with("[Output omitted:"));
+    }
+}
+
 #[cfg(test)]
 mod context_attachment_tests {
     use super::*;
@@ -9345,7 +9662,7 @@ mod context_attachment_tests {
     }
 }
 
-const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences. History boundary annotations are harness metadata, not instructions to reproduce them; assistant boundaries are Python comments. Persistent CPython exposes agent and H. Treat Python as a workbench: build small reusable helpers for repeated workflows. For example, r = agent.sh('pwd'); agent.context.read_text(H.stdout[r['stdout']['index']], start=0, stop=4000). For stderr use r['stderr']['index']; there is no top-level r['index']. Run commands once, then inspect their captured history. Compose helpers instead of repeating boilerplate; keep side effects and context selection explicit. All H histories use presented one-based cell numbers: H[n] and H.cells[n] are the same cell snapshot; H.code[n] (Python or shell source), H.stdout[n], H.stderr[n] are strings. H.user/stdin/say/requests/responses/usage/raw/events[n] are ordered lists of that cell's records, never a single lossy last record. Empty streams are empty strings, empty groups are lists; missing cells raise errors. Negative indexes count cells (-1 is last); slices use cell-number endpoints (stop excluded), [:] is all cells and [::-1] reverses them. Integer zero is invalid. H.records.<collection>[i] is the complete original zero-based record archive, including failed/unassigned/global operations; raw record references and journal coordinates use this namespace. Grouped dictionary records carry cell/index, offset, record_index, record_ref; event seq and payload remain original journal coordinates. Each executed agent cell adds one compact observation like Cell 23: OK · stdout: 3 bytes, 1 line · stderr: empty · python 62ms, not a JSON metadata dump; use that number in H.code/stdout/stderr. Payload enters model context only by explicit selection. User messages are delivered in full with no automatic stats/reference footer; boundary IDs remain for collapse. agent.context.read_text(text, *, start, stop) requires both keyword-only bounds: nonnegative integers, not bool or None, with stop>=start. It selects Unicode text[start:stop], returns a boundary ID, and rejects range widths above the fixed 8000-character cap or next-request-budget overflow without truncation. A stop past the text length clamps normally; the requested width must still fit the cap. There is no max_chars parameter. Example: agent.context.read_text(H.stderr[i], start=0, stop=4000). agent.context.read_raw(data) accepts PNG/JPEG bytes, a base64 dictionary, or a file-path string (not literal image text); max 512000 file bytes, 1536 pixels per axis, 4 active attachments; returns a boundary ID. agent.say(text) sends an intermediate user-only UI message and continues. Use agent.final(text) for every final response: it sends the strong final answer without stdout/context duplication and implicitly ends the turn after the successful cell. Never split a final answer and stopping across cells. Put agent.final last: final/stop do not return or exit Python; subsequent statements run, and a failed cell cancels the staged stop. Final publication is not transactional. agent.sh(command, cwd=None, env=None, timeout=None) runs /bin/sh -c with null stdin and no timeout by default; returns status/exit code and H stream metadata/refs, not text. agent.llm(prompt, model=..., system=..., max_tokens=2048, images=..., effort=...) returns a string; defaults to session model/effort and a helpful-assistant system. agent.llm.list() lists model metadata; agent.llm.image(prompt, model='openai/gpt-image-1') returns cell/index/offset/ref/record_index/bytes; use H.raw[result['index']][result['offset']] for its full image dictionary. raw_index aliases the cell index; record_index addresses H.records.raw. Bytes stay out of model context until explicitly selected. input(prompt) asks the user. agent.loop.reset_python() stages a fresh worker with the frozen startup snapshot; previous variables are lost. agent.context.items()/usage() inspect context metadata. agent.loop.stop(wakeup=None) ends this turn after a successful cell; optional wakeup=(seconds,reason) schedules one continuation. agent.bgtasks.run(source,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None) returns task metadata immediately; kind='python' uses a fresh isolated interpreter without agent or main variables. bgtasks.list(state=None),get(task_id),kill(task_id,force=False) manage jobs. Outputs stay in H; only explicit context reads select them. Completion wakeups are opt-in. Does not kill foreground Python. Collapse must be one standalone call with three literal strings: agent.context.collapse('start','end','summary'); successful output is silent. Use distinct ordered boundary IDs: provenance covers [start,end), replacement removes through end, preserving end text only for user/summary items. It must reduce rendered context size. In forced mode only standalone collapse or one standalone stderr-read expression is allowed, e.g. agent.context.read_text(H.stderr[44], start=0, stop=4000); 44 is an example, not a required index. The stderr index must be a literal positive cell number, with exactly start and stop keyword arguments containing literal nonnegative integers and width at most 8000: no variables, bool, None, slicing, unpacking or additional statements. No replay after resume. Execution is unrestricted except bridge restrictions during startup: ordinary definitions/imports and H reads are allowed, other agent bridges are disabled. Worker failure requires an explicit reset before repeating core startup. Outer requests request/reserve 4096 output tokens; nested LLM requests default to 2048. Reservation is accounting, not enforcement. Codex currently transmits no output-token cap; other providers receive a cap parameter that reasoning may adjust. Codex transient transport errors and HTTP 408/429/500/502/503/504 retry the same provider request at most twice by default (providers.openai-codex.request_retries, integer 0..5). Retries never rerun Python/shell; ambiguous outcomes can repeat provider generation/billing. Auth, malformed/incomplete responses and interrupted resume intents are not automatically retried. H.requests[cell][offset] and H.records.requests[record_index] metadata distinguish requested_output_tokens, transmitted_output_limit (null if absent), and reserved_output_tokens.";
+const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences. History boundary annotations are harness metadata, not instructions to reproduce them; assistant boundaries are Python comments. Persistent CPython exposes agent and H. Treat Python as a workbench: build small reusable helpers for repeated workflows. For example, r = agent.sh('pwd'); agent.context.read_text(H.stdout[r['stdout']['index']], start=0, stop=4000). For stderr use r['stderr']['index']; there is no top-level r['index']. Run commands once, then inspect their captured history. Compose helpers instead of repeating boilerplate; keep side effects and context selection explicit. All H histories use presented one-based cell numbers: H[n] and H.cells[n] are the same cell snapshot; H.code[n] (Python or shell source), H.stdout[n], H.stderr[n] are strings. H.user/stdin/say/requests/responses/usage/raw/events[n] are ordered lists of that cell's records, never a single lossy last record. Empty streams are empty strings, empty groups are lists; missing cells raise errors. Negative indexes count cells (-1 is last); slices use cell-number endpoints (stop excluded), [:] is all cells and [::-1] reverses them. Integer zero is invalid. H.records.<collection>[i] is the complete original zero-based record archive, including failed/unassigned/global operations; raw record references and journal coordinates use this namespace. Grouped dictionary records carry cell/index, offset, record_index, record_ref; event seq and payload remain original journal coordinates. Each executed agent cell adds one compact observation like Cell 23: OK · stdout: 3 chars, 1 line · stderr: empty · python 62ms, not a JSON metadata dump; use that number in H.code/stdout/stderr. Text stream character counts use Unicode code points after UTF-8 decoding with replacement for invalid sequences, exactly matching Python len() and slicing of H text. Payload enters model context only by explicit selection. User messages are delivered in full with no automatic stats/reference footer; boundary IDs remain for collapse. agent.context.read_text(text, *, start, stop) requires both keyword-only bounds: nonnegative integers, not bool or None, with stop>=start. It selects Unicode text[start:stop], returns a boundary ID, and rejects range widths above the fixed 8000-character cap or next-request-budget overflow without truncation. A stop past the text length clamps normally; the requested width must still fit the cap. There is no max_chars parameter. Example: agent.context.read_text(H.stderr[i], start=0, stop=4000). agent.context.read_raw(data) accepts PNG/JPEG bytes, a base64 dictionary, or a file-path string (not literal image text); max 512000 file bytes, 1536 pixels per axis, 4 active attachments; returns a boundary ID. agent.say(text) sends an intermediate user-only UI message and continues. Use agent.final(text) for every final response: it sends the strong final answer without stdout/context duplication and implicitly ends the turn after the successful cell. Never split a final answer and stopping across cells. Put agent.final last: final/stop do not return or exit Python; subsequent statements run, and a failed cell cancels the staged stop. Final publication is not transactional. agent.sh(command, cwd=None, env=None, timeout=None) runs /bin/sh -c with null stdin and no timeout by default; returns status/exit code and H stream metadata/refs, not text. agent.llm(prompt, model=..., system=..., max_tokens=2048, images=..., effort=...) returns a string; defaults to session model/effort and a helpful-assistant system. agent.llm.list() lists model metadata; agent.llm.image(prompt, model='openai/gpt-image-1') returns cell/index/offset/ref/record_index/bytes; use H.raw[result['index']][result['offset']] for its full image dictionary. raw_index aliases the cell index; record_index addresses H.records.raw. Bytes stay out of model context until explicitly selected. input(prompt) asks the user. agent.loop.reset_python() stages a fresh worker with the frozen startup snapshot; previous variables are lost. agent.context.items()/usage() inspect context metadata. agent.loop.stop(wakeup=None) ends this turn after a successful cell; optional wakeup=(seconds,reason) schedules one continuation. agent.bgtasks.run(source,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None) returns task metadata immediately; kind='python' uses a fresh isolated interpreter without agent or main variables. bgtasks.list(state=None),get(task_id),kill(task_id,force=False) manage jobs. Outputs stay in H; only explicit context reads select them. Completion wakeups are opt-in. Does not kill foreground Python. Collapse must be one standalone call with three literal strings: agent.context.collapse('start','end','summary'); successful output is silent. Use distinct ordered boundary IDs: provenance covers [start,end), replacement removes through end, preserving end text only for user/summary items. It must reduce rendered context size. In forced mode only standalone collapse or one standalone stderr-read expression is allowed, e.g. agent.context.read_text(H.stderr[44], start=0, stop=4000); 44 is an example, not a required index. The stderr index must be a literal positive cell number, with exactly start and stop keyword arguments containing literal nonnegative integers and width at most 8000: no variables, bool, None, slicing, unpacking or additional statements. No replay after resume. Execution is unrestricted except bridge restrictions during startup: ordinary definitions/imports and H reads are allowed, other agent bridges are disabled. Worker failure requires an explicit reset before repeating core startup. Outer requests request/reserve 4096 output tokens; nested LLM requests default to 2048. Reservation is accounting, not enforcement. Codex currently transmits no output-token cap; other providers receive a cap parameter that reasoning may adjust. Codex transient transport errors and HTTP 408/429/500/502/503/504 retry the same provider request at most twice by default (providers.openai-codex.request_retries, integer 0..5). Retries never rerun Python/shell; ambiguous outcomes can repeat provider generation/billing. Auth, malformed/incomplete responses and interrupted resume intents are not automatically retried. H.requests[cell][offset] and H.records.requests[record_index] metadata distinguish requested_output_tokens, transmitted_output_limit (null if absent), and reserved_output_tokens.";
 // Reasoning request fields follow the pinned Pi provider transformations, not
 // generic OpenAI-compatible guesses. This is a pure body-layout helper: it never
 // reads credentials, starts I/O or changes session state. A false/absent reasoning
@@ -10054,6 +10371,9 @@ impl Host {
                 }
                 continue;
             }
+            // Normalize before staging cell ownership: normalization failure
+            // leaves the raw response global, with no code or cell executed.
+            let code = normalize_generated_source(&code)?;
             // Bind pre-cell request/response/usage records only after a complete
             // generation succeeds. Failed/global requests stay in H.records.
             self.execution
@@ -11269,6 +11589,9 @@ impl Host {
                 self.ui_text("No operation is running. Ctrl-C cancels an active operation.")
             }
             LocalCommandKind::Compact => {
+                if self.cache_append_only {
+                    return Err("Compaction is disabled by PY_CACHE_APPEND_ONLY=1 (temporary cache experiment)".into());
+                }
                 if self.no_model {
                     return Err("Compaction requires an authenticated model; local mode never silently discards context".into());
                 }
@@ -12076,11 +12399,11 @@ impl Host {
                         .ok_or("task has no output reference")?
                         as usize;
                     self.ui_text(&format!(
-                        "{} — {}\n{}\n[{} bytes; preview only; full output in H]",
+                        "{} — {}\n{}\n[{} chars; preview only; full output in H]",
                         stream,
                         metadata[stream]["ref"].as_str().unwrap_or(""),
                         self.ui_stream_preview(stream, index)?,
-                        metadata[stream]["bytes"]
+                        metadata[stream]["chars"]
                     ));
                 }
                 return Ok(());
@@ -17383,7 +17706,8 @@ mod history_index_tests {
             host.cell_view(1).unwrap()["say"].as_array().unwrap().len(),
             2
         );
-        assert_eq!(host.cell_view(2).unwrap()["parent_cell"], 1);
+        assert_eq!(host.execution.cells(), 1);
+        assert_eq!(host.cell_view(1).unwrap()["stdout"], "parent\nshell");
         assert_eq!(
             host.execute(
                 "reset",
@@ -18773,6 +19097,9 @@ impl Host {
     // provenance proves the full original. Explicit reads and summaries are not
     // user routing; never strip suffixes heuristically or revive retired items.
     fn restore_full_user_context(&mut self, users: &[(usize, usize)]) -> Result<()> {
+        if self.cache_append_only {
+            return Ok(());
+        }
         let originals = users
             .iter()
             .filter_map(|&(sequence, index)| {
@@ -18995,6 +19322,45 @@ mod full_user_context_tests {
             );
         }
     }
+    #[test]
+    fn cache_append_only_skips_proven_legacy_user_upgrade() {
+        let mut host = host();
+        host.cache_append_only = true;
+        let (sequence, index, id) = legacy_user(&mut host, &"X".repeat(12000), "H.records.user");
+        let before = host
+            .context
+            .items()
+            .iter()
+            .map(item_json)
+            .collect::<Vec<_>>();
+        let revision = host.context.revision();
+        let journal_seq = host.journal.seq;
+        host.restore_full_user_context(&[(sequence, index)])
+            .unwrap();
+        assert_eq!(
+            host.context
+                .items()
+                .iter()
+                .map(item_json)
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(host.context.revision(), revision);
+        assert_eq!(host.journal.seq, journal_seq);
+        host.cache_append_only = false;
+        host.restore_full_user_context(&[(sequence, index)])
+            .unwrap();
+        assert_eq!(
+            host.context
+                .items()
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap()
+                .text,
+            "X".repeat(12000)
+        );
+    }
+
     #[test]
     fn legacy_user_migration_failure_preserves_memory_and_revision() {
         let mut host = host();
@@ -19867,7 +20233,7 @@ fn terminal_preview(v: &Value, width: usize) -> Vec<String> {
         ));
     }
     for stream in ["code", "stdout", "stderr"] {
-        if !v[stream].is_object() || stream != "code" && v[stream]["bytes"].as_u64() == Some(0) {
+        if !v[stream].is_object() || stream != "code" && v[stream]["chars"].as_u64() == Some(0) {
             continue;
         }
         if stream != "code" {
@@ -22414,6 +22780,8 @@ impl TaskScheduler {
                 let more_out = if let Some(out) = task.stdout.as_mut() {
                     let more = out.drain(io)?;
                     task.metadata["stdout"]["bytes"] = json!(out.bytes);
+                    task.metadata["stdout"]["chars"] =
+                        json!(out.chars + String::from_utf8_lossy(&out.carry).chars().count());
                     more
                 } else {
                     false
@@ -22421,6 +22789,8 @@ impl TaskScheduler {
                 let more_err = if let Some(err) = task.stderr.as_mut() {
                     let more = err.drain(io)?;
                     task.metadata["stderr"]["bytes"] = json!(err.bytes);
+                    task.metadata["stderr"]["chars"] =
+                        json!(err.chars + String::from_utf8_lossy(&err.carry).chars().count());
                     more
                 } else {
                     false
@@ -22609,6 +22979,8 @@ impl TaskScheduler {
                 task.metadata.as_object_mut().unwrap().remove("pid");
                 for name in ["stdout", "stderr"] {
                     let mut bytes = 0usize;
+                    let mut chars = 0usize;
+                    let mut carry = Vec::new();
                     if let Some(index) = task.metadata[name]["index"].as_u64() {
                         if let Some(chunks) = io
                             .history
@@ -22621,12 +22993,15 @@ impl TaskScheduler {
                                 };
                                 let data =
                                     stream.base64.as_deref().ok_or("invalid stream bytes")?;
-                                bytes += data.len() / 4 * 3
-                                    - data.bytes().rev().take_while(|byte| *byte == b'=').count();
+                                let chunk = B64.decode(data)?;
+                                bytes += chunk.len();
+                                chars += decode_output(&mut carry, &chunk, false).chars().count();
                             }
                         }
                     }
+                    chars += decode_output(&mut carry, &[], true).chars().count();
                     task.metadata[name]["bytes"] = json!(bytes);
+                    task.metadata[name]["chars"] = json!(chars);
                     task.metadata[name]["complete"] = json!(false);
                 }
                 tasks.push(task.snapshot());
@@ -24866,8 +25241,17 @@ architecture. Existing completion covers explicit-Tab commands and paths.
 ## 3. Durable history is not model context (frozen)
 H is append-only, complete and immutable. Context is an ordered selected view.
 Saving a record does not itself select its payload for the model.
-Model-generated source is saved in H.code and retained as assistant source in
-context. Never automatically edit, truncate or evict that source.
+Before recording or executing outer model-generated Python, normalize echoed
+harness metadata: remove standalone COMMENT-token lines exactly matching
+`# [boundary c<digits>]`, allowing leading/trailing whitespace. Preserve line
+endings and line numbers by blanking the comment line. Tokenize Python; never
+strip matching text inside strings, inline comments, or unrelated comments.
+On tokenization error retain original source for normal syntax diagnostics.
+On normalization interpreter failure reject before execution. H.code, previews,
+worker input and assistant context all use normalized source. Raw provider
+responses remain unchanged. Direct user Python and nested agent.llm results are
+not normalized. Only context rendering adds the authoritative boundary.
+Beyond this narrow normalization never edit, truncate or evict retained source.
 Automatic context housekeeping may drop only old output payloads, retaining
 their H references/counts. It may not discard user messages, code or summaries.
 Explicit collapse can replace any selected non-system history, including code,
@@ -25020,12 +25404,14 @@ Example:
   agent.loop.stop()
 
 Metadata after every operation includes execution/request IDs, H refs, status,
-exit code where applicable, byte/char/line counts,
+exit code where applicable, char/line counts (plus exact internal byte counts),
 and completeness flags. No exception message, source line, or traceback text.
 Python success maps to exit_code=0; cell exception to 1 while the process stays
 alive; signal/process death is separate. Shell returncode is its actual value.
 Define lines as newline count plus one for a nonempty unterminated last line.
-Char count is nullable for undecodable bytes; byte count is always exact.
+Char count is the Unicode code-point count after UTF-8 decoding with replacement
+for invalid sequences, matching Python len() and slicing of H text. Original
+bytes remain lossless and internal byte counts remain exact.
 Nested helper replies must be delivered to the running Python child even though
 the next outer model request waits for cell completion.
 
@@ -25057,11 +25443,11 @@ side effects; do not roll back or automatically replay. Python normally stays
 alive after either failure. Process death has a separate status.
 Caught exceptions behave like ordinary Python: no harness-added traceback.
 
-The automatic model observation contains status, stdout/stderr H indices and
-byte/char/line counts, plus completeness flags. No automatic exception type,
-message, source excerpt, traceback or other error payload.
-Example: cell 44 status=error; stdout=H.stdout[44] (0 chars);
-stderr=H.stderr[44] (812 chars).
+The automatic model observation contains cell/status, stdout/stderr char/line
+counts (or empty), and elapsed time. The cell number identifies H.stdout[cell]
+and H.stderr[cell]; completeness flags remain in structured metadata.
+No automatic exception type, message, source excerpt, traceback or other error payload.
+Example: Cell 44: ERROR · stdout: empty · stderr: 812 chars, 20 lines · python 10ms.
 H stream entries support text inspection/slicing in Python, e.g.
 H.stderr[44][:4000]. Merely obtaining or printing this slice does NOT send it
 to the model. Use agent.context.read_text(H.stderr[44], start=0, stop=4000)
@@ -25854,8 +26240,8 @@ agent.context.usage()
   never append automatic usage JSON to provider messages. A minimal forced-mode
   instruction is included in system instructions only when the safety gate is
   active. Automatic execution observations contain only the
-  cell/status, stream byte/line counts (or empty), and elapsed time, e.g.
-  Cell 23: OK · stdout: 3 bytes, 1 line · stderr: empty · python 62ms.
+  cell/status, stream char/line counts (or empty), and elapsed time, e.g.
+  Cell 23: OK · stdout: 3 chars, 1 line · stderr: empty · python 62ms.
   No payload, source metadata or duplicate usage dump.
   Full structured completion metadata stays in the protocol/journal. The
   Python API exposes the same accounting used by the status bar and force gate.
@@ -25966,7 +26352,33 @@ First red-test batch:
 Missing CLI behaviors must produce genuine failing assertions. Compiling this
 spec printer is only draft validation, never proof of an acceptance requirement.
 
+### Single-cell foreground execution
+One submitted Python block is one numbered cell, including nested agent.sh()
+calls. Nested shells keep internal intent/completion and raw stream records, but
+do not emit cell_start/cell_end, source previews or shell-cell footers. Shell
+stdout/stderr append to the enclosing Python capture in execution order and are
+included in its final output and compact observation. Python H.code remains the
+submitted Python, not the last shell command. Shell result stream refs/index
+address the enclosing cell; record_ref/record_index retain per-command captures.
+Timeout/exit status belongs to the returned shell result; cancellation remains
+sticky for the enclosing Python cell. Standalone user shell submissions may
+still create one top-level shell cell. Existing journals retain old numbering.
+
 ## 20. Batched old-output eviction and cache stability
+
+Temporary cache experiment: launch with PY_CACHE_APPEND_ONLY=1 to disable
+manual collapse (/compact and the collapse RPC), automatic output eviction,
+legacy user-context upgrades, and pressure-forced collapse. The flag is sampled
+when a Host is created and is not persisted; set it again when resuming.
+Existing journal replacements are still restored faithfully, not undone.
+The frozen system snapshot is unchanged. New context items still append, so
+the experiment provides a stable growing prefix, not a constant-size request.
+Text-selection admission and protected-system budget checks remain active;
+there is no automatic compaction fallback at the model's context limit.
+Provider wire adaptation and cache behavior remain unchanged. For clean cache
+comparisons use a fresh session and keep model, effort and provider unchanged.
+Unset the variable (or set it to 0) to restore the normal policy below.
+
 Automatic output eviction is batched, never a sliding per-turn window.
 Current default policy: when 50 evictable output payload items accumulate,
 replace the oldest items as one batch and retain the most recent 20.
@@ -26323,10 +26735,12 @@ context compaction added.
       CSI-u/xterm modified-key reports; Ctrl-J is a fallback for terminals that
       cannot distinguish it. Continuation lines align with source text after the
       minimal > prompt. Do not strip leading source whitespace or invent indent.
-[x] R10.30 Each Python/shell execution has a monotonic session cell number and
-      source/operation/history refs, including no-output/error/interrupt cells;
-      resume retains numbering, new session restarts it, nested cells retain
-      outer attribution. End-of-cell status gives result and elapsed time.
+[x] R10.30 Each submitted Python block has one monotonic session cell number,
+      source/operation/history refs and combined Python/helper output, including
+      no-output/error/interrupt cells. agent.sh inside Python does not allocate a
+      cell; standalone native shell submissions retain their own cell/attribution.
+      Resume retains numbering; new sessions restart it. End-of-cell status
+      gives result and elapsed time. Existing journals retain legacy subcells.
 [x] R06.28 Codex uses the upstream ChatGPT login page; social sign-in buttons
       (e.g. Google) are provider-managed, never separate Google credentials in py.
       Do not invent undocumented identity-provider OAuth parameters or claim the
@@ -27099,6 +27513,8 @@ _rpc_signal=__import__('signal')
 _rpc_sequence=0
 def _rpc(op,**kw):
     global _rpc_sequence
+    if op=='sh':
+        sys.stdout.flush();sys.stderr.flush()
     _rpc_sequence+=1
     request_id=_rpc_sequence
     # Defer SIGINT across the whole wire transaction: an interrupted readline
@@ -27381,8 +27797,10 @@ while True:
         _send({'kind':'ide_validation','incomplete':_incomplete})
         continue
     _source=_cmd['source']
-    _out=os.open(_cmd['stdout'],os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
-    _err=os.open(_cmd['stderr'],os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+    # Host-side nested shell capture appends to these same files. O_APPEND
+    # prevents the worker's independent file offset overwriting helper output.
+    _out=os.open(_cmd['stdout'],os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_APPEND,0o600)
+    _err=os.open(_cmd['stderr'],os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_APPEND,0o600)
     os.dup2(_out,1);os.dup2(_err,2);os.close(_out);os.close(_err)
     _status='ok'
     _send({'kind':'started'})
@@ -27416,6 +27834,7 @@ fn test_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
         "PY_MODEL",
         "GOOGLE_API_KEY",
         "PY_CONTEXT_LIMIT",
+        "PY_CACHE_APPEND_ONLY",
         "PY_CODEX_AUTH_BASE_URL",
         "PY_CODEX_DEVICE_TIMEOUT_SECONDS",
         "PY_OAUTH_BROWSER",
@@ -27457,6 +27876,14 @@ mod e2e {
         codes: Vec<&str>,
         commands: Vec<Value>,
         context_limit: Option<usize>,
+    ) -> (Vec<Value>, crate::test_support::TestDirectory, Vec<Value>) {
+        model_run_with_cache_policy(codes, commands, context_limit, false)
+    }
+    fn model_run_with_cache_policy(
+        codes: Vec<&str>,
+        commands: Vec<Value>,
+        context_limit: Option<usize>,
+        append_only: bool,
     ) -> (Vec<Value>, crate::test_support::TestDirectory, Vec<Value>) {
         let mut codes = codes
             .into_iter()
@@ -27515,6 +27942,9 @@ mod e2e {
         if let Some(limit) = context_limit {
             command.env("PY_CONTEXT_LIMIT", limit.to_string());
         }
+        if append_only {
+            command.env("PY_CACHE_APPEND_ONLY", "1");
+        }
         let out = crate::test_support::ProcessSession::spawn(command).collect(
             &crate::test_support::jsonl_input(&commands),
             std::time::Duration::from_secs(30),
@@ -27525,6 +27955,174 @@ mod e2e {
             server.finish(),
         )
     }
+
+    #[test]
+    fn e2e_cache_append_only_keeps_actual_request_prefix_past_eviction_trigger() {
+        let select = (0..55)
+            .map(|i| format!("agent.context.read_text('cache-output-{i}', start=0, stop=40)"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let attempt = r#"try:
+    agent.context.collapse('missing-start', 'missing-end', 'short')
+except Exception as error:
+    assert 'PY_CACHE_APPEND_ONLY' in str(error)
+else:
+    raise AssertionError('collapse unexpectedly succeeded')
+print('normal execution still allowed')"#;
+        let (events, home, requests) = model_run_with_cache_policy(
+            vec![&select, attempt, "agent.final('done')"],
+            vec![json!({"id":"cache-test","kind":"submit","text":"cache experiment"})],
+            None,
+            true,
+        );
+        assert_eq!(requests.len(), 3);
+        for pair in requests.windows(2) {
+            let before = pair[0]["messages"].as_array().unwrap();
+            let after = pair[1]["messages"].as_array().unwrap();
+            assert!(after.len() > before.len());
+            assert_eq!(&after[..before.len()], before.as_slice());
+        }
+        let selected = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m["role"] == "user"
+                    && m["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("\ncache-output-")
+            })
+            .count();
+        assert_eq!(selected, 55);
+        let records = journal(&home);
+        assert!(!records.iter().any(|r| r["kind"] == "context_replace"));
+        assert!(events.iter().any(|e| e["kind"] == "final"));
+        assert!(!events.iter().any(|e| e["kind"] == "error"));
+    }
+
+    #[test]
+    fn e2e_generated_boundary_comments_are_normalized_before_recording_and_execution() {
+        let raw = concat!(
+            "# [boundary c90001]\n",
+            "# [boundary c90002]\n",
+            "literal = '''keep this literal\n# [boundary c90003]\n'''\n",
+            "assert '# [boundary c90003]' in literal\n",
+            "print('executed normalized source')\n",
+        );
+        let (events, home, requests) = model_run(
+            vec![raw, "agent.final('done')"],
+            vec![
+                json!({"id":"manual","kind":"python","source":"# [boundary c90004]\nmanual = 1"}),
+                json!({"id":"normalize","kind":"submit","text":"normalize source"}),
+            ],
+        );
+        assert_eq!(requests.len(), 2);
+        let records = journal(&home);
+        let codes = records
+            .iter()
+            .filter(|r| r["kind"] == "code")
+            .map(|r| r["payload"]["source"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(codes.iter().any(|s| s.starts_with("# [boundary c90004]")));
+        let cleaned = codes.iter().find(|s| s.contains("literal =")).unwrap();
+        assert!(cleaned.starts_with("\n\nliteral ="));
+        assert!(!cleaned.contains("c90001") && !cleaned.contains("c90002"));
+        assert!(cleaned.contains("# [boundary c90003]"));
+        let retained = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| {
+                m["role"] == "assistant"
+                    && m["content"].as_str().unwrap_or("").contains("literal =")
+            })
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(retained.starts_with("# [boundary c"));
+        assert!(retained.contains("\n\n\nliteral ="));
+        assert!(!retained.contains("c90001") && !retained.contains("c90002"));
+        assert!(records
+            .iter()
+            .any(|r| r["kind"] == "response" && r["payload"].to_string().contains("c90001")));
+        assert!(events.iter().any(|e| e["kind"] == "final"));
+        assert!(!events.iter().any(|e| e["kind"] == "error"));
+    }
+
+    #[test]
+    fn e2e_nested_shells_share_python_cell_and_combined_output() {
+        let source = concat!(
+            "print('python-before', flush=True)\n",
+            "a = agent.sh(\"printf shell-one; printf err-one >&2\")\n",
+            "assert a['cell'] == 1 and a['stdout']['index'] == 1\n",
+            "assert H.code[1].startswith('print(')\n",
+            "assert H.stdout[1] == 'python-before\\nshell-one'\n",
+            "assert H.stderr[1] == 'err-one'\n",
+            "print('-between', flush=True)\n",
+            "b = agent.sh(\"printf shell-two; printf err-two >&2; exit 7\")\n",
+            "assert b['cell'] == 1 and b['exit_code'] == 7\n",
+            "assert b['stdout']['record_index'] != a['stdout']['record_index']\n",
+            "print('-after', flush=True)\n",
+            "agent.final('done')",
+        );
+        let (events, home, requests) = model_run(
+            vec![source],
+            vec![json!({"id":"one-cell","kind":"submit","text":"single cell"})],
+        );
+        assert_eq!(requests.len(), 1);
+        let records = journal(&home);
+        let starts = records
+            .iter()
+            .filter(|r| r["kind"] == "cell_start")
+            .collect::<Vec<_>>();
+        let ends = records
+            .iter()
+            .filter(|r| r["kind"] == "cell_end")
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(ends.len(), 1);
+        assert_eq!(starts[0]["payload"]["language"], "python");
+        assert_eq!(ends[0]["payload"]["status"], "ok");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r["kind"] == "shell_completion")
+                .count(),
+            2
+        );
+        let completion = records.iter().find(|r| r["kind"] == "completion").unwrap();
+        assert_eq!(completion["payload"]["cell"], 1);
+        let stdout_index = completion["payload"]["stdout"]["record_index"]
+            .as_u64()
+            .unwrap();
+        let stderr_index = completion["payload"]["stderr"]["record_index"]
+            .as_u64()
+            .unwrap();
+        let text = |name: &str, index: u64| {
+            records
+                .iter()
+                .filter(|r| {
+                    r["kind"] == "stream"
+                        && r["payload"]["collection"] == name
+                        && r["payload"]["index"] == index
+                })
+                .map(|r| r["payload"]["text"].as_str().unwrap())
+                .collect::<String>()
+        };
+        assert_eq!(
+            text("stdout", stdout_index),
+            "python-before\nshell-one-between\nshell-two-after\n"
+        );
+        assert_eq!(text("stderr", stderr_index), "err-oneerr-two");
+        assert_eq!(
+            events.iter().filter(|e| e["kind"] == "cell_start").count(),
+            1
+        );
+        assert!(events.iter().any(|e| e["kind"] == "final"));
+        assert!(!events.iter().any(|e| e["kind"] == "error"));
+    }
+
     #[test]
     fn e2e_actual_requests_keep_code_and_hide_outputs() {
         let (_, h, r) = model_run(
@@ -27642,7 +28240,7 @@ mod e2e {
         let report = reports[0];
         assert!(
             report.contains("python ")
-                && report.contains("stdout: 3 bytes, 1 line · stderr: empty"),
+                && report.contains("stdout: 3 chars, 1 line · stderr: empty"),
             "{report}"
         );
         assert!(
@@ -29294,6 +29892,19 @@ assert p.returncode==0,p.stderr
     }
 
     #[test]
+    fn e2e_invalid_utf8_counts_match_history_and_slices() {
+        let (events, home) = run(vec![
+            py("a", "import os\nos.write(1,b'a'*65535+b'\\xe2\\x82\\xac\\xff\\xf0\\x9f')"),
+            py("b", "text=H.stdout[1]\nassert len(text)==65538\nassert text[-3:]=='€��'\nagent.context.read_text(text,start=65535,stop=65538)"),
+        ]);
+        assert_eq!(done(&events, "a")["stdout"]["chars"], 65538);
+        assert_eq!(done(&events, "b")["status"], "ok");
+        assert!(journal(&home)
+            .iter()
+            .any(|event| event["kind"] == "context_add" && event["payload"]["text"] == "€��"));
+    }
+
+    #[test]
     fn e2e_large_unicode_stream_counts_and_slice() {
         let (ev, h) = run(vec![
             py(
@@ -29799,48 +30410,39 @@ assert p.returncode==0,p.stderr
     }
 
     #[test]
-    fn e2e_cell_histories_share_presented_indexes_for_nested_python_and_shell() {
+    fn e2e_cell_histories_share_presented_indexes_for_python_and_embedded_shell() {
         let source = r#"r=agent.sh('printf child')
-assert r['cell']==2 and r['stdout']['index']==2 and r['stderr']['index']==2
+assert r['cell']==1 and r['stdout']['index']==1 and r['stderr']['index']==1
 assert r['stdout']['record_index']==0 and r['stdout']['record_ref']=='H.records.stdout[0]'
 assert eval(r['stdout']['ref'])=='child' and eval(r['stdout']['record_ref'])=='child'
-assert H.code[2]=='printf child' and H.stdout[2]=='child' and H.stderr[2]==''
-assert H[2].code==H.cells[2].source and H[2].parent_cell==1
+assert H.code[1].startswith("r=agent.sh") and H.stdout[1]=='child' and H.stderr[1]==''
+assert H[1].code==H.cells[1].source and H[1].parent_cell is None
 print('PARENT')"#;
         let inspect = r#"assert H.code[1]==H.records.code[0]
-assert H.code[2]=='printf child' and H.stdout[1]=='PARENT\n' and H.stdout[2]=='child'
-assert H.stderr[1]==H.stderr[2]==''
-assert H.stdout[1:3]==['PARENT\n','child'] and H.stdout[:2]==['PARENT\n']
-assert H.stdout[-3:-1]==['PARENT\n','child'] and H.stdout[::-1]==['','child','PARENT\n']
-assert H.code[2:1]==[] and H[-2].cell==2 and H.cells[-1].cell==3
-assert len(H)==len(H.code)==len(H.stdout)==len(H.stderr)==len(H.events)==3
+assert H.stdout[1]=='childPARENT\n' and H.stderr[1]==''
+assert H.stdout[1:3]==['childPARENT\n',''] and H.stdout[:2]==['childPARENT\n']
+assert H.stdout[-2:-1]==['childPARENT\n'] and H.stdout[::-1]==['','childPARENT\n']
+assert H.code[2:1]==[] and H[-2].cell==1 and H.cells[-1].cell==2
+assert len(H)==len(H.code)==len(H.stdout)==len(H.stderr)==len(H.events)==2
 assert H.stdin[1]==H.stdin[2]==[] and H.say[1]==[]
-assert H[1].stdout_complete and H[2].stderr_complete and not H[3].stdout_complete
-assert H[1].record_indices['stdout']==[1] and H[2].record_indices['stdout']==[0]
-assert H.records.stdout[:]==['child','PARENT\n']
+assert H[1].stdout_complete and H[1].stderr_complete and not H[2].stdout_complete
+assert H[1].record_indices['stdout']==[1]
+assert H.records.stdout[:]==['child','childPARENT\n']
 for view in (H,H.cells,H.code,H.stdout,H.stderr,H.user,H.stdin,H.say,H.requests,H.responses,H.usage,H.raw,H.events):
- for index in (0,4,-4):
+ for index in (0,3,-3):
   try:view[index]
   except IndexError:pass
   else:raise AssertionError((view,index))"#;
         let (events, home) = run(vec![py("cell-parent", source), py("cell-inspect", inspect)]);
-        let parent = events
-            .iter()
-            .find(|event| event["kind"] == "completed" && event["command_id"] == "cell-parent")
-            .unwrap();
-        assert_eq!(parent["status"], "ok");
+        let parent = done(&events, "cell-parent");
+        assert_eq!(parent["status"], "ok", "{events:?}");
         assert_eq!(parent["cell"], 1);
         for collection in ["code", "stdout", "stderr"] {
             assert_eq!(parent[collection]["index"], 1);
         }
         assert_eq!(parent["code"]["record_index"], 0);
         assert_eq!(parent["stdout"]["record_index"], 1);
-        assert!(
-            events.iter().any(|event| event["kind"] == "completed"
-                && event["command_id"] == "cell-inspect"
-                && event["status"] == "ok"),
-            "{events:?}"
-        );
+        assert_eq!(done(&events, "cell-inspect")["status"], "ok", "{events:?}");
         let history = journal(&home);
         let starts = history
             .iter()
@@ -29851,7 +30453,7 @@ for view in (H,H.cells,H.code,H.stdout,H.stderr,H.user,H.stdin,H.say,H.requests,
                 .iter()
                 .map(|event| event["payload"]["source_ref"].clone())
                 .collect::<Vec<_>>(),
-            vec![json!("H.code[1]"), json!("H.code[2]"), json!("H.code[3]")]
+            vec![json!("H.code[1]"), json!("H.code[2]")]
         );
     }
     #[test]
@@ -30979,17 +31581,14 @@ os.write(m,b'/quit\r');p.wait(timeout=4);os.close(m)
             "{output}"
         );
         let parent_source = output.find(source).unwrap();
-        let child_source = output.find("\nprintf CHILD-OUTPUT\n").unwrap();
-        let child_output = output.find("\nCHILD-OUTPUT\n").unwrap();
-        let child_end = output.find("  ↳ cell 1 › 2 · shell").unwrap();
-        let parent_output = output.find("\nPARENT-OUTPUT\n").unwrap();
+        let combined_output = output.find("CHILD-OUTPUTPARENT-OUTPUT").unwrap();
         let parent_end = output.find("── cell 1 · python").unwrap();
         assert!(
-            parent_source < child_source
-                && child_source < child_output
-                && child_output < child_end
-                && child_end < parent_output
-                && parent_output < parent_end,
+            parent_source < combined_output && combined_output < parent_end,
+            "{output}"
+        );
+        assert!(
+            !output.contains("↳ cell") && !output.contains("\nprintf CHILD-OUTPUT\n"),
             "{output}"
         );
         let (json, _) = run(source, 160, true);
@@ -30998,8 +31597,8 @@ os.write(m,b'/quit\r');p.wait(timeout=4);os.close(m)
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .filter(|event| event["kind"] == "preview")
             .collect();
-        assert_eq!(previews.len(), 2);
-        assert_eq!(previews[1]["code"]["preview"], source);
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0]["code"]["preview"], source);
     }
     #[test]
     fn e2e_preview_omits_empty_streams_and_summarizes_only_truncation() {
@@ -34877,15 +35476,15 @@ c=Client();sources=['pass','raise ValueError("fixture")','agent.sh("printf neste
 for n,source in enumerate(sources):c.send(id='p'+str(n),kind='python',source=source);c.until('completed')
 c.send(id='s',kind='shell',command='printf direct');c.until('completed');c.send(id='status',kind='status');status=c.until('status');c.close()
 starts=[v['payload'] for v in events() if v['kind']=='cell_start'];ends=[v['payload'] for v in events() if v['kind']=='cell_end']
-assert [v['cell'] for v in starts]==[1,2,3,4,5],starts
-assert [v['cell'] for v in ends]==[1,2,4,3,5],ends
-assert starts[3]['parent_cell']==3 and starts[4]['parent_cell'] is None,starts
+assert [v['cell'] for v in starts]==[1,2,3,4],starts
+assert [v['cell'] for v in ends]==[1,2,3,4],ends
+assert all(v['parent_cell'] is None for v in starts),starts
 assert [v['source_ref'] for v in starts[:3]]==['H.code[1]','H.code[2]','H.code[3]'],starts
-assert ends[2]['stdout_ref']=='H.stdout[4]' and ends[3]['stdout_ref']=='H.stdout[3]',ends
-for start,command in zip(starts[3:],['printf nested','printf direct']):
+assert ends[2]['stdout_ref']=='H.stdout[3]' and ends[3]['stdout_ref']=='H.stdout[4]',ends
+for start,command in zip(starts[3:],['printf direct']):
  assert eval(start['source_record_ref'].replace('H.records.events','journal'),{'journal':events()})==command,start
 assert ends[0]['status']=='ok' and ends[1]['status']=='error' and all(v['elapsed_ms']>=0 for v in ends),ends
-assert status['state']=='idle' and status['cells']==5,status
+assert status['state']=='idle' and status['cells']==4,status
 assert [v['payload']['source'] for v in events() if v['kind']=='code']==sources
 states=[v for v in c.all if v['kind']=='state'];assert states[0]['state']=='idle' and states[-1]['state']=='idle',states
 assert all('model' not in v for v in states if v['state']!='thinking'),states
@@ -34954,8 +35553,8 @@ assert cell['record_refs']['code']==['H.records.code[0]'] and cell['record_refs'
     fn e2e_state_nested_shell_cell_source_and_outputs_are_readable() {
         fixture(
             r#"
-c=Client();c.send(id='parent',kind='python',source='agent.sh("printf child")\nassert H.cells[2].source=="printf child"\nassert H.cells[2].stdout=="child"\nassert H.cells[2].parent_cell==1');c.until('completed');c.close()
-ends=[v['payload'] for v in events() if v['kind']=='cell_end'];assert len(ends)==2 and all(v['status']=='ok' for v in ends),ends
+c=Client();c.send(id='parent',kind='python',source='agent.sh("printf child")\nassert H.cells[1].source.startswith("agent.sh")\nassert H.cells[1].stdout=="child"\nassert H.cells[1].parent_cell is None');c.until('completed');c.close()
+ends=[v['payload'] for v in events() if v['kind']=='cell_end'];assert len(ends)==1 and all(v['status']=='ok' for v in ends),ends
 "#,
         );
     }
@@ -35183,8 +35782,8 @@ assert b'> !printf draft_tail' in last and b'ctx ~' in last and 'cache hit 30.0%
 assert b'openai/fixture [medium]' in last and b'idle' in last,last
 # Cell 1 is an intermediate transcript boundary, not merely a redrawn footer.
 assert bytes(data).count(b'\xe2\x94\x80\xe2\x94\x80 cell 1 \xc2\xb7 python')==1,bytes(data[-8000:])
-# A nested boundary must survive relinquishing busy stdin to input().
-assert bytes(data).count(b'  \xe2\x86\xb3 cell 1 \xe2\x80\xba 2 \xc2\xb7 shell')==1,bytes(data[-8000:])
+# The helper remains part of the Python cell, without a nested separator.
+assert b'  \xe2\x86\xb3 cell 1 \xe2\x80\xba 2 \xc2\xb7 shell' not in data,bytes(data[-8000:])
 count=data.count(idle_ready);os.write(m,b'keep-\r');wait(lambda:data.count(idle_ready)>count,'draft submitted')
 commands=[v['payload']['source'] for v in events() if v['kind']=='intent' and v['payload']['type']=='shell']
 assert commands==['printf child-only','printf draft_keep-tail'],commands
