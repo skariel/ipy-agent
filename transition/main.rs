@@ -130,7 +130,7 @@ mod context_store {
             Self {
                 items: Vec::new(),
                 revision: 0,
-                trigger: 50,
+                trigger: 70,
                 retain: 20,
             }
         }
@@ -1453,29 +1453,29 @@ mod context_store_tests {
     fn default_batch_policy_keeps_twenty_recent_selected_outputs_and_never_selects_payload_implicitly(
     ) {
         let mut fixture = Fixture::new();
-        let outputs = (0..50)
+        let outputs = (0..70)
             .map(|n| item(&format!("c{n}"), &format!("selected {n}"), true, None))
             .collect::<Vec<_>>();
-        assert!(ContextStore::from_items(outputs[..49].to_vec())
+        assert!(ContextStore::from_items(outputs[..69].to_vec())
             .prepare_evict()
             .unwrap()
             .is_none());
         let mut store = ContextStore::from_items(outputs);
         let prepared = store.prepare_evict().unwrap().unwrap();
-        assert_eq!(store.items().iter().filter(|i| i.output).count(), 50);
+        assert_eq!(store.items().iter().filter(|i| i.output).count(), 70);
         store.persist(&mut fixture.journal, prepared).unwrap();
         assert_eq!(store.items().iter().filter(|i| i.output).count(), 20);
         assert!(store.items()[0].text.starts_with("[Output omitted:"));
-        assert!(store.items()[29].text.starts_with("[Output omitted:"));
-        assert_eq!(store.items()[30].text, "selected 30");
-        assert_eq!(store.items()[49].text, "selected 49");
+        assert!(store.items()[49].text.starts_with("[Output omitted:"));
+        assert_eq!(store.items()[50].text, "selected 50");
+        assert_eq!(store.items()[69].text, "selected 69");
         assert_eq!(store.revision(), 1);
         assert_eq!(
             fixture.journal.event(0).unwrap()["payload"]["reason"],
             "output_batch"
         );
         let metadata = store.metadata().to_string();
-        assert!(!metadata.contains("selected 49"));
+        assert!(!metadata.contains("selected 69"));
     }
     #[test]
     fn collapse_owns_range_and_attachment_changes_and_keeps_endpoint_text_only() {
@@ -9677,7 +9677,60 @@ mod context_attachment_tests {
     }
 }
 
-const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences. Context payloads have no added boundary markers. Assistant source boundary IDs appear only in completion observations as source boundary: cN; these identify the retained source, not the observation or cell. Use those IDs to collapse between your own messages, including intervening user messages and selections. Do not reproduce boundary metadata in Python source. Persistent CPython exposes agent and H. Treat Python as a workbench: build small reusable helpers for repeated workflows. For example, r = agent.sh('pwd'); agent.context.read_text(H.stdout[r['stdout']['index']], start=0, stop=4000). For stderr use r['stderr']['index']; there is no top-level r['index']. Run commands once, then inspect their captured history. Compose helpers instead of repeating boilerplate; keep side effects and context selection explicit. All H histories use presented one-based cell numbers: H[n] and H.cells[n] are the same cell snapshot; H.code[n] (Python or shell source), H.stdout[n], H.stderr[n] are strings. H.user/stdin/say/requests/responses/usage/raw/events[n] are ordered lists of that cell's records, never a single lossy last record. Empty streams are empty strings, empty groups are lists; missing cells raise errors. Negative indexes count cells (-1 is last); slices use cell-number endpoints (stop excluded), [:] is all cells and [::-1] reverses them. Integer zero is invalid. H.records.<collection>[i] is the complete original zero-based record archive, including failed/unassigned/global operations; raw record references and journal coordinates use this namespace. Grouped dictionary records carry cell/index, offset, record_index, record_ref; event seq and payload remain original journal coordinates. Each executed agent cell adds one compact observation like Cell 23: OK · source boundary: c42 · stdout: 3 chars, 1 line · stderr: empty · python 62ms, not a JSON metadata dump; use that number in H.code/stdout/stderr. Text stream character counts use Unicode code points after UTF-8 decoding with replacement for invalid sequences, exactly matching Python len() and slicing of H text. Payload enters model context only by explicit selection. User messages and selections are delivered without boundary prefixes or automatic stats/reference footers. Internal IDs remain available via agent.context.items(), including summary and legacy IDs. agent.context.read_text(text, *, start, stop) requires both keyword-only bounds: nonnegative integers, not bool or None, with stop>=start. It selects Unicode text[start:stop], returns a boundary ID, and rejects range widths above the fixed 8000-character cap or next-request-budget overflow without truncation. A stop past the text length clamps normally; the requested width must still fit the cap. There is no max_chars parameter. Example: agent.context.read_text(H.stderr[i], start=0, stop=4000). agent.context.read_raw(data) accepts PNG/JPEG bytes, a base64 dictionary, or a file-path string (not literal image text); max 512000 file bytes, 1536 pixels per axis, 4 active attachments; returns a boundary ID. agent.say(text) sends an intermediate user-only UI message and continues. Use agent.final(text) for every final response: it sends the strong final answer without stdout/context duplication and implicitly ends the turn after the successful cell. Never split a final answer and stopping across cells. Put agent.final last: final/stop do not return or exit Python; subsequent statements run, and a failed cell cancels the staged stop. Final publication is not transactional. agent.sh(command, cwd=None, env=None, timeout=None) runs /bin/sh -c with null stdin and no timeout by default; returns status/exit code and H stream metadata/refs, not text. agent.llm(prompt, model=..., system=..., max_tokens=2048, images=..., effort=...) returns a string; defaults to session model/effort and a helpful-assistant system. agent.llm.list() lists model metadata; agent.llm.image(prompt, model='openai/gpt-image-1') returns cell/index/offset/ref/record_index/bytes; use H.raw[result['index']][result['offset']] for its full image dictionary. raw_index aliases the cell index; record_index addresses H.records.raw. Bytes stay out of model context until explicitly selected. input(prompt) asks the user. agent.help(topic=None) returns local documentation text without printing or selecting it; topics: bgtasks, history, addresses, context, loop, sh, llm. Inspect Python docstrings too. Example: agent.context.read_text(agent.help('bgtasks'), start=0, stop=4000). Cell numbers (H.stdout[cell]), zero-based record indexes (H.records.stdout[index]), boundary IDs (collapse) and task IDs (bgtasks) are distinct namespaces; ref/record_ref names the authoritative address. agent.loop.reset_python() stages a fresh worker with the frozen startup snapshot; previous variables are lost. agent.context.items()/usage() inspect context metadata. agent.loop.stop(wakeup=None) ends this turn after a successful cell; optional wakeup=(seconds,reason) schedules one continuation. agent.bgtasks.run(source,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None) returns task metadata immediately; kind='python' uses a fresh isolated interpreter without agent or main variables. bgtasks.list(state=None),get(task_id),kill(task_id,force=False) manage jobs. Outputs stay in H; only explicit context reads select them. Completion wakeups are opt-in. Task dictionaries use id (not task_id); get/kill accept task['id']. Background stdout/stderr index is a zero-based H.records index, not a cell number. Scheduling is not success; inspect status/exit_code after completion. Example launch cell: task = agent.bgtasks.run('cargo test', name='tests', wakeup_reason='Inspect tests'); agent.loop.stop(). On completion continuation: info = agent.bgtasks.get(task['id']); agent.context.read_text(H.records.stdout[info['stdout']['index']], start=0, stop=4000); agent.context.read_text(H.records.stderr[info['stderr']['index']], start=0, stop=4000). Prefer completion wakeups over sleeping. Does not kill foreground Python. Collapse must be one standalone call with three literal strings: agent.context.collapse('start','end','summary'); successful output is silent. Use distinct ordered boundary IDs: provenance covers [start,end), replacement removes through end, preserving end text only for user/summary items. It must reduce rendered context size. In forced mode only standalone collapse or one standalone stderr-read expression is allowed, e.g. agent.context.read_text(H.stderr[44], start=0, stop=4000); 44 is an example, not a required index. The stderr index must be a literal positive cell number, with exactly start and stop keyword arguments containing literal nonnegative integers and width at most 8000: no variables, bool, None, slicing, unpacking or additional statements. No replay after resume. Execution is unrestricted except bridge restrictions during startup: ordinary definitions/imports and H reads are allowed, other agent bridges are disabled. Worker failure requires an explicit reset before repeating core startup. Outer requests request/reserve 4096 output tokens; nested LLM requests default to 2048. Reservation is accounting, not enforcement. Codex currently transmits no output-token cap; other providers receive a cap parameter that reasoning may adjust. Codex transient transport errors and HTTP 408/429/500/502/503/504 retry the same provider request at most twice by default (providers.openai-codex.request_retries, integer 0..5). Retries never rerun Python/shell; ambiguous outcomes can repeat provider generation/billing. Auth, malformed/incomplete responses and interrupted resume intents are not automatically retried. H.requests[cell][offset] and H.records.requests[record_index] metadata distinguish requested_output_tokens, transmitted_output_limit (null if absent), and reserved_output_tokens.";
+#[cfg(test)]
+mod system_prompt_tests {
+    use super::SYSTEM;
+    #[test]
+    fn compact_prompt_keeps_operating_contracts() {
+        assert!(
+            SYSTEM.chars().count() <= 5000,
+            "guide grew to {} characters",
+            SYSTEM.chars().count()
+        );
+        for section in [
+            "Execution",
+            "History and selection",
+            "Communication",
+            "Background work",
+            "Collapse and recovery",
+            "Help",
+        ] {
+            assert!(SYSTEM.contains(section), "missing {section}");
+        }
+        for contract in [
+            "ONLY with complete ordinary Python source",
+            "Persistent CPython",
+            "8000",
+            "agent.final",
+            "Put final/stop last",
+            "task['id']",
+            "H.records.stdout",
+            "source boundary:",
+            "three literal strings",
+            "No replay",
+            "startup",
+            "explicit reset",
+            "providers",
+            "agent.context.read_text(H.stderr[44], start=0, stop=4000)",
+        ] {
+            assert!(SYSTEM.contains(contract), "missing {contract}");
+        }
+        for reference in [
+            "providers.openai-codex.request_retries",
+            "raw_index",
+            "transmitted_output_limit",
+            "512000",
+            "cached_tokens",
+        ] {
+            assert!(
+                !SYSTEM.contains(reference),
+                "reference detail remains: {reference}"
+            );
+        }
+    }
+}
+
+const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences.\n\nExecution\nPersistent CPython exposes agent and H. Use Python as a workbench: build reusable helpers, run commands once, then inspect captured history. Keep side effects and context selection explicit. No replay after resume.\n\nHistory and selection\nEvery executed cell produces a compact completion observation, not its output. Its cell number addresses H.code/stdout/stderr; these are strings. H[n] and H.cells[n] are cell snapshots. H.user/stdin/say/requests/responses/usage/raw/events[n] are lists of all records in that cell. Cell numbers are one-based; zero is invalid.\nH.records.<collection>[index] is the original zero-based record archive, including global/failed operations. Do not confuse cell numbers, record indexes, boundary IDs or task IDs. ref/record_ref names the authoritative address.\nForeground example:\nr = agent.sh('pwd')\nagent.context.read_text(H.stdout[r['stdout']['index']], start=0, stop=4000)\nFor stderr use r['stderr']['index']; there is no top-level r['index'].\nOutput stays in history; only explicit selections enter model context.\nagent.context.read_text(text, *, start, stop) requires nonnegative integers (not bool), stop>=start, and stop-start<=8000 Unicode characters. Both bounds are required; no max_chars. Range or next-request-budget overflow rejects, not truncates. Stop past the end clamps, but the requested width must fit.\nSource has no added boundary comment. Completion observations expose source boundary: cN (the retained assistant source ID, not the observation or cell). Use these IDs to collapse between your own messages, including intervening user messages/selections. Do not reproduce metadata in source. agent.context.items()/usage() expose context metadata.\n\nCommunication\nagent.say(text) sends a user-only progress message and continues. input(prompt) asks the user.\nUse agent.final(text) for every final answer; it publishes without stdout/context duplication and stages turn end after a successful cell. Never split final and stopping across cells. Put final/stop last: they do not exit Python; later statements execute. A failed cell cancels staged stop, but final publication is not transactional.\nagent.loop.stop(wakeup=None) stages turn end; wakeup=(seconds,reason) requests a timed continuation.\n\nBackground work\nagent.sh(command, cwd=None, env=None, timeout=None) runs /bin/sh -c with null stdin, no timeout by default; returns metadata, not text.\nLaunch asynchronous work with an opt-in completion wakeup:\ntask = agent.bgtasks.run('cargo test', name='tests', wakeup_reason='Inspect tests')\nagent.loop.stop()\nOn completion continuation:\ninfo = agent.bgtasks.get(task['id'])\nagent.context.read_text(H.records.stdout[info['stdout']['index']], start=0, stop=4000)\nagent.context.read_text(H.records.stderr[info['stderr']['index']], start=0, stop=4000)\nTask dictionaries use id, not task_id. Background stream indexes address H.records, NOT cell-grouped H.stdout/stderr. Scheduling is not execution success; inspect status/exit_code. Prefer completion wakeups over blocking sleeps. See help for options, list/kill and isolated Python jobs.\n\nCollapse and recovery\nCollapse must be one standalone call with three literal strings:\nagent.context.collapse('start','end','summary')\nSuccess is silent. IDs must be distinct and ordered; provenance covers [start,end), replacement removes through end, preserving end text only for user/summary items. It must reduce rendered context size; history remains intact.\nIn forced mode only standalone collapse or one standalone stderr-read expression is allowed:\nagent.context.read_text(H.stderr[44], start=0, stop=4000)\n44 is an example, not a required index. The cell must be a literal positive integer, with exactly start and stop keywords containing literal nonnegative integers and width<=8000. No variables, bool, None, slicing, unpacking or other statements.\nDuring startup, ordinary definitions/imports and H reads are allowed; other agent bridges are disabled. Worker failure requires an explicit reset before repeating core startup. agent.loop.reset_python() stages a fresh worker with the frozen startup snapshot; variables are lost.\n\nHelp\nagent.help(topic=None) returns local documentation text without printing, RPCs or selection. Topics: bgtasks, history, addresses, context, loop, sh, llm, providers. Inspect Python signatures/docstrings too.\nagent.context.read_text(agent.help('bgtasks'), start=0, stop=4000)\nUse help for history edge cases, images (read_raw), nested LLM calls, provider retry policy and token accounting.\n";
 // Reasoning request fields follow the pinned Pi provider transformations, not
 // generic OpenAI-compatible guesses. This is a pure body-layout helper: it never
 // reads credentials, starts I/O or changes session state. A false/absent reasoning
@@ -12060,7 +12113,7 @@ mod context_html_export_tests {
     fn html_retains_selected_originals_after_output_eviction() {
         let directory = directory();
         let mut host = Host::new(directory.to_path_buf(), None, true, true, None, None).unwrap();
-        for number in 0..51 {
+        for number in 0..71 {
             host.add_context("user", format!("EVICT_SELECTED_{number}"), true, vec![])
                 .unwrap();
         }
@@ -26406,7 +26459,7 @@ background full transition suite: 471 passed, 0 failed (66.61s).
 ### On-demand Python API help (approved)
 agent.help(topic=None) returns ordinary documentation text; it never prints,
 selects context, launches work, or makes an RPC. None returns an overview listing
-the supported topics: bgtasks, history, addresses, context, loop, sh, llm.
+the supported topics: bgtasks, history, addresses, context, loop, sh, llm, providers.
 Unknown topics raise ValueError listing topics; non-string topics raise TypeError.
 Documentation includes actual signatures, return shapes and usable examples,
 with no credentials or live state. Python docstrings provide the same discovery
@@ -26424,6 +26477,23 @@ e2e_api_help_background_example_and_address_namespaces.
 Verification: build and formatting checks succeeded. Targeted help tests passed;
 full suite via background job with completion wakeup: 473 passed, 0 failed (65.76s).
 
+
+### Compact operating prompt and reference help (approved)
+The built-in SYSTEM is a sectioned operating guide, not the full API reference.
+Keep Python-only execution, persistent workbench, explicit bounded selection,
+cell/record addressing examples, final/stop staging, background completion
+workflow, exact collapse/forced-mode gates, startup/reset restrictions, and help
+discovery in the prompt. Move history edge cases, images, nested model defaults,
+provider retries and token accounting to on-demand help without losing them.
+providers is a supported help topic. Reference help remains local and unselected.
+The built-in guide should fit 5000 Unicode characters; this is a maintenance
+guardrail, not a user selection limit. Frozen existing session prompts are not
+rewritten. New session snapshots use the improved guide.
+Witnesses: system_prompt_tests::compact_prompt_keeps_operating_contracts;
+e2e_api_help_is_local_discoverable_and_not_selected;
+e2e_compact_prompt_example_uses_actual_history_and_bounds.
+Verification: pending.
+
 ## 20. Batched old-output eviction and cache stability
 
 Temporary cache experiment: launch with PY_CACHE_APPEND_ONLY=1 to disable
@@ -26440,8 +26510,11 @@ comparisons use a fresh session and keep model, effort and provider unchanged.
 Unset the variable (or set it to 0) to restore the normal policy below.
 
 Automatic output eviction is batched, never a sliding per-turn window.
-Current default policy: when 50 evictable output payload items accumulate,
+Current default policy: when 70 evictable output payload items accumulate,
 replace the oldest items as one batch and retain the most recent 20.
+At 69 eligible selections no batch runs; at 70, the oldest 50 are replaced
+and the newest 20 retained. Witnesses: default_batch_policy_keeps_twenty_recent_selected_outputs_and_never_selects_payload_implicitly;
+e2e_batched_output_eviction_preserves_originals; html_retains_selected_originals_after_output_eviction.
 Future configurable trigger/retention must enforce trigger > retention.
 Batching itself is required.
 
@@ -27798,6 +27871,8 @@ agent.context.read_text(text, start=0, stop=4000)
 Grouped record dictionaries carry cell/index, offset, record_index, record_ref.
 Original event seq and payload coordinates are unchanged. ref/record_ref strings
 name their address; read the named namespace directly rather than guessing.
+Text streams decode UTF-8 with replacement for invalid sequences. Character
+counts are Unicode code points, matching Python len() and slicing, not bytes.
 Reading or printing H does not select payload into model context. Missing cells
 raise errors; empty streams are strings and empty record groups are lists.
 ''',
@@ -27827,14 +27902,20 @@ read_text requires nonnegative integer bounds (not bool), stop >= start, and a
 requested width <= 8000 Unicode characters. Stop beyond the end clamps but the
 requested width still must fit. Budget overflow rejects, never silently truncates.
 Example: agent.context.read_text(agent.help('history'), start=0, stop=4000)
+Automatic text-output eviction triggers at 70 eligible selections, retaining the
+newest 20. Eviction replaces context payloads, never history; explicit rereads work.
 read_raw accepts PNG/JPEG bytes, base64 dictionary or file path; max 512000 bytes,
 1536 pixels per axis, 4 active attachments.
 collapse must be one standalone call with three literal strings and ordered
 distinct IDs. Provenance covers [start,end); replacement removes through end,
 preserving end text only for user/summary items. It must reduce context size.
 Use source IDs in completion observations for assistant-to-assistant collapse.
-History stays intact. Forced mode permits only standalone collapse or the
-documented literal stderr selection; help is not a forced-mode escape hatch.
+History stays intact. In forced mode only standalone collapse or a standalone
+agent.context.read_text(H.stderr[44], start=0, stop=4000) is permitted. 44 is an
+example, not a required index: use a literal positive cell number. Exactly start
+and stop keyword arguments must have literal nonnegative integers and width
+<=8000. No variables, bool, None, slicing, unpacking or other statements.
+help is not a forced-mode escape hatch.
 ''',
     'loop': '''agent.loop: staged turn control
 stop(*, wakeup=None) -> stages turn end after a successful cell
@@ -27848,6 +27929,11 @@ On completion, use agent.bgtasks.get(task['id']) and explicitly select output.
 stop/final do not return or exit Python; later statements still execute. Put them
 last. A failed cell cancels staged stop. Reset loses variables; history remains.
 agent.final(text) publishes the final answer and implicitly stages turn end.
+Publication is not transactional: a later exception cannot retract it.
+During startup, ordinary definitions/imports and H reads are allowed; other agent
+bridges are disabled. Worker failure requires explicit reset before core startup
+can repeat; reset/resume use the original frozen startup snapshot, not edited files.
+No replay of completed work after resume.
 ''',
     'sh': '''agent.sh(command, cwd=None, env=None, timeout=None)
 Runs /bin/sh -c with null stdin; no timeout by default.
@@ -27861,6 +27947,41 @@ agent.context.read_text(H.stdout[r['stdout']['index']], start=0, stop=4000)
 agent.context.read_text(H.stderr[r['stderr']['index']], start=0, stop=4000)
 Run once, inspect captured history. For async work use agent.bgtasks.run;
 its output indexes use H.records instead.
+''',
+    'providers': '''Provider requests, retries and usage accounting
+Outer requests request/reserve 4096 output tokens; nested agent.llm requests
+default to 2048. Reservation is accounting, not enforcement. Codex currently
+transmits no output-token cap; other providers receive a cap that reasoning may adjust.
+H.requests[cell][offset] and H.records.requests[record_index] distinguish:
+requested_output_tokens: requested generation budget
+transmitted_output_limit: actual provider cap (None if absent)
+reserved_output_tokens: context accounting reservation
+Cell groups retain every request, not just the last one. Record indexes are zero-based.
+Example:
+requests = H.requests[-1]
+if requests:
+    request = requests[0]
+    print(request['requested_output_tokens'], request['transmitted_output_limit'],
+          request['reserved_output_tokens'])
+Printing does not select output; explicitly select H.stdout if needed.
+
+Codex transient transport errors and HTTP 408/429/500/502/503/504 retry the
+same provider request at most twice by default. Configuration:
+providers.openai-codex.request_retries is an integer 0..5.
+Retries never rerun Python or shell. Ambiguous outcomes may repeat generation/billing.
+Auth, malformed/incomplete responses and interrupted resume intents are not
+automatically retried. No automatic model fallback.
+Retry-After seconds are honored up to 30s; unsupported/date/longer headers stop
+instead of retrying earlier than requested.
+
+Cache hit percentage is a cumulative ratio of measured cached input to measured
+total input, not an average of per-request percentages or context occupancy.
+Only valid input/cache pairs contribute to the ratio. Missing usage, unknown
+attempts or incomplete legacy coverage mark the metric partial; later successful
+measurements do not erase earlier missing data.
+Usage reports distinguish reported_input_tokens/reported_cache_hit_tokens
+from complete totals, with cache_percentage_complete/cache_usage_complete flags.
+Context occupancy is separately estimated, not an exact provider token count.
 ''',
     'llm': '''agent.llm(prompt, model=..., system=..., max_tokens=2048, images=..., effort=...)
 Returns a string; default model/effort are the session settings.
@@ -27879,13 +28000,13 @@ Nested calls do not execute their returned source. Select or execute deliberatel
 _API_OVERVIEW = '''agent.help(topic=None) returns ordinary documentation text without printing,
 RPCs, context selection or work. To see it in model context:
 agent.context.read_text(agent.help('bgtasks'), start=0, stop=4000)
-Topics: bgtasks, history, addresses, context, loop, sh, llm.
+Topics: bgtasks, history, addresses, context, loop, sh, llm, providers.
 Use agent.help('addresses') to distinguish cell numbers, record indexes,
 boundary IDs and task IDs. Inspect signatures/docstrings with Python inspect.
 '''
 def _help(topic=None):
     '''agent.help(topic=None) -> documentation string; no printing, RPC or selection.
-    Topics: bgtasks, history, addresses, context, loop, sh, llm.
+    Topics: bgtasks, history, addresses, context, loop, sh, llm, providers.
     Example: agent.context.read_text(agent.help('bgtasks'), start=0, stop=4000).
     '''
     if topic is None:return _API_OVERVIEW
@@ -28547,12 +28668,54 @@ print('normal execution still allowed')"#;
     }
 
     #[test]
+    fn e2e_compact_prompt_example_uses_actual_history_and_bounds() {
+        let (events, _, requests) = model_run(
+            vec![
+                "r = agent.sh('printf prompt-example'); agent.context.read_text(H.stdout[r['stdout']['index']], start=0, stop=4000)",
+                r#"assert H.stdout[1] == 'prompt-example'
+assert H.code[1].startswith('r = agent.sh')
+try: agent.context.read_text('x' * 8001, start=0, stop=8001)
+except ValueError: pass
+else: raise AssertionError('oversize selection accepted')
+agent.context.read_text(agent.help('providers'), start=0, stop=4000)"#,
+                "agent.final('done')",
+            ],
+            vec![json!({"id":"compact","kind":"submit","text":"exercise the guide"})],
+        );
+        assert!(
+            events
+                .iter()
+                .filter(|e| e["kind"] == "completed")
+                .all(|e| e["status"] == "ok"),
+            "{events:?}"
+        );
+        assert_eq!(
+            events.iter().filter(|e| e["kind"] == "completed").count(),
+            3
+        );
+        assert_eq!(requests.len(), 3);
+        let wire = requests[1]["messages"].as_array().unwrap();
+        assert!(wire.iter().any(|m| m["content"] == "prompt-example"));
+        let system = requests[0]["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("Background work") && system.contains("agent.help(topic=None)"));
+        assert!(requests[2]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("transmitted_output_limit")));
+    }
+
+    #[test]
     fn e2e_api_help_is_local_discoverable_and_not_selected() {
         let source = r#"
 import inspect
 overview = agent.help()
 assert isinstance(overview, str) and 'agent.help' in overview
-for topic in ('bgtasks', 'history', 'addresses', 'context', 'loop', 'sh', 'llm'):
+for topic in ('bgtasks', 'history', 'addresses', 'context', 'loop', 'sh', 'llm', 'providers'):
     text = agent.help(topic)
     assert isinstance(text, str) and text
 assert 'H.records.stdout' in agent.help('bgtasks')
@@ -28560,6 +28723,16 @@ assert 'not task_id' in agent.help('bgtasks')
 assert 'wakeup_reason' in agent.help('bgtasks')
 assert 'record index' in agent.help('addresses').lower()
 assert '8000' in agent.help('context')
+assert '512000' in agent.help('context')
+assert 'UTF-8' in agent.help('history')
+assert 'raw_index' in agent.help('llm')
+assert 'startup' in agent.help('loop')
+provider_help = agent.help('providers')
+for detail in ('requested_output_tokens', 'transmitted_output_limit',
+               'reserved_output_tokens', '4096', '2048', 'HTTP 408/429/500/502/503/504',
+               'providers.openai-codex.request_retries', 'H.requests'):
+    assert detail in provider_help, detail
+assert len(provider_help) <= 8000
 assert 'topic' in agent.help.__doc__
 assert 'H.records' in agent.bgtasks.__doc__
 assert 'id' in agent.bgtasks.run.__doc__
@@ -29037,7 +29210,7 @@ agent.context.read_text(agent.help('history'), start=0, stop=4000)
     }
     #[test]
     fn e2e_batched_output_eviction_preserves_originals() {
-        let source = (0..49)
+        let source = (0..69)
             .map(|i| format!("agent.context.read_text('output-{i}', start=0, stop=20)"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -29045,7 +29218,7 @@ agent.context.read_text(agent.help('history'), start=0, stop=4000)
             py("a", &source),
             py(
                 "b",
-                "agent.context.read_text('output-49', start=0, stop=20)",
+                "agent.context.read_text('output-69', start=0, stop=20)",
             ),
             py("c", "print(len(H.events))"),
         ]);
@@ -29058,15 +29231,15 @@ agent.context.read_text(agent.help('history'), start=0, stop=4000)
         let items = batches[0]["payload"]["items"].as_array().unwrap();
         assert_eq!(items.iter().filter(|i| i["output"] == true).count(), 20);
         assert!(items[0]["text"].as_str().unwrap().contains("omitted"));
-        assert!(items[29]["text"].as_str().unwrap().contains("omitted"));
-        assert_eq!(items[30]["text"], "output-30");
-        assert_eq!(items[49]["text"], "output-49");
+        assert!(items[49]["text"].as_str().unwrap().contains("omitted"));
+        assert_eq!(items[50]["text"], "output-50");
+        assert_eq!(items[69]["text"], "output-69");
         let adds_before_batch = j
             .iter()
             .take_while(|v| v["seq"] != batches[0]["seq"])
             .filter(|v| v["kind"] == "context_add" && v["payload"]["output"] == true)
             .count();
-        assert_eq!(adds_before_batch, 50);
+        assert_eq!(adds_before_batch, 70);
         assert!(j
             .iter()
             .any(|v| v["kind"] == "context_add" && v["payload"]["text"] == "output-0"));
