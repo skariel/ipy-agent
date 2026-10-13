@@ -10895,7 +10895,11 @@ fn terminal_cell_end(v: &Value, width: usize) -> Vec<String> {
         "{label}{}",
         "─".repeat(width.saturating_sub(terminal_columns(&label)))
     );
-    terminal_style_lines(terminal_wrap(&text, width).0, terminal_result_style(status))
+    let mut lines =
+        terminal_style_lines(terminal_wrap(&text, width).0, terminal_result_style(status));
+    lines.insert(0, String::new());
+    lines.push(String::new());
+    lines
 }
 fn ui_json(title: &str, value: &Value) {
     ui_text(title);
@@ -13339,6 +13343,52 @@ mod busy_editor_tests {
             matches!(picker.apply(PickerAction::Accept),PickerDecision::Accepted(value) if value=="two")
         );
     }
+
+    #[test]
+    fn shared_footer_spacers_are_owned_and_tiny_terminals_remain_usable() {
+        for headers in [
+            vec!["status".into()],
+            vec!["wrapped status".into(), "continued".into()],
+        ] {
+            let footer = EditorFooterLayout::new(&headers, "draft", 3, 80, 24);
+            assert_eq!(footer.headers.first().unwrap(), "");
+            assert_eq!(footer.headers.last().unwrap(), "");
+            assert_eq!(
+                &footer.headers[1..footer.headers.len() - 1],
+                headers.as_slice()
+            );
+            assert_eq!(footer.cursor_row, headers.len() + 2);
+            assert_eq!(footer.rows(), headers.len() + 3);
+        }
+        let empty = EditorFooterLayout::new(&[], "draft", 3, 80, 24);
+        assert!(empty.headers.is_empty());
+        for height in 1..9 {
+            let footer = EditorFooterLayout::new(&["status".into()], "a\nb\nc", 4, 12, height);
+            assert!(
+                footer.rows() <= height,
+                "rows={} height={height}",
+                footer.rows()
+            );
+            assert!(footer.cursor_row < footer.rows());
+            assert!(footer.cursor_column < 12);
+        }
+        let tiny = EditorFooterLayout::new(&["status".into()], "draft", 3, 12, 4);
+        assert!(tiny.headers.is_empty());
+    }
+    #[test]
+    fn terminal_cell_separator_spacing() {
+        let parent = json!({"cell":1,"status":"ok","language":"python","elapsed_ms":10});
+        let lines = terminal_cell_end(&parent, 200);
+        assert_eq!(lines.first().unwrap(), "");
+        assert_eq!(lines.last().unwrap(), "");
+        assert!(lines[1].contains("cell 1"));
+        let child =
+            json!({"cell":2,"parent_cell":1,"status":"ok","language":"python","elapsed_ms":10});
+        assert!(terminal_cell_end(&child, 200)
+            .iter()
+            .all(|line| !line.is_empty()));
+    }
+
     #[test]
     fn shared_footer_places_menu_after_all_visible_prompt_rows_and_owns_query_cursor() {
         let choices = vec![rustyline::completion::Pair {
@@ -14153,7 +14203,14 @@ struct EditorFooterLayout {
 impl EditorFooterLayout {
     fn new(headers: &[String], line: &str, cursor: usize, width: usize, height: usize) -> Self {
         let limit = height.saturating_sub(4).min(2);
-        let headers = headers[..headers.len().min(limit)].to_vec();
+        let mut headers = headers[..headers.len().min(limit)].to_vec();
+        // Spacer rows belong to the editable region, not to permanent output:
+        // account for them in viewport, cursor and completion-menu coordinates.
+        // Preserve room for input and menus on short terminals.
+        if !headers.is_empty() && height >= 8 {
+            headers.insert(0, String::new());
+            headers.push(String::new());
+        }
         let pad = if width >= 4 {
             2
         } else {
@@ -21179,7 +21236,10 @@ mod provider_retry_tests {
         assert!(terminal_cell_end(&event, 40).join("\n").contains("error"));
         event["parent_cell"] = Value::Null;
         let parent = terminal_cell_end(&event, 500).join("\n");
-        assert!(parent.starts_with("── cell 50 · shell"), "{parent}");
+        assert!(
+            parent.starts_with("\n── cell 50 · shell") && parent.ends_with("\n"),
+            "{parent}"
+        );
         assert!(
             parent.contains("cache hit") && parent.contains("codex/model"),
             "{parent}"
@@ -26492,7 +26552,23 @@ rewritten. New session snapshots use the improved guide.
 Witnesses: system_prompt_tests::compact_prompt_keeps_operating_contracts;
 e2e_api_help_is_local_discoverable_and_not_selected;
 e2e_compact_prompt_example_uses_actual_history_and_bounds.
-Verification: pending.
+Verification: background build/format checks and full suite passed:
+475 tests, 0 failures (67.31s), including the 70-selection eviction policy.
+
+
+### Cell separator whitespace (approved)
+Human terminal cell separators have one blank row before the separator and one
+after it, separating answer/output above from the editable prompt below.
+The shared idle/busy footer owns both spacer rows: redraws, cursor positions,
+wrapped input and completion-menu placement must include them. Menus remain
+directly below the visible prompt, without an extra intervening gap.
+Tiny terminals may omit spacers to preserve usable prompt/menu rows. Nested
+child completion labels remain compact. JSON events, journal payloads and
+model context are unchanged.
+Witnesses: shared_footer_spacers_are_owned_and_tiny_terminals_remain_usable;
+terminal_cell_separator_spacing; e2e_idle_and_busy_completion_have_identical_below_prompt_panels.
+Verification: background build and formatting checks passed; full suite
+477 passed, 0 failed (66.77s), including idle/busy PTY spacing and menu parity.
 
 ## 20. Batched old-output eviction and cache stability
 
@@ -28690,7 +28766,10 @@ agent.context.read_text(agent.help('providers'), start=0, stop=4000)"#,
             "{events:?}"
         );
         assert_eq!(
-            events.iter().filter(|e| e["kind"] == "completed").count(),
+            events
+                .iter()
+                .filter(|e| e["kind"] == "completed" && e["code"].is_object())
+                .count(),
             3
         );
         assert_eq!(requests.len(), 3);
@@ -38790,6 +38869,9 @@ def panel(start):
  prompt=next(index for index,line in enumerate(lines) if line.startswith('> /mo'))
  menu=next(index for index,line in enumerate(lines) if line.startswith('Fuzzy select'))
  assert menu==prompt+1,lines
+ assert lines[0]=='',lines
+ assert lines[prompt-1]=='',lines
+ assert any('── ' in line for line in lines[1:prompt-1]),lines
  rows=[line.rstrip('\r') for line in lines[menu:menu+8]]
  assert rows[1]=='Find: /mo',rows
  return rows
