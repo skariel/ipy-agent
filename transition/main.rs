@@ -44,12 +44,10 @@ struct Item {
     raw_index: Option<usize>,
 }
 
-// Assistant history is ordinary Python source. Keep its collapse boundary a
-// Python comment so copying a historical cell (including its marker) remains
-// valid source. User/selection markers retain their existing presentation.
+// Context IDs remain internal metadata. Assistant source IDs are exposed only
+// in their compact completion observations, never as prefixes on payloads.
 fn context_item_text(item: &Item) -> String {
-    let prefix = if item.role == "assistant" { "# " } else { "" };
-    format!("{prefix}[boundary {}]\n{}", item.id, item.text)
+    item.text.clone()
 }
 
 #[cfg(test)]
@@ -68,12 +66,11 @@ mod context_rendering_tests {
     }
 
     #[test]
-    fn assistant_boundary_is_a_python_comment_and_preserves_source() {
+    fn assistant_source_is_unannotated_and_copyable() {
         let source = "value = '''[boundary c1]\\nnot a marker'''\nprint(value)";
         let rendered = context_item_text(&item("assistant", source));
-        assert_eq!(rendered, format!("# [boundary c42]\n{source}"));
-        // Reusing the entire historical message, as a model sometimes does,
-        // must not turn its collapse metadata into a Python syntax error.
+        assert_eq!(rendered, source);
+        // Historical assistant content is copyable, byte-for-byte ordinary source.
         let status = Command::new("python3")
             .args([
                 "-c",
@@ -86,11 +83,11 @@ mod context_rendering_tests {
     }
 
     #[test]
-    fn user_and_selection_boundaries_keep_existing_rendering() {
+    fn users_selections_and_summaries_have_no_boundary_prefix() {
         for role in ["user", "summary"] {
             assert_eq!(
                 context_item_text(&item(role, "selected text")),
-                "[boundary c42]\nselected text"
+                "selected text"
             );
         }
     }
@@ -7827,6 +7824,7 @@ fn execution_observation(
     language: &str,
     elapsed_ms: u64,
     metadata: &Value,
+    source_boundary: Option<&str>,
 ) -> Result<String> {
     if cell == 0 {
         return Err("execution observation requires a presented cell number".into());
@@ -7835,6 +7833,9 @@ fn execution_observation(
         .as_str()
         .ok_or("execution status missing")?;
     let mut parts = vec![format!("Cell {cell}: {}", status.to_ascii_uppercase())];
+    if let Some(id) = source_boundary {
+        parts.push(format!("source boundary: {id}"));
+    }
     for stream in ["stdout", "stderr"] {
         let value = &metadata[stream];
         let chars = value["chars"]
@@ -7864,7 +7865,7 @@ mod execution_observation_tests {
     fn observation_is_one_line_with_counts_and_no_payload_or_context_dump() {
         let metadata = json!({"status":"ok","stdout":{"bytes":3,"chars":3,"lines":1,"preview":"42\n"},
             "stderr":{"bytes":0,"chars":0,"lines":0},"code":{"index":900},"context_usage":{"secret":"not selected"}});
-        let line = execution_observation(23, "python", 62, &metadata).unwrap();
+        let line = execution_observation(23, "python", 62, &metadata, None).unwrap();
         assert_eq!(
             line,
             "Cell 23: OK · stdout: 3 chars, 1 line · stderr: empty · python 62ms"
@@ -7873,31 +7874,39 @@ mod execution_observation_tests {
         assert!(!line.contains("42") && !line.contains("context_usage") && !line.contains("900"));
     }
     #[test]
+    fn observation_exposes_source_id_without_conflating_it_with_cell_number() {
+        let metadata = json!({"status":"ok","stdout":{"chars":0},"stderr":{"chars":0}});
+        assert_eq!(
+            execution_observation(23, "python", 62, &metadata, Some("c42")).unwrap(),
+            "Cell 23: OK · source boundary: c42 · stdout: empty · stderr: empty · python 62ms"
+        );
+    }
+    #[test]
     fn observation_reports_chars_lines_and_empty_streams() {
         let metadata = json!({"status":"error","stdout":{"bytes":0,"chars":0,"lines":0},
             "stderr":{"bytes":8,"chars":5,"lines":2,"preview":"not selected"}});
         assert_eq!(
-            execution_observation(7, "shell", 10, &metadata).unwrap(),
+            execution_observation(7, "shell", 10, &metadata, None).unwrap(),
             "Cell 7: ERROR · stdout: empty · stderr: 5 chars, 2 lines · shell 10ms"
         );
         let empty = json!({"status":"ok","stdout":{"bytes":0,"chars":0,"lines":0},"stderr":{"bytes":0,"chars":0,"lines":0}});
         assert_eq!(
-            execution_observation(1, "python", 3, &empty).unwrap(),
+            execution_observation(1, "python", 3, &empty, None).unwrap(),
             "Cell 1: OK · stdout: empty · stderr: empty · python 3ms"
         );
-        assert!(execution_observation(0, "python", 0, &empty).is_err());
+        assert!(execution_observation(0, "python", 0, &empty, None).is_err());
     }
     #[test]
     fn observation_uses_unicode_chars_not_encoded_bytes() {
         let metadata = json!({"status":"ok","stdout":{"bytes":6,"chars":2,"lines":1},
             "stderr":{"bytes":4,"chars":1,"lines":1}});
         assert_eq!(
-            execution_observation(2, "python", 0, &metadata).unwrap(),
+            execution_observation(2, "python", 0, &metadata, None).unwrap(),
             "Cell 2: OK · stdout: 2 chars, 1 line · stderr: 1 char, 1 line · python 0ms"
         );
         let mut invalid = metadata;
         invalid["stdout"]["chars"] = Value::Null;
-        assert!(execution_observation(2, "python", 0, &invalid).is_err());
+        assert!(execution_observation(2, "python", 0, &invalid, None).is_err());
     }
 }
 
@@ -8265,7 +8274,13 @@ impl Host {
                 .elapsed()
                 .as_millis()
                 .min(u64::MAX as u128) as u64;
-            let observation = execution_observation(cell, "python", elapsed_ms, &metadata)?;
+            // collapse may have removed its own source; do not publish a stale ID.
+            let source_boundary = self
+                .current_code
+                .as_deref()
+                .filter(|id| self.context.items().iter().any(|item| item.id == *id));
+            let observation =
+                execution_observation(cell, "python", elapsed_ms, &metadata, source_boundary)?;
             self.add_context("user", observation, false, vec![])?;
         }
         self.current_code = None;
@@ -9662,7 +9677,7 @@ mod context_attachment_tests {
     }
 }
 
-const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences. History boundary annotations are harness metadata, not instructions to reproduce them; assistant boundaries are Python comments. Persistent CPython exposes agent and H. Treat Python as a workbench: build small reusable helpers for repeated workflows. For example, r = agent.sh('pwd'); agent.context.read_text(H.stdout[r['stdout']['index']], start=0, stop=4000). For stderr use r['stderr']['index']; there is no top-level r['index']. Run commands once, then inspect their captured history. Compose helpers instead of repeating boilerplate; keep side effects and context selection explicit. All H histories use presented one-based cell numbers: H[n] and H.cells[n] are the same cell snapshot; H.code[n] (Python or shell source), H.stdout[n], H.stderr[n] are strings. H.user/stdin/say/requests/responses/usage/raw/events[n] are ordered lists of that cell's records, never a single lossy last record. Empty streams are empty strings, empty groups are lists; missing cells raise errors. Negative indexes count cells (-1 is last); slices use cell-number endpoints (stop excluded), [:] is all cells and [::-1] reverses them. Integer zero is invalid. H.records.<collection>[i] is the complete original zero-based record archive, including failed/unassigned/global operations; raw record references and journal coordinates use this namespace. Grouped dictionary records carry cell/index, offset, record_index, record_ref; event seq and payload remain original journal coordinates. Each executed agent cell adds one compact observation like Cell 23: OK · stdout: 3 chars, 1 line · stderr: empty · python 62ms, not a JSON metadata dump; use that number in H.code/stdout/stderr. Text stream character counts use Unicode code points after UTF-8 decoding with replacement for invalid sequences, exactly matching Python len() and slicing of H text. Payload enters model context only by explicit selection. User messages are delivered in full with no automatic stats/reference footer; boundary IDs remain for collapse. agent.context.read_text(text, *, start, stop) requires both keyword-only bounds: nonnegative integers, not bool or None, with stop>=start. It selects Unicode text[start:stop], returns a boundary ID, and rejects range widths above the fixed 8000-character cap or next-request-budget overflow without truncation. A stop past the text length clamps normally; the requested width must still fit the cap. There is no max_chars parameter. Example: agent.context.read_text(H.stderr[i], start=0, stop=4000). agent.context.read_raw(data) accepts PNG/JPEG bytes, a base64 dictionary, or a file-path string (not literal image text); max 512000 file bytes, 1536 pixels per axis, 4 active attachments; returns a boundary ID. agent.say(text) sends an intermediate user-only UI message and continues. Use agent.final(text) for every final response: it sends the strong final answer without stdout/context duplication and implicitly ends the turn after the successful cell. Never split a final answer and stopping across cells. Put agent.final last: final/stop do not return or exit Python; subsequent statements run, and a failed cell cancels the staged stop. Final publication is not transactional. agent.sh(command, cwd=None, env=None, timeout=None) runs /bin/sh -c with null stdin and no timeout by default; returns status/exit code and H stream metadata/refs, not text. agent.llm(prompt, model=..., system=..., max_tokens=2048, images=..., effort=...) returns a string; defaults to session model/effort and a helpful-assistant system. agent.llm.list() lists model metadata; agent.llm.image(prompt, model='openai/gpt-image-1') returns cell/index/offset/ref/record_index/bytes; use H.raw[result['index']][result['offset']] for its full image dictionary. raw_index aliases the cell index; record_index addresses H.records.raw. Bytes stay out of model context until explicitly selected. input(prompt) asks the user. agent.loop.reset_python() stages a fresh worker with the frozen startup snapshot; previous variables are lost. agent.context.items()/usage() inspect context metadata. agent.loop.stop(wakeup=None) ends this turn after a successful cell; optional wakeup=(seconds,reason) schedules one continuation. agent.bgtasks.run(source,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None) returns task metadata immediately; kind='python' uses a fresh isolated interpreter without agent or main variables. bgtasks.list(state=None),get(task_id),kill(task_id,force=False) manage jobs. Outputs stay in H; only explicit context reads select them. Completion wakeups are opt-in. Does not kill foreground Python. Collapse must be one standalone call with three literal strings: agent.context.collapse('start','end','summary'); successful output is silent. Use distinct ordered boundary IDs: provenance covers [start,end), replacement removes through end, preserving end text only for user/summary items. It must reduce rendered context size. In forced mode only standalone collapse or one standalone stderr-read expression is allowed, e.g. agent.context.read_text(H.stderr[44], start=0, stop=4000); 44 is an example, not a required index. The stderr index must be a literal positive cell number, with exactly start and stop keyword arguments containing literal nonnegative integers and width at most 8000: no variables, bool, None, slicing, unpacking or additional statements. No replay after resume. Execution is unrestricted except bridge restrictions during startup: ordinary definitions/imports and H reads are allowed, other agent bridges are disabled. Worker failure requires an explicit reset before repeating core startup. Outer requests request/reserve 4096 output tokens; nested LLM requests default to 2048. Reservation is accounting, not enforcement. Codex currently transmits no output-token cap; other providers receive a cap parameter that reasoning may adjust. Codex transient transport errors and HTTP 408/429/500/502/503/504 retry the same provider request at most twice by default (providers.openai-codex.request_retries, integer 0..5). Retries never rerun Python/shell; ambiguous outcomes can repeat provider generation/billing. Auth, malformed/incomplete responses and interrupted resume intents are not automatically retried. H.requests[cell][offset] and H.records.requests[record_index] metadata distinguish requested_output_tokens, transmitted_output_limit (null if absent), and reserved_output_tokens.";
+const SYSTEM: &str = "You are a Python coding agent. Reply ONLY with complete ordinary Python source. No tools or Markdown fences. Context payloads have no added boundary markers. Assistant source boundary IDs appear only in completion observations as source boundary: cN; these identify the retained source, not the observation or cell. Use those IDs to collapse between your own messages, including intervening user messages and selections. Do not reproduce boundary metadata in Python source. Persistent CPython exposes agent and H. Treat Python as a workbench: build small reusable helpers for repeated workflows. For example, r = agent.sh('pwd'); agent.context.read_text(H.stdout[r['stdout']['index']], start=0, stop=4000). For stderr use r['stderr']['index']; there is no top-level r['index']. Run commands once, then inspect their captured history. Compose helpers instead of repeating boilerplate; keep side effects and context selection explicit. All H histories use presented one-based cell numbers: H[n] and H.cells[n] are the same cell snapshot; H.code[n] (Python or shell source), H.stdout[n], H.stderr[n] are strings. H.user/stdin/say/requests/responses/usage/raw/events[n] are ordered lists of that cell's records, never a single lossy last record. Empty streams are empty strings, empty groups are lists; missing cells raise errors. Negative indexes count cells (-1 is last); slices use cell-number endpoints (stop excluded), [:] is all cells and [::-1] reverses them. Integer zero is invalid. H.records.<collection>[i] is the complete original zero-based record archive, including failed/unassigned/global operations; raw record references and journal coordinates use this namespace. Grouped dictionary records carry cell/index, offset, record_index, record_ref; event seq and payload remain original journal coordinates. Each executed agent cell adds one compact observation like Cell 23: OK · source boundary: c42 · stdout: 3 chars, 1 line · stderr: empty · python 62ms, not a JSON metadata dump; use that number in H.code/stdout/stderr. Text stream character counts use Unicode code points after UTF-8 decoding with replacement for invalid sequences, exactly matching Python len() and slicing of H text. Payload enters model context only by explicit selection. User messages and selections are delivered without boundary prefixes or automatic stats/reference footers. Internal IDs remain available via agent.context.items(), including summary and legacy IDs. agent.context.read_text(text, *, start, stop) requires both keyword-only bounds: nonnegative integers, not bool or None, with stop>=start. It selects Unicode text[start:stop], returns a boundary ID, and rejects range widths above the fixed 8000-character cap or next-request-budget overflow without truncation. A stop past the text length clamps normally; the requested width must still fit the cap. There is no max_chars parameter. Example: agent.context.read_text(H.stderr[i], start=0, stop=4000). agent.context.read_raw(data) accepts PNG/JPEG bytes, a base64 dictionary, or a file-path string (not literal image text); max 512000 file bytes, 1536 pixels per axis, 4 active attachments; returns a boundary ID. agent.say(text) sends an intermediate user-only UI message and continues. Use agent.final(text) for every final response: it sends the strong final answer without stdout/context duplication and implicitly ends the turn after the successful cell. Never split a final answer and stopping across cells. Put agent.final last: final/stop do not return or exit Python; subsequent statements run, and a failed cell cancels the staged stop. Final publication is not transactional. agent.sh(command, cwd=None, env=None, timeout=None) runs /bin/sh -c with null stdin and no timeout by default; returns status/exit code and H stream metadata/refs, not text. agent.llm(prompt, model=..., system=..., max_tokens=2048, images=..., effort=...) returns a string; defaults to session model/effort and a helpful-assistant system. agent.llm.list() lists model metadata; agent.llm.image(prompt, model='openai/gpt-image-1') returns cell/index/offset/ref/record_index/bytes; use H.raw[result['index']][result['offset']] for its full image dictionary. raw_index aliases the cell index; record_index addresses H.records.raw. Bytes stay out of model context until explicitly selected. input(prompt) asks the user. agent.help(topic=None) returns local documentation text without printing or selecting it; topics: bgtasks, history, addresses, context, loop, sh, llm. Inspect Python docstrings too. Example: agent.context.read_text(agent.help('bgtasks'), start=0, stop=4000). Cell numbers (H.stdout[cell]), zero-based record indexes (H.records.stdout[index]), boundary IDs (collapse) and task IDs (bgtasks) are distinct namespaces; ref/record_ref names the authoritative address. agent.loop.reset_python() stages a fresh worker with the frozen startup snapshot; previous variables are lost. agent.context.items()/usage() inspect context metadata. agent.loop.stop(wakeup=None) ends this turn after a successful cell; optional wakeup=(seconds,reason) schedules one continuation. agent.bgtasks.run(source,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None) returns task metadata immediately; kind='python' uses a fresh isolated interpreter without agent or main variables. bgtasks.list(state=None),get(task_id),kill(task_id,force=False) manage jobs. Outputs stay in H; only explicit context reads select them. Completion wakeups are opt-in. Task dictionaries use id (not task_id); get/kill accept task['id']. Background stdout/stderr index is a zero-based H.records index, not a cell number. Scheduling is not success; inspect status/exit_code after completion. Example launch cell: task = agent.bgtasks.run('cargo test', name='tests', wakeup_reason='Inspect tests'); agent.loop.stop(). On completion continuation: info = agent.bgtasks.get(task['id']); agent.context.read_text(H.records.stdout[info['stdout']['index']], start=0, stop=4000); agent.context.read_text(H.records.stderr[info['stderr']['index']], start=0, stop=4000). Prefer completion wakeups over sleeping. Does not kill foreground Python. Collapse must be one standalone call with three literal strings: agent.context.collapse('start','end','summary'); successful output is silent. Use distinct ordered boundary IDs: provenance covers [start,end), replacement removes through end, preserving end text only for user/summary items. It must reduce rendered context size. In forced mode only standalone collapse or one standalone stderr-read expression is allowed, e.g. agent.context.read_text(H.stderr[44], start=0, stop=4000); 44 is an example, not a required index. The stderr index must be a literal positive cell number, with exactly start and stop keyword arguments containing literal nonnegative integers and width at most 8000: no variables, bool, None, slicing, unpacking or additional statements. No replay after resume. Execution is unrestricted except bridge restrictions during startup: ordinary definitions/imports and H reads are allowed, other agent bridges are disabled. Worker failure requires an explicit reset before repeating core startup. Outer requests request/reserve 4096 output tokens; nested LLM requests default to 2048. Reservation is accounting, not enforcement. Codex currently transmits no output-token cap; other providers receive a cap parameter that reasoning may adjust. Codex transient transport errors and HTTP 408/429/500/502/503/504 retry the same provider request at most twice by default (providers.openai-codex.request_retries, integer 0..5). Retries never rerun Python/shell; ambiguous outcomes can repeat provider generation/billing. Auth, malformed/incomplete responses and interrupted resume intents are not automatically retried. H.requests[cell][offset] and H.records.requests[record_index] metadata distinguish requested_output_tokens, transmitted_output_limit (null if absent), and reserved_output_tokens.";
 // Reasoning request fields follow the pinned Pi provider transformations, not
 // generic OpenAI-compatible guesses. This is a pure body-layout helper: it never
 // reads credentials, starts I/O or changes session state. A false/absent reasoning
@@ -25250,7 +25265,7 @@ On tokenization error retain original source for normal syntax diagnostics.
 On normalization interpreter failure reject before execution. H.code, previews,
 worker input and assistant context all use normalized source. Raw provider
 responses remain unchanged. Direct user Python and nested agent.llm results are
-not normalized. Only context rendering adds the authoritative boundary.
+not normalized. Completion observations expose the authoritative source boundary.
 Beyond this narrow normalization never edit, truncate or evict retained source.
 Automatic context housekeeping may drop only old output payloads, retaining
 their H references/counts. It may not discard user messages, code or summaries.
@@ -25444,10 +25459,11 @@ alive after either failure. Process death has a separate status.
 Caught exceptions behave like ordinary Python: no harness-added traceback.
 
 The automatic model observation contains cell/status, stdout/stderr char/line
-counts (or empty), and elapsed time. The cell number identifies H.stdout[cell]
+counts (or empty), elapsed time, and the retained assistant source boundary ID.
+If that source was removed by collapse, omit its ID. The cell number identifies H.stdout[cell]
 and H.stderr[cell]; completeness flags remain in structured metadata.
 No automatic exception type, message, source excerpt, traceback or other error payload.
-Example: Cell 44: ERROR · stdout: empty · stderr: 812 chars, 20 lines · python 10ms.
+Example: Cell 44: ERROR · source boundary: c42 · stdout: empty · stderr: 812 chars, 20 lines · python 10ms.
 H stream entries support text inspection/slicing in Python, e.g.
 H.stderr[44][:4000]. Merely obtaining or printing this slice does NOT send it
 to the model. Use agent.context.read_text(H.stderr[44], start=0, stop=4000)
@@ -25495,8 +25511,10 @@ one. Commit the replacement items and resulting active-attachment set in the
 same context transaction, and persist enough detach state that resume cannot
 resurrect an attachment from an older attachment event.
 
-Expose stable boundary markers at user turns, every 10 completed cells, and
-on context pressure (cadence provisional, inherited from this harness).
+Expose only retained assistant source IDs in their completion observations;
+never prefix user messages, selections, summaries or assistant source with markers.
+Internal item IDs remain available through agent.context.items() for legacy and
+summary endpoints. Source IDs identify source items, not observation items.
 Every 50 model responses, remind the model to compact unnecessary history.
 Above 90% context usage, insert a fresh end marker and FORCE collapse.
 In forced mode accept only standalone collapse or restricted explicit stderr
@@ -25601,7 +25619,8 @@ trigger the outer model loop. Hidden means not auto-forwarded, not secret.
 Visible shell interactions start immediately while busy; their full results
 enter context and are seen by generation at the next safe boundary.
 User messages are never truncated or given a status/reference footer. Keep
-boundary IDs for explicit collapse. A hard provider-budget failure must be
+internal IDs for explicit collapse, without displaying markers on user messages.
+A hard provider-budget failure must be
 reported, not hidden by shortening the message. The 8000-character read_text
 range limit is distinct: it applies to explicit payload reads, not user routing.
 Human previews are separately limited to 12 lines. Neither preview mutates H.
@@ -26363,6 +26382,47 @@ address the enclosing cell; record_ref/record_index retain per-command captures.
 Timeout/exit status belongs to the returned shell result; cancellation remains
 sticky for the enclosing Python cell. Standalone user shell submissions may
 still create one top-level shell cell. Existing journals retain old numbering.
+
+
+### Model-visible collapse addresses (approved)
+User messages, selected text/images and summaries have no added boundary prefix.
+Retained assistant source is ordinary Python with no added boundary comment.
+Each retained agent cell's compact completion observation carries
+`source boundary: cN`, identifying its assistant source item, NOT the observation
+item or cell number. Use those source IDs to collapse assistant-to-assistant spans,
+including intervening user messages and selections. Internal item IDs, ordering,
+provenance, metadata access and collapse semantics are unchanged.
+Do not advertise a source ID removed by that cell's collapse. Summary IDs and
+legacy session IDs remain discoverable through agent.context.items(); do not
+rewrite historical source/observations or frozen session system snapshots.
+Legacy standalone boundary comments are still normalized from generated source.
+Witnesses: context_rendering_tests; e2e_model_execution_observation_is_compact_but_protocol_metadata_is_full;
+e2e_user_messages_are_full_and_have_no_status_footer_in_actual_requests;
+e2e_source_boundaries_collapse_intervening_payloads_and_survive_resume.
+Verification: background cargo build and cargo fmt --check succeeded;
+background full transition suite: 471 passed, 0 failed (66.61s).
+
+
+### On-demand Python API help (approved)
+agent.help(topic=None) returns ordinary documentation text; it never prints,
+selects context, launches work, or makes an RPC. None returns an overview listing
+the supported topics: bgtasks, history, addresses, context, loop, sh, llm.
+Unknown topics raise ValueError listing topics; non-string topics raise TypeError.
+Documentation includes actual signatures, return shapes and usable examples,
+with no credentials or live state. Python docstrings provide the same discovery
+entry point via agent.help.__doc__ and agent.bgtasks method/class __doc__.
+The system instructions advertise help and show launch/get/history selection.
+Background run returns a dict keyed by id, NOT task_id. get/kill accept task_id.
+Background stdout/stderr index is zero-based H.records, not a cell number; ref
+is its authoritative textual address (no eval required). Scheduling is not
+success: inspect status and exit_code after completion. wakeup_reason requests
+one completion continuation; stop the turn to wait rather than sleeping.
+Cell numbers, record indexes, boundary IDs and task IDs are separate namespaces.
+Payload enters model context only via explicit selection, even help output.
+Witnesses: e2e_api_help_is_local_discoverable_and_not_selected;
+e2e_api_help_background_example_and_address_namespaces.
+Verification: build and formatting checks succeeded. Targeted help tests passed;
+full suite via background job with completion wakeup: 473 passed, 0 failed (65.76s).
 
 ## 20. Batched old-output eviction and cache stability
 
@@ -27601,6 +27661,7 @@ class _Cells:
         return _Cell(_rpc('cell',cell=indexes))
     def __len__(self):return _rpc('cell_len')
 class _H:
+    '''Read-only cell views and H.records archive; see agent.help('history').'''
     __slots__=()
     def __setattr__(self,name,value):raise AttributeError('H is read-only')
     def __delattr__(self,name):raise AttributeError('H is read-only')
@@ -27612,6 +27673,7 @@ class _H:
         if name not in _history_names:raise AttributeError(name)
         return _History(name)
 class _Context:
+    '''Explicit model context selection; see agent.help('context').'''
     def read_text(self,text,*,start,stop):
         if not isinstance(text,str): raise TypeError('read_text expects text')
         if type(start) is not int or type(stop) is not int or start<0 or stop<0:
@@ -27643,7 +27705,9 @@ class _Loop:
         return _rpc('stop',wakeup=wakeup)
     def reset_python(self): _rpc('reset')
 class _BgTasks:
+    '''Background job metadata uses id and H.records stream addresses. See agent.help('bgtasks').'''
     def run(self,source,*,kind='shell',cwd=None,env=None,timeout=None,name=None,wakeup_reason=None):
+        "Return task metadata keyed by id; H.records stream indexes. See agent.help('bgtasks')."
         if not isinstance(source,str) or not isinstance(kind,str): raise TypeError('source and kind must be strings')
         for value in (cwd,name,wakeup_reason):
             if value is not None and not isinstance(value,str): raise TypeError('cwd, name and wakeup_reason must be strings or None')
@@ -27655,12 +27719,15 @@ class _BgTasks:
                 raise ValueError('timeout must be finite and positive, at most 7 days')
         return _rpc('bg_run',source=source,task_kind=kind,options=dict(cwd=cwd,env=env,timeout=timeout,name=name,wakeup_reason=wakeup_reason))
     def list(self,state=None):
+        "Return task metadata list filtered by state. See agent.help('bgtasks')."
         if state is not None and not isinstance(state,str): raise TypeError('state must be a string or None')
         return _rpc('task_list',state=state)
     def get(self,task_id):
+        "Return metadata for task_id = task['id']; streams use H.records."
         if not isinstance(task_id,str): raise TypeError('task_id must be a string')
         return _rpc('task_get',task_id=task_id)
     def kill(self,task_id,*,force=False):
+        "Cancel task_id = task['id']; return task metadata, never kill foreground Python."
         if not isinstance(task_id,str) or not isinstance(force,bool): raise TypeError('task_id must be a string and force must be boolean')
         return _rpc('task_kill',task_id=task_id,force=force)
 class _LLM:
@@ -27679,7 +27746,156 @@ class _LLM:
         return _rpc('llm',prompt=prompt,options=kwargs)
     def list(self,**kwargs): return _rpc('models',options=kwargs)
     def image(self,prompt,**kwargs): return _rpc('image',prompt=prompt,options=kwargs)
+_API_HELP = {
+    'bgtasks': '''agent.bgtasks: isolated background jobs
+Signatures:
+run(source, *, kind='shell', cwd=None, env=None, timeout=None, name=None, wakeup_reason=None)
+list(state=None)
+get(task_id)
+kill(task_id, *, force=False)
+run/get/kill return task metadata dictionaries. list returns a list of them.
+Task fields include id (not task_id), kind, name, pid, status, stdout, stderr.
+Terminal metadata includes exit_code for exited processes (may be None if
+terminated by signal); inspect status too. pid exists only while applicable.
+Active statuses: starting, running, cancelling. Terminal statuses: succeeded,
+failed, cancelled, killed, timed_out, outcome_unknown.
+stdout/stderr contain index, ref, bytes, complete. Their index is a zero-based
+record index into H.records.stdout/stderr, NOT a cell number. The ref string
+is the authoritative textual address; access H.records directly, no eval needed.
+Scheduling is not execution success. Inspect get(task['id']) after completion.
+kind='python' runs a fresh isolated interpreter without agent or main variables.
+wakeup_reason opts into one completion continuation; no automatic wakeup otherwise.
+To wait, finish this cell with agent.loop.stop(), not a blocking sleep.
+After the completion continuation, inspect the task using the retained variable.
+Example, launch cell:
+task = agent.bgtasks.run("cargo test", kind='shell', name='tests',
+                        wakeup_reason='Inspect test results')
+agent.loop.stop()
+Example, completion continuation:
+info = agent.bgtasks.get(task['id'])
+assert info['status'] == 'succeeded', info
+agent.context.read_text(H.records.stdout[info['stdout']['index']], start=0, stop=4000)
+agent.context.read_text(H.records.stderr[info['stderr']['index']], start=0, stop=4000)
+Full outputs stay in history; neither scheduling nor inspecting metadata selects them.
+env maps strings to strings; timeout is positive seconds, at most 7 days.
+get/kill's parameter is called task_id but accepts the returned dictionary's id.
+kill cancels only that job, not foreground Python.
+''',
+    'history': '''H: read-only durable history
+H[n] and H.cells[n] return the same cell snapshot (dictionary with attribute access).
+H.code[n], H.stdout[n], H.stderr[n] are strings.
+H.user/stdin/say/requests/responses/usage/raw/events[n] are lists of all cell records.
+n is a one-based cell number: zero is invalid, negatives count from the end.
+Slices use cell-number endpoints (stop excluded). H[:] covers all cells.
+H.records.<collection>[i] addresses the complete original zero-based record archive,
+including failed, global and unassigned operations. It is NOT a cell-grouped view.
+Example:
+r = agent.sh('printf hello')
+text = H.stdout[r['stdout']['index']]  # foreground helper uses a cell number
+info = agent.bgtasks.get(task['id'])
+text = H.records.stdout[info['stdout']['index']]  # background uses record index
+agent.context.read_text(text, start=0, stop=4000)
+Grouped record dictionaries carry cell/index, offset, record_index, record_ref.
+Original event seq and payload coordinates are unchanged. ref/record_ref strings
+name their address; read the named namespace directly rather than guessing.
+Reading or printing H does not select payload into model context. Missing cells
+raise errors; empty streams are strings and empty record groups are lists.
+''',
+    'addresses': '''Address namespaces (do not interchange)
+Cell number: positive one-based execution number; H.stdout[cell], H.code[cell].
+Record index: zero-based original archive position; H.records.stdout[index].
+Boundary ID: string such as c42, context-collapse address, not a cell or record.
+Task ID: string returned in task['id']; pass to agent.bgtasks.get/kill(task_id).
+Foreground agent.sh stdout/stderr index addresses H.stdout/H.stderr by cell.
+Background task stdout/stderr index addresses H.records.stdout/H.records.stderr.
+Grouped record_index/record_ref address H.records; index/offset address cell groups.
+The ref (or record_ref) is the authoritative textual address. No eval is required.
+Source boundary IDs are exposed in completion observations; internal context IDs
+are also available through agent.context.items(). Source and observation differ.
+Example:
+task = agent.bgtasks.run('printf hello')
+info = agent.bgtasks.get(task['id'])
+text = H.records.stdout[info['stdout']['index']]
+''',
+    'context': '''agent.context: explicitly selected model context
+read_text(text, *, start, stop) -> boundary ID string
+read_raw(data) -> boundary ID string
+items() -> list of context metadata dictionaries (including id)
+usage() -> context budget metadata dictionary
+collapse('start-id', 'end-id', 'summary') -> silent control operation
+read_text requires nonnegative integer bounds (not bool), stop >= start, and a
+requested width <= 8000 Unicode characters. Stop beyond the end clamps but the
+requested width still must fit. Budget overflow rejects, never silently truncates.
+Example: agent.context.read_text(agent.help('history'), start=0, stop=4000)
+read_raw accepts PNG/JPEG bytes, base64 dictionary or file path; max 512000 bytes,
+1536 pixels per axis, 4 active attachments.
+collapse must be one standalone call with three literal strings and ordered
+distinct IDs. Provenance covers [start,end); replacement removes through end,
+preserving end text only for user/summary items. It must reduce context size.
+Use source IDs in completion observations for assistant-to-assistant collapse.
+History stays intact. Forced mode permits only standalone collapse or the
+documented literal stderr selection; help is not a forced-mode escape hatch.
+''',
+    'loop': '''agent.loop: staged turn control
+stop(*, wakeup=None) -> stages turn end after a successful cell
+reset_python() -> stages a fresh worker with the frozen startup snapshot
+wakeup is (positive_seconds, reason), at most 7 days, for a timed continuation.
+Background completion continuations are separate: set wakeup_reason on bgtasks.run.
+Example:
+task = agent.bgtasks.run('cargo test', wakeup_reason='Inspect tests')
+agent.loop.stop()
+On completion, use agent.bgtasks.get(task['id']) and explicitly select output.
+stop/final do not return or exit Python; later statements still execute. Put them
+last. A failed cell cancels staged stop. Reset loses variables; history remains.
+agent.final(text) publishes the final answer and implicitly stages turn end.
+''',
+    'sh': '''agent.sh(command, cwd=None, env=None, timeout=None)
+Runs /bin/sh -c with null stdin; no timeout by default.
+Returns metadata, not output text: status, exit_code, stdout, stderr and refs.
+stdout/stderr index is a one-based cell number into H.stdout/H.stderr.
+Nested shells share the enclosing Python cell, including combined output.
+There is no top-level result['index']. Original record addresses use record_ref.
+Example:
+r = agent.sh('pwd')
+agent.context.read_text(H.stdout[r['stdout']['index']], start=0, stop=4000)
+agent.context.read_text(H.stderr[r['stderr']['index']], start=0, stop=4000)
+Run once, inspect captured history. For async work use agent.bgtasks.run;
+its output indexes use H.records instead.
+''',
+    'llm': '''agent.llm(prompt, model=..., system=..., max_tokens=2048, images=..., effort=...)
+Returns a string; default model/effort are the session settings.
+agent.llm.list() -> model metadata list
+agent.llm.image(prompt, model='openai/gpt-image-1') -> image record metadata
+Image result includes cell/index/offset/ref/record_index/bytes; obtain the full
+dictionary using H.raw[result['index']][result['offset']].
+raw_index aliases the cell index; record_index addresses H.records.raw.
+No image payload enters context until explicitly selected with read_raw.
+Example:
+reply = agent.llm('Suggest a small test case')
+agent.context.read_text(reply, start=0, stop=4000)
+Nested calls do not execute their returned source. Select or execute deliberately.
+''',
+}
+_API_OVERVIEW = '''agent.help(topic=None) returns ordinary documentation text without printing,
+RPCs, context selection or work. To see it in model context:
+agent.context.read_text(agent.help('bgtasks'), start=0, stop=4000)
+Topics: bgtasks, history, addresses, context, loop, sh, llm.
+Use agent.help('addresses') to distinguish cell numbers, record indexes,
+boundary IDs and task IDs. Inspect signatures/docstrings with Python inspect.
+'''
+def _help(topic=None):
+    '''agent.help(topic=None) -> documentation string; no printing, RPC or selection.
+    Topics: bgtasks, history, addresses, context, loop, sh, llm.
+    Example: agent.context.read_text(agent.help('bgtasks'), start=0, stop=4000).
+    '''
+    if topic is None:return _API_OVERVIEW
+    if not isinstance(topic,str):raise TypeError('help topic must be a string or None')
+    if topic not in _API_HELP:
+        raise ValueError('unknown help topic '+repr(topic)+'; topics: '+', '.join(_API_HELP))
+    return _API_HELP[topic]
+
 agent=types.ModuleType('agent')
+agent.help=_help
 agent.context=_Context()
 agent.loop=_Loop()
 agent.bgtasks=_BgTasks()
@@ -27890,34 +28106,49 @@ mod e2e {
             .map(str::to_string)
             .collect::<Vec<_>>()
             .into_iter();
+        let home = crate::test_support::TestDirectory::new("py-model-e2e");
+        let fixture_home = home.path().to_path_buf();
         let server = crate::test_support::MockProvider::json(codes.len(), move |request| {
             let code = codes.next().unwrap();
-            let code = if code == "FIXTURE_COLLAPSE_ACTUAL_BOUNDARIES" {
-                let messages = request["messages"].as_array().unwrap();
-                let start = messages
+            let code = if code == "FIXTURE_COLLAPSE_SOURCE_BOUNDARIES" {
+                let ids = request["messages"]
+                    .as_array()
+                    .unwrap()
                     .iter()
                     .filter_map(|m| m["content"].as_str())
-                    .find(|s| s.contains("large user task"))
-                    .unwrap();
-                let end = messages
-                    .iter()
-                    .filter_map(|m| m["content"].as_str())
-                    .find(|s| s.contains("\nend-marker"))
-                    .unwrap();
-                let boundary = |s: &str| {
-                    s.lines()
-                        .next()
-                        .unwrap()
-                        .strip_prefix("[boundary ")
-                        .unwrap()
-                        .strip_suffix(']')
+                    .filter(|s| s.starts_with("Cell "))
+                    .filter_map(|s| s.split("source boundary: ").nth(1))
+                    .map(|s| s.split(" · ").next().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(ids.len(), 2);
+                format!(
+                    "agent.context.collapse({:?}, {:?}, 'source-span-summary')",
+                    ids[0], ids[1]
+                )
+            } else if code == "FIXTURE_COLLAPSE_ACTUAL_BOUNDARIES" {
+                // Forced mode cannot perform an items() lookup. This fixture
+                // uses internal IDs to test the unchanged legacy collapse gate.
+                let records = journal(&fixture_home);
+                let id_for = |needle: &str| {
+                    records
+                        .iter()
+                        .find(|r| {
+                            r["kind"] == "context_add"
+                                && r["payload"]["role"] == "user"
+                                && r["payload"]["text"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .starts_with(needle)
+                        })
+                        .unwrap()["payload"]["id"]
+                        .as_str()
                         .unwrap()
                         .to_string()
                 };
                 format!(
                     "agent.context.collapse({:?}, {:?}, 'unique-condensed-summary')",
-                    boundary(start),
-                    boundary(end)
+                    id_for("large user task"),
+                    id_for("end-marker")
                 )
             } else {
                 code
@@ -27930,7 +28161,6 @@ mod e2e {
             }
         });
         let address = server.address;
-        let home = crate::test_support::TestDirectory::new("py-model-e2e");
         let bin = std::env::var("PY_HARNESS_BIN").unwrap();
         let mut command = crate::test_command(bin);
         command
@@ -27991,7 +28221,7 @@ print('normal execution still allowed')"#;
                     && m["content"]
                         .as_str()
                         .unwrap_or("")
-                        .contains("\ncache-output-")
+                        .starts_with("cache-output-")
             })
             .count();
         assert_eq!(selected, 55);
@@ -28040,14 +28270,120 @@ print('normal execution still allowed')"#;
             .unwrap()["content"]
             .as_str()
             .unwrap();
-        assert!(retained.starts_with("# [boundary c"));
-        assert!(retained.contains("\n\n\nliteral ="));
+        assert_eq!(retained, *cleaned);
         assert!(!retained.contains("c90001") && !retained.contains("c90002"));
         assert!(records
             .iter()
             .any(|r| r["kind"] == "response" && r["payload"].to_string().contains("c90001")));
         assert!(events.iter().any(|e| e["kind"] == "final"));
         assert!(!events.iter().any(|e| e["kind"] == "error"));
+    }
+
+    #[test]
+    fn e2e_source_boundaries_collapse_intervening_payloads_and_survive_resume() {
+        let first = "agent.context.read_text('selected-payload-' * 100, start=0, stop=1700)";
+        let (events, home, requests) = model_run(
+            vec![
+                first,
+                "print('second-source')",
+                "FIXTURE_COLLAPSE_SOURCE_BOUNDARIES",
+                "agent.final('done')",
+            ],
+            vec![
+                json!({"id":"boundaries","kind":"submit","text":"user-without-marker"}),
+                json!({"id":"intervening","kind":"submit","text":"intervening-user-without-marker","mode":"steering"}),
+            ],
+        );
+        assert_eq!(requests.len(), 4);
+        let before = requests[2]["messages"].as_array().unwrap();
+        assert!(before.iter().any(|m| m["content"] == "user-without-marker"));
+        assert!(before
+            .iter()
+            .any(|m| m["content"] == "intervening-user-without-marker"));
+        assert!(before.iter().any(|m| m["content"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("selected-payload-")));
+        assert!(before
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .all(|s| !s.starts_with("[boundary ") && !s.starts_with("# [boundary ")));
+        let records = journal(&home);
+        let sources = records
+            .iter()
+            .filter(|r| r["kind"] == "context_add" && r["payload"]["role"] == "assistant")
+            .collect::<Vec<_>>();
+        let start = sources[0]["payload"]["id"].as_str().unwrap();
+        let end = sources[1]["payload"]["id"].as_str().unwrap();
+        let reports = before
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .filter(|s| s.starts_with("Cell "))
+            .collect::<Vec<_>>();
+        assert!(reports[0].contains(&format!("source boundary: {start}")));
+        assert!(reports[1].contains(&format!("source boundary: {end}")));
+        let observation = records
+            .iter()
+            .find(|r| {
+                r["kind"] == "context_add"
+                    && r["payload"]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("Cell 1:")
+            })
+            .unwrap();
+        assert_ne!(
+            observation["payload"]["id"], start,
+            "the exposed ID belongs to source, not its observation"
+        );
+        let after = requests[3]["messages"].as_array().unwrap();
+        assert!(after.iter().any(|m| m["content"] == "user-without-marker"));
+        assert!(!after
+            .iter()
+            .any(|m| m["content"] == "intervening-user-without-marker"));
+        assert!(!after.iter().any(|m| m["content"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("selected-payload-")));
+        assert!(after.iter().any(|m| m["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("source-span-summary")));
+        let collapse_id = sources[2]["payload"]["id"].as_str().unwrap();
+        assert!(
+            !after
+                .iter()
+                .filter_map(|m| m["content"].as_str())
+                .any(|s| s.contains(&format!("source boundary: {collapse_id}"))),
+            "removed collapse source must not be advertised"
+        );
+        assert!(events.iter().any(|e| e["kind"] == "final"));
+        assert!(!events.iter().any(|e| e["kind"] == "error"));
+        let session = fs::read_dir(home.join("sessions"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut command = super::test_command(std::env::var("PY_HARNESS_BIN").unwrap());
+        command
+            .env("PY_HOME", home.path())
+            .args(["--json", "--json-input", "--no-model", "--resume"])
+            .arg(&session);
+        let output = crate::test_support::ProcessSession::spawn(command).collect(
+            &crate::test_support::jsonl_input(&[json!({
+                "id":"inspect","kind":"python",
+                "source":"assert 'selected-payload-' in H.code[1]; assert any(i['id'] for i in agent.context.items())"
+            })]),
+            std::time::Duration::from_secs(30),
+        );
+        let resumed_events = crate::test_support::jsonl_events(&output);
+        assert!(
+            resumed_events.iter().any(|e| e["kind"] == "completed"
+                && e["command_id"] == "inspect"
+                && e["status"] == "ok"),
+            "{resumed_events:?}"
+        );
     }
 
     #[test]
@@ -28211,6 +28547,115 @@ print('normal execution still allowed')"#;
     }
 
     #[test]
+    fn e2e_api_help_is_local_discoverable_and_not_selected() {
+        let source = r#"
+import inspect
+overview = agent.help()
+assert isinstance(overview, str) and 'agent.help' in overview
+for topic in ('bgtasks', 'history', 'addresses', 'context', 'loop', 'sh', 'llm'):
+    text = agent.help(topic)
+    assert isinstance(text, str) and text
+assert 'H.records.stdout' in agent.help('bgtasks')
+assert 'not task_id' in agent.help('bgtasks')
+assert 'wakeup_reason' in agent.help('bgtasks')
+assert 'record index' in agent.help('addresses').lower()
+assert '8000' in agent.help('context')
+assert 'topic' in agent.help.__doc__
+assert 'H.records' in agent.bgtasks.__doc__
+assert 'id' in agent.bgtasks.run.__doc__
+assert 'task_id' in agent.bgtasks.get.__doc__
+assert 'task_id' in agent.bgtasks.kill.__doc__
+assert 'state' in agent.bgtasks.list.__doc__
+assert str(inspect.signature(agent.help)) == '(topic=None)'
+namespace = agent.help.__globals__
+original_rpc = namespace['_rpc']
+def no_rpc(*args, **kwargs): raise AssertionError('help must be local')
+namespace['_rpc'] = no_rpc
+try:
+    assert agent.help('history')
+    assert agent.help()
+finally: namespace['_rpc'] = original_rpc
+for topic, error in [(42, TypeError), (True, TypeError), ('missing-topic', ValueError)]:
+    try: agent.help(topic)
+    except error as e:
+        if error is ValueError: assert 'bgtasks' in str(e) and 'history' in str(e)
+    else: raise AssertionError('invalid topic accepted')
+"#;
+        let (events, home, requests) = model_run(
+            vec![source, "agent.final('done')"],
+            vec![json!({"id":"help","kind":"submit","text":"inspect docs"})],
+        );
+        assert!(
+            events.iter().any(|e| e["kind"] == "completed"
+                && e["code"]["index"] == 1
+                && e["status"] == "ok"),
+            "{events:?}"
+        );
+        let records = journal(&home);
+        assert!(!records.iter().any(|r| r["kind"] == "task_state"));
+        assert!(!records.iter().any(|r| r["kind"] == "context_add"
+            && r["payload"]["role"] == "user"
+            && r["payload"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("agent.help(")));
+        assert!(requests[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("agent.help(topic=None)"));
+        assert!(requests[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("task['id']"));
+    }
+
+    #[test]
+    fn e2e_api_help_background_example_and_address_namespaces() {
+        let (events, home) = run(vec![
+            py(
+                "launch",
+                r#"
+task = agent.bgtasks.run("printf discoverable-output", kind='shell', name='docs-example')
+assert isinstance(task['id'], str) and 'task_id' not in task
+assert task['stdout']['ref'] == "H.records.stdout[%d]" % task['stdout']['index']
+assert task['stderr']['ref'] == "H.records.stderr[%d]" % task['stderr']['index']
+"#,
+            ),
+            py(
+                "inspect",
+                r#"
+import time
+deadline = time.monotonic() + 5
+while True:
+    info = agent.bgtasks.get(task['id'])
+    if info['status'] not in ('starting', 'running'): break
+    assert time.monotonic() < deadline
+    time.sleep(.01)
+assert info['status'] == 'succeeded' and info['exit_code'] == 0, info
+assert info['stdout']['complete']
+assert H.records.stdout[info['stdout']['index']] == 'discoverable-output'
+assert len(H.stdout) == 2
+assert 'discoverable-output' not in H.stdout[1]
+agent.context.read_text(H.records.stdout[info['stdout']['index']], start=0, stop=4000)
+agent.context.read_text(agent.help('history'), start=0, stop=4000)
+"#,
+            ),
+        ]);
+        assert_eq!(done(&events, "launch")["status"], "ok");
+        assert_eq!(done(&events, "inspect")["status"], "ok");
+        let records = journal(&home);
+        assert!(records
+            .iter()
+            .any(|r| r["kind"] == "context_add" && r["payload"]["text"] == "discoverable-output"));
+        assert!(records.iter().any(|r| r["kind"] == "context_add"
+            && r["payload"]["role"] == "user"
+            && r["payload"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("H.records")));
+    }
+
+    #[test]
     fn e2e_model_execution_observation_is_compact_but_protocol_metadata_is_full() {
         let (events, home, requests) = model_run(
             vec!["x = 40 + 2\nprint(x)", "agent.final('done')"],
@@ -28223,8 +28668,7 @@ print('normal execution still allowed')"#;
             .find(|message| message["role"] == "assistant")
             .unwrap();
         let retained = assistant["content"].as_str().unwrap();
-        assert!(retained.starts_with("# [boundary c"), "{retained}");
-        assert_eq!(retained.split_once('\n').unwrap().1, "x = 40 + 2\nprint(x)");
+        assert_eq!(retained, "x = 40 + 2\nprint(x)");
         let system = requests[0]["messages"][0]["content"].as_str().unwrap();
         assert!(
             system.contains("r['stdout']['index']") && system.contains("no top-level r['index']")
@@ -28233,11 +28677,29 @@ print('normal execution still allowed')"#;
             .iter()
             .filter(|message| message["role"] == "user")
             .filter_map(|message| message["content"].as_str())
-            .filter_map(|text| text.lines().nth(1))
+            .filter_map(|text| text.lines().next())
             .filter(|line| line.starts_with("Cell 1: OK ·"))
             .collect::<Vec<_>>();
         assert_eq!(reports.len(), 1, "{messages:?}");
         let report = reports[0];
+        let records = journal(&home);
+        let source_item = records
+            .iter()
+            .find(|r| r["kind"] == "context_add" && r["payload"]["role"] == "assistant")
+            .unwrap();
+        let source_id = source_item["payload"]["id"].as_str().unwrap();
+        assert!(
+            report.contains(&format!("source boundary: {source_id}")),
+            "{report}"
+        );
+        assert!(messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .all(|text| !text.starts_with("[boundary ") && !text.starts_with("# [boundary ")));
+        assert!(
+            system.contains("source boundary:")
+                && !system.contains("assistant boundaries are Python comments")
+        );
         assert!(
             report.contains("python ")
                 && report.contains("stdout: 3 chars, 1 line · stderr: empty"),
@@ -28327,11 +28789,11 @@ print('normal execution still allowed')"#;
             .filter_map(|message| message["content"].as_str())
             .find(|text| {
                 text.lines()
-                    .nth(1)
+                    .next()
                     .is_some_and(|line| line.starts_with("Cell 1: ERROR ·"))
             })
             .unwrap();
-        assert_eq!(report.lines().count(), 2);
+        assert_eq!(report.lines().count(), 1);
         assert!(report.contains("stderr:") && report.contains("python "));
         assert!(
             !report.contains("compact-private-diagnostic")
@@ -28369,7 +28831,7 @@ print('normal execution still allowed')"#;
             .filter_map(|message| message["content"].as_str())
             .find(|text| {
                 text.lines()
-                    .nth(1)
+                    .next()
                     .is_some_and(|line| line.starts_with("Cell 1: OK ·"))
             })
             .unwrap();
@@ -28429,13 +28891,9 @@ print('normal execution still allowed')"#;
                 .unwrap()
                 .iter()
                 .filter_map(|message| message["content"].as_str())
-                .find(|text| {
-                    text.split_once('\n')
-                        .is_some_and(|(_, body)| body == expected)
-                })
+                .find(|text| *text == expected)
                 .unwrap_or_else(|| panic!("full user message absent from actual provider request"));
-            assert!(selected.starts_with("[boundary c"));
-            assert_eq!(selected.split_once('\n').unwrap().1, expected);
+            assert_eq!(selected, expected);
         }
         let additions = journal(&home)
             .into_iter()
@@ -28467,12 +28925,9 @@ print('normal execution still allowed')"#;
                 .unwrap()
                 .iter()
                 .filter_map(|message| message["content"].as_str())
-                .find(|text| {
-                    text.split_once('\n')
-                        .is_some_and(|(_, body)| body == original)
-                })
+                .find(|text| *text == original)
                 .unwrap();
-            assert_eq!(selected.split_once('\n').unwrap().1, original);
+            assert_eq!(selected, original);
             assert!(!selected.contains("omitted 0 chars") && !selected.contains("H.records.user["));
         }
     }
@@ -29558,7 +30013,7 @@ finally:
             .unwrap()
             .iter()
             .filter_map(|message| message["content"].as_str())
-            .any(|text| text.split_once('\n').is_some_and(|(_, body)| body == full)));
+            .any(|text| text == full));
         assert!(journal(&h)
             .iter()
             .any(|v| v["kind"] == "queue_delivered" && v["payload"]["command_id"] == "s"));
@@ -29582,7 +30037,7 @@ finally:
             .unwrap()
             .iter()
             .filter_map(|message| message["content"].as_str())
-            .any(|text| text.split_once('\n').is_some_and(|(_, body)| body == full)));
+            .any(|text| text == full));
     }
 
     #[test]
