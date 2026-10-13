@@ -4800,6 +4800,7 @@ enum CommandInterruption {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommandCompletion {
+    Commands,
     Files,
     Models,
     Effort,
@@ -4819,10 +4820,10 @@ struct CommandSpec {
 }
 // This order preserves the existing picker inventory, including aliases.
 const LOCAL_COMMANDS: &[CommandSpec] = &[
-    CommandSpec {kind:LocalCommandKind::Help,names:&["/help","/hotkeys"],usage:"/help /hotkeys",help:"Editor keys and implemented local commands.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
+    CommandSpec {kind:LocalCommandKind::Help,names:&["/help","/hotkeys"],usage:"/help [command] (/hotkeys)",help:"Editor keys and implemented local commands; with a command, show its usage and help (with or without the leading slash).",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Commands},
     CommandSpec {kind:LocalCommandKind::Model,names:&["/model"],usage:"/model <provider/id or fuzzy query>",help:"Select and save defaults, rejecting ambiguity; no argument shows the current model. /model list [query]: cached inventory, refreshed when stale. /model list refresh [provider]: force refresh.",schedule:CommandSchedule::MutationAtCellBoundary,interruption:CommandInterruption::None,completion:CommandCompletion::Models},
     CommandSpec {kind:LocalCommandKind::Models,names:&["/models"],usage:"/models [query]",help:"Cached usable-model inventory, refreshed when stale; /models refresh [provider]: force refresh.",schedule:CommandSchedule::MutationAtCellBoundary,interruption:CommandInterruption::None,completion:CommandCompletion::Models},
-    CommandSpec {kind:LocalCommandKind::Effort,names:&["/effort","/think","/thinking"],usage:"/effort <off|minimal|low|medium|high|xhigh> (/think, /thinking)",help:"Save accepted defaults; no argument shows the current effort.",schedule:CommandSchedule::MutationAtCellBoundary,interruption:CommandInterruption::None,completion:CommandCompletion::Effort},
+    CommandSpec {kind:LocalCommandKind::Effort,names:&["/effort","/think","/thinking"],usage:"/effort <off|minimal|low|medium|high|xhigh|max> (/think, /thinking)",help:"Save accepted defaults; no argument shows the current effort.",schedule:CommandSchedule::MutationAtCellBoundary,interruption:CommandInterruption::None,completion:CommandCompletion::Effort},
     CommandSpec {kind:LocalCommandKind::Status,names:&["/status"],usage:"/status",help:"Session and execution status.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
     CommandSpec {kind:LocalCommandKind::Context,names:&["/context"],usage:"/context",help:"Selected context metadata and budget.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
     CommandSpec {kind:LocalCommandKind::Save,names:&["/save"],usage:"/save [path.html]",help:"Private, offline HTML of selected context and collapse history.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
@@ -4832,7 +4833,7 @@ const LOCAL_COMMANDS: &[CommandSpec] = &[
     CommandSpec {kind:LocalCommandKind::Auth,names:&["/auth"],usage:"/auth",help:"Authentication (no secrets).",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Authentication},
     CommandSpec {kind:LocalCommandKind::Session,names:&["/session"],usage:"/session",help:"Current journal path.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
     CommandSpec {kind:LocalCommandKind::Sessions,names:&["/sessions"],usage:"/sessions",help:"Saved sessions.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
-    CommandSpec {kind:LocalCommandKind::Resume,names:&["/resume"],usage:"/resume <path or fuzzy session>",help:"Restore H/context/settings, never Python variables or execution; no argument lists sessions.",schedule:CommandSchedule::MutationAfterTurn,interruption:CommandInterruption::EndTurn,completion:CommandCompletion::Sessions},
+    CommandSpec {kind:LocalCommandKind::Resume,names:&["/resume"],usage:"/resume <path or fuzzy session> [--cancel-tasks]",help:"Restore H/context/settings and the frozen startup snapshot; start fresh Python without replaying cells or restoring variables. No argument lists sessions; running jobs require --cancel-tasks.",schedule:CommandSchedule::MutationAfterTurn,interruption:CommandInterruption::EndTurn,completion:CommandCompletion::Sessions},
     CommandSpec {kind:LocalCommandKind::Recovery,names:&["/recovery"],usage:"/recovery",help:"Recovery diagnostics; no automatic replay.",schedule:CommandSchedule::Immediate,interruption:CommandInterruption::None,completion:CommandCompletion::Files},
     CommandSpec {kind:LocalCommandKind::Reset,names:&["/reset"],usage:"/reset",help:"Authorized worker reset with the frozen startup snapshot.",schedule:CommandSchedule::AfterTurn,interruption:CommandInterruption::EndTurn,completion:CommandCompletion::Files},
     CommandSpec {kind:LocalCommandKind::New,names:&["/new"],usage:"/new [--cancel-tasks]",help:"New session and newly loaded core entries/inventory.",schedule:CommandSchedule::AfterTurn,interruption:CommandInterruption::EndTurn,completion:CommandCompletion::Tasks},
@@ -4971,18 +4972,38 @@ struct LocalCommand {
     parsed: ParsedLocalCommand,
     phase: LocalCommandPhase,
 }
+fn command_help_entry(spec: &CommandSpec) -> String {
+    let mut help = format!("{}: {}", spec.usage, spec.help);
+    if !spec.names[1..].is_empty() {
+        help.push_str(" Aliases: ");
+        help.push_str(&spec.names[1..].join(", "));
+        help.push('.');
+    }
+    help
+}
+fn command_help_for(args: &str) -> Result<String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(command_help());
+    }
+    if args.split_whitespace().count() != 1 {
+        return Err("Usage: /help [command] (for example, /help resume)".into());
+    }
+    let name = args.strip_prefix('/').unwrap_or(args);
+    let spec = LOCAL_COMMANDS
+        .iter()
+        .find(|spec| {
+            spec.names
+                .iter()
+                .any(|alias| alias.strip_prefix('/') == Some(name))
+        })
+        .ok_or("Unknown help command; /help lists implemented commands")?;
+    Ok(command_help_entry(spec))
+}
 fn command_help() -> String {
     let mut help = "py — ordinary persistent Python, unrestricted execution.\nOrdinary Python. No sandbox.\n! shell / @ Python: hidden from the model; !! / @@: visible.\nTab: fuzzy picker for commands, arguments, Python names, executables and files.\nType to filter; arrows/Tab move, Enter selects (not submits); Esc cancels.\nWhile busy: / commands stay local; queries run now, mutations at a safe cell boundary.\n! and !! run immediately; !! is visible, ! stays hidden.\nShift+Enter inserts newline on supported terminals; Ctrl-J is a fallback.\nContinuation lines align after the two-column > prompt.\nPython brackets/suites and bracketed multiline paste form a single cell.\nCtrl-D: exit idle editor. Ctrl-C: clear editor / cancel active operation.\n".to_owned();
     for spec in LOCAL_COMMANDS {
-        help.push_str(spec.usage);
-        help.push_str(": ");
-        help.push_str(spec.help);
-        let aliases = &spec.names[1..];
-        if !aliases.is_empty() {
-            help.push_str(" Aliases: ");
-            help.push_str(&aliases.join(", "));
-            help.push('.');
-        }
+        help.push_str(&command_help_entry(spec));
         help.push('\n');
     }
     help.push_str("Model/effort queries do not change config; explicit changes save both accepted values.\nDurable entries: ~/.py/skills/*.md (or PY_HOME); ordinary file editing, no skills API.\nCore entries and inventory freeze on /new; reset/resume preserve that snapshot.\nCore Python repeats on authorized startup/reset, not automatically after a worker crash.\nStartup bridges are limited to H history/cell reads; prefer definitions/imports.\n/quit, /new and /resume require --cancel-tasks while jobs run.\nH stores full history; previews show at most 12 original lines.\nSession resume restores H/context/settings, never Python variables or execution.\nBrowser OAuth: Codex callback, Anthropic hidden code paste.\nUnsupported provider protocols and live subscription parity are not claimed.");
@@ -5064,6 +5085,92 @@ mod local_command_contract_tests {
         assert!(help.contains("/save [path.html]"));
     }
     #[test]
+    fn focused_help_uses_registry_for_every_command_and_alias() {
+        assert_eq!(command_help_for("").unwrap(), command_help());
+        assert_eq!(command_help_for("  ").unwrap(), command_help());
+        for spec in LOCAL_COMMANDS {
+            let expected = command_help_entry(spec);
+            for name in spec.names {
+                assert_eq!(command_help_for(name).unwrap(), expected);
+                assert_eq!(
+                    command_help_for(name.trim_start_matches('/')).unwrap(),
+                    expected
+                );
+                let parsed = ParsedLocalCommand::parse(&format!("/help {name}"));
+                assert_eq!(parsed.phase(), LocalCommandPhase::Immediate);
+                assert_eq!(parsed.interruption(), CommandInterruption::None);
+            }
+        }
+        let resume = command_help_for("resume").unwrap();
+        assert!(resume.contains("--cancel-tasks") && resume.contains("fresh Python"));
+        assert!(!resume.contains("Tab:") && !resume.contains("/login"));
+        assert_eq!(
+            command_help_for("thinking").unwrap(),
+            command_help_for("effort").unwrap()
+        );
+    }
+    #[test]
+    fn focused_help_rejects_unknown_and_extra_arguments_without_echoing_them() {
+        for query in [
+            "unknown-private-topic",
+            "//resume",
+            "res",
+            "/",
+            "resume extra",
+            "resume\textra",
+        ] {
+            let error = command_help_for(query).unwrap_err().to_string();
+            assert!(error.contains("/help"), "{error}");
+            if query.len() > 1 {
+                assert!(!error.contains(query), "{error}");
+            }
+        }
+    }
+    #[test]
+    fn help_completion_offers_commands_and_aliases_not_files() {
+        let catalog = catalog();
+        for prefix in ["/help ", "/hotkeys "] {
+            let (start, pairs) = catalog.candidates(prefix, prefix.len(), false).unwrap();
+            assert_eq!(start, prefix.len());
+            let actual = pairs
+                .iter()
+                .map(|p| p.replacement.as_str())
+                .collect::<HashSet<_>>();
+            let expected = LOCAL_COMMANDS
+                .iter()
+                .flat_map(|spec| spec.names.iter())
+                .map(|name| name.trim_start_matches('/'))
+                .collect::<HashSet<_>>();
+            assert_eq!(actual, expected);
+        }
+        for (line, expected) in [
+            ("/help res", "resume"),
+            ("/help /res", "/resume"),
+            ("/hotkeys thk", "think"),
+        ] {
+            let (start, pairs) = catalog.candidates(line, line.len(), false).unwrap();
+            assert_eq!(start, line.find(' ').unwrap() + 1);
+            assert!(pairs.iter().any(|p| p.replacement == expected), "{line}");
+        }
+        for line in ["/help definitely-not-a-command", "/help resume "] {
+            assert!(catalog
+                .candidates(line, line.len(), false)
+                .unwrap()
+                .1
+                .is_empty());
+        }
+        let line = "/help /res";
+        let (_, pairs) = catalog.candidates(line, line.len(), true).unwrap();
+        assert!(pairs.iter().all(|p| p.replacement.starts_with('/')));
+        assert_eq!(
+            pairs.len(),
+            LOCAL_COMMANDS
+                .iter()
+                .map(|spec| spec.names.len())
+                .sum::<usize>()
+        );
+    }
+    #[test]
     fn conditional_busy_policy_and_aliases_preserve_existing_boundaries() {
         for line in [
             "/model",
@@ -5080,6 +5187,8 @@ mod local_command_contract_tests {
             "/login status",
             "/resume",
             "/save file.html",
+            "/help resume",
+            "/hotkeys /exit",
             "/task kill t1",
             "/wat secret",
         ] {
@@ -11476,7 +11585,7 @@ impl Host {
             | LocalCommandKind::Wakeup => {
                 self.ui_background_command(command.kind.canonical_name().unwrap(), args)?
             }
-            LocalCommandKind::Help => self.ui_text(&command_help()),
+            LocalCommandKind::Help => self.ui_text(&command_help_for(args)?),
             LocalCommandKind::Model if command.operation == CommandOperation::Query => {
                 self.ui_text(&self.provider.model)
             }
@@ -12461,7 +12570,7 @@ fn cli() -> Result<()> {
         i += 1;
     }
     if help {
-        ui_text("Usage: py [options]\nPersistent ordinary Python + a Python-writing model. No sandbox.\n\n--model <provider/id or unique fuzzy query>: choose a known/configured model\n--effort <off|minimal|low|medium|high|xhigh|max>: reasoning preference (supported levels depend on the model)\n--session <path>, --resume <path>: restore an existing journal; fresh Python, no replay\n--no-model: local Python/shell mode, no automatic model turns\n--json: write versioned JSONL events to stdout instead of human previews\n--json-input: read JSONL commands from stdin instead of the editor\n--spec: print the embedded specification and coverage ledger\n--help, -h: show this help without starting Python or creating files\n--version, -V: show the version without creating files\n\nJSON input and output are independent; combine --json --json-input for automation.\nPY_HOME chooses global state storage (default ~/.py); PY_MODEL/config.json choose defaults.\nCLI model/effort override restored session settings and are saved in that session, not global defaults.\nExplicit /model and /effort (/thinking) changes atomically save config.json defaults; queries do not.\nJSON kind=model with model=<query>, or kind=effort/thinking with effort=<level>, saves the same defaults.\nOmit the value to query; call-local agent.llm options never change defaults.\nInteractive: /help, /login, /model list, /new, /resume. Tab fuzzily completes.\n! / @: hidden shell / Python; !! / @@: visible. Empty prompts are ignored.\nThere are no positional prompts or CLI API-key flags; use hidden /login entry.");
+        ui_text("Usage: py [options]\nPersistent ordinary Python + a Python-writing model. No sandbox.\n\n--model <provider/id or unique fuzzy query>: choose a known/configured model\n--effort <off|minimal|low|medium|high|xhigh|max>: reasoning preference (supported levels depend on the model)\n--session <path>, --resume <path>: restore an existing journal; fresh Python, no replay\n--no-model: local Python/shell mode, no automatic model turns\n--json: write versioned JSONL events to stdout instead of human previews\n--json-input: read JSONL commands from stdin instead of the editor\n--spec: print the embedded specification and coverage ledger\n--help, -h: show this help without starting Python or creating files\n--version, -V: show the version without creating files\n\nJSON input and output are independent; combine --json --json-input for automation.\nPY_HOME chooses global state storage (default ~/.py); PY_MODEL/config.json choose defaults.\nCLI model/effort override restored session settings and are saved in that session, not global defaults.\nExplicit /model and /effort (/thinking) changes atomically save config.json defaults; queries do not.\nJSON kind=model with model=<query>, or kind=effort/thinking with effort=<level>, saves the same defaults.\nOmit the value to query; call-local agent.llm options never change defaults.\nInteractive: /help [command], /login, /model list, /new, /resume. Tab fuzzily completes.\n! / @: hidden shell / Python; !! / @@: visible. Empty prompts are ignored.\nThere are no positional prompts or CLI API-key flags; use hidden /login entry.");
         return Ok(());
     }
     if version {
@@ -16101,7 +16210,28 @@ impl CompletionCatalog {
             let (start, _) = completion_token(prefix, arg_start);
             let raw_word = &prefix[start..];
             let word = if all { "" } else { raw_word };
-            if completion == Some(CommandCompletion::Models) {
+            if completion == Some(CommandCompletion::Commands) {
+                // Help takes one exact command or alias; fuzzy matching is only
+                // for the picker. Never fall back to filesystem suggestions.
+                if start == arg_start {
+                    for spec in LOCAL_COMMANDS {
+                        for name in spec.names {
+                            let value = if raw_word.starts_with('/') {
+                                *name
+                            } else {
+                                name.strip_prefix('/').unwrap()
+                            };
+                            if let Some(score) = fuzzy_score(word, value) {
+                                items.push((
+                                    score,
+                                    format!("{value}  {}", spec.help),
+                                    value.to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else if completion == Some(CommandCompletion::Models) {
                 if command == "/model" && start == arg_start {
                     if let Some(score) = fuzzy_score(word, "list") {
                         items.push((score, "list".into(), "list".into()));
@@ -28431,6 +28561,51 @@ finally:
     }
 
     #[test]
+    fn e2e_focused_help_json_is_local_and_read_only() {
+        let (events, home) = run(vec![
+            json!({"id":"resume-help","kind":"submit","text":"/help /resume"}),
+            json!({"id":"alias-help","kind":"submit","text":"/help thinking"}),
+            json!({"id":"bad-help","kind":"submit","text":"/help unknown-private-topic"}),
+            json!({"id":"extra-help","kind":"submit","text":"/help resume extra"}),
+            py("after-help", "assert not agent.context.items()"),
+        ]);
+        for id in ["resume-help", "alias-help", "after-help"] {
+            assert_eq!(done(&events, id)["status"], "ok");
+        }
+        let notices = events
+            .iter()
+            .filter(|v| v["kind"] == "notice")
+            .filter_map(|v| v["text"].as_str())
+            .collect::<Vec<_>>();
+        assert!(notices
+            .iter()
+            .any(|text| text.starts_with("/resume ") && text.contains("fresh Python")));
+        assert!(notices
+            .iter()
+            .any(|text| text.starts_with("/effort ") && text.contains("Aliases: /think")));
+        assert!(!notices
+            .iter()
+            .any(|text| text.contains("Tab: fuzzy picker")));
+        for id in ["bad-help", "extra-help"] {
+            assert!(events
+                .iter()
+                .any(|v| v["kind"] == "error" && v["command_id"] == id));
+        }
+        let records = journal(&home);
+        assert!(!records
+            .iter()
+            .any(|v| matches!(v["kind"].as_str(), Some("context_add" | "request"))));
+        assert!(!records
+            .iter()
+            .any(|v| v["kind"] == "user" && v["payload"].to_string().contains("/help")));
+        assert_eq!(records.iter().filter(|v| v["kind"] == "code").count(), 1);
+        assert!(!records.iter().any(|v| matches!(
+            v["kind"].as_str(),
+            Some("config_changed" | "defaults_changed" | "settings_changed")
+        )));
+    }
+
+    #[test]
     fn e2e_interactive_cli_help_prefixes_and_completion() {
         let home = std::env::temp_dir().join(format!("py-pty-e2e-{}", super::now_ms()));
         let script = r#"
@@ -28460,6 +28635,9 @@ os.write(master,b'/he\t');wait_for(b'Fuzzy select')
 os.write(master,b'\r');wait_for(b'\x1b[0J')
 # First Enter selects /help from /help and /hotkeys; second submits it.
 os.write(master,b'\r');wait_for(b'H stores full history')
+start=len(data);os.write(master,b'/help resum\t');wait_for(b'/help resume',start)
+# A unique completion inserts directly; it does not open the picker or submit.
+os.write(master,b'\r');wait_for(b'fresh Python',start)
 start=len(data);os.write(master,b"@print('pty-result')\r");wait_for(b'status: ok',start)
 os.write(master,b'/quit\r');data+=collect()
 try:p.wait(timeout=3)
@@ -32953,6 +33131,27 @@ assert sources.count('marker=42; print("only-once")')==1,sources
 assert len(glob.glob(home+'/sessions/*.jsonl'))==2,out
 streams=''.join(v['payload'].get('text','') for v in journals() if v['kind']=='stream' and v['payload']['collection']=='stdout')
 assert streams.count('only-once\n')==1 and streams.count('False\n')==2 and '0\n' in streams,streams
+"#,
+        );
+    }
+    #[test]
+    fn e2e_focused_help_is_local_and_bad_topics_do_not_exit() {
+        fixture(
+            r#"
+out=run(['/help resume','/help /thinking','/hotkeys exit','/help missing-topic',
+         '/help resume extra','@print("help-still-alive")','/quit'])
+assert '/resume <path or fuzzy session> [--cancel-tasks]' in out,out
+assert 'fresh Python without replaying cells' in out,out
+assert '/effort <off|minimal|low|medium|high|xhigh|max>' in out,out
+flat=' '.join(out.split())
+assert 'Aliases: /think, /thinking.' in flat and 'Aliases: /exit.' in flat,out
+assert 'Unknown help command' in out and 'Usage: /help [command]' in out,out
+assert 'Tab: fuzzy picker' not in out and '/login <provider>' not in out,out
+assert 'help-still-alive' in out,out
+records=journals()
+assert not any(v['kind']=='context_add' for v in records),records
+assert [v['payload']['source'] for v in records if v['kind']=='code']==['print("help-still-alive")'],records
+assert not any(v['kind']=='user' and '/help' in json.dumps(v['payload']) for v in records),records
 "#,
         );
     }
