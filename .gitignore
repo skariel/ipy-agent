@@ -1,13 +1,13 @@
+# Build and local workbench state
+transition/target/
+.py/
 .venv/
 .uv-cache/
-.py/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 __pycache__/
 *.py[cod]
-*.egg-info/
-dist/
 # Device placeholders injected by the outer sandbox, not project files.
 /.bash_profile
 /.bashrc
