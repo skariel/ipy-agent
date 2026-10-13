@@ -10560,6 +10560,9 @@ fn terminal_status(v: &Value, width: usize) -> Vec<String> {
             label.push_str(&format!(" · {language} {:.1}s", ms as f64 / 1000.0));
         }
     }
+    if let Some(count) = v["active_background_tasks"].as_u64().filter(|n| *n > 0) {
+        label.push_str(&format!(" · jobs: {count} running"));
+    }
     label.push_str(&terminal_retry(v));
     label.push_str(" · ");
     label.push_str(&terminal_metrics(v));
@@ -10612,9 +10615,204 @@ fn terminal_cell_end(v: &Value, width: usize) -> Vec<String> {
     lines.push(String::new());
     lines
 }
+
+fn human_label(key: &str) -> String {
+    let text = key.replace('_', " ");
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+fn human_metadata(title: &str, value: &Value) -> String {
+    fn rows(value: &Value, indent: usize, out: &mut Vec<String>) {
+        let pad = " ".repeat(indent);
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    let label = human_label(key);
+                    match value {
+                        Value::Object(_) => {
+                            out.push(format!("{pad}{label}:"));
+                            rows(value, indent + 2, out);
+                        }
+                        Value::Array(items) if !items.is_empty() => {
+                            out.push(format!("{pad}{label}:"));
+                            rows(value, indent + 2, out);
+                        }
+                        _ => out.push(format!("{pad}{label}: {}", scalar(value))),
+                    }
+                }
+            }
+            Value::Array(items) => {
+                if items.is_empty() {
+                    out.push(format!("{pad}(none)"));
+                }
+                for value in items {
+                    if value.is_object() || value.is_array() {
+                        out.push(format!("{pad}—"));
+                        rows(value, indent + 2, out);
+                    } else {
+                        out.push(format!("{pad}• {}", scalar(value)));
+                    }
+                }
+            }
+            _ => out.push(format!("{pad}{}", scalar(value))),
+        }
+    }
+    fn scalar(value: &Value) -> String {
+        match value {
+            Value::String(s) => s.clone(),
+            Value::Null => "—".into(),
+            Value::Array(items) if items.is_empty() => "(none)".into(),
+            _ => value.to_string(),
+        }
+    }
+    let mut out = vec![title.into()];
+    rows(value, 0, &mut out);
+    terminal_safe(&out.join("\n"))
+}
+fn human_background_result(kind: NativeCommandKind, value: &Value) -> String {
+    use NativeCommandKind as K;
+    let text = |v: &Value, key: &str| v[key].as_str().unwrap_or("—").to_owned();
+    match kind {
+        K::TaskList => {
+            let Some(tasks) = value.as_array().filter(|a| !a.is_empty()) else {
+                return "No background jobs. Start one with /bg shell <command>.".into();
+            };
+            let mut lines = vec![
+                "Background jobs".into(),
+                format!("{:<16} {:<16} {:<8} NAME", "ID", "STATE", "KIND"),
+            ];
+            for task in tasks {
+                lines.push(format!(
+                    "{:<16} {:<16} {:<8} {}",
+                    text(task, "id"),
+                    text(task, "status"),
+                    text(task, "kind"),
+                    text(task, "name")
+                ));
+            }
+            lines.push("Inspect: /task <id> · Logs: /task logs <id> [stdout|stderr|both] · Cancel: /task kill <id> [--force]".into());
+            terminal_safe(&lines.join("\n"))
+        }
+        K::TaskGet | K::TaskKill | K::BgRun => {
+            let id = text(value, "id");
+            let mut lines = vec![
+                format!("Task {id}"),
+                format!(
+                    "State: {} · Kind: {}",
+                    text(value, "status"),
+                    text(value, "kind")
+                ),
+            ];
+            if let Some(name) = value["name"].as_str() {
+                lines.push(format!("Name: {name}"));
+            }
+            if let Some(pid) = value["pid"].as_u64() {
+                lines.push(format!("PID: {pid}"));
+            }
+            if let Some(code) = value["exit_code"].as_i64() {
+                lines.push(format!("Exit code: {code}"));
+            }
+            lines.push(format!(
+                "Output: stdout {} chars · stderr {} chars",
+                value["stdout"]["chars"].as_u64().unwrap_or(0),
+                value["stderr"]["chars"].as_u64().unwrap_or(0)
+            ));
+            lines.push(format!(
+                "Logs: /task logs {id} · Cancel: /task kill {id} [--force]"
+            ));
+            terminal_safe(&lines.join("\n"))
+        }
+        K::TaskLogs => {
+            let mut lines = vec![format!("Task {} logs", text(value, "id"))];
+            for stream in ["stdout", "stderr"] {
+                if let Some(data) = value.get(stream) {
+                    lines.push(format!(
+                        "── {stream}{} ──",
+                        if data["preview_truncated"] == true {
+                            " (preview truncated; full output remains in history)"
+                        } else {
+                            ""
+                        }
+                    ));
+                    let preview = data["preview"].as_str().unwrap_or("");
+                    lines.push(if preview.is_empty() {
+                        "(empty)".into()
+                    } else {
+                        preview.into()
+                    });
+                    if let Some(address) = data["ref"].as_str() {
+                        lines.push(format!("History: {address}"));
+                    }
+                }
+            }
+            terminal_safe(&lines.join("\n"))
+        }
+        K::WakeupList | K::WakeupCancel => human_metadata("Scheduled continuations", value),
+        _ => human_metadata("Background management", value),
+    }
+}
+
+#[cfg(test)]
+mod human_management_rendering_tests {
+    use super::*;
+    #[test]
+    fn live_badge_is_present_only_with_active_jobs_in_all_states() {
+        for state in ["idle", "thinking", "running"] {
+            let mut value = json!({"state":state,"cells":2,"active_background_tasks":2});
+            assert!(terminal_status(&value, 500)
+                .join("\n")
+                .contains("jobs: 2 running"));
+            value["active_background_tasks"] = json!(0);
+            assert!(!terminal_status(&value, 500).join("\n").contains("jobs:"));
+        }
+    }
+    #[test]
+    fn tables_details_and_metadata_are_human_readable_and_terminal_safe() {
+        let task = json!({"id":"task1","kind":"shell","name":"tests\x1b[2J","status":"running",
+            "created_ms":1000,"stdout":{"chars":42,"ref":"H.records.stdout[0]"},
+            "stderr":{"chars":0,"ref":"H.records.stderr[0]"}});
+        let list = human_background_result(NativeCommandKind::TaskList, &json!([task.clone()]));
+        for needle in ["ID", "STATE", "NAME", "task1", "running", "/task logs"] {
+            assert!(list.contains(needle), "{list}");
+        }
+        assert!(!terminal_safe(&list).contains('\x1b'));
+        assert!(
+            human_background_result(NativeCommandKind::TaskList, &json!([]))
+                .contains("No background jobs")
+        );
+        let detail = human_background_result(NativeCommandKind::TaskGet, &task);
+        assert!(
+            detail.contains("Task task1") && detail.contains("Output:") && detail.contains("42"),
+            "{detail}"
+        );
+        let stopped = json!({"id":"task1","kind":"shell","status":"cancelled","exit_code":null});
+        let kill = human_background_result(NativeCommandKind::TaskKill, &stopped);
+        assert!(
+            kill.contains("cancelled") && !kill.contains("killed successfully"),
+            "{kill}"
+        );
+        let values = human_metadata(
+            "Status",
+            &json!({"selected_model":"provider/model",
+            "active_background_tasks":1,"nested":{"enabled":true},"empty":[]}),
+        );
+        assert!(
+            values.contains("Selected model: provider/model")
+                && values.contains("Active background tasks: 1"),
+            "{values}"
+        );
+        assert!(
+            !values.contains("{") && !values.contains("\"selected_model\""),
+            "{values}"
+        );
+    }
+}
+
 fn ui_json(title: &str, value: &Value) {
-    ui_text(title);
-    ui_text(&serde_json::to_string_pretty(value).unwrap_or_default());
+    ui_text(&human_metadata(title, value));
 }
 impl Host {
     fn ui_text(&self, text: &str) {
@@ -10639,6 +10837,7 @@ impl Host {
             context: &self.context,
             skills: &self.skills,
             last_generation_failed: self.last_generation_failed,
+            active_background_tasks: self.scheduler.active_count(),
         }
     }
     fn state_payload(&self) -> Value {
@@ -12170,6 +12369,7 @@ impl Host {
             }
             NativeCommandKind::TaskLogs => {
                 let metadata = self.bg_get(command.args.task_id.require()?)?;
+                let mut logs = json!({"id":metadata["id"]});
                 for stream in ["stdout", "stderr"] {
                     if !command.args.stream.require()?.includes(stream) {
                         continue;
@@ -12178,19 +12378,26 @@ impl Host {
                         .as_u64()
                         .ok_or("task has no output reference")?
                         as usize;
-                    self.ui_text(&format!(
-                        "{} — {}\n{}\n[{} chars; preview only; full output in H]",
-                        stream,
-                        metadata[stream]["ref"].as_str().unwrap_or(""),
-                        self.ui_stream_preview(stream, index)?,
-                        metadata[stream]["chars"]
-                    ));
+                    let preview = self.ui_stream_preview(stream, index)?;
+                    logs[stream] = metadata[stream].clone();
+                    logs[stream]["preview_truncated"] = json!(
+                        preview.chars().count()
+                            < metadata[stream]["chars"].as_u64().unwrap_or(0) as usize
+                    );
+                    logs[stream]["preview"] = json!(preview);
+                }
+                if !self.json {
+                    self.ui_text(&human_background_result(NativeCommandKind::TaskLogs, &logs));
                 }
                 return Ok(());
             }
             _ => self.wakeup_list()?,
         };
-        self.ui_json("Background management", &result);
+        if self.json {
+            self.ui_json("Background management", &result);
+        } else {
+            self.ui_text(&human_background_result(command.kind, &result));
+        }
         Ok(())
     }
     fn ui_stream_preview(&self, stream: &str, index: usize) -> Result<String> {
@@ -13671,17 +13878,14 @@ impl BusyInput {
         let mut lines = display.take_intermediate_boundary();
         lines.extend(match kind {
             "source" | "preview" => terminal_preview(event, display.terminal.width()),
-            "info" => {
-                let width = display.terminal.width();
-                let mut lines = terminal_wrap(event["title"].as_str().unwrap_or(""), width).0;
-                for line in serde_json::to_string_pretty(&event["value"])
-                    .unwrap_or_default()
-                    .lines()
-                {
-                    lines.extend(terminal_wrap(line, width).0);
-                }
-                terminal_style_lines(lines, "2")
-            }
+            "info" => terminal_style_lines(
+                terminal_wrap(
+                    &human_metadata(event["title"].as_str().unwrap_or(""), &event["value"]),
+                    display.terminal.width(),
+                )
+                .0,
+                "2",
+            ),
             "cell_end" => {
                 display.pending_boundary = Some(event.clone());
                 Vec::new()
@@ -14043,7 +14247,7 @@ impl EditTerminal {
             }
             self.output.write_all(item.text.as_bytes())?;
         }
-        // The exact same rows/cursor as PickerTerminal, below all visible input.
+        // Shared footer rows place the menu below all visible input.
         let (rows, local, columns) = if let Some(menu) = menu {
             for (text, style) in &menu.lines {
                 self.output.write_all(b"\r\n")?;
@@ -14908,7 +15112,7 @@ fn editor_complete(
         terminal.keyboard(true)?;
         if choice.is_err() {
             // Clear owned modal rows on exceptional exits, just as the
-            // standalone picker's guard does before restoring its caller.
+            // shared footer does before restoring its caller.
             terminal.draw(&buffer.line, buffer.cursor)?;
             terminal.output.write_all(b"\x1b[?25h")?;
             terminal.output.flush()?;
@@ -15095,6 +15299,7 @@ fn terminal_readline(
     let mut width = terminal.width();
     let mut height = terminal.height();
     let mut refreshed = None;
+    let mut active_jobs = host.scheduler.active_count();
     loop {
         host.service_background()
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -15122,7 +15327,9 @@ fn terminal_readline(
         if INTERRUPT.swap(false, std::sync::atomic::Ordering::SeqCst) {
             return Err(ReadlineError::Interrupted);
         }
-        if width != terminal.width() || height != terminal.height() {
+        let current_jobs = host.scheduler.active_count();
+        if current_jobs != active_jobs || width != terminal.width() || height != terminal.height() {
+            active_jobs = current_jobs;
             width = terminal.width();
             height = terminal.height();
             terminal.headers = terminal_status(&host.state_payload(), width);
@@ -21904,6 +22111,7 @@ struct StatusSnapshotInputs<'a> {
     context: &'a ContextStore,
     skills: &'a Value,
     last_generation_failed: bool,
+    active_background_tasks: usize,
 }
 impl StatusSnapshotInputs<'_> {
     fn context_usage(&self) -> Value {
@@ -21931,7 +22139,7 @@ impl StatusSnapshotInputs<'_> {
     fn payload(&self) -> Value {
         #[cfg(test)]
         STATUS_SNAPSHOT_CALLS.with(|calls| calls.set(calls.get() + 1));
-        let mut payload = json!({"state":self.frontend.state().label(),"cell":self.execution.cell(),"cells":self.execution.cells(),
+        let mut payload = json!({"active_background_tasks":self.active_background_tasks,"state":self.frontend.state().label(),"cell":self.execution.cell(),"cells":self.execution.cells(),
             "language":self.execution.language(),"cell_elapsed_ms":self.execution.started().map(|start|start.elapsed().as_millis().min(u64::MAX as u128) as u64),
             "thinking_elapsed_ms":self.frontend.thinking_elapsed(),
             "selected_model":self.provider.model(),"effort":self.provider.effort(),
@@ -21970,6 +22178,7 @@ impl Host {
             context: &self.context,
             skills: &self.skills,
             last_generation_failed: self.last_generation_failed,
+            active_background_tasks: self.scheduler.active_count(),
         };
         let owner = self.execution.cell().zip(self.execution.operation());
         let mut io = CaptureSession {
@@ -21983,7 +22192,12 @@ impl Host {
                     status.payload()
                 })
         };
-        action(&mut self.scheduler, &mut io, &mut emit)
+        let before = status.active_background_tasks;
+        let result = action(&mut self.scheduler, &mut io, &mut emit);
+        if self.scheduler.active_count() != before {
+            self.event("state", self.state_payload());
+        }
+        result
     }
     fn bg_save_task(&mut self, metadata: &Value) -> Result<()> {
         self.scheduler_operation(|_, io, emit| TaskScheduler::save_task(io, emit, metadata))
@@ -24890,6 +25104,24 @@ Witnesses: current_format_contract_tests; current CLI/PTY/history/resume tests;
 installation shell smoke tests. Verification: background build/format checks
 and full suite passed: 466 tests, 0 failed (64.69s). Isolated PREFIX release
 installation, installed --help, run.sh --help and shell syntax checks passed.
+
+
+### Human background activity and management output (approved)
+Human idle/busy footers show `jobs: N running` while owned background jobs are
+active (including launch/cancellation/output-draining); omit the badge at zero.
+Refresh on count transitions without input, preserving drafts, cursor/menu state,
+and separator spacers. Scheduled timers and restored terminal jobs do not count.
+User /tasks, /task, /bg and wakeup commands render readable tables/details and
+log previews with clear truncation/empty-stream labels and actionable commands.
+Other metadata slash commands use readable labeled values, not raw JSON.
+JSON-mode events and Python API values stay structured; display output must not
+enter model context or expose terminal control characters.
+Witnesses: human_management_rendering_tests;
+e2e_tty_background_badge_and_human_commands_preserve_draft;
+e2e_bgtasks_slash_controls_and_user_only_logs.
+Verification: background build/format checks and full suite passed: 469 tests,
+0 failures. PTY idle/busy badge, draft preservation, human commands and burst
+input performance passed; structured task-control tests remain passing.
 
 ## 20. Batched old-output eviction and cache stability
 
@@ -37010,6 +37242,40 @@ def finish(marker):
 tty_wait(lambda:idle in data,'idle editor ready')
 "###, body].concat();
         fixture(&script);
+    }
+
+    #[test]
+    fn e2e_tty_background_badge_and_human_commands_preserve_draft() {
+        tty_editor_fixture(
+            r###"
+import re
+ansi=re.compile(rb'\x1b\[[0-?]*[ -/]*[@-~]')
+def frame_since(start):
+ frames=bytes(data[start:]).split(b'\x1b[K\x1b[J')[1:]
+ complete=[frame for frame in frames if b'\x1b[?2004h' in frame or re.search(rb'\x1b\[[0-9]+C(?:\x1b\[\?25h)?$',frame)]
+ return ansi.sub(b'',complete[-1]) if complete else b''
+send("@agent.bgtasks.run('sleep 1.5',name='idle-test')\r")
+tty_wait(lambda:b'jobs: 1 running' in data,'idle badge')
+start=len(data);send('kept draft')
+tty_wait(lambda:b'> kept draft' in frame_since(start),'draft visible')
+tty_wait(lambda:b'> kept draft' in frame_since(start) and b'jobs:' not in frame_since(start),'badge clears with draft preserved')
+send('\x15/tasks\r')
+tty_wait(lambda:b'Background jobs' in data and b'idle-test' in data and frame_since(start).rstrip(b'\r').endswith(b'> '),'readable task list')
+task=[e['payload'] for e in records() if e['kind']=='task_state'][0]['id']
+start=len(data);send('/task '+task+'\r')
+tty_wait(lambda:('Task '+task).encode() in data[start:] and b'Output:' in data[start:] and frame_since(start).rstrip(b'\r').endswith(b'> '),'readable task details')
+start=len(data);send('/task logs '+task+' stdout\r')
+tty_wait(lambda:b'(empty)' in data[start:] and frame_since(start).rstrip(b'\r').endswith(b'> '),'plain empty log')
+send('held task\r')
+tty_wait(lambda:request_started.is_set() and busy in data,'held provider')
+start=len(data);send('/bg shell sleep 10\r')
+tty_wait(lambda:b'jobs: 1 running' in frame_since(start),'busy badge')
+task=[e['payload'] for e in records() if e['kind']=='task_state'][-1]['id']
+send('/task kill '+task+' --force\r')
+tty_wait(lambda:b'jobs:' not in frame_since(start) and any(e['kind']=='task_settled' and e['payload']['task']['id']==task for e in records()),'busy badge clears after kill')
+finish('fixture-result')
+"###,
+        );
     }
 
     #[test]
